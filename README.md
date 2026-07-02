@@ -89,6 +89,20 @@ through them, with discovery, schema validation, and audit built in. Copy-paste
 config for Zed, Cursor, Claude Desktop, Claude Code, and VS Code:
 [Wire praxec into your editor](https://praxec.dev/guides/editors/).
 
+## Run a full pack — one command
+
+Beyond a single tool, get a complete **workflow pack** and every MCP tool it needs
+provisioned and wired in one step:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/praxec/packs/main/setup.sh | bash
+```
+
+That pulls the `cognitive-architectures` pack (a SWE-lifecycle library) plus its tools
+(cpm-planner, fmeca, elicitation, scientific-process), sets up your provider keys, writes a
+validated gateway config, and prints the `serve` command. Browse the catalog at
+[praxec.dev/packs](https://praxec.dev/packs) or the [pack registry](https://github.com/praxec/packs).
+
 ## Two tools
 
 praxec exposes exactly two MCP tools, no matter how many capabilities you wire
