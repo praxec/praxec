@@ -1,0 +1,155 @@
+version: "1.0.0"
+
+audit:
+    sink: file
+    path: ~/.local/share/praxec/audit-logs
+    rotation: daily
+
+store:
+    kind: file
+    path: ~/.local/share/praxec/workflows/
+
+connections:
+    filesystem:
+        kind: cli
+        command: npx
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    github:
+        kind: cli
+        command: npx
+        args: ["-y", "@modelcontextprotocol/server-github"]
+    shell:
+        kind: cli
+        command: npx
+        args: ["-y", "@modelcontextprotocol/server-shell"]
+
+capabilities:
+    fs.read_file:
+        executor:
+            kind: mcp
+            connection: filesystem
+            tool: read_file
+    fs.list_directory:
+        executor:
+            kind: mcp
+            connection: filesystem
+            tool: list_directory
+    fs.search:
+        executor:
+            kind: mcp
+            connection: filesystem
+            tool: search
+    fs.raw_write:
+        executor:
+            kind: mcp
+            connection: filesystem
+            tool: write_file
+    fs.safe_write:
+        wraps: fs.raw_write
+        guards:
+            - kind: evidence
+              requires: [tests_passed]
+    shell.run_test:
+        executor:
+            kind: cli
+            command: cargo
+            args: ["test", "--workspace"]
+    shell.build:
+        executor:
+            kind: cli
+            command: cargo
+            args: ["build"]
+    git.list_branches:
+        executor:
+            kind: mcp
+            connection: github
+            tool: list_branches
+    git.create_pr:
+        executor:
+            kind: mcp
+            connection: github
+            tool: create_pull_request
+        guards:
+            - kind: evidence
+              requires: [tests_passed]
+
+proxy:
+    expose:
+        - capability: fs.read_file
+          as: fs.read
+        - capability: fs.list_directory
+          as: fs.ls
+        - capability: fs.search
+          as: fs.search
+        - capability: fs.safe_write
+          as: fs.write
+        - capability: shell.run_test
+          as: test.run
+        - capability: shell.build
+          as: build.run
+        - capability: git.list_branches
+          as: git.branches
+        - capability: git.create_pr
+          as: git.create_pr
+
+workflows:
+    tdd:
+        initialState: red
+        states:
+            red:
+                transitions:
+                    write_test:
+                        target: green
+                        executor:
+                            kind: noop
+            green:
+                transitions:
+                    write_code:
+                        target: red
+                        executor:
+                            kind: noop
+                    refactor:
+                        target: done
+                        executor:
+                            kind: noop
+            done:
+                terminal: true
+    governed_change:
+        initialState: planning
+        states:
+            planning:
+                transitions:
+                    implement:
+                        target: testing
+                        executor:
+                            kind: noop
+            testing:
+                transitions:
+                    test_passed:
+                        target: awaiting_approval
+                        executor:
+                            kind: noop
+                    test_failed:
+                        target: planning
+                        executor:
+                            kind: noop
+            awaiting_approval:
+                transitions:
+                    approve:
+                        target: merging
+                        executor:
+                            kind: human
+                            queue: change-approvals
+                    request_changes:
+                        target: planning
+                        executor:
+                            kind: human
+                            queue: change-approvals
+            merging:
+                transitions:
+                    merge:
+                        target: done
+                        executor:
+                            kind: noop
+            done:
+                terminal: true

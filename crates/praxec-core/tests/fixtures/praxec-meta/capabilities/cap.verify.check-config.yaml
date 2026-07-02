@@ -1,0 +1,29 @@
+# capabilities/cap.verify.check-config.yaml
+
+workflows:
+  cap.verify.check-config:
+    verb: verify
+    lifecycle: experimental
+    description: >
+      Validate a candidate YAML via `praxec check`. Emit ok=true
+      when zero hard errors; surface the diagnostic list otherwise.
+    snippet:
+      inputs:
+        config_path: { type: string, required: true }
+      outputs:
+        ok:          { type: boolean }
+        diagnostics: { type: array }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          check:
+            target: done
+            actor: deterministic
+            executor:
+              kind: script
+              subject: verify.praxec.check
+            output:
+              ok:          "$.output.ok"
+              diagnostics: "$.output.diagnostics"
+      done: { terminal: true }

@@ -1,0 +1,66 @@
+# Vector configuration to ingest praxec audit events and forward to a SIEM.
+#
+# praxec writes one JSON line per audit event to a file (audit.sink: file).
+# This Vector config tails that file, parses JSON, enriches events, and ships
+# to a configurable sink (Elasticsearch, Splunk, Loki, etc.).
+#
+# Usage:
+#   vector --config examples/audit-to-vector/vector.toml
+
+[sources.praxec_audit]
+type = "file"
+include = ["/var/log/praxec-audit.jsonl"]
+fingerprint.strategy = "device_and_inode"
+start_at_beginning = false
+
+[transforms.parse_audit]
+type = "remap"
+inputs = ["praxec_audit"]
+source = '''
+  . = parse_json!(.message)
+  .@timestamp = now()
+  .event = del(.event_type)
+  .workflow_id = del(.workflow_id) ?? null
+  .correlation_id = del(.correlation_id) ?? null
+  .actor = del(.actor) ?? "unknown"
+  .payload = del(.payload) ?? {}
+  .tags = ["praxec", "audit"]
+'''
+
+[transforms.enrich_siem]
+type = "remap"
+inputs = ["parse_audit"]
+source = '''
+  # Classify events for SIEM severity mapping
+  severity = "info"
+  if starts_with!(.event, "executor.failed") || starts_with!(.event, "transition.rejected") {
+    severity = "warning"
+  }
+  if starts_with!(.event, "workflow.timed_out") {
+    severity = "warning"
+  }
+  if starts_with!(.event, "human.approval") {
+    severity = "notice"
+  }
+  .severity = severity
+
+  # Add SIEM-compliant metadata
+  .event.dataset = "praxec.audit"
+  .service.type = "praxec"
+  .observer.product = "praxec"
+  .observer.vendor = "outboundlabs"
+'''
+
+[sinks.elasticsearch]
+type = "elasticsearch"
+inputs = ["enrich_siem"]
+endpoints = ["http://localhost:9200"]
+mode = "bulk"
+index = "praxec-audit-%Y-%m-%d"
+healthcheck.enabled = true
+
+# Alternative: send to stdout for debugging
+[sinks.stdout]
+type = "console"
+inputs = ["enrich_siem"]
+encoding.codec = "json"

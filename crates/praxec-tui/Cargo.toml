@@ -1,0 +1,99 @@
+[package]
+name = "praxec-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Praxec — a control plane for AI coding agents. Inverts the industry's generative-first paradigm: a deterministic execution harness comes first, and the model generates only inside governed workflows, via praxec as its sole MCP server"
+autobins = false
+
+[dependencies]
+# Shared agent logic (reasoning-effort mapping, etc.) lives in the agents crate
+# so the in-step `kind: agent` executor and the TUI external-spine spawner
+# don't duplicate it.
+praxec-agents = { workspace = true }
+# Aether agent framework — full feature set
+aether_cli = { version = "0.7", package = "aether-agent-cli" }
+wisp = { version = "0.4", package = "aether-wisp" }
+tui = { version = "0.2", package = "aether-tui", features = ["syntax"] }
+aether_core = { version = "0.6", package = "aether-agent-core" }
+# T19: `ReasoningEffort` is owned by aether-llm; we depend on it
+# directly to translate `agents.yaml` per-provider feature toggles into
+# the effective effort level aether's runtime takes.
+# Workspace pin: ~0.7.6 (patches only) per FMECA F13.
+llm = { workspace = true }
+
+# Note: no Cargo-level dependency on `praxec`. The TUI spawns the
+# praxec binary as a child process at runtime; binary discovery is
+# handled by `find_praxec_binary` in src/praxec_mcp.rs (sibling of
+# current_exe, then PATH, then MCP_PRAXEC_PATH env override).
+# Adding a path-dep would be silently ignored anyway because praxec
+# is a binary-only crate (no `[lib]` target).
+
+# Shared
+clap.workspace = true
+clap_complete.workspace = true
+clap_mangen.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+crossterm = { version = "0.29", features = ["event-stream"] }
+# SPEC §20.6 (audit recommendation) — platform-standard cache/log dir
+# resolution for the TUI's log output. See B.4 in the audit-resolution
+# plan; replaces the previously hardcoded /tmp path.
+dirs = "5"
+tempfile.workspace = true
+# SPEC §21 — `async fn` in traits for the interpreter's `McpToolCaller`
+# and `SubAgentSpawner` abstractions. Required so tests can substitute
+# mocks without spinning up real MCP/LLM processes.
+async-trait.workspace = true
+thiserror.workspace = true
+
+# SPEC §21 — production `McpToolCaller` impl: rmcp client that talks to
+# a `praxec` child process over stdio. Same workspace dep + same
+# feature set the executors crate uses for outbound MCP calls.
+rmcp = { workspace = true }
+
+# Tranche 3 (px doctor) — pre-flight checks call core's config
+# resolver and parse YAML directly to surface resolve-time errors
+# without spinning the runtime.
+praxec-core = { workspace = true }
+serde_yaml = { workspace = true }
+
+# T23: doctor's live-probe cache. chrono for timestamps in
+# ~/.praxec/agents-last-probe.json; reqwest for the actual
+# HTTP probe of provider /v1/models endpoints. `--refresh-agents`
+# flag re-probes; default doctor runs read the cache + warn on stale.
+chrono = { workspace = true }
+reqwest = { workspace = true }
+rpassword.workspace = true
+
+# Library surface: `interpreter`, `agent_config`, `tui_config`, `sub_agent`
+# (see src/lib.rs). Integration tests import via `praxec_tui::…`.
+[lib]
+name = "praxec_tui"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# SPEC §B.1 — two `[[bin]]` entries pointing at the same source. `px`
+# is the primary short alias users type; `praxec-tui` is the discoverable
+# long-form. (`px` is the short name the earlier `fg` alias couldn't be —
+# `fg` collided with the bash builtin for resuming backgrounded jobs.)
+[[bin]]
+name = "px"
+path = "src/main.rs"
+
+[[bin]]
+name = "praxec-tui"
+path = "src/main.rs"
+
+[dev-dependencies]
+# meta_scripts_integration.rs exercises the praxec-meta production scripts
+# through the real public ScriptExecutor, spawning this crate's `px`
+# binary (CARGO_BIN_EXE_px) for `validate-agents-config`.
+praxec-executors = { workspace = true }

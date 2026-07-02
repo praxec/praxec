@@ -1,0 +1,56 @@
+version: "1.0.0"
+
+connections:
+  github:
+    kind: mcp
+    command: github-mcp-server
+
+  dotnet:
+    kind: cli
+    command: dotnet
+
+audit:
+  sink: stderr
+
+proxy:
+  expose:
+    - name: github.list_issues
+      title: List GitHub issues
+      description: List issues from a GitHub repository.
+      tags: [github, issues, read]
+      inputSchema:
+        type: object
+        properties:
+          repo:
+            type: string
+        required: [repo]
+        additionalProperties: false
+      executor:
+        kind: mcp
+        connection: github
+        tool: list_issues
+
+    - name: dotnet.test
+      title: Run .NET tests
+      description: Run `dotnet test` in the configured working directory.
+      tags: [dotnet, test, cli]
+      inputSchema:
+        type: object
+        properties:
+          project:
+            type: string
+        required: [project]
+        additionalProperties: false
+      executor:
+        kind: cli
+        connection: dotnet
+        args:
+          - test
+          - "$.arguments.project"
+      reliability:
+        timeoutMs: 120000
+        retry:
+          maxAttempts: 2
+          backoff: fixed
+          initialDelayMs: 1000
+          retryOn: [transient_error, timeout]

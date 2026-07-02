@@ -1,0 +1,50 @@
+# capabilities/cap.verify.capability-harness.yaml
+#
+# T22 — capability verification per affinity. Complement (not
+# replacement) for cap.verify.auth-only-smoke-test:
+#   - auth-only-smoke is fast, cheap, and proves credentials.
+#   - this cap is slower (one real model call per matching binding),
+#     incurs token spend, and proves the model can actually do work
+#     in the affinity it's slotted for.
+#
+# Operators who care about capability run BOTH: auth-only-smoke
+# catches credential bugs in ~1s; capability-harness catches "the
+# free-tier model can't actually code" later. Auth failures from
+# auth-only-smoke obviate capability-harness for that binding.
+
+workflows:
+  cap.verify.capability-harness:
+    verb: verify
+    lifecycle: experimental
+    description: >
+      Run a golden contract (prompt + verifier) against every binding
+      in agents.yaml whose override-key affinity matches the contract.
+      Output names per-binding pass/fail with the verifier kind +
+      detail, NOT just a green/red. Exit 0 always — gating decisions
+      live in the flow that called this cap.
+    snippet:
+      inputs:
+        agents_config_path: { type: string, required: true }
+        contract_path:      { type: string, required: true }
+      outputs:
+        contract_id: { type: string }
+        affinity:    { type: string }
+        results:     { type: array }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          run:
+            target: done
+            actor: deterministic
+            executor:
+              kind: script
+              subject: verify.capability-harness
+              args:
+                - "$.input.agents_config_path"
+                - "$.input.contract_path"
+            output:
+              contract_id: "$.output.json.contract_id"
+              affinity:    "$.output.json.affinity"
+              results:     "$.output.json.results"
+      done: { terminal: true }

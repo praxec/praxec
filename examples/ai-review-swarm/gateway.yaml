@@ -1,0 +1,424 @@
+# SPEC §17 + §24 — parallel AI code review swarm
+#
+# Seven specialized reviewers fan out in parallel, each reviewing the
+# same diff through a different lens. Findings are merged, deduplicated,
+# ranked, and presented to a human for arbitration. Optionally, accepted
+# fixes are auto-applied.
+#
+# Architecture (each arrow = one transition):
+#
+#   extract_diff ──→ review_swarm (parallel, 7 branches)
+#                           │
+#                     ┌─────┼─────┬─────┬─────┬─────┬─────┐
+#                     ▼     ▼     ▼     ▼     ▼     ▼     ▼
+#                  arch   bug   sec   perf  test   api   maint
+#                     │     │     │     │     │     │     │
+#                     └─────┼─────┴─────┴─────┴─────┴─────┘
+#                           ▼
+#                      merge_findings
+#                           │
+#                           ▼
+#                    human_arbitration
+#                        │         │
+#                   apply_fixes  done (reject all)
+#                        │
+#                      done
+
+version: "1.0.0"
+audit:
+  sink: stderr
+
+praxec:
+  strict_namespacing: false   # `git.*` script roots aren't in the blessed set
+
+scripts:
+  git.uncommitted-diff:
+    verb: inspect
+    lifecycle: stable
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      # Produce { diff, files[], stats }
+      FILES=$(git diff --name-only | jq -R -s 'split("\n") | map(select(length > 0))')
+      DIFF=$(git diff | jq -R -s .)
+      STATS=$(git diff --stat | tail -1)
+      jq -n \
+        --arg diff "$DIFF" \
+        --argjson files "$FILES" \
+        --arg stats "$STATS" \
+        '{diff: $diff, files: $files, stats: $stats}'
+
+  git.base-diff:
+    verb: inspect
+    lifecycle: stable
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      BASE="${1:-main}"
+      FILES=$(git diff --name-only "$BASE" | jq -R -s 'split("\n") | map(select(length > 0))')
+      DIFF=$(git diff "$BASE" | jq -R -s .)
+      STATS=$(git diff --stat "$BASE" | tail -1)
+      jq -n \
+        --arg diff "$DIFF" \
+        --argjson files "$FILES" \
+        --arg stats "$STATS" \
+        '{diff: $diff, files: $files, stats: $stats, base: $base}'
+
+skills:
+  review.architecture:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Architecture Reviewer
+      You are a senior staff engineer performing a focused architecture review.
+      Review ONLY the provided diff and its direct impact radius.
+
+      Priorities:
+      1. correctness
+      2. architecture
+      3. maintainability
+      4. security
+      5. testability
+      6. performance
+
+      Rules:
+      - avoid stylistic nitpicks
+      - avoid speculative feedback
+      - identify concrete risks
+      - explain why the issue matters
+      - propose minimal fixes
+      - reference exact files/symbols
+      - prefer existing project patterns
+      - do not rewrite working code unnecessarily
+
+      Output format:
+      [
+        {
+          "severity": "high|medium|low",
+          "category": "bug|architecture|security|performance|testing|maintainability",
+          "file": "...",
+          "symbol": "...",
+          "problem": "...",
+          "why_it_matters": "...",
+          "suggested_fix": "..."
+        }
+      ]
+  review.bug-risk:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Bug Risk Reviewer
+      You are a senior staff engineer performing a focused bug-risk review.
+      Same rules and output format as review.architecture.
+      Focus on: correctness, edge cases, null/nil handling, off-by-one errors,
+      race conditions, error propagation, input validation, state machine
+      transitions, invariant violations.
+  review.security:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Security Reviewer
+      You are a senior staff engineer performing a focused security review.
+      Same rules and output format as review.architecture.
+      Focus on: injection vectors, authN/authZ bypass, secret exposure,
+      input validation gaps, dependency vulnerabilities, sandbox escape,
+      path traversal, privilege escalation.
+  review.performance:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Performance Reviewer
+      You are a senior staff engineer performing a focused performance review.
+      Same rules and output format as review.architecture.
+      Focus on: algorithmic complexity, N+1 queries, memory allocation hot paths,
+      lock contention, unnecessary copies, missing caching, unbounded growth.
+  review.testing:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Testing Reviewer
+      You are a senior staff engineer performing a focused testing review.
+      Same rules and output format as review.architecture.
+      Focus on: missing tests for new behavior, weak assertions, untestable code,
+      missing edge-case coverage, flaky test patterns, test isolation,
+      missing integration/contract tests.
+  review.api-contract:
+    verb: review
+    lifecycle: stable
+    body: |
+      # API Contract Reviewer
+      You are a senior staff engineer performing a focused API contract review.
+      Same rules and output format as review.architecture.
+      Focus on: breaking changes to public APIs, schema compatibility,
+      versioning, error response shape, rate limiting, backward compatibility,
+      deprecation paths, documentation gaps.
+  review.maintainability:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Maintainability Reviewer
+      You are a senior staff engineer performing a focused maintainability review.
+      Same rules and output format as review.architecture.
+      Focus on: naming clarity, coupling vs cohesion, function/method length,
+      documentation quality, dead code, magic numbers, configuration vs code,
+      test readability.
+  review.merge-dedupe:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Findings Merger
+      You are a senior staff engineer merging findings from 7 parallel reviewers.
+      Input: 7 arrays of findings (may include nulls for failed reviewers).
+      Output:
+      {
+        "merged": [...],        // deduplicated, ranked
+        "stats": {
+          "total_raw": N,       // before dedup
+          "merged_count": N,    // after dedup
+          "high": N, "medium": N, "low": N,  // by severity
+          "by_category": { "bug": N, ... },
+          "reviewers_succeeded": 7,  // how many produced output
+          "reviewers_failed": 0
+        }
+      }
+
+      Merge rules:
+      - Two findings are duplicates if they reference the same file + symbol
+        AND describe substantively similar problems.
+      - When merging duplicates, keep the HIGHEST severity version.
+      - Rank: high severity first, then by category priority (bug > security >
+        architecture > api-contract > testing > performance > maintainability).
+  review.autofix:
+    verb: implement
+    lifecycle: experimental
+    body: |
+      # Auto-Fixer
+      You are a senior staff engineer applying minimal fixes to accepted findings.
+      Input: a filtered findings array (only 'accept' verdicts).
+      For each finding, produce a minimal code change that addresses the
+      suggested fix. Prefer surgical edits over rewrites. Output:
+      {
+        "changes": [
+          { "file": "...", "symbol": "...", "patch": "..." }
+        ],
+        "unfixable": [
+          { "file": "...", "symbol": "...", "reason": "..." }
+        ]
+      }
+
+workflows:
+  ai_review_swarm:
+    initialState: extract_diff
+    blackboard:
+      diff:           { type: string }
+      files:          { type: array }
+      stats:          { type: string }
+      base_branch:    { type: string }
+      raw_findings:   { type: array }
+      merged_findings:{ type: array }
+      merge_stats:    { type: object }
+      verdicts:       { type: object }
+      fix_result:     { type: object }
+
+    initialContext:
+      base_branch: "main"
+
+    states:
+      # ── Step 1: Extract the diff ──────────────────────────────────────
+      extract_diff:
+        goal: Extract the git diff for review
+        skills:
+          - review.architecture
+          - review.bug-risk
+          - review.security
+          - review.performance
+          - review.testing
+          - review.api-contract
+          - review.maintainability
+        transitions:
+          run_diff:
+            target: review_swarm
+            actor: deterministic
+            executor:
+              kind: script
+              subject: git.base-diff
+              args: ["$.context.base_branch"]
+            output:
+              diff:  "$.output.diff"
+              files: "$.output.files"
+              stats: "$.output.stats"
+
+      # ── Step 2: Parallel review swarm ─────────────────────────────────
+      review_swarm:
+        goal: Run all 7 reviewers in parallel
+        transitions:
+          fan_out:
+            target: merge_findings
+            actor: deterministic
+            executor:
+              kind: parallel
+              join: all
+              on_branch_failure: continue
+              total_timeout_ms: 300000
+              max_concurrency: 7
+              branches:
+                # Architecture Reviewer
+                - kind: mcp
+                  connection: review_llm
+                  tool: chat
+                  map:
+                    system: "review.architecture"
+                    diff:    "$.workflow.context.diff"
+                    files:   "$.workflow.context.files"
+                  evidence:
+                    kind: review
+                    id: "arch-{{$.workflow.id}}"
+                    summary: Architecture review
+
+                # Bug Risk Reviewer
+                - kind: mcp
+                  connection: review_llm
+                  tool: chat
+                  map:
+                    system: "review.bug-risk"
+                    diff:    "$.workflow.context.diff"
+                    files:   "$.workflow.context.files"
+                  evidence:
+                    kind: review
+                    id: "bug-{{$.workflow.id}}"
+                    summary: Bug risk review
+
+                # Security Reviewer
+                - kind: mcp
+                  connection: review_llm
+                  tool: chat
+                  map:
+                    system: "review.security"
+                    diff:    "$.workflow.context.diff"
+                    files:   "$.workflow.context.files"
+                  evidence:
+                    kind: review
+                    id: "sec-{{$.workflow.id}}"
+                    summary: Security review
+
+                # Performance Reviewer
+                - kind: mcp
+                  connection: review_llm
+                  tool: chat
+                  map:
+                    system: "review.performance"
+                    diff:    "$.workflow.context.diff"
+                    files:   "$.workflow.context.files"
+                  evidence:
+                    kind: review
+                    id: "perf-{{$.workflow.id}}"
+                    summary: Performance review
+
+                # Testing Reviewer
+                - kind: mcp
+                  connection: review_llm
+                  tool: chat
+                  map:
+                    system: "review.testing"
+                    diff:    "$.workflow.context.diff"
+                    files:   "$.workflow.context.files"
+                  evidence:
+                    kind: review
+                    id: "test-{{$.workflow.id}}"
+                    summary: Testing review
+
+                # API Contract Reviewer
+                - kind: mcp
+                  connection: review_llm
+                  tool: chat
+                  map:
+                    system: "review.api-contract"
+                    diff:    "$.workflow.context.diff"
+                    files:   "$.workflow.context.files"
+                  evidence:
+                    kind: review
+                    id: "api-{{$.workflow.id}}"
+                    summary: API contract review
+
+                # Maintainability Reviewer
+                - kind: mcp
+                  connection: review_llm
+                  tool: chat
+                  map:
+                    system: "review.maintainability"
+                    diff:    "$.workflow.context.diff"
+                    files:   "$.workflow.context.files"
+                  evidence:
+                    kind: review
+                    id: "maint-{{$.workflow.id}}"
+                    summary: Maintainability review
+
+            output:
+              raw_findings: "$.output.branches[*].output"
+
+      # ── Step 3: Merge + dedupe findings ───────────────────────────────
+      merge_findings:
+        delegate: merge-agent
+        goal: Merge, deduplicate, and rank findings from all reviewers
+        skills:
+          - review.merge-dedupe
+        transitions:
+          merged:
+            target: human_arbitration
+            inputSchema:
+              type: object
+              required: [merged, stats]
+              properties:
+                merged: { type: array }
+                stats:  { type: object }
+            executor: { kind: noop }
+            output:
+              merged_findings: "$.arguments.merged"
+              merge_stats:     "$.arguments.stats"
+
+      # ── Step 4: Human arbitration ─────────────────────────────────────
+      human_arbitration:
+        goal: Accept, reject, or convert findings to rules
+        actor: human
+        guidance: >
+          {{ $.context.merge_stats.merged_count }} findings to review
+          ({{ $.context.merge_stats.high }} high,
+           {{ $.context.merge_stats.medium }} medium,
+           {{ $.context.merge_stats.low }} low).
+
+          For each finding, decide: accept | reject | ignore_permanently | convert_to_rule.
+        transitions:
+          apply_fixes:
+            target: fix
+            actor: human
+            inputSchema:
+              type: object
+              properties:
+                verdicts: { type: object }
+            output:
+              verdicts: "$.arguments.verdicts"
+
+          reject_all:
+            target: done
+            actor: human
+            executor: { kind: noop }
+
+      # ── Step 5: Optional autofix ──────────────────────────────────────
+      fix:
+        delegate: fix-agent
+        goal: Apply minimal fixes for accepted findings
+        skills:
+          - review.autofix
+        transitions:
+          fixes_applied:
+            target: done
+            inputSchema:
+              type: object
+              properties:
+                changes:   { type: array }
+                unfixable: { type: array }
+            output:
+              fix_result: "$.arguments"
+
+      done:
+        terminal: true

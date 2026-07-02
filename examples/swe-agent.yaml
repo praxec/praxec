@@ -1,0 +1,238 @@
+# SPEC §17 + docs/architecture/research.md — reference SWE-agent workflow.
+#
+# The architecture is six Praxec states (planning → retrieving → editing
+# → verifying → critiquing → human_review), each backed by a guidance skill
+# fragment, plus three EXTERNAL tools that plug in via the existing
+# `connections:` block. Praxec runtime stays unchanged.
+#
+# To run this workflow you need three out-of-repo tools running locally:
+#   - `scip-mcp` (or any SCIP-backed code-graph MCP server) on :7100
+#   - `verifier-harness-mcp` on :7200
+#   - `constrained-edit` CLI on PATH
+#
+# See README.md §"Coding-agent recipe" for sourcing/building these tools.
+#
+# Then start the gateway:
+#   praxec serve --config examples/swe-agent.yaml
+#
+# And drive the workflow from any MCP client by calling
+#   workflow.start { definitionId: "swe_agent", input: {…} }
+
+version: "1.0.0"
+
+connections:
+  codebase_graph:
+    type: mcp
+    transport:
+      kind: streamable_http
+      url: "http://localhost:7100/mcp"
+  verifier_harness:
+    type: mcp
+    transport:
+      kind: streamable_http
+      url: "http://localhost:7200/mcp"
+  constrained_edit:
+    type: cli
+    command: ["constrained-edit"]
+
+skills:
+  plan.specify.change-request:
+    verb: plan
+    lifecycle: stable
+    body: |
+      # Normalising a change request
+      Convert the raw issue into a typed problem statement. Required fields:
+      `normalizedProblem`, `acceptanceCriteria`, `risk` (low|medium|high|critical),
+      `blastRadius` (touchesAuth, touchesSchema, crossRepo, estimatedFiles).
+      Read evidence; do not propose code.
+  diagnose.codebase.search:
+    verb: diagnose
+    lifecycle: stable
+    body: |
+      # Composing precise codebase queries
+      Use `search_symbol`, `resolve_dependencies`, `find_tests`, `lookup_owner`
+      against the codebase_graph executor. Assemble an evidence pack that names
+      the smallest set of files implicated by the problem. Cite each finding
+      with a symbol id and a file:line range.
+  implement.edit.constrained:
+    verb: implement
+    lifecycle: stable
+    body: |
+      # Constrained edit operations
+      Emit only the eight allowed operations: replace_symbol_body,
+      insert_before_symbol, insert_after_symbol, replace_range, create_file,
+      delete_file, modify_manifest, add_test. Never propose shell. Never
+      touch paths in `constraints.forbiddenPaths`.
+  review.code.adversarial:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Adversarial patch review
+      Attack the candidate patch: find missed edge cases, hidden regressions,
+      policy violations, security issues. Cite each finding with file:line and
+      a counterexample input. Return verdict: accept | retry | escalate.
+  review.code.final-approval:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Human reviewer checklist
+      Before approving an AI-authored patch:
+      - confirm the verifier harness ran and all gates passed
+      - read the diff fully, not just the summary
+      - cross-check changes against `acceptanceCriteria` from the original request
+      - inspect blast radius — auth/secrets/schemas/cross-repo changes require
+        the change-owner's sign-off, not just code-owner approval
+      - if any uncertainty remains, send back with `reject` and a specific question
+
+workflows:
+  swe_agent:
+    version: "2026-05-25"
+    initialState: intake
+    skills:
+      - plan.specify.change-request
+      - review.code.adversarial
+    blackboard:
+      normalizedProblem:    { type: string }
+      acceptanceCriteria:   { type: array }
+      risk:                 { type: string }
+      evidencePack:         { type: object }
+      candidatePatch:       { type: object }
+      verifierPassed:       { type: boolean }
+      critique:             { type: object }
+      retryCount:           { type: integer }
+    initialContext:
+      retryCount: 0
+
+    # ADR-0008 — the mission's measurable definition of done. Each outcome pairs a
+    # human-readable statement (the orchestrator's target focus) with a
+    # deterministic `check` (the guard `expr` language over $.context). The mission
+    # `succeeded` only when it reaches a `success` terminal with all outcomes met.
+    outcomes:
+      - id: verified
+        statement: The patch passes deterministic verification.
+        check: "$.context.verifierPassed == true"
+      - id: risk-acceptable
+        statement: The change is not critical-risk (low-risk auto-accepts; higher risk needs human sign-off).
+        check: "$.context.risk != 'critical'"
+
+    states:
+      intake:
+        goal: Receive the change request
+        transitions:
+          start_planning:
+            target: planning
+            executor: { kind: noop }
+
+      planning:
+        delegate: planning-agent
+        goal: Normalise the change request into a typed problem
+        skills:
+          - plan.specify.change-request
+        transitions:
+          plan_ready:
+            target: retrieving
+            inputSchema:
+              type: object
+              required: [normalizedProblem, risk]
+              properties:
+                normalizedProblem:  { type: string }
+                acceptanceCriteria: { type: array }
+                risk:               { type: string }
+            executor: { kind: noop }
+            output:
+              normalizedProblem:  "$.arguments.normalizedProblem"
+              acceptanceCriteria: "$.arguments.acceptanceCriteria"
+              risk:               "$.arguments.risk"
+
+      retrieving:
+        delegate: retrieval-agent
+        goal: Assemble a precise evidence pack
+        skills:
+          - diagnose.codebase.search
+        transitions:
+          evidence_ready:
+            target: editing
+            executor:
+              kind: mcp
+              connection: codebase_graph
+              tool: assemble_evidence_pack
+            output:
+              evidencePack: "$.output"
+
+      editing:
+        delegate: editing-agent
+        goal: Produce constrained edit operations
+        skills:
+          - implement.edit.constrained
+        transitions:
+          edits_produced:
+            target: verifying
+            executor:
+              kind: cli
+              connection: constrained_edit
+            output:
+              candidatePatch: "$.output.patch"
+
+      verifying:
+        goal: Run deterministic verification stages
+        transitions:
+          run_verifier:
+            target: critiquing
+            actor: deterministic
+            executor:
+              kind: mcp
+              connection: verifier_harness
+              tool: run_harness
+            output:
+              verifierPassed: "$.output.passed"
+
+      critiquing:
+        delegate: critique-agent
+        goal: Adversarial review of the patch
+        skills:
+          - review.code.adversarial
+        transitions:
+          accept_low_risk:
+            target: completed
+            guards:
+              - { kind: expr, expr: "$.context.verifierPassed == true" }
+              - { kind: expr, expr: "$.context.risk != 'high'" }
+              - { kind: expr, expr: "$.context.risk != 'critical'" }
+            executor: { kind: noop }
+          accept_high_risk:
+            target: human_review
+            guards:
+              - { kind: expr, expr: "$.context.verifierPassed == true" }
+              - { kind: expr, expr: "$.context.risk == 'high'" }
+            executor: { kind: noop }
+          retry:
+            target: retrieving
+            guards:
+              - { kind: expr, expr: "$.context.verifierPassed == false" }
+              - { kind: expr, expr: "$.context.retryCount < 3" }
+            executor: { kind: noop }
+            output:
+              retryCount: { add: ["$.context.retryCount", 1] }
+          escalate:
+            target: human_review
+            guards:
+              - { kind: expr, expr: "$.context.verifierPassed == false" }
+              - { kind: expr, expr: "$.context.retryCount >= 3" }
+            executor: { kind: noop }
+
+      human_review:
+        goal: Final human sign-off
+        actor: human
+        skills:
+          - review.code.final-approval
+        transitions:
+          approve:
+            target: completed
+            executor: { kind: human }
+          reject:
+            target: planning
+            executor: { kind: human }
+
+      completed:
+        terminal: true
+        outcome: success

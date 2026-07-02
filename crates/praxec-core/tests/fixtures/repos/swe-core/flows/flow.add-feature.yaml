@@ -1,0 +1,14 @@
+workflows:
+  flow.add-feature:
+    title: Add feature (swe-core fixture)
+    initialState: planning
+    states:
+      planning:
+        transitions:
+          plan_drafted:
+            target: done
+            executor:
+              kind: workflow
+              definitionId: cap.plan.vet
+      done:
+        terminal: true

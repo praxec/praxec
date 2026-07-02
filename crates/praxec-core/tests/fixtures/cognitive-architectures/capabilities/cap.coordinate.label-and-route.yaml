@@ -1,0 +1,35 @@
+# capabilities/cap.coordinate.label-and-route.yaml
+
+workflows:
+  cap.coordinate.label-and-route:
+    verb: coordinate
+    lifecycle: experimental
+    description: >
+      Apply severity + component labels to an issue and assign the
+      resolved owner team.
+    snippet:
+      inputs:
+        issue:      { type: object, required: true }
+        severity:   { type: string, required: true }
+        component:  { type: string, required: true }
+        owner_team: { type: string, required: true }
+      outputs:
+        applied: { type: object }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          apply:
+            target: done
+            actor: deterministic
+            executor:
+              kind: mcp
+              connection: github_mcp
+              tool: update_issue
+              arguments:
+                issue:      "$.context.issue"
+                labels:     ["$.context.severity", "$.context.component"]
+                assignees:  ["$.context.owner_team"]
+            output:
+              applied: "$.output"
+      done: { terminal: true }

@@ -1,0 +1,65 @@
+name: Nightly — live integration tests
+
+on:
+    schedule:
+        # 04:00 UTC daily — after the typical daily release-train
+        # cadence; before US/Europe morning so failures land in a
+        # reviewer's inbox at start-of-day.
+        - cron: "0 4 * * *"
+    workflow_dispatch: {}
+
+env:
+    CARGO_TERM_COLOR: always
+    RUSTFLAGS: "-Dwarnings"
+
+jobs:
+    live-integration:
+        name: live integration (ignored + env-gated tests)
+        runs-on: ubuntu-latest
+        timeout-minutes: 60
+        # Skip the live tests on forks (no secrets). The schedule
+        # trigger only fires on the canonical repo anyway, but guard
+        # the workflow_dispatch path too.
+        if: github.repository == 'praxec/praxec'
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install system dependencies
+              # libdbus-1-dev is required by libdbus-sys (transitive dep
+              # via aether-auth's OS keyring abstraction on Linux).
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libdbus-1-dev pkg-config
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Cache cargo registry + build
+              uses: Swatinem/rust-cache@v2
+
+            - name: Run env-gated integration tests
+              env:
+                  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_CI }}
+                  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY_CI }}
+                  GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY_CI }}
+              run: |
+                  cargo test --workspace -- --include-ignored
+
+            - name: Run the live smoke-ete walk
+              env:
+                  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_CI }}
+              run: |
+                  bash examples/smoke-ete/walk-live.sh
+
+            - name: Notify on failure
+              if: failure()
+              uses: actions/github-script@v7
+              with:
+                  script: |
+                      github.rest.issues.create({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          title: `Nightly live-integration failed: ${context.runId}`,
+                          body: `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThe nightly live-integration suite failed. Investigate ASAP — failures here indicate either a live-API contract drift or a regression in praxec's live paths.`,
+                          labels: ['nightly-failure', 'priority']
+                      });

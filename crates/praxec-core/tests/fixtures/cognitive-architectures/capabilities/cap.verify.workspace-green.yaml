@@ -1,0 +1,31 @@
+# capabilities/cap.verify.workspace-green.yaml
+#
+# Deterministic cap: bind to the existing `verify.workspace.green`
+# script in the library. The script runs the workspace's full sweep
+# (lint + format + test) and emits structured JSON on stdout.
+
+workflows:
+  cap.verify.workspace-green:
+    verb: verify
+    lifecycle: experimental
+    description: >
+      Run the workspace sweep (lint + format + test); emit ok + summary.
+    snippet:
+      inputs: {}
+      outputs:
+        ok:      { type: boolean }
+        summary: { type: object }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          run:
+            target: done
+            actor: deterministic
+            executor:
+              kind: script
+              subject: verify.workspace.green
+            output:
+              ok:      "$.output.passed"
+              summary: "$.output"
+      done: { terminal: true }

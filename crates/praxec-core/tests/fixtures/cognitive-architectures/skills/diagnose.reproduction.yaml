@@ -1,0 +1,41 @@
+# skills/diagnose.reproduction.yaml
+#
+# Authored: structured-repro discipline for bug investigation. A repro that
+# is not minimal, deterministic, and self-contained costs more in confusion
+# than it saves in evidence.
+skills:
+  diagnose.reproduction:
+    verb: diagnose
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Structured reproduction discipline
+
+      A reproduction without these five fields is a story, not evidence.
+      Before any fix discussion, produce all five — in this order. Stop and
+      complete each one before moving on.
+
+      1. **Minimal steps.** The shortest path from a clean environment to the
+         broken state. Strip irrelevant config, fixtures, and dependencies. If
+         it takes more than ten lines or one screenful, you have not minimised.
+      2. **Expected vs actual.** State both in one sentence each, in
+         user-visible terms (not stack-trace terms). "I expected the export
+         button to download a CSV; I got a 500." Stack traces support, they do
+         not replace.
+      3. **Environment baseline.** OS + kernel, runtime version, package
+         versions for direct dependencies, browser + version when relevant,
+         data fixture identifier. Record only what could plausibly affect
+         the outcome; do not dump `lsb_release -a` wholesale.
+      4. **Frequency.** Always / sometimes (with rate) / once. If "sometimes,"
+         note any signal you have on the trigger (load, time of day, specific
+         input class). Intermittent bugs need a different investigation shape
+         than deterministic ones; declaring frequency picks the shape.
+      5. **Isolation already attempted.** What did you rule out? "Reproduces
+         on commit X, does not on X~1," "reproduces against staging DB, not
+         local SQLite," "reproduces in incognito so it is not a cookie." This
+         list is the diff between *your* knowledge and the next investigator's
+         starting point — without it, they redo your work.
+
+      Anti-patterns: "see attached video" without timestamps, "doesn't work"
+      without an expectation, copy-pasted production stack traces with no
+      version metadata, and "intermittent" with no frequency estimate.

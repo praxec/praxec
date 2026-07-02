@@ -1,0 +1,31 @@
+# capabilities/cap.test.compare-baseline.yaml
+#
+# Deterministic cap bound to the `test.baseline.compare` script.
+
+workflows:
+  cap.test.compare-baseline:
+    verb: test
+    lifecycle: experimental
+    description: >
+      Re-run tests post-edit; compare to baseline. ok=true iff no new
+      failures AND no lost passes.
+    snippet:
+      inputs:
+        baseline: { type: object, required: true }
+      outputs:
+        ok:    { type: boolean }
+        drift: { type: object }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          compare:
+            target: done
+            actor: deterministic
+            executor:
+              kind: script
+              subject: test.baseline.compare
+            output:
+              ok:    "$.output.ok"
+              drift: "$.output.drift"
+      done: { terminal: true }

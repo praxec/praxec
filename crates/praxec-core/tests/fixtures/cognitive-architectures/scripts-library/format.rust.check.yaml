@@ -1,0 +1,13 @@
+version: "1.0.0"
+scripts:
+  format.rust.check:
+    verb: format
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # Check-only: read-only audit that fails on diff.
+      # The matching format-and-write script lives under `format.rust.write`
+      # (not shipped here — operators decide their own write policy).
+      set -euo pipefail
+      cargo fmt --all -- --check "$@"

@@ -1,0 +1,71 @@
+# capabilities/cap.implement.write-agents-config.yaml
+#
+# Atomic write of `agents.yaml` + round-trip validation through the
+# same `agents.yaml` loader the runtime uses at startup (FMECA U3/U6).
+#
+# The cap's script:
+#   1. Writes the YAML to a temp file in the SAME directory as the
+#      target (cross-fs renames are not atomic).
+#   2. Round-trips the temp file through `AgentsFile::from_path` —
+#      the same code path the resolver uses at workflow start.
+#   3. On pass: atomic rename → target. On fail: rolls back the
+#      temp file so a broken config never replaces a good one.
+
+workflows:
+  cap.implement.write-agents-config:
+    verb: implement
+    lifecycle: experimental
+    description: >
+      Render the approved plan into `agents.yaml`, atomic-write
+      (temp + rename), and round-trip-validate through the `agents.yaml`
+      loader. round_trip_ok=false rolls back; the flow branches
+      to `failed`.
+    snippet:
+      inputs:
+        plan_final:  { type: object, required: true }
+        target_path:
+          type: string
+          default: ".praxec/agents.yaml"
+      outputs:
+        yaml_text:     { type: string }
+        written_path:  { type: string }
+        round_trip_ok: { type: boolean }
+        validation:    { type: object }
+    skills: [implement.emit-praxec-yaml]
+    initialState: rendering
+    states:
+      rendering:
+        goal: >
+          Serialize plan_final to YAML text following agents.yaml
+          v1 schema. The emit-praxec-yaml skill's discipline
+          applies: snippet contract conformance, no anonymous
+          shadowing, strict over-deny on unknown fields.
+        transitions:
+          submit_yaml:
+            target: writing
+            actor: agent
+            inputSchema:
+              type: object
+              required: [yaml_text]
+              properties:
+                yaml_text: { type: string }
+            executor: { kind: noop }
+            output:
+              yaml_text: "$.arguments.yaml_text"
+      writing:
+        transitions:
+          write:
+            target: done
+            actor: deterministic
+            executor:
+              kind: script
+              subject: install.agents-config
+              args:
+                - "$.context.yaml_text"
+                - "$.input.target_path"
+              treatNonZeroAsFailure: false
+            output:
+              written_path:  "$.output.json.written_path"
+              round_trip_ok: "$.output.json.round_trip_ok"
+              validation:    "$.output.json.validation"
+      done: { terminal: true }

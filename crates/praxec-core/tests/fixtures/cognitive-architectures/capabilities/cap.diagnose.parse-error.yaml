@@ -1,0 +1,32 @@
+# capabilities/cap.diagnose.parse-error.yaml
+
+workflows:
+  cap.diagnose.parse-error:
+    verb: diagnose
+    lifecycle: experimental
+    description: >
+      Parse a raw error log / stack trace into a structured defect
+      descriptor: error_class, frames, hint, error_signature.
+    snippet:
+      inputs:
+        error_log: { type: string, required: true }
+      outputs:
+        parsed: { type: object }
+    skills: [diagnose.error-trace.parse]
+    initialState: ready
+    states:
+      ready:
+        goal: Parse the trace bottom-up; identify error_class + user-code frames.
+        transitions:
+          submit_parsed:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [parsed]
+              properties:
+                parsed: { type: object }
+            executor: { kind: noop }
+            output:
+              parsed: "$.arguments.parsed"
+      done: { terminal: true }

@@ -1,0 +1,58 @@
+# skills/deploy.safety.checklist.yaml
+#
+# Authored: pre-deploy 10-point operator-grade safety checklist. Use this
+# at the gate just before any production deploy. Every item is a yes/no
+# question with a clear failure mode if the answer is "no."
+skills:
+  deploy.safety.checklist:
+    verb: review
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Pre-deploy 10-point safety checklist
+
+      Run this gate immediately before promoting to production. Every item
+      requires an explicit "yes" with named evidence. A single "no" or
+      "unclear" blocks the deploy until resolved.
+
+      1. **Migrations are reversible.** Every DB migration in the diff has a
+         tested down-migration, OR is additive-only (new nullable column, new
+         table). Destructive migrations (drop column, narrow type, NOT NULL
+         backfill) require an out-of-band runbook and a separate ticket.
+      2. **Feature flags default to OFF.** Any new behavior is behind a flag
+         whose default in the deployed config is `false`. Roll-out is a
+         config flip after deploy, not an implicit part of deploy.
+      3. **Rollback plan named.** A specific named action ("redeploy SHA
+         abc1234," "flip flag X to false," "revert PR #123") that the on-call
+         can execute in under five minutes without paging anyone.
+      4. **Traffic shadowing or canary readiness confirmed.** Either the
+         change is risk-tiered such that shadowing is unnecessary (docs,
+         pure read-side), or the shadow/canary path has been exercised in
+         staging and metrics dashboards exist for the deciding signals.
+      5. **On-call acknowledged.** The on-call for the affected service has
+         pinged "ack" in the deploy thread, in this hour, on the current
+         change set. Acknowledgment from yesterday does not count.
+      6. **Dependency versions pinned.** No `latest`, no unpinned floating
+         tags, no `~`/`^` ranges resolving at build time in production
+         manifests. The deploy artifact is byte-identical to what was
+         tested.
+      7. **Runbook updated.** The service runbook reflects any new failure
+         mode, new dashboard, new alert, or new operational lever this
+         change introduces. "We'll update it after" is a deferred
+         outage cause.
+      8. **Secrets rotation handled.** If the change touches secret
+         material — new env var, new IAM role, new API key — the rotation
+         path is documented and the new secrets are in the production
+         secret store before deploy, not as part of deploy.
+      9. **Cross-region / cross-cluster effects considered.** State the
+         blast radius beyond the immediate service: cache invalidation,
+         downstream queue contracts, replication lag, multi-tenant
+         isolation. If the answer is "none," say so explicitly so the
+         next reviewer can challenge it.
+      10. **Blackout window respected.** Not during a customer-facing
+          event, end-of-quarter financial close, peak traffic hour for
+          the affected region, or an already-active incident. A deploy
+          window is a policy, not a habit.
+
+      The checklist itself is the artifact. Paste it into the deploy thread
+      with each item ticked and the evidence pointer next to it.

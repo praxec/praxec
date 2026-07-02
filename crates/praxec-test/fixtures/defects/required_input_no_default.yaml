@@ -1,0 +1,37 @@
+version: "1.0.0"
+# DEFECT 7: required_input_no_default
+# The workflow declares inputSchema with a required field 'thing', but provides
+# no default in initialContext. A transition reads $.workflow.input.thing.
+# The fuzz harness seeds instances with input: {} (empty), so $.workflow.input.thing
+# is null/absent at runtime when the guard or output reads it.
+# Expected detection: This depends on how/whether the runtime validates input
+# schema at start time. The fuzz harness uses submit_isolated which bypasses
+# the normal start flow (it seeds the instance directly at a given state).
+# The inputSchema requirement is therefore NOT checked by the per-transition fuzz.
+# This is a BLIND SPOT: the fuzz cannot catch missing required inputs because
+# it never goes through the normal start path that validates inputSchema.
+workflows:
+  required_input_flow:
+    version: "1.0.0"
+    initialState: start
+    inputSchema:
+      type: object
+      required: [thing]
+      properties:
+        thing:
+          type: string
+    states:
+      start:
+        goal: "Read a required input field"
+        transitions:
+          go:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+            guards:
+              - kind: expr
+                expr: "$.context.thing == 'expected'"
+      done:
+        goal: "Finished"
+        terminal: true
+        transitions: {}

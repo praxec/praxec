@@ -1,0 +1,37 @@
+# capabilities/cap.implement.emit-yaml.yaml
+
+workflows:
+  cap.implement.emit-yaml:
+    verb: implement
+    lifecycle: experimental
+    description: >
+      Render the chosen shape into a v0.2-conformant YAML body for a
+      capability or flow. Output is the YAML text + target path.
+    snippet:
+      inputs:
+        chosen:    { type: object, required: true }
+        kind:      { type: string, enum: [capability, flow] }
+        namespace: { type: string, default: "draft" }
+      outputs:
+        yaml_text:   { type: string }
+        target_path: { type: string }
+    skills: [implement.emit-praxec-yaml]
+    initialState: ready
+    states:
+      ready:
+        goal: Render the YAML body; cite skill checklist.
+        transitions:
+          submit_yaml:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [yaml_text, target_path]
+              properties:
+                yaml_text:   { type: string }
+                target_path: { type: string }
+            executor: { kind: noop }
+            output:
+              yaml_text:   "$.arguments.yaml_text"
+              target_path: "$.arguments.target_path"
+      done: { terminal: true }

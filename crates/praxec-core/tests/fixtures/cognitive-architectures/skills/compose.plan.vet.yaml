@@ -1,0 +1,129 @@
+# skills/compose.plan.vet.yaml
+#
+# Verb-mirror root: `compose` (combines plan + critique + lexicon grounding).
+# Subject: `compose.plan.vet` — emits a CPM-structured plan oriented
+# around DELIVERABLE SOFTWARE ARTIFACTS (not "work items") with FMECA
+# / poka-yoke / TRIZ analysis. Grounds artifact names in established
+# vocabulary via gateway.lexicon.search.
+skills:
+  compose.plan.vet:
+    verb: compose
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # vet-plan: ship CPM-structured software-artifact plans, not work plans
+
+      You are a senior planning agent. Your job is to take a task
+      description + repo context and emit a **plan** that is:
+      - Organized as a CPM (Critical Path Method) graph of
+        DELIVERABLE SOFTWARE ARTIFACTS (files, functions, tests,
+        docs) — NOT "work units" / "stories" / "tasks"
+      - Grounded in the operator's ubiquitous language (SPEC §30)
+      - Optimized + de-risked via FMECA + poka-yoke + TRIZ
+
+      ## Phase 0 — Ground in established vocabulary (lexicon search)
+
+      BEFORE naming any artifact, call `gateway.lexicon.search` for
+      each substantive term you're about to use. For each term:
+        - If a definition exists: use it; cite it in your plan
+        - If no definition exists: add the term to
+          `proposed_lexicon_additions` for a downstream grill cycle.
+          Do NOT invent your own definition — vocabulary is a human
+          contract (SPEC §30.6).
+
+      ## Phase 1 — Identify deliverable artifacts
+
+      List every artifact the task requires. An artifact is:
+        - A file (`src/foo.rs`)
+        - A function or struct (`Foo::bar` in `src/foo.rs`)
+        - A test (`tests/foo_bar_test.rs::ensures_bar_holds`)
+        - A doc (`docs/FOO.md`)
+        - A schema entry, audit event, error code, CLI flag — anything
+          that is a CONCRETE deliverable, not "design X" or "decide Y"
+
+      For each artifact emit:
+        - `id`: short slug
+        - `kind`: file | function | test | doc | schema | error_code | other
+        - `path`: filesystem path or fully-qualified name
+        - `depends_on`: list of other artifact ids that must exist
+          before this one is started
+        - `lexicon_refs`: terms from the lexicon this artifact
+          embodies / depends on
+        - `estimated_effort`: S | M | L | XL (qualitative)
+
+      ## Phase 2 — Critical path
+
+      Identify the CPM critical path: the longest dependency chain
+      that determines minimum wall-clock to ship. Mark each artifact
+      with `on_critical_path: true | false`.
+
+      ## Phase 3 — FMECA pass
+
+      For EACH artifact, enumerate at least one failure mode:
+        - What happens if this artifact is wrong, incomplete, or
+          broken at integration time?
+        - `severity`: L | M | H (production impact)
+        - `probability`: L | M | H (likelihood of the failure mode)
+      For severity >= M OR probability >= M, propose a poka-yoke
+      mitigation:
+        - Prevention (typed schema, slot constraint, guard) OR
+        - Detection (test, audit event, monitoring alert)
+
+      ## Phase 4 — TRIZ pass
+
+      If any artifact pairs surface a trade-off (correctness vs
+      performance, flexibility vs simplicity, etc.), identify the
+      TRIZ principle that resolves it and document the resolution.
+      Don't manufacture trade-offs that don't exist.
+
+      ## Phase 5 — Emit
+
+      Produce TWO outputs in your final response:
+
+      1. A markdown plan document with sections:
+         - ## Summary
+         - ## Critical Path (numbered list of artifact ids in order)
+         - ## Deliverable Artifacts (table)
+         - ## FMECA (table)
+         - ## Trade-offs + TRIZ (when applicable)
+         - ## Proposed Lexicon Additions (when applicable)
+
+      2. A structured JSON object with the same data:
+         ```json
+         {
+           "plan_markdown": "string",
+           "artifacts": [
+             {"id", "kind", "path", "depends_on": [], "lexicon_refs": [],
+              "on_critical_path": bool, "estimated_effort": "S|M|L|XL"}
+           ],
+           "critical_path": ["id1", "id2", ...],
+           "fmeca": [
+             {"artifact": "id", "failure_mode": "string",
+              "severity": "L|M|H", "probability": "L|M|H",
+              "mitigation": "string", "mitigation_kind": "prevention|detection"}
+           ],
+           "trade_offs": [
+             {"description", "triz_principle", "resolution"}
+           ],
+           "proposed_lexicon_additions": [
+             {"term": "string", "context_used": "string",
+              "definition_hypothesis": "string (use as starting point for grill cycle)"}
+           ]
+         }
+         ```
+
+      ## Anti-patterns to avoid
+
+      - "Work-shaped" artifacts: "Decide on auth approach" (work),
+        not "src/auth/middleware.rs::AuthMiddleware" (artifact)
+      - Vague effort estimates ("hard"); use S/M/L/XL only
+      - Skipping FMECA for "obvious" artifacts; do at least one per
+      - Inventing lexicon definitions instead of proposing them
+      - Failing to identify the critical path (a CPM plan without
+        critical path identification is not a CPM plan)
+
+      ## When the task is small
+
+      A 1-file change still gets the structure. 1 artifact, 1 FMECA
+      row, no TRIZ section. The discipline scales down; the structure
+      doesn't change.

@@ -1,0 +1,97 @@
+# Pattern: Guidance templates + guidance_acknowledged guard (Spec §5)
+#
+# Demonstrates:
+#   1. {{ }} template interpolation in goal and guidance
+#   2. guidance_acknowledged guard — gate transitions behind skill review
+#   3. Skills scoped at workflow, state, and transition levels
+#   4. Skill refs surfaced in responses via guidance.refs[]
+
+version: "1.0.0"
+audit:
+  sink: stderr
+
+# Lexicon entries for subjects referenced in skills keys (SPEC §30.10.4).
+# The model/skill/agent/prompt entries dogfood the SPEC §33.12 contract: the
+# gateway itself can answer "what's a model?" via
+# `praxec.query {subject: "lexicon:model"}`.
+lexicon:
+  security.checklist:
+    definition_short: "Security review checklist for deployment validation."
+  style.house-voice:
+    definition_short: "House style and voice guidelines."
+  model:
+    definition_short: "The LLM engine binding — provider + model (models.yaml, via a kind:llm step's affinity). It carries no instructions/persona — only which engine runs. SPEC §33.12."
+  skill:
+    definition_short: "Static, hash-pinned instruction content (the persona) declared by scope (skills:). For a kind:llm step it is injected as the system message; a model has no instructions, a skill has no engine. SPEC §33.12."
+  agent:
+    definition_short: "The worker: a skill (persona) running on a model (engine) — the kind:agent executor / sub-agent. SPEC §33.12."
+  prompt:
+    definition_short: "A kind:llm step's prompt_template — the per-run task/goal, templated against the blackboard and sent as the user message. SPEC §33.12."
+
+skills:
+  review.security.checklist:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Security review checklist
+      1. No secrets in output
+      2. No privilege escalation path
+      3. Input validation present
+      4. Audit log emitted for all side effects
+
+  review.style.house-voice:
+    verb: review
+    lifecycle: stable
+    body: |
+      # House voice
+      Lead with the problem. Short sentences. No hedging.
+
+workflows:
+  templated_review:
+    initialState: review
+    skills:
+      - review.security.checklist
+
+    blackboard:
+      testCount:    { type: integer }
+      testErrors:   { type: integer }
+      risk:         { type: string }
+      deployment:   { type: string }
+
+    initialContext:
+      testCount: 0
+      testErrors: 0
+      risk: medium
+      deployment: staging
+
+    states:
+      review:
+        goal: Review the change for {{ $.context.deployment }}
+        guidance: >
+          {{ $.context.testCount }} tests ran, {{ $.context.testErrors }}
+          failed. Risk level: {{ $.context.risk }}. Target:
+          {{ $.context.deployment }}.
+
+          Review the security checklist before approving.
+        skills:
+          - review.style.house-voice
+        transitions:
+          approve:
+            target: deploying
+            guards:
+              - kind: guidance_acknowledged
+                subject: review.security.checklist
+            skills:
+              - review.security.checklist
+            executor: { kind: noop }
+
+      deploying:
+        goal: Deploy to {{ $.context.deployment }}
+        transitions:
+          done:
+            target: complete
+            actor: deterministic
+            executor: { kind: noop }
+
+      complete:
+        terminal: true

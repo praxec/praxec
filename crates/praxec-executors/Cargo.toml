@@ -1,0 +1,41 @@
+[package]
+name = "praxec-executors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Default executors for praxec (cli, rest, mcp, human, workflow, noop)"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+praxec-core = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+jsonschema = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+# SPEC §22 — script executor materializes the snapshot's stamped body to
+# a per-invocation temp file (chmod 0700) before exec.
+tempfile = "3"
+# SPEC §24 — ParallelExecutor's defensive snapshot-hash assert (F1).
+sha2 = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+tokio = { workspace = true }
+tempfile = "3"
+wiremock = "0.6"

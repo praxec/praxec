@@ -1,0 +1,35 @@
+# capabilities/cap.audit.mine-transitions.yaml
+#
+# Deterministic mining of audit transition records. Bound to a script
+# that reads the audit log and emits a structured report. Operators
+# can replace the script with one that targets their actual audit
+# backend (file, postgres, datadog, etc.) — the cap contract stays
+# the same.
+
+workflows:
+  cap.audit.mine-transitions:
+    verb: audit
+    lifecycle: experimental
+    description: >
+      Read transition records for a workflow definition; emit a
+      structured report (stalls, failing guards, interventions,
+      slow transitions, error_kinds) driving the optimize loop.
+    snippet:
+      inputs:
+        definition_id: { type: string, required: true }
+        since:         { type: string, default: "" }
+      outputs:
+        report: { type: object }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          mine:
+            target: done
+            actor: deterministic
+            executor:
+              kind: script
+              subject: audit.mine-praxec-transitions
+            output:
+              report: "$.output"
+      done: { terminal: true }

@@ -1,0 +1,35 @@
+# capabilities/cap.gate.human-disambiguate.yaml
+
+workflows:
+  cap.gate.human-disambiguate:
+    verb: gate
+    lifecycle: experimental
+    description: >
+      Ask a human to pick between candidate routings / classifications
+      when a deterministic classifier returns is_ambiguous=true.
+    snippet:
+      inputs:
+        candidates: { type: array,  required: true }
+        prompt:     { type: string, default: "Pick one" }
+      outputs:
+        chosen:    { type: object }
+        rationale: { type: string }
+    initialState: awaiting_human
+    states:
+      awaiting_human:
+        goal: Block; surface candidates + prompt to the operator.
+        transitions:
+          pick:
+            target: done
+            actor: human
+            inputSchema:
+              type: object
+              required: [chosen]
+              properties:
+                chosen:    { type: object }
+                rationale: { type: string, default: "" }
+            executor: { kind: human }
+            output:
+              chosen:    "$.arguments.chosen"
+              rationale: "$.arguments.rationale"
+      done: { terminal: true }

@@ -1,0 +1,25 @@
+version: "1.0.0"
+scripts:
+  search.codebase.ripgrep:
+    verb: search
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # Content discovery against the working directory using ripgrep.
+      # First arg is the pattern; remaining args are passed through to rg.
+      # Emits matches on stderr (line-numbered, human-readable) and a JSON
+      # summary on stdout (match count, files touched).
+      set -euo pipefail
+      : "${1:?Usage: pass the search pattern as the first arg}"
+
+      pattern="$1"; shift
+
+      # Stream matches to stderr so the workflow's stdout JSON stays clean.
+      rg --line-number --no-heading --color=never "$pattern" "$@" >&2 || true
+
+      # Structured summary for $.output.json.
+      match_count=$(rg --count-matches --no-heading "$pattern" "$@" 2>/dev/null \
+        | awk -F: '{sum+=$NF} END {print sum+0}')
+      file_count=$(rg --files-with-matches "$pattern" "$@" 2>/dev/null | wc -l)
+      echo "{\"pattern\": \"$pattern\", \"matches\": $match_count, \"files\": $file_count, \"subject\": \"$PRAXEC_SCRIPT_SUBJECT\"}"

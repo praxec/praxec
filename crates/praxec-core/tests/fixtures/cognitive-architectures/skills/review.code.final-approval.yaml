@@ -1,0 +1,17 @@
+# skills/review.code.final-approval.yaml
+#
+# Lifted verbatim from the SWE-agent reference workflow.
+skills:
+  review.code.final-approval:
+    verb: review
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Human reviewer checklist
+      Before approving an AI-authored patch:
+      - confirm the verifier harness ran and all gates passed
+      - read the diff fully, not just the summary
+      - cross-check changes against `acceptanceCriteria` from the original request
+      - inspect blast radius — auth/secrets/schemas/cross-repo changes require
+        the change-owner's sign-off, not just code-owner approval
+      - if any uncertainty remains, send back with `reject` and a specific question

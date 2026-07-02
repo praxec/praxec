@@ -1,0 +1,15 @@
+version: "1.0.0"
+scripts:
+  deploy.cargo-install:
+    verb: deploy
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # Install a Rust binary from a local crate path. The typical
+      # "deploy this CLI to my machine" gesture. Pair with a
+      # `script_acknowledged` guard if the target binary writes to
+      # locations outside ~/.cargo/bin.
+      set -euo pipefail
+      : "${TARGET_PATH:?TARGET_PATH must name a crate path to install from}"
+      cargo install --path "$TARGET_PATH" --locked "$@"

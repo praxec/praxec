@@ -1,0 +1,32 @@
+# capabilities/cap.research.context-assemble.yaml
+
+workflows:
+  cap.research.context-assemble:
+    verb: research
+    lifecycle: experimental
+    description: >
+      Assemble a code-context bundle from a scope description: symbols,
+      dependencies, tests, ownership.
+    snippet:
+      inputs:
+        scope_description: { type: object, required: true }
+      outputs:
+        context: { type: object }
+    skills: [research.context.assemble]
+    initialState: ready
+    states:
+      ready:
+        goal: Walk symbols + dependencies + tests; emit a bundled context.
+        transitions:
+          submit_context:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [context]
+              properties:
+                context: { type: object }
+            executor: { kind: noop }
+            output:
+              context: "$.arguments.context"
+      done: { terminal: true }

@@ -1,0 +1,8 @@
+workflows:
+  cap.plan.vet:
+    title: Plan vet (quality-core fixture)
+    description: Same id as swe-core, distinct namespace — no collision.
+    initialState: ready
+    states:
+      ready:
+        terminal: true

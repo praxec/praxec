@@ -1,0 +1,42 @@
+# capabilities/cap.triage.route-component.yaml
+
+workflows:
+  cap.triage.route-component:
+    verb: triage
+    lifecycle: experimental
+    description: >
+      Identify the component + owner team for an inbound issue.
+      Surfaces is_ambiguous=true when the classifier can't pick
+      confidently (triggers HITL disambiguation downstream).
+    snippet:
+      inputs:
+        issue: { type: object, required: true }
+      outputs:
+        component:    { type: string }
+        owner_team:   { type: string }
+        confidence:   { type: number }
+        is_ambiguous: { type: boolean }
+    skills: [triage.issue.routing]
+    initialState: ready
+    states:
+      ready:
+        goal: Route by service ownership first; CODEOWNERS second; flag ambiguity.
+        transitions:
+          submit_routing:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [component, owner_team]
+              properties:
+                component:    { type: string }
+                owner_team:   { type: string }
+                confidence:   { type: number, minimum: 0, maximum: 1, default: 0.7 }
+                is_ambiguous: { type: boolean, default: false }
+            executor: { kind: noop }
+            output:
+              component:    "$.arguments.component"
+              owner_team:   "$.arguments.owner_team"
+              confidence:   "$.arguments.confidence"
+              is_ambiguous: "$.arguments.is_ambiguous"
+      done: { terminal: true }

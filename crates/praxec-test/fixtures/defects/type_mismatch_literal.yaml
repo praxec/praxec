@@ -1,0 +1,30 @@
+version: "1.0.0"
+# DEFECT 4: type_mismatch_literal
+# The blackboard declares 'x' as type:string, but the transition's output
+# writes a literal boolean 'true' directly (not via $.output.*).
+# The fuzz harness analyzes output: the slot 'x' is NOT an OutputSource::Field
+# (it's a literal bool, not "$.output.<field>"), so all_output_slots_typed is
+# false (no field paths). This means BLACKBOARD_TYPE_ERROR is EXCUSED by the
+# fuzzer (treated as ok with a soft note).
+# Expected detection: BLIND SPOT — the fuzzer excuses BLACKBOARD_TYPE_ERROR
+# when the output is a literal (not a $.output.* field reference).
+workflows:
+  type_mismatch_flow:
+    version: "1.0.0"
+    initialState: start
+    blackboard:
+      x: { type: string }
+    states:
+      start:
+        goal: "Write a bool literal to a string-typed slot"
+        transitions:
+          go:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+            output:
+              x: true
+      done:
+        goal: "Finished"
+        terminal: true
+        transitions: {}

@@ -1,0 +1,35 @@
+# skills/plan.gap-reconciliation.yaml
+#
+# After implementation, the plan and the result diverge. Reconciling the
+# delta — what the plan said vs what the diff actually does — is the
+# discipline that prevents "I wrote SOMETHING, ship it" syndrome.
+
+skills:
+  plan.gap-reconciliation:
+    verb: plan
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Gap reconciliation between plan and implementation
+
+      You have the original plan (typed JSON) and the implementation
+      result (diff summary + tests added). Emit a structured `report`
+      with these fields:
+
+      - **`unresolved_gaps`** — integer count. Any plan item that
+        the implementation did NOT cover. A plan item with deferred
+        scope (explicitly marked `defer: true` in the plan) does
+        NOT count as a gap.
+      - **`details`** — array of `{ plan_item, status, reason }`
+        for every plan item. Status is `done | partial | deferred |
+        gap`. `gap` requires a `reason` explaining why the item
+        was skipped — "ran out of time" is a legitimate reason;
+        "forgot" is a signal to revise process not skip the gap.
+      - **`unplanned_changes`** — array of files / symbols touched
+        by the diff but NOT mentioned in the plan. Empty is good
+        and expected. Non-empty means scope-creep; flag each one.
+
+      The downstream gate (`unresolved_gaps == 0`) decides whether
+      the implementation advances or loops back. Being conservative
+      with `gap` (not `partial`) is the right error direction —
+      another iteration is cheap; shipping with hidden gaps is not.

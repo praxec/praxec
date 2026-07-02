@@ -1,0 +1,105 @@
+# SPEC §28 + §29 ETE smoke workflow — composes every v0.4 primitive.
+#
+# What this exercises:
+#   - kind: parallel with for_each + where: filter + aggregator join
+#   - kind: pipeline with on_step_failure: continue
+#   - while: loop on a state with max_iterations + max_fires_per_visit cap
+#   - enable_human_ask: true (auto-injected ask_human self-loop on every state)
+#   - blackboard slot with path_allowlist constraint
+#   - state-local slot (scope: state) with exit-cleanup
+#
+# Run via:
+#   cargo test -p praxec-executors --test ete_smoke   # composition smoke
+#   ./examples/smoke-ete/walk.sh                            # CLI driver
+
+version: "1.0.0"
+audit:
+  sink: stderr
+
+workflows:
+  smoke_ete:
+    initialState: scan
+    maxChainDepth: 10
+    enable_human_ask: true
+    human_ask_cap: 2
+
+    inputSchema:
+      type: object
+      required: [queries]
+      properties:
+        queries:
+          type: array
+          items: { type: string }
+
+    blackboard:
+      results:
+        type: array
+        items: { type: object }
+      ok_count:
+        type: integer
+      validated_paths:
+        type: array
+        items: { type: string }
+        constraint:
+          path_allowlist:
+            allow:
+              - "allowed/**"
+              - "tests/**"
+            deny:
+              - "allowed/legacy/**"
+
+    states:
+      scan:
+        goal: Fan out per-query parallel scans
+        slots:
+          scan_attempts: { type: integer, scope: state, default: 0 }
+        transitions:
+          fan_out:
+            target: verify
+            actor: deterministic
+            executor:
+              kind: parallel
+              branches:
+                for_each: "$.workflow.input.queries"
+                where:    "$.value != ''"
+                do:
+                  kind: noop
+              join:
+                aggregator:
+                  kind: expression
+                  expr: "$.ok_count >= 1"
+              max_concurrency: 4
+              on_branch_failure: continue
+            output:
+              results:  "$.output.branches"
+              ok_count: "$.output.summary.ok_count"
+
+      verify:
+        goal: Run verification pipeline
+        transitions:
+          verify_all:
+            target: validate_paths
+            actor: deterministic
+            executor:
+              kind: pipeline
+              steps:
+                - kind: noop
+                - kind: noop
+              on_step_failure: continue
+            output:
+              # final_output is the last successful pipeline step's output;
+              # validated_paths must match the path_allowlist constraint.
+              validated_paths: { set: ["allowed/auth/login.rs", "tests/auth/login_test.rs"] }
+
+      validate_paths:
+        # Constraint on validated_paths slot was already evaluated when
+        # `verify_all` wrote it. If we got here, the paths passed.
+        # This state just advances to ship.
+        transitions:
+          ok:
+            target: ship
+            actor: deterministic
+            executor: { kind: noop }
+
+      ship:
+        terminal: true

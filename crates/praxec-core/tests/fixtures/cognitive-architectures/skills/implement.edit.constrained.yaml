@@ -1,0 +1,14 @@
+# skills/implement.edit.constrained.yaml
+#
+# Lifted verbatim from the SWE-agent reference workflow.
+skills:
+  implement.edit.constrained:
+    verb: implement
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Constrained edit operations
+      Emit only the eight allowed operations: replace_symbol_body,
+      insert_before_symbol, insert_after_symbol, replace_range, create_file,
+      delete_file, modify_manifest, add_test. Never propose shell. Never
+      touch paths in `constraints.forbiddenPaths`.

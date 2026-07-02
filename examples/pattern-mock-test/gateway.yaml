@@ -1,0 +1,52 @@
+# A minimal workflow for the mock-test pattern example.
+# The real value of this pattern is the Rust test harness shown in the README,
+# not this YAML. See tests/walk_examples.rs for the harness that drives
+# *every* example through its state machine.
+
+version: "1.0.0"
+audit:
+  sink: stderr
+
+workflows:
+  mock_test_demo:
+    initialState: first
+    blackboard:
+      result:     { type: string }
+      retryCount: { type: integer }
+    initialContext:
+      retryCount: 0
+
+    states:
+      first:
+        goal: Run the first step
+        transitions:
+          step1:
+            target: second
+            executor: { kind: noop }
+            output:
+              result: "$.output"
+
+      second:
+        goal: Route based on result
+        transitions:
+          to_done:
+            target: done
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.result != 'fail'"
+            executor: { kind: noop }
+          retry:
+            target: first
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.result == 'fail'"
+              - kind: expr
+                expr: "$.context.retryCount < 3"
+            executor: { kind: noop }
+            output:
+              retryCount: { add: ["$.context.retryCount", 1] }
+
+      done:
+        terminal: true

@@ -1,0 +1,33 @@
+# capabilities/cap.plan.compose-implementation.yaml
+
+workflows:
+  cap.plan.compose-implementation:
+    verb: plan
+    lifecycle: experimental
+    description: >
+      From a goal + inventory, draft 2-3 candidate implementation
+      shapes with tradeoffs for the operator to pick between.
+    snippet:
+      inputs:
+        goal:      { type: string, required: true }
+        inventory: { type: object, required: true }
+      outputs:
+        candidates: { type: array }
+    skills: [plan.compose-implementation]
+    initialState: ready
+    states:
+      ready:
+        goal: Propose 2-4 distinct shapes; cite tools from inventory.
+        transitions:
+          submit_candidates:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [candidates]
+              properties:
+                candidates: { type: array, minItems: 2, maxItems: 4 }
+            executor: { kind: noop }
+            output:
+              candidates: "$.arguments.candidates"
+      done: { terminal: true }

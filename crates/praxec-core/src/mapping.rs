@@ -1,0 +1,276 @@
+use anyhow::anyhow;
+use serde_json::{json, Value};
+
+/// Apply an output-mapping object to the workflow's context.
+///
+/// Each mapping value is either:
+/// - A **path string** like `"$.output.plan"` resolved against
+///   `executor_output`, or any of the broader scopes (`$.context.*`,
+///   `$.arguments.*`, `$.workflow.input.*`).
+/// - An **operator object** for declarative computation: `{ add: [a, b] }`,
+///   `{ subtract: […] }`, `{ multiply: […] }`, `{ divide: […] }`,
+///   `{ set: <literal> }`. Operands may themselves be path strings or literal
+///   numbers.
+/// - Any other JSON literal — used as the value verbatim.
+///
+/// Numeric operations treat missing/null operands as 0 so a counter can be
+/// incremented even before it's first written.
+pub fn merge_output(
+    context: &mut Value,
+    mapping: Option<&Value>,
+    arguments: &Value,
+    workflow_input: &Value,
+    executor_output: &Value,
+) -> anyhow::Result<()> {
+    let Some(mapping) = mapping.and_then(Value::as_object) else {
+        return Ok(());
+    };
+
+    if !context.is_object() {
+        return Err(anyhow!("workflow context must be an object"));
+    }
+
+    // Collect first so we can read context while building. The borrow checker
+    // doesn't love &mut context + &context simultaneously.
+    let pending: Vec<(String, Value)> = mapping
+        .iter()
+        .map(|(k, spec)| {
+            let v = resolve_value(spec, arguments, context, workflow_input, executor_output);
+            (k.clone(), v)
+        })
+        .collect();
+
+    // Invariant: the `is_object()` guard above already proved this is
+    // an object — the `as_object_mut()` cannot return None here.
+    let obj = context
+        .as_object_mut()
+        .expect("invariant: context.is_object() checked above");
+    for (k, v) in pending {
+        obj.insert(k, v);
+    }
+    Ok(())
+}
+
+/// Resolve a single mapping value against the available scopes.
+///
+/// Public so other parts of the runtime (link prefill, executor maps) can
+/// reuse the same expression syntax — string paths, operator objects
+/// (`{ add: [a, b] }`, `{ set: x }`, etc.), or literal pass-through.
+///
+/// FALLBACK-05: this function is infallible by design — a MALFORMED operator
+/// (wrong arity, non-numeric/non-array operands) resolves to `Value::Null`
+/// here rather than erroring. That is SAFE only because malformed operator
+/// shapes are now rejected at config-load time by
+/// `validate::validate_output_operator_shapes`, so they cannot reach this
+/// runtime path. The one intentional runtime null is divide-by-zero (a
+/// data-dependent condition that can't be caught at load). Do NOT relax the
+/// load-time validator without also making this function fallible.
+pub fn resolve_value(
+    spec: &Value,
+    arguments: &Value,
+    context: &Value,
+    workflow_input: &Value,
+    executor_output: &Value,
+) -> Value {
+    match spec {
+        Value::String(s) => {
+            // Strings starting with "$." are path expressions; everything
+            // else is a literal. Lets authors write `base: "main"` instead
+            // of having to wrap every literal in `{ set: "main" }`.
+            if s.starts_with("$.") || s == "$" {
+                read_in_scopes(s, arguments, context, workflow_input, Some(executor_output))
+                    .unwrap_or(Value::Null)
+            } else {
+                Value::String(s.clone())
+            }
+        }
+
+        Value::Object(obj) if obj.len() == 1 => {
+            // Invariant: the `len() == 1` match guard above guarantees
+            // iter().next() yields Some.
+            let (op, args) = obj
+                .iter()
+                .next()
+                .expect("invariant: obj.len() == 1 checked in match guard");
+            match op.as_str() {
+                "set" => args.clone(),
+
+                "add" | "subtract" | "multiply" | "divide" => {
+                    let nums = match resolve_operands(
+                        args,
+                        arguments,
+                        context,
+                        workflow_input,
+                        executor_output,
+                    ) {
+                        Some(n) => n,
+                        None => return Value::Null,
+                    };
+                    if nums.len() != 2 {
+                        return Value::Null;
+                    }
+                    let (a, b) = (nums[0], nums[1]);
+                    let result = match op.as_str() {
+                        "add" => a + b,
+                        "subtract" => a - b,
+                        "multiply" => a * b,
+                        "divide" => {
+                            if b == 0.0 {
+                                return Value::Null;
+                            }
+                            a / b
+                        }
+                        _ => unreachable!(),
+                    };
+                    json_number(result)
+                }
+
+                "concat" => {
+                    let parts = match args.as_array() {
+                        Some(arr) => arr,
+                        None => return Value::Null,
+                    };
+                    let mut result = String::new();
+                    for part in parts {
+                        let resolved = resolve_value(
+                            part,
+                            arguments,
+                            context,
+                            workflow_input,
+                            executor_output,
+                        );
+                        match resolved {
+                            Value::String(s) => result.push_str(&s),
+                            Value::Number(n) => result.push_str(&n.to_string()),
+                            Value::Bool(b) => result.push_str(&b.to_string()),
+                            Value::Null => result.push_str("null"),
+                            other => {
+                                result.push_str(&serde_json::to_string(&other).unwrap_or_default())
+                            }
+                        }
+                    }
+                    Value::String(result)
+                }
+
+                _ => spec.clone(),
+            }
+        }
+
+        other => other.clone(),
+    }
+}
+
+/// Parse the operands of an arithmetic operator. Each operand is either a
+/// path string or a literal number; missing/null path resolutions become 0.
+fn resolve_operands(
+    spec: &Value,
+    arguments: &Value,
+    context: &Value,
+    workflow_input: &Value,
+    executor_output: &Value,
+) -> Option<Vec<f64>> {
+    let arr = spec.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let resolved = match v {
+            Value::String(s) => {
+                read_in_scopes(s, arguments, context, workflow_input, Some(executor_output))
+                    .unwrap_or(Value::Null)
+            }
+            other => other.clone(),
+        };
+        let n = match &resolved {
+            Value::Null => 0.0,
+            Value::Number(n) => n.as_f64().unwrap_or(0.0),
+            _ => return None,
+        };
+        out.push(n);
+    }
+    Some(out)
+}
+
+fn json_number(n: f64) -> Value {
+    if n.is_finite() {
+        // Prefer integers when round.
+        if n.fract() == 0.0 && n.abs() <= i64::MAX as f64 {
+            return json!(n as i64);
+        }
+        json!(n)
+    } else {
+        Value::Null
+    }
+}
+
+/// Reads any of the supported expression roots against the relevant scopes.
+/// Used by the CLI executor and similar places that need late-bound values.
+///
+/// SPEC §24 — supports bracket-wildcard **array projection** via `[*]`.
+/// `$.output.branches[*].field` resolves `branches` to an array (under the
+/// `$.output` root) and plucks `field` from each element, returning a JSON
+/// array of plucked values in original order. `[*]` against a non-array
+/// returns `None` (consistent with the existing unresolved-path contract).
+/// Multiple `[*]` in the same path are NOT supported in v1 — only the
+/// first wildcard expands; subsequent literal segments treat the projected
+/// array's elements as individual roots.
+pub fn read_in_scopes(
+    expr: &str,
+    arguments: &Value,
+    context: &Value,
+    workflow_input: &Value,
+    executor_output: Option<&Value>,
+) -> Option<Value> {
+    if let Some(path) = expr.strip_prefix("$.arguments.") {
+        return resolve_path_with_projection(arguments, path);
+    }
+    if let Some(path) = expr.strip_prefix("$.context.") {
+        return resolve_path_with_projection(context, path);
+    }
+    if let Some(path) = expr.strip_prefix("$.workflow.input.") {
+        return resolve_path_with_projection(workflow_input, path);
+    }
+    if let Some(out) = executor_output {
+        if expr == "$.output" || expr == "$" {
+            return Some(out.clone());
+        }
+        if let Some(path) = expr.strip_prefix("$.output.") {
+            return resolve_path_with_projection(out, path);
+        }
+    }
+    None
+}
+
+/// Resolve a dot-separated path against `root`, with `[*]` projection
+/// support. Falls back to plain JSON Pointer when no `[*]` is present.
+fn resolve_path_with_projection(root: &Value, path: &str) -> Option<Value> {
+    // No wildcard → plain JSON Pointer (legacy path).
+    if !path.contains("[*]") {
+        return root
+            .pointer(&format!("/{}", path.replace('.', "/")))
+            .cloned();
+    }
+    // Split on FIRST `[*]`. Prefix is the array root; suffix (if any) is
+    // plucked from each element. `prefix` may be empty when path starts
+    // with `[*]` (e.g. raw `[*].x` against a Vec root — unusual).
+    let (prefix, suffix_after) = path.split_once("[*]")?;
+    let prefix_clean = prefix.trim_end_matches('.');
+    let array = if prefix_clean.is_empty() {
+        root.clone()
+    } else {
+        root.pointer(&format!("/{}", prefix_clean.replace('.', "/")))
+            .cloned()?
+    };
+    let arr = array.as_array()?;
+    let suffix = suffix_after.trim_start_matches('.');
+    let projected: Vec<Value> = arr
+        .iter()
+        .map(|element| {
+            if suffix.is_empty() {
+                element.clone()
+            } else {
+                // Recurse: support nested `[*]` in the suffix.
+                resolve_path_with_projection(element, suffix).unwrap_or(Value::Null)
+            }
+        })
+        .collect();
+    Some(Value::Array(projected))
+}

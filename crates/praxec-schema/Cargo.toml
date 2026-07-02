@@ -1,0 +1,28 @@
+[package]
+name = "praxec-schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Typify-generated Rust types for the praxec gateway config and workflow response schemas"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+regress = "0.11"
+
+[build-dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+typify = { workspace = true }
+prettyplease = { workspace = true }
+syn = { workspace = true }
+schemars = { workspace = true }

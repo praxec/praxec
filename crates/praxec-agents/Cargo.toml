@@ -1,0 +1,45 @@
+[package]
+name = "praxec-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Autonomous sub-agent executor (kind: agent) for praxec — agent logic only, no storage engine"
+
+[lib]
+name = "praxec_agents"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+praxec-core = { workspace = true }
+# ADR-0007 — the in-process rig runner reuses the llm-executor's ProviderFactory
+# (rig under the hood, one provider wiring) + rig's ToolDefinition.
+praxec-llm-executor = { workspace = true }
+rig = { package = "rig-core", version = "0.38" }
+# C5 — the external-tool bridge maps rmcp's wire `Tool` into rig's `ToolDefinition`
+# (protocol model types only; transports stay in the binary).
+rmcp = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+# Exposes MockSessionRunner / MockModelResolver to integration tests + example
+# drivers (not shipped in production builds).
+test-util = []
+
+[dev-dependencies]
+rstest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tempfile = "3"

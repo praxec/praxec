@@ -1,0 +1,40 @@
+schema: praxec.repo/v1
+name: cognitive-architectures
+namespace: cognitive
+version: 0.6.0
+description: |
+  The canonical first resource repo for the praxec v0.6
+  capability/flow composition model (SPEC §9).
+
+  Ships four lifecycle flows (flow.*) and the capabilities
+  (cap.*) they depend on. Operators reference this repo from their
+  gateway config via:
+
+      repos:
+        - path: /path/to/cognitive-architectures
+
+  Every loaded definitionId is namespace-prefixed `cognitive/<id>`
+  (e.g. `cognitive/flow.add-feature`, `cognitive/cap.plan.vet`).
+
+  Pre-v0.6 demo content lives under `workflows/`, `skills/`,
+  `scripts-library/`, `agents/`, `patterns/`, and `examples/` — those
+  trees stay outside this manifest's layout and continue to load via
+  the legacy `include:` path so existing operators don't break on
+  upgrade.
+
+# Default layout (`capabilities/`, `flows/`, `skills/`,
+# `scripts/`, `connections/`) matches the field names, so we only
+# need to override the ones that differ from the defaults. v0.6
+# ships only capabilities and flows through the repo
+# manifest; the legacy `skills/` and `scripts-library/` trees stay
+# outside the manifest until they're re-shaped for v0.7.
+layout:
+  capabilities:  capabilities
+  flows: flows
+  skills:        skills
+  scripts:       scripts-library
+  # Connections stay outside the manifest at v0.2 — operators wire their
+  # own MCP / CLI endpoints in the gateway config. The connections/
+  # tree under this repo contains REFERENCE connection definitions
+  # operators copy into their config rather than loading wholesale.
+  connections:   ._unused_v02_connections

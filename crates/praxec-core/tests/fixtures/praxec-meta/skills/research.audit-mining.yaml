@@ -1,0 +1,68 @@
+# skills/research.audit-mining.yaml
+#
+# Authoring-time guidance for operators writing audit-mining caps.
+# The skill itself is `research`-rooted (research-into-historical-data
+# rather than the deterministic `audit` verb that runs scans). It
+# guides the SHAPE of a good mining script — what signals to surface,
+# what to leave to interpretation downstream.
+
+skills:
+  research.audit-mining:
+    verb: research
+    lifecycle: stable
+    source: praxec-meta
+    body: |
+      # Mining transition records for refinement signals
+
+      You have a workflow definition_id (an flow or
+      capability) and optionally a `since:` timestamp. Walk the
+      audit log; emit a structured `report` with:
+
+      - **`stalled_states`** — states where workflows entered but
+        a high fraction stayed > N seconds before advancing. Each
+        entry: `{ state, fraction_stalled, median_dwell_sec }`.
+        Threshold N: 30s for cognitive states, 10s for
+        deterministic. Stalls indicate either a missing automation
+        (cognitive state that should be deterministic) or an LLM
+        struggling with poor guidance.
+      - **`failing_guards`** — guards that failed > 20% of the
+        time they were evaluated. Each entry:
+        `{ from_state, transition, guard_expr, fail_fraction }`.
+        High guard failure means the guard's logic doesn't match
+        reality OR upstream states aren't reliably producing the
+        expected output shape.
+      - **`human_interventions`** — every state where a human
+        actor submitted a transition. Each entry:
+        `{ state, transition, count, fraction_of_total }`. Many
+        interventions in a "should be deterministic" state =
+        candidate for an HITL gate cap; few interventions in an
+        agent-driven state = candidate for promotion to
+        deterministic.
+      - **`slow_transitions`** — transitions whose median
+        duration exceeds a reasonable threshold for their executor
+        kind. `kind: noop` should be < 100ms; `kind: script` <
+        30s; `kind: mcp` < 10s. Slow noops mean the agent is
+        struggling; slow scripts mean the operator's environment
+        is degraded.
+      - **`error_kinds`** — `cap.terminated` events grouped by
+        `error_kind` token (V18). Frequent
+        `schema_violation` suggests the snippet contract is
+        wrong (too strict for actual outputs) OR the cap's body
+        doesn't honor the contract.
+
+      ## Discipline
+
+      - **Window matters.** A report covering 24h tells a
+        different story than one covering 30d. Default to the
+        last 7 days; let `since:` override.
+      - **Don't propose fixes.** This skill mines signal; the
+        downstream compose-implementation cap proposes the
+        refinement candidates. Mixing analysis and prescription
+        produces narrower options.
+      - **Cite events, not aggregates only.** Each finding should
+        include 1-3 concrete event IDs the operator can drill
+        into. Aggregates without exemplars are hand-wavy.
+      - **Empty findings mean healthy.** A "nothing to refine"
+        report is a legitimate output, not a failure. The
+        optimize loop terminates without changes if nothing
+        actionable surfaces.

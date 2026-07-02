@@ -1,0 +1,41 @@
+version: "1.0.0"
+workflows:
+  orch:
+    initialState: start
+    version: "1.0.0"
+    blackboard:
+      sev: { type: string }
+    states:
+      start:
+        transitions:
+          classify:
+            target: gate
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap_sev
+              use:
+                outputs:
+                  "$.context.sev": severity
+      gate:
+        transitions:
+          proceed:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+            guards:
+              - kind: expr
+                expr: "$.context.sev == \"S1\""
+      done:
+        terminal: true
+        transitions: {}
+  cap_sev:
+    initialState: only
+    version: "1.0.0"
+    snippet:
+      outputs:
+        severity: { type: string, enum: [S1, S2] }
+    states:
+      only:
+        terminal: true
+        transitions: {}

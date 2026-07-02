@@ -1,0 +1,117 @@
+# Pattern: Recovery & escalation topology
+#
+# Composes circuit-breaker, deterministic routing, and human-in-the-loop.
+# The check state reads the attempt's result and routes without LLM
+# involvement — guards do all the work.
+#
+# Flow:
+#   attempt → check ──pass──→ done
+#                   ──fail + retries < 3──→ attempt (loop)
+#                   ──fail + retries >= 3──→ escalate_to_human → retry_after_human → attempt
+
+version: "1.0.0"
+audit:
+  sink: stderr
+
+workflows:
+  recovery_demo:
+    initialState: attempt
+    blackboard:
+      attempt_result: { type: string }
+      retryCount:     { type: integer }
+      human_fix:      { type: string }
+    initialContext:
+      retryCount: 0
+
+    states:
+      attempt:
+        goal: Execute the operation (may fail transiently)
+        transitions:
+          run:
+            target: check
+            actor: deterministic
+            executor:
+              # In production: swap for a real executor.
+              # A script executor returning { result: "ok" } or { result: "fail" }
+              # drives the routing below.
+              kind: cli
+              command:
+                - "sh"
+                - "-c"
+                - |
+                  # Simulate: succeed on every 3rd attempt
+                  ATTEMPT=$((${PRAXEC_RETRY_COUNT:-0} + 1))
+                  if [ $ATTEMPT -ge 3 ]; then
+                    echo '{"result":"ok"}'
+                  else
+                    echo '{"result":"fail"}'
+                  fi
+              env:
+                PRAXEC_RETRY_COUNT: "$.context.retryCount"
+            output:
+              attempt_result: "$.output.result"
+
+      check:
+        goal: Deterministic routing — no LLM needed
+        transitions:
+          # ── success ──
+          pass:
+            target: done
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.attempt_result == 'ok'"
+            executor: { kind: noop }
+
+          # ── retry (loop back) ──
+          retry:
+            target: attempt
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.attempt_result == 'fail'"
+              - kind: expr
+                expr: "$.context.retryCount < 3"
+            executor: { kind: noop }
+            output:
+              retryCount: { add: ["$.context.retryCount", 1] }
+
+          # ── escalate ──
+          escalate:
+            target: escalate_to_human
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.attempt_result == 'fail'"
+              - kind: expr
+                expr: "$.context.retryCount >= 3"
+            executor: { kind: noop }
+
+      escalate_to_human:
+        goal: Human reviews the failure and decides next steps
+        actor: human
+        guidance: >
+          Operation failed after {{ $.context.retryCount }} attempts.
+          Last result: {{ $.context.attempt_result }}.
+          Choose: retry with a fix, or mark as failed.
+        transitions:
+          retry_after_human:
+            target: attempt
+            actor: human
+            inputSchema:
+              type: object
+              properties:
+                fix: { type: string }
+            output:
+              human_fix: "$.arguments.fix"
+
+          mark_failed:
+            target: failed
+            actor: human
+            executor: { kind: noop }
+
+      failed:
+        terminal: true
+
+      done:
+        terminal: true

@@ -1,0 +1,140 @@
+# SPEC §8.4 — reference EDIT authoring workflow.
+#
+# The companion to authoring-workflow.yaml (which CREATES a new definition).
+# This one safely EDITS a definition already on record:
+#
+#   editing → diffing → reviewing_structure → reviewed_structure
+#           → validating → ready → published
+#
+# The author submits the definition they READ (`baseDefinition`) alongside their
+# proposed `definition`. The `diff` executor shows exactly what changes; the
+# `registry` executor publishes with optimistic concurrency — it hashes
+# `base_definition` and rejects CONFLICT_STALE if the on-record snapshot moved
+# under the author. Re-reading + re-applying is the recovery.
+#
+# Requires the gateway started with:
+#   praxec.authoring.write_enabled: true
+#   repos: [{ path: <your repo>, writable: true }]
+
+version: "1.0.0"
+
+lexicon:
+  rubric.workflow-shape:
+    definition_short: "Structural rubric for well-formed workflow definitions."
+
+praxec:
+  authoring:
+    write_enabled: false
+
+skills:
+  authoring.rubric.workflow-shape:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Workflow-shape rubric
+      A good workflow has:
+      - A small number of states with intent-revealing names.
+      - A linear happy path with named exits at decision points.
+      - One terminal state per outcome class (done, failed, cancelled).
+      - Guards that read declared blackboard slots.
+
+workflows:
+  authoring-edit:
+    initialState: editing
+    skills: [authoring.rubric.workflow-shape]
+    blackboard:
+      candidate_definition_id: { type: string }
+      candidate_definition:    { type: object }
+      base_definition:         { type: object }
+      edit_diff:               { type: string }
+      structural_issues:       { type: array }
+      structural_issues_count: { type: integer }
+    states:
+      editing:
+        goal: Propose an edit to a definition already on record.
+        guidance: >
+          Read the current definition first (praxec.query), then call
+          `submit propose_edit` with `definitionId`, the edited `definition`,
+          and `baseDefinition` (the snapshot you read). The runtime will diff
+          and structurally check it, and publish only if the on-record snapshot
+          still matches what you edited.
+        skills: [authoring.rubric.workflow-shape]
+        transitions:
+          propose_edit:
+            target: diffing
+            inputSchema:
+              type: object
+              required: [definitionId, definition, baseDefinition]
+              properties:
+                definitionId:   { type: string }
+                definition:     { type: object }
+                baseDefinition: { type: object }
+            executor: { kind: noop }
+            output:
+              candidate_definition_id: $.arguments.definitionId
+              candidate_definition:    $.arguments.definition
+              base_definition:         $.arguments.baseDefinition
+
+      diffing:
+        goal: Show exactly what this edit changes.
+        transitions:
+          run_diff:
+            target: reviewing_structure
+            actor: deterministic
+            executor: { kind: diff }
+            output:
+              edit_diff: $.output.diff
+
+      reviewing_structure:
+        goal: Run structural analysis on the edited definition.
+        transitions:
+          run_struct_check:
+            target: reviewed_structure
+            actor: deterministic
+            executor: { kind: structural_analysis }
+            output:
+              structural_issues:       $.output.issues
+              structural_issues_count: $.output.issue_count
+
+      reviewed_structure:
+        goal: Advance to dry-run if clean, else loop back to editing.
+        transitions:
+          to_dry_run:
+            target: validating
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.structural_issues_count == 0"
+            executor: { kind: noop }
+          back_to_editing:
+            target: editing
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.structural_issues_count > 0"
+            executor: { kind: noop }
+
+      validating:
+        goal: Dry-run the edited definition.
+        transitions:
+          run_dry_run:
+            target: ready
+            actor: deterministic
+            executor: { kind: dry_run }
+
+      ready:
+        goal: Acknowledge the rubric and publish the edit.
+        skills: [authoring.rubric.workflow-shape]
+        transitions:
+          publish:
+            # No arguments: the registry executor publishes the validated
+            # candidate on the blackboard and uses `base_definition` as the
+            # optimistic-concurrency basis (CONFLICT_STALE if it moved).
+            target: published
+            guards:
+              - kind: guidance_acknowledged
+                subject: authoring.rubric.workflow-shape
+            executor: { kind: registry }
+
+      published:
+        terminal: true

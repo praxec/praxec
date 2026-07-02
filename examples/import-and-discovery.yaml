@@ -1,0 +1,83 @@
+version: "1.0.0"
+
+# Connections are just processes the gateway speaks MCP to. The gateway
+# doesn't care what's underneath: a native binary, an `npx` shim, a `uvx`
+# launcher, a containerized MCP server, or anything else that can run on
+# stdio. All four examples below are first-class.
+connections:
+  # Native binary on PATH.
+  github_native:
+    kind: mcp
+    command: github-mcp-server
+
+  # npm-distributed MCP server via npx.
+  filesystem_npx:
+    kind: mcp
+    command: npx
+    args: [-y, "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+  # Python-distributed MCP server via uvx.
+  fetch_uvx:
+    kind: mcp
+    command: uvx
+    args: [mcp-server-fetch]
+
+  # Containerized MCP server. Docker is one option here, podman/nerdctl/etc.
+  # would all look the same — just a different `command`.
+  postgres_container:
+    kind: mcp
+    command: docker
+    args:
+      - run
+      - -i
+      - --rm
+      - -e
+      - DATABASE_URL
+      - mcp/postgres:latest
+    env:
+      DATABASE_URL: postgres://localhost/app
+
+audit:
+  sink: stderr
+
+discovery:
+  index: memory
+  include: [proxy, workflows, connections]
+
+# Imports run `tools/list` against each named connection at startup and
+# turn every returned tool into a proxy exposure. This works the same way
+# regardless of how the connection is launched.
+proxy:
+  import:
+    - connection: github_native
+      prefix: github
+      include: [list_issues, create_issue, create_pull_request]
+      tags: [github, source-control]
+
+    - connection: filesystem_npx
+      prefix: fs
+      tags: [filesystem]
+
+    - connection: fetch_uvx
+      prefix: web
+      tags: [web, http]
+
+    - connection: postgres_container
+      prefix: pg
+      include: [query, schema]
+      tags: [postgres, sql]
+
+  # You can mix imports with explicit declarations. Declared ones can carry
+  # guards, reliability, and audit hooks that imports don't have by default.
+  expose:
+    - name: hello.echo
+      title: Echo
+      description: A trivial declared capability for sanity-checking the gateway.
+      inputSchema:
+        type: object
+        properties:
+          msg: { type: string }
+        required: [msg]
+        additionalProperties: false
+      executor:
+        kind: noop

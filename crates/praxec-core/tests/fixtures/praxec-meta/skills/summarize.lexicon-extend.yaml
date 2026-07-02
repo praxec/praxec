@@ -1,0 +1,66 @@
+# skills/summarize.lexicon-extend.yaml
+#
+# Register a new term in the lexicon (SPEC §30) when authored
+# content introduces vocabulary that wasn't there before. Keeping
+# the lexicon synchronized with the live cap/flow surface
+# is what makes the ubiquitous-language story work over time.
+
+skills:
+  summarize.lexicon-extend:
+    verb: summarize
+    lifecycle: stable
+    source: praxec-meta
+    body: |
+      # Extending the lexicon with newly-coined vocabulary
+
+      You are authoring (or optimizing) a capability/flow
+      and have introduced a term not currently in the lexicon.
+      Before the PR opens, register the term so the next author
+      reading the library sees consistent vocabulary.
+
+      ## When to register
+
+      Register a term IF:
+
+      - It appears in a `snippet:` input/output name, OR
+      - It appears in a state name, OR
+      - It appears in a guard expression, OR
+      - It would plausibly appear in TWO future caps composing
+        against this one.
+
+      Do NOT register:
+
+      - Implementation details ("the regex anchor at the end").
+      - Generic engineering vocabulary ("retry", "timeout") — the
+        lexicon is for domain language, not technical-term repeat.
+      - Synonyms of existing terms — pick the better one and use
+        it consistently; don't duplicate the lexicon.
+
+      ## What to register
+
+      Each `gateway.lexicon.define` call needs:
+
+      - **`term`** — the canonical short form. Lowercase
+        kebab-case if multi-word.
+      - **`definition`** — one or two sentences. State what the
+        term MEANS in this codebase, not what it means generally.
+        "A `verdict` is a tri-valued output from a vet step:
+        `pass`, `fail`, or `needs-revision`."
+      - **`governance`** — default to `advisory` for terms a single
+        author coined; bump to `human-only` for terms that
+        cross-cutting flows rely on (so future agents
+        can't silently redefine them).
+
+      ## Anti-patterns
+
+      - **Lexicon-by-comment.** Defining a term in a YAML comment
+        and not calling `lexicon.define` leaves no machine-readable
+        record. The next author won't find it.
+      - **Definitions citing implementation.** "A `slot` is what
+        `merge_output` writes into" — describe the concept, not
+        the function. Implementation details drift; concepts
+        don't.
+      - **Bulk-defining at the end.** If the lexicon update is the
+        last step before PR, you'll batch and skip. Define each
+        term as you introduce it; treat the lexicon as a
+        running notebook, not a release deliverable.

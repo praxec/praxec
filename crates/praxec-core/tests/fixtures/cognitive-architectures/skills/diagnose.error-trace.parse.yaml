@@ -1,0 +1,48 @@
+# skills/diagnose.error-trace.parse.yaml
+#
+# Parsing raw error logs / stack traces into structured defect
+# descriptors. The downstream reproduce + localize caps consume this
+# structured output; bad parsing here cascades into wild-goose-chase
+# diagnoses.
+
+skills:
+  diagnose.error-trace.parse:
+    verb: diagnose
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Parsing an error log or stack trace
+
+      Convert the raw error_log input into a typed `parsed` object
+      with these fields:
+
+      - **`error_class`** — the actual exception / error type
+        (`NullPointerException`, `pq: relation does not exist`,
+        `panicked at 'index out of bounds'`). Strip framework
+        wrapper classes when you can; the inner cause is usually
+        more informative.
+      - **`frames`** — array of `{ file, line, symbol, in_user_code }`
+        for every stack frame. `in_user_code` is a boolean — `false`
+        for stdlib / framework / vendored dependency frames.
+        Filtering to user-code frames usually localizes the defect
+        within 1-3 entries.
+      - **`hint`** — one sentence naming your best guess at the
+        root cause. This guides cap.diagnose.reproduce; mark it as
+        a guess, not a conclusion. "Looks like a missing migration
+        for the `audit_log.run_id` column."
+      - **`error_signature`** — a short stable string the dedup
+        layer can match against to recognize "this error again."
+        Typically `<error_class>:<innermost-user-code-symbol>`.
+        Same signature → same defect.
+
+      Anti-patterns:
+
+      - **Treating the outermost frame as the defect.** It's usually
+        a request handler or test runner; the defect is usually
+        deeper. Read the trace bottom-up.
+      - **Speculating in `hint`.** A bad guess wastes the next cap's
+        time. If you genuinely don't know, write
+        `hint: "cause unclear from trace alone; needs reproduce"`.
+      - **Ignoring "Caused by" chains.** Java / .NET / many JS
+        frameworks wrap the root cause in 3-5 layers. The bottom
+        cause is usually what you want; the wrappers are noise.

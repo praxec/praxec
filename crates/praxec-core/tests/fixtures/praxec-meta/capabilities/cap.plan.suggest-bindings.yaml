@@ -1,0 +1,55 @@
+# capabilities/cap.plan.suggest-bindings.yaml
+#
+# From a typed model inventory + the operator's intended delegate
+# set, compose a single binding plan (default + sparse overrides
+# keyed by closed-enum affinity-tier). Agent-driven; surfaces
+# rationale + assumptions for the human gate.
+
+workflows:
+  cap.plan.suggest-bindings:
+    verb: plan
+    lifecycle: experimental
+    description: >
+      Recommend an `agents.yaml` plan given a provider model
+      inventory and the workflow's delegate set. Output is one
+      opinionated plan plus rationale; the human-approve-plan gate
+      reviews before write. Per the FMECA: cite inventory entries
+      by id (no fabricated models), use closed-enum affinity/tier
+      keys only, no silent CoR fallbacks.
+    snippet:
+      inputs:
+        inventory: { type: object, required: true }
+        delegates: { type: array,  default: [] }
+        errors:    { type: array,  default: [] }
+      outputs:
+        plan:        { type: object }
+        rationale:   { type: object }
+        tradeoffs:   { type: array }
+        assumptions: { type: array }
+    skills: [plan.suggest-bindings]
+    initialState: ready
+    states:
+      ready:
+        goal: >
+          Compose one opinionated agents.yaml plan; cite inventory
+          entries by id; surface rationale/tradeoffs/assumptions per
+          the skill checklist.
+        transitions:
+          submit_plan:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [plan, rationale, tradeoffs, assumptions]
+              properties:
+                plan:        { type: object }
+                rationale:   { type: object }
+                tradeoffs:   { type: array }
+                assumptions: { type: array }
+            executor: { kind: noop }
+            output:
+              plan:        "$.arguments.plan"
+              rationale:   "$.arguments.rationale"
+              tradeoffs:   "$.arguments.tradeoffs"
+              assumptions: "$.arguments.assumptions"
+      done: { terminal: true }

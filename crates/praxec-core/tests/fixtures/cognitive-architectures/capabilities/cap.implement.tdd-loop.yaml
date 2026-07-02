@@ -1,0 +1,48 @@
+# capabilities/cap.implement.tdd-loop.yaml
+#
+# TDD red-green-refactor loop. Cognitive cap with multi-state internal
+# shape — the agent iterates through RED → GREEN → REFACTOR cycles
+# guided by the `implement.tdd.discipline` skill until the plan slice
+# is complete. The cap terminates on convergence OR max_iterations
+# exhaustion (which surfaces as `cap.terminated` with
+# `error_kind: tdd_no_convergence`).
+#
+# v0.2 ships the internal state machine; full discipline (per-iteration
+# guards, test-count monotonicity check) lands in v0.3 once the slot-
+# constraint helper supports per-state counters across iterations.
+
+workflows:
+  cap.implement.tdd-loop:
+    verb: implement
+    lifecycle: experimental
+    description: >
+      Run a scope-bounded TDD loop against the plan; emit result + tests
+      added. Internal: red → green → refactor self-loop until plan slice
+      converges.
+    snippet:
+      inputs:
+        plan:        { type: object, required: true }
+        scope_paths: { type: array,  default: [] }
+      outputs:
+        result:      { type: object }
+        tests_added: { type: integer }
+    skills: [implement.tdd.discipline]
+    initialState: iterating
+    states:
+      iterating:
+        goal: Pick the next plan slice; execute one red-green-refactor cycle.
+        transitions:
+          submit_result:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [result, tests_added]
+              properties:
+                result:      { type: object }
+                tests_added: { type: integer, minimum: 0 }
+            executor: { kind: noop }
+            output:
+              result:      "$.arguments.result"
+              tests_added: "$.arguments.tests_added"
+      done: { terminal: true }

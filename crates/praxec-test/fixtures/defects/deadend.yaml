@@ -1,0 +1,26 @@
+version: "1.0.0"
+# DEFECT 3: deadend
+# 'stuck' is non-terminal but has an empty transitions map.
+# Expected detection: validate_workflows emits a Warning-level diagnostic
+# "non-terminal with no outgoing transitions". The check command prints this warning.
+# fuzz_coverage: the walk produces no edges from 'stuck', but it's reachable
+# (start -> stuck), so it's NOT an orphan. The fuzz has no transitions to test from it.
+workflows:
+  deadend_flow:
+    version: "1.0.0"
+    initialState: start
+    states:
+      start:
+        goal: "Begin"
+        transitions:
+          go:
+            target: stuck
+            actor: agent
+            executor: { kind: noop }
+      stuck:
+        goal: "Non-terminal dead-end — no transitions, not marked terminal"
+        transitions: {}
+      done:
+        goal: "Never reached"
+        terminal: true
+        transitions: {}

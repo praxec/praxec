@@ -1,0 +1,33 @@
+# capabilities/cap.implement.scope-bounded.yaml
+
+workflows:
+  cap.implement.scope-bounded:
+    verb: implement
+    lifecycle: experimental
+    description: >
+      Apply edits constrained to scope_paths. Out-of-scope writes are
+      refused by the underlying edit tool.
+    snippet:
+      inputs:
+        plan:        { type: object, required: true }
+        scope_paths: { type: array,  required: true }
+      outputs:
+        result: { type: object }
+    skills: [implement.edit.constrained]
+    initialState: ready
+    states:
+      ready:
+        goal: Apply edits constrained to scope_paths.
+        transitions:
+          submit_result:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [result]
+              properties:
+                result: { type: object }
+            executor: { kind: noop }
+            output:
+              result: "$.arguments.result"
+      done: { terminal: true }

@@ -1,0 +1,29 @@
+# contracts/prose-coffee-mug-v1.yaml
+#
+# Golden contract for the `prose` affinity. The prompt asks for a short
+# product description. The verifier confirms response length is in the
+# expected band — a coarse but mechanical signal that the model can
+# produce flowing prose without padding/refusing.
+
+contract:
+  id: prose-coffee-mug-v1
+  affinity: prose
+  description: |
+    Tests basic constrained-length prose generation. The verifier is a
+    word-count band rather than coherence judgment; this catches the
+    common failure modes (refused-to-comply 0-word responses,
+    runaway-length 500-word responses) without needing an LLM judge.
+  prompt: |
+    Write a 50-word product description for a hand-thrown ceramic
+    coffee mug. The mug holds 12 oz, has a matte glaze, and is
+    dishwasher-safe.
+
+    Respond with ONLY the description text — no headers, no
+    bullet points, no markdown.
+  verifier:
+    # regex_match used as a length proxy: 30-80 distinct word tokens
+    # accepts modest under/over per real-world model behavior. The
+    # negative lookahead rejects markdown bullet/header characters at
+    # line starts.
+    kind: regex_match
+    pattern: '\A(?s)(?:[^\n*#`-][^\n]*\n?){1,20}\z'

@@ -1,0 +1,163 @@
+# flows/flow.optimize-flow.yaml
+#
+# Refine an existing flow (state-shape, branch reduction,
+# verb-shape drift, etc.). Same body as flow.optimize-capability
+# but targets an flow id — broader scope, same shape.
+
+workflows:
+  flow.optimize-flow:
+    description: |
+      Mine an existing flow's audit history → propose 2-3
+      refinement shapes → operator picks one → emit improved YAML →
+      check-config → adversarial review → PR.
+    inputs:
+      target_definition_id: { type: string, required: true }
+      since:                { type: string, default: "" }
+      base_ref:             { type: string, default: main }
+    initialState: mining_audit
+    states:
+      mining_audit:
+        transitions:
+          mine:
+            target: composing
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.audit.mine-transitions
+              use:
+                inputs:
+                  definition_id: "$.context.target_definition_id"
+                  since:         "$.context.since"
+                outputs:
+                  "$.context.audit_report": report
+
+      composing:
+        transitions:
+          compose:
+            target: picking_shape
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.plan.compose-implementation
+              use:
+                inputs:
+                  goal:      "$.context.target_definition_id"
+                  inventory: "$.context.audit_report"
+                outputs:
+                  "$.context.candidates": candidates
+
+      picking_shape:
+        transitions:
+          pick:
+            target: emitting
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.gate.human-pick-shape
+              use:
+                inputs:
+                  candidates: "$.context.candidates"
+                  prompt:     "Pick the flow refinement to apply"
+                outputs:
+                  "$.context.chosen":          chosen
+                  "$.context.shape_rationale": rationale
+
+      emitting:
+        transitions:
+          emit:
+            target: checking
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.implement.emit-yaml
+              use:
+                inputs:
+                  chosen:    "$.context.chosen"
+                  kind:      "$.context.target_definition_id"
+                  namespace: "$.context.target_definition_id"
+                outputs:
+                  "$.context.yaml_text":   yaml_text
+                  "$.context.target_path": target_path
+
+      checking:
+        transitions:
+          check:
+            target: checked
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.verify.check-config
+              use:
+                inputs:
+                  config_path: "$.context.target_path"
+                outputs:
+                  "$.context.check_ok":          ok
+                  "$.context.check_diagnostics": diagnostics
+
+      checked:
+        transitions:
+          advance:
+            target: reviewing
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.check_ok == true"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.check_ok == false"
+
+      reviewing:
+        transitions:
+          review:
+            target: reviewed
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.review.adversarial
+              use:
+                inputs:
+                  diff_against: "$.context.base_ref"
+                outputs:
+                  "$.context.review_verdict":  verdict
+                  "$.context.review_findings": findings
+
+      reviewed:
+        transitions:
+          advance:
+            target: opening_pr
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.review_verdict == 'approved'"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.review_verdict == 'rejected'"
+
+      opening_pr:
+        transitions:
+          open:
+            target: done
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.coordinate.pr-open
+              use:
+                inputs:
+                  title: "$.context.target_definition_id"
+                  body:  "$.context.target_definition_id"
+                  base:  "$.context.base_ref"
+                outputs:
+                  "$.context.pr_url":    url
+                  "$.context.pr_number": pr_number
+
+      done:
+        terminal: true
+
+      failed:
+        terminal: true

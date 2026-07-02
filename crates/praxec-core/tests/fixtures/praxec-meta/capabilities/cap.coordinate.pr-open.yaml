@@ -1,0 +1,39 @@
+# capabilities/cap.coordinate.pr-open.yaml
+#
+# STUB SHADOW (see cap.review.adversarial.yaml for the override pattern).
+
+workflows:
+  cap.coordinate.pr-open:
+    verb: coordinate
+    lifecycle: experimental
+    description: >
+      Open a PR with the authored content. Operators with
+      cognitive-architectures loaded should override this with
+      `cognitive/cap.coordinate.pr-open` for the richer version.
+    snippet:
+      inputs:
+        title: { type: string, required: true }
+        body:  { type: string, default: "" }
+        base:  { type: string, default: "main" }
+      outputs:
+        url:       { type: string }
+        pr_number: { type: integer }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          open:
+            target: done
+            actor: deterministic
+            executor:
+              kind: mcp
+              connection: github_mcp
+              tool: create_pr
+              arguments:
+                title: "$.context.title"
+                body:  "$.context.body"
+                base:  "$.context.base"
+            output:
+              url:       "$.output.url"
+              pr_number: "$.output.number"
+      done: { terminal: true }

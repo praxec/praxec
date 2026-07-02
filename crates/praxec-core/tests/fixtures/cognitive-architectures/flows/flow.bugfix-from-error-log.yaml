@@ -1,0 +1,172 @@
+# flows/flow.bugfix-from-error-log.yaml
+#
+# State-shape note: see flow.add-feature.yaml for the execute+branch
+# split pattern. Same applies here.
+
+workflows:
+  flow.bugfix-from-error-log:
+    description: |
+      Drive a bugfix from an inbound error log / stack trace through
+      diagnosis, scope-bounded edit, regression verification, review,
+      and PR open.
+    inputs:
+      error_log: { type: string, required: true }
+      base_ref:  { type: string, default: main }
+    initialState: parsing
+    states:
+      parsing:
+        transitions:
+          parse:
+            target: reproducing
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.diagnose.parse-error
+              use:
+                inputs:
+                  error_log: "$.context.error_log"
+                outputs:
+                  "$.context.parsed": parsed
+
+      reproducing:
+        transitions:
+          repro:
+            target: localizing
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.diagnose.reproduce
+              use:
+                inputs:
+                  parsed: "$.context.parsed"
+                outputs:
+                  "$.context.repro_steps": repro_steps
+
+      localizing:
+        transitions:
+          localize:
+            target: planning
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.diagnose.localize
+              use:
+                inputs:
+                  parsed:      "$.context.parsed"
+                  repro_steps: "$.context.repro_steps"
+                outputs:
+                  "$.context.defect_location": defect_location
+
+      planning:
+        transitions:
+          plan:
+            target: implementing
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.plan.fix
+              use:
+                inputs:
+                  defect_location: "$.context.defect_location"
+                  repro_steps:     "$.context.repro_steps"
+                outputs:
+                  "$.context.fix_plan": plan
+
+      implementing:
+        transitions:
+          edit:
+            target: verifying
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.implement.scope-bounded
+              use:
+                inputs:
+                  plan:        "$.context.fix_plan"
+                  scope_paths: "$.context.fix_plan"
+                outputs:
+                  "$.context.edit_result": result
+
+      verifying:
+        transitions:
+          verify:
+            target: verified
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.verify.regression-tests
+              use:
+                inputs:
+                  defect_location: "$.context.defect_location"
+                  repro_steps:     "$.context.repro_steps"
+                outputs:
+                  "$.context.regression_ok":          ok
+                  "$.context.regression_tests_added": tests_added
+
+      verified:
+        transitions:
+          advance:
+            target: reviewing
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.regression_ok == true"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.regression_ok == false"
+
+      reviewing:
+        transitions:
+          review:
+            target: reviewed
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.review.adversarial
+              use:
+                inputs:
+                  diff_against: "$.context.base_ref"
+                outputs:
+                  "$.context.review_verdict":  verdict
+                  "$.context.review_findings": findings
+
+      reviewed:
+        transitions:
+          advance:
+            target: opening_pr
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.review_verdict == 'approved'"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.review_verdict == 'rejected'"
+
+      opening_pr:
+        transitions:
+          open:
+            target: done
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.coordinate.pr-open
+              use:
+                inputs:
+                  title: "$.context.error_log"
+                  body:  "$.context.error_log"
+                  base:  "$.context.base_ref"
+                outputs:
+                  "$.context.pr_url":    url
+                  "$.context.pr_number": pr_number
+
+      done:
+        terminal: true
+
+      failed:
+        terminal: true

@@ -1,0 +1,23 @@
+version: "1.0.0"
+# GOOD TWIN for type_mismatch_literal: output writes "ok" (a string) to x (type:string).
+# No BLACKBOARD_TYPE_ERROR should fire; fuzz should pass cleanly.
+workflows:
+  type_mismatch_good_flow:
+    version: "1.0.0"
+    initialState: start
+    blackboard:
+      x: { type: string }
+    states:
+      start:
+        goal: "Write a string literal to a string-typed slot"
+        transitions:
+          go:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+            output:
+              x: "ok"
+      done:
+        goal: "Finished"
+        terminal: true
+        transitions: {}

@@ -1,0 +1,61 @@
+# skills/plan.compose-implementation.yaml
+#
+# Propose 2-3 candidate implementation shapes from a goal + tool
+# inventory. The discipline: multiple distinct candidates, each
+# articulating its tradeoffs, so the operator's pick has informed
+# context.
+
+skills:
+  plan.compose-implementation:
+    verb: plan
+    lifecycle: stable
+    source: praxec-meta
+    body: |
+      # Composing candidate implementation shapes
+
+      You have a goal description and an inventory of reachable
+      tooling. Propose 2-3 candidate shapes for the operator to
+      pick between. Each candidate must include:
+
+      - **`id`** — short kebab token. Becomes a stable handle for
+        the chosen shape downstream.
+      - **`name`** — one-line human-readable summary.
+      - **`approach`** — one or two paragraphs describing the
+        cognitive shape. "Three-state machine: surveys → drafts →
+        verifies." Avoid implementation jargon; the operator
+        reading this isn't necessarily a praxec expert.
+      - **`tradeoffs`** — what this shape gives up vs the
+        alternatives. "More portable but slower than candidate B."
+        "Requires an LLM connection candidate C doesn't."
+      - **`verb`** — for `cap.*` shapes, the cap verb from the
+        24-cloud. For `flow.*` shapes, omit.
+      - **`snippet_inputs` / `snippet_outputs`** — sketch of the
+        contract. Names + JSON-schema-shaped types.
+      - **`tool_stack`** — which inventory entries this shape
+        uses. Cite by name so the operator can verify the
+        compose step didn't fabricate tools.
+      - **`state_count`** — rough state-machine size for the
+        operator's mental load estimate.
+
+      ## Discipline
+
+      - **At least two, at most four** candidates. One is "did the
+        compose step actually think"; five is decision paralysis.
+        Spec §11 V13 anti-pattern: a forced fanout is worse than
+        no fanout.
+      - **Make them genuinely different.** Two candidates that
+        differ only in slot naming are wasted slots; pick the
+        better-named one and propose a structurally different
+        alternative. Different verbs, different state shapes,
+        different determinism profiles.
+      - **Cite inventory entries by name** — if you propose using
+        `cap.review.adversarial`, the operator should be able to
+        cross-reference that against the inventory you assembled.
+        Fabricated cap names mean the operator gets a
+        config-load error at verify time; better to fail at
+        compose time.
+      - **Mark unknowns.** If a shape requires an LLM connection
+        the operator doesn't have yet, surface that as a
+        `requires_new: ["llm_planner"]` field on the candidate.
+        The operator's pick implies their commitment to wire that
+        new dependency.

@@ -1,0 +1,97 @@
+{
+  "__inputs": [],
+  "__requires": [],
+  "dashboard": {
+    "title": "praxec Audit",
+    "description": "Audit metrics from praxec, collected via Prometheus",
+    "tags": ["praxec", "audit"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Event Rate",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+        "targets": [
+          {
+            "expr": "rate(praxec_audit_events_total[5m])",
+            "legendFormat": "{{event_type}}",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "cps",
+            "custom": { "displayMode": "table" }
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "Active Workflows",
+        "type": "stat",
+        "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+        "targets": [
+          {
+            "expr": "praxec_audit_workflows_active",
+            "refId": "A"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "none",
+            "color": { "mode": "thresholds" },
+            "thresholds": {
+              "steps": [
+                { "color": "green", "value": null },
+                { "color": "yellow", "value": 10 },
+                { "color": "red", "value": 50 }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 3,
+        "title": "Workflow State Distribution",
+        "type": "barchart",
+        "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+        "targets": [
+          {
+            "expr": "praxec_audit_workflow_state_total",
+            "legendFormat": "{{state}}",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Executor Results",
+        "type": "barchart",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+        "targets": [
+          {
+            "expr": "rate(praxec_audit_executor_total[5m])",
+            "legendFormat": "{{event}} - {{kind}}",
+            "refId": "A"
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "title": "Guard Results",
+        "type": "barchart",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+        "targets": [
+          {
+            "expr": "rate(praxec_audit_guard_total[5m])",
+            "legendFormat": "{{guard_kind}} - {{result}}",
+            "refId": "A"
+          }
+        ]
+      }
+    ],
+    "schemaVersion": 36,
+    "version": 1
+  }
+}

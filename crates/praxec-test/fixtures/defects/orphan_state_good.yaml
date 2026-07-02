@@ -1,0 +1,29 @@
+version: "1.0.0"
+# GOOD TWIN for orphan_state: 'side' is reachable via the 'branch' transition.
+workflows:
+  orphan_good_flow:
+    version: "1.0.0"
+    initialState: start
+    states:
+      start:
+        goal: "Begin"
+        transitions:
+          go:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+          branch:
+            target: side
+            actor: agent
+            executor: { kind: noop }
+      side:
+        goal: "Reachable via branch"
+        transitions:
+          merge:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+      done:
+        goal: "Finished"
+        terminal: true
+        transitions: {}

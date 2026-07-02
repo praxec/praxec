@@ -1,0 +1,122 @@
+# skills/plan.suggest-bindings.yaml
+#
+# Compose a binding plan for `agents.yaml` from a provider model
+# inventory + the operator's intended delegate set. Same shape
+# discipline as `plan.compose-implementation`: a plan, not a single
+# answer; tradeoffs surfaced; assumptions cited.
+
+skills:
+  plan.suggest-bindings:
+    verb: plan
+    lifecycle: stable
+    source: praxec-meta
+    body: |
+      # Composing a binding plan for agents.yaml
+
+      You have a provider model inventory (the typed output of
+      `cap.research.model-inventory`) and a delegate set (the
+      affinity-tier pairs the operator's workflows reference).
+      Your job is to recommend a single `agents.yaml` plan with:
+
+      - **One mandatory `default:` list** — the catch-all the
+        specificity walk falls through to. Pick one binding good
+        enough for general work; the operator can refine via
+        overrides without losing the catch-all safety net.
+      - **Sparse overrides** keyed by `<affinity>-<tier>`,
+        `<affinity>`, or `<tier>` — only where the operator's
+        delegate set actually needs differentiation from
+        `default`. Cartesian completeness is NOT the goal.
+      - **Per-list Chain of Responsibility** — when a single
+        binding can fail (rate limits, transient 429s, regional
+        outages), suggest a secondary in the same list. Make the
+        primary the operator's preferred and the secondary their
+        actually-available fallback. NEVER use CoR to mask
+        operator misconfiguration; per the FMECA, only
+        infrastructure failures (401/403/429/404/network/timeout)
+        trigger fall-through.
+
+      ## Output shape
+
+      Emit `plan` as:
+
+      ```yaml
+      version: 1
+      strict_specificity: false   # operator may flip to true
+      default:
+        - provider: { name: <provider> }
+          model: <id>
+          features: { ... }       # optional per-provider features
+      overrides:
+        <affinity-tier-key>:
+          - { provider: { name: ... }, model: ... }
+          - { provider: { name: ... }, model: ... }   # CoR secondary
+      ```
+
+      Plus a sidecar object:
+
+      ```json
+      {
+        "rationale": {
+          "<key>": "Why this binding for this affinity-tier",
+          ...
+        },
+        "tradeoffs": [
+          "One-line summary of each non-obvious choice"
+        ],
+        "assumptions": [
+          "Operators on regions A, B, C; OPENAI_API_KEY available; ..."
+        ]
+      }
+      ```
+
+      ## Discipline
+
+      - **Cite inventory entries by id** — every model you recommend
+        must appear in the inventory. Fabricated model names mean
+        the smoke test fails immediately; better to fail in the
+        compose step where the operator sees the diagnostic.
+
+      - **Closed-enum providers only** — `anthropic | openai |
+        google | ollama | lmstudio | custom`. The `custom` provider
+        requires a non-empty `endpoint:` field; if the inventory
+        surfaces a model that isn't from one of the five known
+        providers, route it through `custom` with the explicit
+        endpoint.
+
+      - **Closed-enum override keys only** — affinity ∈
+        `{coding, reasoning, prose, web-search, recon}`, tier ∈
+        `{frontier, standard, commoditized}`. A key like
+        `vision-frontier` fails at load — better to leave the
+        delegate falling through to `default` than to invent.
+
+      - **Be honest about feature flags** — `extended_thinking`,
+        `reasoning_effort`, etc. are typed per provider; a typo
+        like `reasoning_effrt` fails at load. Only emit a feature
+        key if you're confident in the spelling AND the provider
+        supports it for the chosen model.
+
+      - **No silent CoR** — if you propose a CoR fallback, name
+        WHY in the rationale. "openai is the primary; google as
+        secondary because it shares the same affinity-tier and is
+        operationally distinct (different rate limit pool)."
+        Never propose CoR around an API key the operator hasn't
+        confirmed they have.
+
+      ## Anti-patterns
+
+      - **Cartesian completeness.** A binding per `<affinity>-<tier>`
+        cell, even where the operator's delegates don't span them.
+        Bloats the file; obscures the actual coverage.
+
+      - **Mirror the inventory in the plan.** Every inventory entry
+        getting a slot. The plan is opinionated; the inventory is
+        exhaustive. The plan is your recommendation, not a dump.
+
+      - **Speculative feature flags.** "Try with `extended_thinking:
+        on`" without knowing whether the operator's chosen model
+        supports it. The loader's per-provider feature struct uses
+        `deny_unknown_fields` — speculative flags fail at load.
+
+      - **Pseudo-CoR.** Two bindings in the same list, both
+        identical providers and models. CoR around what is
+        functionally one binding adds latency without resilience.

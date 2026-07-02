@@ -1,0 +1,16 @@
+# skills/plan.specify.change-request.yaml
+#
+# Verb-mirror root: `plan` (also a domain root). Subject:
+# `plan.specify.change-request` — durable artifact (a normalized problem
+# statement). Lifted verbatim from the SWE-agent reference workflow.
+skills:
+  plan.specify.change-request:
+    verb: plan
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Normalising a change request
+      Convert the raw issue into a typed problem statement. Required fields:
+      `normalizedProblem`, `acceptanceCriteria`, `risk` (low|medium|high|critical),
+      `blastRadius` (touchesAuth, touchesSchema, crossRepo, estimatedFiles).
+      Read evidence; do not propose code.

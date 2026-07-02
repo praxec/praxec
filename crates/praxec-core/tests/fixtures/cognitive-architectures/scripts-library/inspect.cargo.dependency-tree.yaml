@@ -1,0 +1,22 @@
+version: "1.0.0"
+scripts:
+  inspect.cargo.dependency-tree:
+    verb: inspect
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # Read-only introspection of the cargo workspace dependency graph.
+      # Emits the tree on stderr (human-readable) and a structured
+      # summary on stdout (workflow-readable). No mutation. Pass `--depth N`
+      # via "$@" to limit recursion.
+      set -euo pipefail
+
+      cargo tree --workspace --edges=normal,dev,build "$@" >&2
+
+      # Compact JSON summary for the workflow to consume via $.output.json.
+      crate_count=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+        | jq -r '.packages | length')
+      total_deps=$(cargo metadata --format-version 1 2>/dev/null \
+        | jq -r '.packages | length')
+      echo "{\"workspace_crates\": $crate_count, \"total_packages_including_deps\": $total_deps, \"subject\": \"$PRAXEC_SCRIPT_SUBJECT\"}"

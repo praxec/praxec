@@ -1,0 +1,156 @@
+# flows/flow.safe-refactor.yaml
+#
+# Code-health lifecycle: assemble context → draft refactor →
+# baseline tests → scope-bounded edit → compare → review → PR.
+# See SPEC §12.6 for the lifecycle table.
+
+workflows:
+  flow.safe-refactor:
+    description: |
+      Refactor with observable-behavior preservation: baseline snapshot
+      before, compare-to-baseline after.
+    inputs:
+      scope_description: { type: object, required: true }
+      base_ref:          { type: string, default: main }
+    initialState: assembling_context
+    states:
+      assembling_context:
+        transitions:
+          assemble:
+            target: drafting_refactor
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.research.context-assemble
+              use:
+                inputs:
+                  scope_description: "$.context.scope_description"
+                outputs:
+                  "$.context.code_context": context
+
+      drafting_refactor:
+        transitions:
+          draft:
+            target: snapshotting
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.refactor.draft
+              use:
+                inputs:
+                  context: "$.context.code_context"
+                outputs:
+                  "$.context.refactor_plan":  plan
+                  "$.context.scope_paths":    scope_paths
+
+      snapshotting:
+        transitions:
+          snapshot:
+            target: implementing
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.test.baseline-snapshot
+              use:
+                inputs:
+                  scope_paths: "$.context.scope_paths"
+                outputs:
+                  "$.context.baseline": baseline
+
+      implementing:
+        transitions:
+          edit:
+            target: comparing
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.implement.scope-bounded
+              use:
+                inputs:
+                  plan:        "$.context.refactor_plan"
+                  scope_paths: "$.context.scope_paths"
+                outputs:
+                  "$.context.edit_result": result
+
+      comparing:
+        transitions:
+          compare:
+            target: compared
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.test.compare-baseline
+              use:
+                inputs:
+                  baseline: "$.context.baseline"
+                outputs:
+                  "$.context.compare_ok":    ok
+                  "$.context.compare_drift": drift
+
+      compared:
+        transitions:
+          advance:
+            target: reviewing
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.compare_ok == true"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.compare_ok == false"
+
+      reviewing:
+        transitions:
+          review:
+            target: reviewed
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.review.adversarial
+              use:
+                inputs:
+                  diff_against: "$.context.base_ref"
+                outputs:
+                  "$.context.review_verdict":  verdict
+                  "$.context.review_findings": findings
+
+      reviewed:
+        transitions:
+          advance:
+            target: opening_pr
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.review_verdict == 'approved'"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.review_verdict == 'rejected'"
+
+      opening_pr:
+        transitions:
+          open:
+            target: done
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.coordinate.pr-open
+              use:
+                inputs:
+                  title: "$.context.base_ref"
+                  body:  "$.context.base_ref"
+                  base:  "$.context.base_ref"
+                outputs:
+                  "$.context.pr_url":    url
+                  "$.context.pr_number": pr_number
+
+      done:
+        terminal: true
+
+      failed:
+        terminal: true

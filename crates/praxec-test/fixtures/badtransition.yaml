@@ -1,0 +1,32 @@
+version: "1.0.0"
+workflows:
+  badflow:
+    initialState: start
+    version: "1.0.0"
+    states:
+      start:
+        transitions:
+          go:
+            target: gated
+            actor: agent
+            executor: { kind: noop }
+      gated:
+        transitions:
+          finish:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+            guards:
+              - kind: evidence
+                requires:
+                  - kind: tests_passed
+                    count: 1
+      done:
+        terminal: true
+        transitions: {}
+      orphan:
+        transitions:
+          x:
+            target: done
+            actor: agent
+            executor: { kind: noop }

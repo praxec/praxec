@@ -1,0 +1,41 @@
+# capabilities/cap.research.model-inventory.yaml
+#
+# Probe each named provider's models endpoint, emit a typed
+# inventory the planner reasons against. Deterministic; no agent
+# in the loop — operators inspect the inventory before composing.
+
+workflows:
+  cap.research.model-inventory:
+    verb: research
+    lifecycle: experimental
+    description: >
+      Query the configured providers' `/v1/models` (or equivalent)
+      endpoints; emit a typed inventory mapping provider →
+      [{id, family}] plus a per-provider error list. Auth surfaces
+      (401/403) and reachability failures (404/network/timeout) are
+      classified per the FailureClass enum so the operator can see
+      which provider misconfiguration to fix.
+    snippet:
+      inputs:
+        providers:
+          type: string
+          default: "anthropic,openai,google"
+      outputs:
+        inventory: { type: object }
+        errors:    { type: array }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          probe:
+            target: done
+            actor: deterministic
+            executor:
+              kind: script
+              subject: fetch.provider-model-inventory
+              args:
+                - "$.input.providers"
+            output:
+              inventory: "$.output.json.inventory"
+              errors:    "$.output.json.errors"
+      done: { terminal: true }

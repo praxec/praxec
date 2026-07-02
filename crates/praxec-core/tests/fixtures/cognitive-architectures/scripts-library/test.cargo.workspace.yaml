@@ -1,0 +1,17 @@
+version: "1.0.0"
+scripts:
+  test.cargo.workspace:
+    verb: test
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # Full workspace test sweep. Emits a JSON summary so the workflow's
+      # output mapping can read pass/fail without parsing test runner text.
+      set -euo pipefail
+      if cargo test --workspace "$@" 2>&1 | tee /tmp/praxec-test.log; then
+        echo "{\"passed\": true, \"runner\": \"cargo\", \"subject\": \"$PRAXEC_SCRIPT_SUBJECT\"}"
+      else
+        echo "{\"passed\": false, \"runner\": \"cargo\", \"subject\": \"$PRAXEC_SCRIPT_SUBJECT\"}" >&2
+        exit 1
+      fi

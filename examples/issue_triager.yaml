@@ -1,0 +1,152 @@
+# SPEC §33 D9 — reference workflow for the in-runtime LLM executor.
+#
+# Triage an incoming GitHub issue into one of three outcomes (bug,
+# feature request, noise) and route to the appropriate downstream
+# state. Drives the `kind: llm` executor through a single triage state.
+#
+# Use with the gateway:
+#   praxec check examples/issue_triager.yaml
+#   praxec serve --config examples/issue_triager.yaml
+#
+# The triage state declares three transitions; the LLM executor surfaces
+# each as a tool to the model. The model picks exactly one per turn
+# (FMECA F1 enforced); the runtime advances to the matching target.
+
+version: "1.0.0"
+
+audit:
+  sink: stderr
+
+workflows:
+  issue_triager:
+    description: |
+      Triage an incoming GitHub issue as bug, feature, or noise, then
+      route to the appropriate downstream state. Drives the LlmExecutor.
+    version: "2026-05-29"
+
+    inputSchema:
+      type: object
+      required: [issue_body]
+      properties:
+        issue_body:
+          type: string
+      additionalProperties: false
+
+    blackboard:
+      issue_body: { type: string }
+
+    initialState: triaging
+
+    states:
+      triaging:
+        goal: Decide whether the issue is a bug, feature request, or noise.
+
+        transitions:
+          mark_as_bug:
+            title: Classify as a bug
+            target: investigating
+            inputSchema:
+              type: object
+              required: [severity]
+              properties:
+                severity: { type: string, enum: [low, medium, high] }
+                labels:   { type: array, items: { type: string } }
+              additionalProperties: false
+            executor:
+              kind: llm
+              model: anthropic:claude-sonnet-4-6
+              prompt_template: |
+                Triage this GitHub issue. The body is in `$.blackboard.issue_body`.
+                Pick exactly one of `mark_as_bug`, `mark_as_feature`, or `close_as_noise`.
+
+                Issue body:
+                {{ blackboard.issue_body }}
+              max_iterations: 3
+              max_seconds: 60
+              max_tokens: 2000
+            # CMP-022: persist the synthetic `_llm.*` cap counters the
+            # executor emits so `max_tokens` / `max_seconds` actually
+            # fire on later turns. Without these the caps silently never
+            # bind (the counters never reach `instance.context`).
+            output:
+              "_llm.cumulative_tokens": "$.output._llm.cumulative_tokens"
+              "_llm.session.triaging.started_at": "$.output._llm.session.triaging.started_at"
+
+          mark_as_feature:
+            title: Classify as a feature request
+            target: backlog
+            inputSchema:
+              type: object
+              required: [priority]
+              properties:
+                priority: { type: string, enum: [p0, p1, p2, p3] }
+              additionalProperties: false
+            executor:
+              kind: llm
+              model: anthropic:claude-sonnet-4-6
+              prompt_template: |
+                Triage this GitHub issue. The body is in `$.blackboard.issue_body`.
+                Pick exactly one of `mark_as_bug`, `mark_as_feature`, or `close_as_noise`.
+
+                Issue body:
+                {{ blackboard.issue_body }}
+              max_iterations: 3
+              max_seconds: 60
+              max_tokens: 2000
+            # CMP-022: see note on `mark_as_bug` above.
+            output:
+              "_llm.cumulative_tokens": "$.output._llm.cumulative_tokens"
+              "_llm.session.triaging.started_at": "$.output._llm.session.triaging.started_at"
+
+          close_as_noise:
+            title: Close as noise
+            target: closed
+            inputSchema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+              additionalProperties: false
+            executor:
+              kind: llm
+              model: anthropic:claude-sonnet-4-6
+              prompt_template: |
+                Triage this GitHub issue. The body is in `$.blackboard.issue_body`.
+                Pick exactly one of `mark_as_bug`, `mark_as_feature`, or `close_as_noise`.
+
+                Issue body:
+                {{ blackboard.issue_body }}
+              max_iterations: 3
+              max_seconds: 60
+              max_tokens: 2000
+            # CMP-022: see note on `mark_as_bug` above.
+            output:
+              "_llm.cumulative_tokens": "$.output._llm.cumulative_tokens"
+              "_llm.session.triaging.started_at": "$.output._llm.session.triaging.started_at"
+
+      investigating:
+        goal: Bug under investigation.
+        transitions:
+          resolve:
+            title: Mark resolved
+            target: closed
+            executor:
+              kind: noop
+
+      backlog:
+        goal: Feature queued for prioritization.
+        transitions:
+          promote:
+            title: Promote to active investigation
+            target: investigating
+            executor:
+              kind: noop
+          defer:
+            title: Defer indefinitely
+            target: closed
+            executor:
+              kind: noop
+
+      closed:
+        goal: Issue closed.
+        terminal: true

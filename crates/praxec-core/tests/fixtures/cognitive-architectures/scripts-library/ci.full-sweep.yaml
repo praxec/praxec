@@ -1,0 +1,32 @@
+version: "1.0.0"
+scripts:
+  ci.full-sweep:
+    verb: verify
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # The CI gauntlet: install → format-check → lint → test → release build.
+      # Equivalent to a "pre-merge" or "nightly" pipeline; each stage emits
+      # its own log section. Fails fast on first red stage.
+      set -euo pipefail
+
+      section() { echo; echo "=== $1 ==="; }
+
+      section "install (no-op for offline runs; expand here if needed)"
+      :
+
+      section "format check"
+      cargo fmt --all -- --check
+
+      section "clippy (warnings as errors)"
+      cargo clippy --workspace --all-targets -- -D warnings
+
+      section "test workspace"
+      cargo test --workspace
+
+      section "release build"
+      cargo build --release --locked
+
+      section "summary"
+      echo "{\"passed\": true, \"stages\": [\"format\", \"lint\", \"test\", \"build\"], \"subject\": \"$PRAXEC_SCRIPT_SUBJECT\"}"

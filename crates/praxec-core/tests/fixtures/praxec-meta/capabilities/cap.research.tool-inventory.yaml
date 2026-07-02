@@ -1,0 +1,32 @@
+# capabilities/cap.research.tool-inventory.yaml
+
+workflows:
+  cap.research.tool-inventory:
+    verb: research
+    lifecycle: experimental
+    description: >
+      Survey the live gateway for reachable tools/scripts/skills/caps;
+      emit a typed inventory the planner can compose against.
+    snippet:
+      inputs:
+        filter: { type: object, default: {} }
+      outputs:
+        inventory: { type: object }
+    skills: [research.tool-inventory.assemble]
+    initialState: ready
+    states:
+      ready:
+        goal: Build the typed inventory of reachable tooling.
+        transitions:
+          submit_inventory:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [inventory]
+              properties:
+                inventory: { type: object }
+            executor: { kind: noop }
+            output:
+              inventory: "$.arguments.inventory"
+      done: { terminal: true }

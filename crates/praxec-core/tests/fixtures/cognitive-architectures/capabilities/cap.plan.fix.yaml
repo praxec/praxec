@@ -1,0 +1,32 @@
+# capabilities/cap.plan.fix.yaml
+
+workflows:
+  cap.plan.fix:
+    verb: plan
+    lifecycle: experimental
+    description: >
+      Plan a scope-bounded fix from a localized defect + repro steps.
+    snippet:
+      inputs:
+        defect_location: { type: object, required: true }
+        repro_steps:     { type: array,  required: true }
+      outputs:
+        plan: { type: object }
+    skills: [plan.fix.scope-bounded]
+    initialState: ready
+    states:
+      ready:
+        goal: Plan the fix — declare scope, approach, regression tests.
+        transitions:
+          submit_plan:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [plan]
+              properties:
+                plan: { type: object }
+            executor: { kind: noop }
+            output:
+              plan: "$.arguments.plan"
+      done: { terminal: true }

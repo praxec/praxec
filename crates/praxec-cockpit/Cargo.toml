@@ -1,0 +1,49 @@
+[package]
+name = "praxec-cockpit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Praxec Mission Control — a ratatui cockpit for directing and supervising governed missions"
+
+[[bin]]
+name = "praxec-cockpit"
+path = "src/main.rs"
+
+[lib]
+name = "praxec_cockpit"
+path = "src/lib.rs"
+
+[dependencies]
+# `unstable-rendered-line-info` gives Paragraph::line_count — used to pin the
+# chat transcript to the bottom (scroll past overflow, keep the newest visible).
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# The cockpit attaches to the runtime as a governed client (ADR-0001); core
+# carries the provider catalog, the provider-keys backend, and models.yaml
+# parsing the setup gate reuses for detection (ADR-0005 §5).
+praxec-core = { workspace = true }
+# The cockpit is a CLIENT of the gateway (SPEC §32): the live gateway is a thin
+# rmcp stdio client to a running `praxec` server (read the same surface the
+# model sees).
+rmcp = { workspace = true }
+# Resolve the per-OS config dir for the user `models.yaml` during detection.
+dirs = "5"
+# The in-process Mission Control LLM driver (the central cockpit tool): rig drives
+# the chat loop (one LLM lib across the cockpit — the same crate the embeddings
+# use), tokio runs it off the UI thread, futures drains the streams.
+rig = { package = "rig-core", version = "0.38" }
+tokio = { workspace = true }
+futures = { workspace = true }
+# The shared embedding model is picked at startup (the bootstrap gate) and powers
+# all semantic discovery; this carries the rig-backed embedder + option catalog.
+praxec-embeddings = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = "3"
+# C2 (testing-strategy) — validate the cockpit's response fixtures against the
+# shared §32 schema so the typed `GatewayResponse` mirror can't drift.
+jsonschema = { workspace = true }

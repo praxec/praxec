@@ -1,0 +1,178 @@
+# Spec §24 — parallel executor reference
+#
+# Five workflows, one per join condition + failure-mode combination.
+# Branch executors are `kind: noop` so the config checks without
+# external tools. Swap real executors when integrating.
+#
+# Invariants (Spec §24.5):
+#   - One save_if_version per parallel block
+#   - One transition record
+#   - Version bumps once — the state machine sees a single executor call
+
+version: "1.0.0"
+audit:
+  sink: stderr
+
+scripts:
+  verify.schema.json-schema:
+    verb: verify
+    lifecycle: stable
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      echo '{"valid": true, "checks": 12}'
+
+
+workflows:
+  # ── all + bail (strict) ──
+  parallel_all:
+    initialState: fanout
+    blackboard:
+      branch_results: { type: array }
+      all_passed:     { type: boolean }
+    states:
+      fanout:
+        goal: Run all checks — any failure rejects
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor:
+              kind: parallel
+              join: all
+              on_branch_failure: bail
+              total_timeout_ms: 30000
+              branches:
+                - kind: noop
+                - kind: noop
+                - kind: noop
+            output:
+              branch_results: "$.output.branches"
+              all_passed:     "$.output.summary.verdict == 'passed'"
+      done:
+        terminal: true
+
+  # ── any (first success wins) ──
+  parallel_any:
+    initialState: fanout
+    blackboard:
+      winner: { type: object }
+    states:
+      fanout:
+        goal: Try three approaches — first success wins
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor:
+              kind: parallel
+              join: any
+              on_branch_failure: continue
+              total_timeout_ms: 30000
+              branches:
+                - { kind: noop }
+                - { kind: noop }
+                - { kind: noop }
+            output:
+              winner: "$.output.summary"
+      done:
+        terminal: true
+
+  # ── at_least K ──
+  parallel_at_least:
+    initialState: fanout
+    blackboard:
+      ok_count:     { type: integer }
+      failed_count:  { type: integer }
+    states:
+      fanout:
+        goal: Need at least 2 of 3 branches to pass
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor:
+              kind: parallel
+              join:
+                at_least: 2
+              on_branch_failure: continue
+              total_timeout_ms: 30000
+              branches:
+                - { kind: noop }
+                - { kind: noop }
+                - { kind: noop }
+            output:
+              ok_count:    "$.output.summary.ok_count"
+              failed_count: "$.output.summary.failed_count"
+      done:
+        terminal: true
+
+  # ── percent quorum ──
+  parallel_percent:
+    initialState: fanout
+    states:
+      fanout:
+        goal: 70% of branches must pass
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor:
+              kind: parallel
+              join:
+                percent: 70
+              on_branch_failure: continue
+              total_timeout_ms: 30000
+              branches:
+                - { kind: noop }
+                - { kind: noop }
+                - { kind: noop }
+                - { kind: noop }
+                - { kind: noop }
+      done:
+        terminal: true
+
+  # ── all + continue (run all, decide after) ──
+  parallel_all_continue:
+    initialState: fanout
+    blackboard:
+      branch_results:   { type: array }
+      any_failed:        { type: boolean }
+    states:
+      fanout:
+        goal: Run every check, collect all results, route after
+        transitions:
+          go_all:
+            target: decision_point
+            actor: deterministic
+            executor:
+              kind: parallel
+              join: all
+              on_branch_failure: continue
+              total_timeout_ms: 30000
+              branches:
+                - { kind: noop }
+                - { kind: noop }
+                - { kind: noop }
+            output:
+              branch_results: "$.output.branches"
+              any_failed:     "$.output.summary.failed_count"
+      decision_point:
+        goal: Route based on aggregate outcome
+        transitions:
+          all_ok:
+            target: done
+            guards:
+              - kind: expr
+                expr: "$.context.any_failed == false"
+            executor: { kind: noop }
+          some_failed:
+            target: escalate_to_human
+            guards:
+              - kind: expr
+                expr: "$.context.any_failed == true"
+            executor: { kind: noop }
+      escalate_to_human:
+        terminal: true
+      done:
+        terminal: true

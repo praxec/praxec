@@ -1,0 +1,13 @@
+# skills/review.code.adversarial.yaml
+#
+# Lifted verbatim from the SWE-agent reference workflow.
+skills:
+  review.code.adversarial:
+    verb: review
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Adversarial patch review
+      Attack the candidate patch: find missed edge cases, hidden regressions,
+      policy violations, security issues. Cite each finding with file:line and
+      a counterexample input. Return verdict: accept | retry | escalate.

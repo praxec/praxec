@@ -1,0 +1,12 @@
+[
+  { "vendor": "openai",     "model": "text-embedding-3-small",        "dims": 1536, "input_usd_per_million": 0.02, "local": false, "mteb_score": 62.3 },
+  { "vendor": "openai",     "model": "text-embedding-3-large",        "dims": 3072, "input_usd_per_million": 0.13, "local": false, "mteb_score": 64.6 },
+  { "vendor": "gemini",     "model": "text-embedding-004",            "dims": 768,  "input_usd_per_million": 0.0,  "local": false, "mteb_score": 62.0 },
+  { "vendor": "gemini",     "model": "gemini-embedding-001",          "dims": 3072, "input_usd_per_million": 0.15, "local": false, "mteb_score": 68.3 },
+  { "vendor": "openrouter", "model": "openai/text-embedding-3-small", "dims": 1536, "input_usd_per_million": 0.02, "local": false, "mteb_score": 62.3 },
+  { "vendor": "openrouter", "model": "openai/text-embedding-3-large", "dims": 3072, "input_usd_per_million": 0.13, "local": false, "mteb_score": 64.6 },
+  { "vendor": "openrouter", "model": "google/gemini-embedding-001",   "dims": 3072, "input_usd_per_million": 0.15, "local": false, "mteb_score": 68.3 },
+  { "vendor": "openrouter", "model": "baai/bge-m3",                   "dims": 1024, "input_usd_per_million": 0.01, "local": false, "mteb_score": 63.0 },
+  { "vendor": "ollama",     "model": "nomic-embed-text",              "dims": 768,  "input_usd_per_million": 0.0,  "local": true,  "mteb_score": 62.4 },
+  { "vendor": "ollama",     "model": "all-minilm",                    "dims": 384,  "input_usd_per_million": 0.0,  "local": true,  "mteb_score": 56.3 }
+]

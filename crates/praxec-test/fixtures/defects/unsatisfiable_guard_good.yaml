@@ -1,0 +1,22 @@
+version: "1.0.0"
+# GOOD TWIN for unsatisfiable_guard: single consistent guard (n == 1).
+# satisfying_context sets n=1, violating sets n=false. Should pass cleanly.
+workflows:
+  satisfiable_flow:
+    version: "1.0.0"
+    initialState: start
+    states:
+      start:
+        goal: "Transition with a single satisfiable guard"
+        transitions:
+          go:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+            guards:
+              - kind: expr
+                expr: "$.context.n == 1"
+      done:
+        goal: "Finished"
+        terminal: true
+        transitions: {}

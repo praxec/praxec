@@ -1,0 +1,84 @@
+# capabilities/cap.gate.human-approve-plan.yaml
+#
+# HITL gate over the suggested binding plan. Two modes:
+#
+#   - `auto`         — skip the human; plan_final = plan; approved = true.
+#   - `review_plan`  — block for the operator's decision; they may
+#                      approve, reject, or hand back an edited plan.
+#
+# `review_each` (per-binding approval) is explicitly deferred to
+# v0.3.1+ per the FMECA P4 split.
+
+workflows:
+  cap.gate.human-approve-plan:
+    verb: gate
+    lifecycle: experimental
+    description: >
+      Decide whether to write the suggested agents.yaml plan.
+      `auto` mode short-circuits with approved=true; `review_plan`
+      blocks until the operator submits an approval (with optional
+      edited plan) or a rejection. The chosen plan_final flows on
+      to the write cap.
+    snippet:
+      inputs:
+        plan:        { type: object, required: true }
+        rationale:   { type: object, default: {} }
+        tradeoffs:   { type: array,  default: [] }
+        assumptions: { type: array,  default: [] }
+        mode:
+          type: string
+          enum: [auto, review_plan]
+          default: review_plan
+        prompt:
+          type: string
+          default: "Approve this agents.yaml plan, or hand back an edited version."
+      outputs:
+        approved:   { type: boolean }
+        plan_final: { type: object }
+        rationale:  { type: string }
+    initialState: routing
+    states:
+      routing:
+        goal: >
+          Branch on `mode`: auto skips the human; review_plan
+          requires explicit operator approval.
+        transitions:
+          auto_approve:
+            target: done
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.input.mode == 'auto'"
+            executor: { kind: noop }
+            output:
+              approved:   true
+              plan_final: "$.input.plan"
+              rationale:  "auto mode — no human review"
+          need_human:
+            target: awaiting_human
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.input.mode == 'review_plan'"
+            executor: { kind: noop }
+      awaiting_human:
+        goal: >
+          Surface the plan + rationale + tradeoffs + assumptions to
+          the operator; wait for approve / edit / reject.
+        transitions:
+          approve:
+            target: done
+            actor: human
+            inputSchema:
+              type: object
+              required: [approved, plan_final]
+              properties:
+                approved:   { type: boolean }
+                plan_final: { type: object }
+                rationale:  { type: string, default: "" }
+            executor: { kind: human }
+            output:
+              approved:   "$.arguments.approved"
+              plan_final: "$.arguments.plan_final"
+              rationale:  "$.arguments.rationale"
+      done: { terminal: true }

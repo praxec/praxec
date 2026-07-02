@@ -1,0 +1,34 @@
+# capabilities/cap.refactor.draft.yaml
+
+workflows:
+  cap.refactor.draft:
+    verb: refactor
+    lifecycle: experimental
+    description: >
+      Draft a scope-bounded refactor plan: extractions, renames, moves.
+    snippet:
+      inputs:
+        context: { type: object, required: true }
+      outputs:
+        plan:        { type: object }
+        scope_paths: { type: array }
+    skills: [refactor.scope-bounded]
+    initialState: ready
+    states:
+      ready:
+        goal: Draft the refactor plan; declare scope and expected behavior preservation.
+        transitions:
+          submit_plan:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [plan, scope_paths]
+              properties:
+                plan:        { type: object }
+                scope_paths: { type: array }
+            executor: { kind: noop }
+            output:
+              plan:        "$.arguments.plan"
+              scope_paths: "$.arguments.scope_paths"
+      done: { terminal: true }

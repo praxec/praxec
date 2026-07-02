@@ -1,0 +1,115 @@
+version: "1.0.0"
+
+audit:
+  sink: stderr
+
+workflows:
+  deploy_pipeline:
+    title: Deploy Pipeline
+    description: >
+      A deployment pipeline that demonstrates deterministic chaining.
+      Lint, test, and build run automatically as deterministic steps.
+      The LLM only sees the deploy decision after all checks pass.
+    tags: [deploy, deterministic, pipeline]
+
+    inputSchema:
+      type: object
+      required: [service]
+      properties:
+        service:
+          type: string
+          description: Name of the service to deploy
+        environment:
+          type: string
+          enum: [staging, production]
+          default: staging
+      additionalProperties: false
+
+    initialState: lint
+    maxChainDepth: 10
+
+    states:
+      lint:
+        goal: Validate code quality
+        guidance: >
+          This step runs automatically. The linter checks formatting,
+          style rules, and static analysis.
+        transitions:
+          run_lint:
+            title: Run linter
+            target: test
+            actor: deterministic
+            executor:
+              kind: cli
+              command: lint-check
+              args: ["$.input.service"]
+            output:
+              lintPassed: "$.output.json.passed"
+              lintReport: "$.output.json.report"
+
+      test:
+        goal: Run the test suite
+        guidance: >
+          This step runs automatically after lint passes.
+          All unit and integration tests are executed.
+        transitions:
+          run_tests:
+            title: Run test suite
+            target: build
+            actor: deterministic
+            executor:
+              kind: cli
+              command: test-runner
+              args: ["$.input.service"]
+            output:
+              testsPassed: "$.output.json.passed"
+              testCount: "$.output.json.count"
+              coverage: "$.output.json.coverage"
+
+      build:
+        goal: Build the deployment artifact
+        guidance: >
+          This step runs automatically after tests pass.
+          Produces a versioned container image.
+        transitions:
+          build_artifact:
+            title: Build artifact
+            target: ready_to_deploy
+            actor: deterministic
+            executor:
+              kind: cli
+              command: build-artifact
+              args: ["$.input.service", "$.input.environment"]
+            output:
+              artifactId: "$.output.json.artifactId"
+              imageTag: "$.output.json.imageTag"
+
+      ready_to_deploy:
+        goal: Confirm deployment
+        guidance: >
+          All automated checks passed. Review the lint report, test
+          results, and build artifact before deciding to deploy.
+          The context contains lintReport, testCount, coverage,
+          and artifactId for your review.
+        transitions:
+          deploy:
+            title: Deploy to environment
+            target: deployed
+            actor: agent
+            executor:
+              kind: cli
+              command: deploy
+              args: ["$.context.artifactId", "$.input.environment"]
+            output:
+              deploymentId: "$.output.json.deploymentId"
+
+          abort:
+            title: Abort deployment
+            target: aborted
+            actor: agent
+
+      deployed:
+        terminal: true
+
+      aborted:
+        terminal: true

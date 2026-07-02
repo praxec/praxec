@@ -1,0 +1,163 @@
+# flows/flow.author-flow.yaml
+#
+# Author a brand-new flow that composes existing
+# capabilities. Adds a cap-picking step on top of flow.author-capability
+# so the operator can select which loaded caps the new flow
+# strings together.
+
+workflows:
+  flow.author-flow:
+    description: |
+      Survey reachable tooling → propose 2-3 flow shapes
+      composing existing caps → operator picks one → emit YAML →
+      check-config → adversarial review → PR.
+    inputs:
+      goal:      { type: string, required: true }
+      namespace: { type: string, default: "draft" }
+      base_ref:  { type: string, default: main }
+    initialState: surveying_tools
+    states:
+      surveying_tools:
+        transitions:
+          survey:
+            target: composing
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.research.tool-inventory
+              use:
+                inputs:
+                  filter: "$.context.goal"
+                outputs:
+                  "$.context.inventory": inventory
+
+      composing:
+        transitions:
+          compose:
+            target: picking_shape
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.plan.compose-implementation
+              use:
+                inputs:
+                  goal:      "$.context.goal"
+                  inventory: "$.context.inventory"
+                outputs:
+                  "$.context.candidates": candidates
+
+      picking_shape:
+        transitions:
+          pick:
+            target: emitting
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.gate.human-pick-shape
+              use:
+                inputs:
+                  candidates: "$.context.candidates"
+                  prompt:     "Pick flow shape (which caps to compose, what state machine)"
+                outputs:
+                  "$.context.chosen":           chosen
+                  "$.context.shape_rationale": rationale
+
+      emitting:
+        transitions:
+          emit:
+            target: checking
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.implement.emit-yaml
+              use:
+                inputs:
+                  chosen:    "$.context.chosen"
+                  kind:      "$.context.goal"
+                  namespace: "$.context.namespace"
+                outputs:
+                  "$.context.yaml_text":   yaml_text
+                  "$.context.target_path": target_path
+
+      checking:
+        transitions:
+          check:
+            target: checked
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.verify.check-config
+              use:
+                inputs:
+                  config_path: "$.context.target_path"
+                outputs:
+                  "$.context.check_ok":          ok
+                  "$.context.check_diagnostics": diagnostics
+
+      checked:
+        transitions:
+          advance:
+            target: reviewing
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.check_ok == true"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.check_ok == false"
+
+      reviewing:
+        transitions:
+          review:
+            target: reviewed
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.review.adversarial
+              use:
+                inputs:
+                  diff_against: "$.context.base_ref"
+                outputs:
+                  "$.context.review_verdict":  verdict
+                  "$.context.review_findings": findings
+
+      reviewed:
+        transitions:
+          advance:
+            target: opening_pr
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.review_verdict == 'approved'"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.review_verdict == 'rejected'"
+
+      opening_pr:
+        transitions:
+          open:
+            target: done
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.coordinate.pr-open
+              use:
+                inputs:
+                  title: "$.context.goal"
+                  body:  "$.context.goal"
+                  base:  "$.context.base_ref"
+                outputs:
+                  "$.context.pr_url":    url
+                  "$.context.pr_number": pr_number
+
+      done:
+        terminal: true
+
+      failed:
+        terminal: true

@@ -1,0 +1,108 @@
+# Enticement golden-test fixture: a self-contained content-revision workflow.
+#
+# Unlike examples/content-publish/ (which needs a docs/brand/cms stack and is
+# framed Mode B — praxec as the sole tool source), this fixture is fully
+# self-contained: kind: noop throughout, in-memory boot, no external
+# connections. It is built for the *enticement* test (Mode A): a model that
+# also has a `publish_directly` escape hatch must *choose* to drive this
+# governed path instead of freeballing.
+#
+# The value the model gains by using it: (a) house-voice guidance it must fetch
+# (the guidance_acknowledged gate), (b) an approval gate, (c) an audited
+# published artifact. See WIP/enticement-golden-test-spec.md.
+#
+# Validate:  praxec check --config examples/content-revise/gateway.yaml
+version: "1.0.0"
+
+gateway:
+  allow_ephemeral: true
+  principal: { subject: operator, roles: [human] }
+
+audit:
+  sink: memory   # the rig reads events back to score the rubric
+
+skills:
+  review.style.house-voice:
+    verb: review
+    lifecycle: stable
+    body: |
+      # House voice
+      Lead with the problem. Short sentences. No hedging.
+
+workflows:
+  content_revise:
+    description: Revise a piece of content to the house voice, get it approved, publish it.
+    tags: [content, governed, demo, enticement-test]
+
+    inputSchema:
+      type: object
+      required: [original]
+      properties:
+        original: { type: string, description: "The content to revise." }
+      additionalProperties: false
+
+    initialState: drafting
+
+    outcomes:
+      - id: revised
+        statement: A revised draft was produced.
+        check: "$.context.revised != null"
+      - id: approved
+        statement: A human approved the revision.
+        check: "$.context.approved == true"
+
+    blackboard:
+      revised:  { type: string }
+      approved: { type: boolean }
+
+    states:
+      drafting:
+        goal: Revise the provided content to match the house voice.
+        skills: [review.style.house-voice]
+        transitions:
+          submit_draft:
+            title: Submit the revised draft.
+            target: reviewing
+            inputSchema:
+              type: object
+              required: [revised]
+              properties:
+                revised: { type: string, description: "The revised content." }
+              additionalProperties: false
+            executor: { kind: noop }
+            output:
+              revised: "$.arguments.revised"
+
+      reviewing:
+        goal: Confirm the draft follows the house voice, then request approval.
+        skills: [review.style.house-voice]
+        transitions:
+          request_approval:
+            title: Request human approval to publish.
+            target: awaiting_approval
+            guards:
+              - kind: guidance_acknowledged
+                subject: review.style.house-voice
+            executor: { kind: noop }
+
+      awaiting_approval:
+        goal: A human approves or sends it back.
+        actor: human
+        transitions:
+          approve:
+            title: Approve the revision for publication.
+            target: published
+            actor: human
+            executor: { kind: noop }
+            output:
+              approved: true
+          request_changes:
+            title: Send the revision back for another pass.
+            target: drafting
+            actor: human
+            executor: { kind: noop }
+
+      published:
+        terminal: true
+        outcome: success
+        goal: Published. The audit log holds the full revise to approve to publish trail.

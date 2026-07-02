@@ -1,0 +1,155 @@
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
+
+env:
+    CARGO_TERM_COLOR: always
+    RUSTFLAGS: "-Dwarnings"
+    # CI build artifacts are throwaway; full debuginfo (`debug = 2`) is what
+    # bloats this workspace's `target/debug` to tens of GB and blows the runner
+    # disk during the multi-variant build (and inflates link memory). Drop it —
+    # panic messages still surface in logs; we don't need line-table backtraces.
+    CARGO_PROFILE_DEV_DEBUG: "0"
+    CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+    build-test:
+        name: build + test + lint
+        runs-on: ubuntu-latest
+        # A cold cache rebuilds this large workspace from scratch (~30 min); the
+        # multi-variant build + tests + dogfood then need headroom on top.
+        timeout-minutes: 55
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install system dependencies
+              # libdbus-1-dev is required by libdbus-sys (transitive dep
+              # via aether-auth's OS keyring abstraction on Linux). Without
+              # it cargo build panics during the libdbus-sys build script
+              # before any of our crates compile.
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libdbus-1-dev pkg-config
+
+            - name: Free disk space + add swap
+              # The multi-variant build (cargo test debug binaries + bench +
+              # lean + release) fills the ~72 GB root disk; the first run was
+              # also memory-killed. Reclaim the big preinstalled toolchains we
+              # never use (keep /opt/hostedtoolcache's Python for the dogfood
+              # step) and add a modest swap. The swapfile goes on / too, so keep
+              # it small — after the cleanup the build is disk-bound, not RAM.
+              run: |
+                  echo "before:"; df -h /
+                  sudo rm -rf \
+                    /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+                    /usr/local/lib/android /opt/hostedtoolcache/CodeQL \
+                    /usr/share/swift /usr/local/share/powershell \
+                    /usr/local/share/chromium /usr/local/lib/node_modules || true
+                  sudo docker image prune --all --force 2>/dev/null || true
+                  sudo apt-get clean
+                  sudo swapoff -a || true
+                  sudo fallocate -l 6G /swapfile2
+                  sudo chmod 600 /swapfile2 && sudo mkswap /swapfile2 && sudo swapon /swapfile2
+                  echo "after:"; df -h / ; free -h
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  components: clippy, rustfmt
+
+            - name: Cache cargo registry + build
+              uses: Swatinem/rust-cache@v2
+              with:
+                  # Save target/ even when a later step fails, so the next run
+                  # warms instead of paying the full cold rebuild again.
+                  cache-on-failure: "true"
+
+            - name: cargo fmt --check
+              run: cargo fmt --all -- --check
+
+            - name: cargo clippy
+              run: cargo clippy --workspace --all-targets -- -D warnings
+
+            - name: validation-rule parity scan
+              # SPEC §11 + PR3 — every rule V1..V23 must have at least
+              # one accepts test AND one rejects test (named per the
+              # `fn v<N>_(accepts|rejects)_*` convention). Failing here
+              # surfaces missing coverage before CI runs the suite.
+              run: bash scripts/check-validation-parity.sh
+
+            - name: cargo test
+              run: cargo test --workspace
+
+            - name: cargo doctest
+              # Doctest scaffold: any future docstring example becomes a
+              # compile/run check. Today's count is small but the gate is
+              # in place so spec/code drift in API examples breaks the build.
+              run: cargo test --workspace --doc
+
+            - name: Benchmark (check only)
+              run: cargo bench --bench gateway_overhead -- --warm-up-time 1 --measurement-time 5 --sample-size 50
+
+            - name: cargo build feature-gating (lean)
+              # `llm-executor` is the only optional feature now — agents are
+              # first-class / non-optional (ADR-0007). Guard the minimal build
+              # (no default features) so the cfg-gating around the LLM executor
+              # can't silently regress.
+              run: |
+                  cargo build -p praxec --no-default-features
+
+            - name: cargo build --release (for dogfood)
+              run: cargo build --release -p praxec
+
+            - name: schema check on examples
+              run: |
+                  for f in examples/*.yaml examples/*/gateway.yaml; do
+                    echo "--- checking $f"
+                    ./target/release/praxec check --config "$f"
+                  done
+
+            - name: migrate command smoke test
+              run: |
+                  ./target/release/praxec migrate --config examples/simple-proxy.yaml
+
+            - name: dogfood transcript
+              run: |
+                  python3 examples/tdd/dogfood-drive.py 2>&1 | tee dogfood-transcript.txt
+
+            - name: upload dogfood transcript
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: dogfood-transcript
+                  path: dogfood-transcript.txt
+                  retention-days: 90
+
+    release-guard:
+        name: release guard (CHANGELOG must change with version)
+        runs-on: ubuntu-latest
+        if: github.event_name == 'pull_request'
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Verify CHANGELOG entry when version bumps
+              run: |
+                  base="${{ github.base_ref }}"
+                  git fetch origin "$base" --depth=1
+
+                  version_changed=$(git diff "origin/$base"..HEAD -- Cargo.toml crates/*/Cargo.toml | grep -E '^\+version =' || true)
+                  if [ -z "$version_changed" ]; then
+                    echo "No version bump detected; release guard skipped."
+                    exit 0
+                  fi
+
+                  changelog_changed=$(git diff --name-only "origin/$base"..HEAD | grep -E '^CHANGELOG\.md$' || true)
+                  if [ -z "$changelog_changed" ]; then
+                    echo "::error::Version bumped but CHANGELOG.md not updated."
+                    exit 1
+                  fi
+                  echo "Version bump accompanied by CHANGELOG.md update — OK."

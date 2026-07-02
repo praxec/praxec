@@ -1,0 +1,110 @@
+# Publish the release Docker image to GHCR, then register praxec
+# (the gateway) with the official MCP Registry (registry.modelcontextprotocol.io).
+#
+# Triggered by `v*` tags — the same trigger as release.yml and
+# publish.yml.
+#
+# Auth: GitHub OIDC. No stored secrets — the registry grants the
+# `io.github.praxec/*` namespace to whoever owns this repo (so both
+# server names are covered by one login), and GHCR uses the built-in
+# GITHUB_TOKEN.
+#
+# Job ordering: `registry` waits on `image`. The registry validates
+# that each OCI image exists and carries the
+# `io.modelcontextprotocol.server.name` label (set per-target in the
+# Dockerfile) before it accepts the publish — so the images must be
+# pushed first. The two images share one builder stage via the GHA layer
+# cache, so the planner image adds image-assembly time, not a second Rust
+# compile.
+
+name: Publish to MCP Registry
+
+on:
+    push:
+        tags:
+            - 'v*'
+
+jobs:
+    image:
+        name: build & push image (GHCR)
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            packages: write
+        outputs:
+            version: ${{ steps.ver.outputs.version }}
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Resolve version from tag
+              id: ver
+              run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+            - name: Verify tag matches workspace version
+              run: |
+                  ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  if [ "${{ steps.ver.outputs.version }}" != "$ver" ]; then
+                    echo "::error::Tag v${{ steps.ver.outputs.version }} does not match workspace version $ver"
+                    exit 1
+                  fi
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to GHCR
+              uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build and push gateway image
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  target: gateway
+                  push: true
+                  # arm64 compiles Rust under QEMU emulation and is slow.
+                  # Add `linux/arm64` here when a multi-arch image is wanted.
+                  platforms: linux/amd64
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+                  tags: |
+                      ghcr.io/${{ github.repository }}:${{ steps.ver.outputs.version }}
+                      ghcr.io/${{ github.repository }}:latest
+
+
+    registry:
+        name: publish to MCP Registry
+        needs: image
+        runs-on: ubuntu-latest
+        permissions:
+            id-token: write # required for GitHub OIDC auth
+            contents: read
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Pin server manifests to the release tag
+              run: |
+                  v="${{ needs.image.outputs.version }}"
+                  for f in server.json; do
+                    jq --arg v "$v" '
+                      .version = $v
+                      | .packages = [ .packages[]
+                          | if .registryType == "oci"
+                            then .identifier |= sub(":[^:/]*$"; ":" + $v)
+                            else . end ]
+                    ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+                    echo "--- $f ---"; cat "$f"
+                  done
+
+            - name: Install mcp-publisher
+              run: |
+                  curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+            - name: Authenticate (GitHub OIDC)
+              run: ./mcp-publisher login github-oidc
+
+            # mcp-publisher reads ./server.json.
+            - name: Publish gateway to MCP Registry
+              run: ./mcp-publisher publish

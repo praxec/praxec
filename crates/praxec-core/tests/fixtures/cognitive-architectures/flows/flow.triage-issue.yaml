@@ -1,0 +1,98 @@
+# flows/flow.triage-issue.yaml
+#
+# Intake lifecycle: classify severity → route to component →
+# disambiguate (HITL if ambiguous) → label + assign.
+# See SPEC §12.6 for the lifecycle table.
+
+workflows:
+  flow.triage-issue:
+    description: |
+      Triage an inbound issue through severity classification,
+      component routing, optional HITL disambiguation, and final
+      label + owner assignment.
+    inputs:
+      issue: { type: object, required: true }
+    initialState: classifying
+    states:
+      classifying:
+        transitions:
+          classify:
+            target: routing
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.triage.classify-severity
+              use:
+                inputs:
+                  issue: "$.context.issue"
+                outputs:
+                  "$.context.severity":             severity
+                  "$.context.severity_confidence": confidence
+
+      routing:
+        transitions:
+          route:
+            target: routed
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.triage.route-component
+              use:
+                inputs:
+                  issue: "$.context.issue"
+                outputs:
+                  "$.context.component":            component
+                  "$.context.owner_team":           owner_team
+                  "$.context.route_confidence":     confidence
+                  "$.context.route_is_ambiguous":   is_ambiguous
+
+      routed:
+        transitions:
+          advance:
+            target: applying
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.route_is_ambiguous == false"
+          disambiguate:
+            target: disambiguated
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.route_is_ambiguous == true"
+            executor:
+              kind: workflow
+              definitionId: cap.gate.human-disambiguate
+              use:
+                inputs:
+                  candidates: "$.context.issue"
+                  prompt:     "Pick the owner team"
+                outputs:
+                  "$.context.disambiguation":           chosen
+                  "$.context.disambiguation_rationale": rationale
+
+      disambiguated:
+        transitions:
+          advance:
+            target: applying
+            actor: deterministic
+
+      applying:
+        transitions:
+          apply:
+            target: done
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.coordinate.label-and-route
+              use:
+                inputs:
+                  issue:      "$.context.issue"
+                  severity:   "$.context.severity"
+                  component:  "$.context.component"
+                  owner_team: "$.context.owner_team"
+                outputs:
+                  "$.context.applied": applied
+
+      done:
+        terminal: true

@@ -1,0 +1,305 @@
+# Test-Driven Development enforcement workflow with anti-cheating defenses.
+#
+# This config exposes a single workflow, `tdd`, that walks a developer (or
+# an LLM agent) through the red → green → refactor loop. Each phase has
+# guards that *prove* discipline:
+#
+#   - red:    a test exists, has been run, and failed
+#   - green:  the test now passes AND the test count strictly increased
+#   - refactor: code was changed and tests still pass (count must not drop)
+#
+# Caller proof comes from the test runner's structured JSON, not the
+# caller's word. The runner is `tdd-runner.sh` (alongside this file),
+# which emits `{passed: bool, count: int, output: str}`.
+#
+# Defenses against the obvious cheating modes:
+#   * Delete a failing test                → count drops → routed to `cheated`
+#   * Trivialize a test (assert True)      → count doesn't go up → blocked at `red→green`
+#   * Skip / ignore a test                 → count drops → routed to `cheated`
+#   * Pretend tests passed                 → runner is the source of truth, model can't lie
+#
+# Defenses NOT covered here (require deployment / external tooling):
+#   * Mutation testing for "implementation hardcoded to test"
+#   * git-state diffing for "implementation existed before test"
+#   * Tool gating beyond the workflow (the model needs to be deployed
+#     against THIS gateway as its only MCP source — see the example README)
+
+version: "1.0.0"
+
+# This is a demo config: ephemeral in-memory store + stderr audit. `serve`
+# refuses non-durable storage by default (state/audit would be lost in
+# production), so this demo explicitly opts in. Do NOT copy this line into a
+# real deployment — configure store.kind: file|sqlite + audit.sink: file.
+gateway:
+  allow_ephemeral: true
+
+connections:
+  shell:
+    kind: cli
+    command: bash
+
+audit:
+  sink: stderr
+
+workflows:
+  tdd:
+    description: |
+      Enforce red-green-refactor TDD discipline with anti-cheating
+      defenses. Start with `start_cycle` and follow the links each
+      response returns.
+    tags: [tdd, discipline, testing, anti-cheating]
+
+    inputSchema:
+      type: object
+      required: [test_cmd, count_cmd]
+      properties:
+        # The shell command that runs your test suite. Examples:
+        #   - "cargo test --quiet"
+        #   - "pytest tests/ -q"
+        #   - "npm test --silent"
+        test_cmd: { type: string }
+        # A command that prints (only) the current test count to stdout.
+        # Examples:
+        #   - "cargo test --quiet -- --list 2>/dev/null | grep -c ': test$'"
+        #   - "pytest --collect-only -q 2>/dev/null | tail -n 1 | awk '{print $1}'"
+        count_cmd: { type: string }
+        # Path to tdd-runner.sh — see examples/tdd/tdd-runner.sh.
+        runner_path: { type: string, default: "./examples/tdd/tdd-runner.sh" }
+        # Optional human-readable identifier for the change being made.
+        feature: { type: string, default: "next change" }
+
+    initialState: idle
+
+    initialContext:
+      cycles_completed: 0
+      baseline_count: null            # rolls forward each successful cycle
+      session_baseline_count: null    # captured ONCE at start_cycle; never rolls back
+      last_passed: null
+      last_count: null
+      cheated_reason: null
+
+    states:
+
+      # ───────────────────────────────────────────────────────────────────
+      idle:
+        description: |
+          No active TDD cycle. Begin by writing a failing test, then
+          submit `start_cycle` — the gateway baselines the test count
+          (so deletions later become detectable) and routes you to
+          `red_pending`.
+        transitions:
+          start_cycle:
+            title: Capture baseline count; head to red_pending.
+            target: red_pending
+            executor:
+              kind: cli
+              connection: shell                     # connection.command = bash
+              # The CLI executor substitutes $.scope.path values only when
+              # the WHOLE arg is a path expression — not when they're
+              # embedded inside a shell string. So we pass each path as
+              # its own arg, and the runner reads them positionally.
+              # Runner positional args: $1 = test_cmd, $2 = count_cmd.
+              # For start_cycle, we don't need to run tests — `true` is a
+              # no-op that exits 0; only the count matters here.
+              args:
+                - "$.workflow.input.runner_path"
+                - "true"
+                - "$.workflow.input.count_cmd"
+              treatNonZeroAsFailure: false
+            output:
+              baseline_count:         "$.output.json.count"
+              # Session baseline is captured ONCE here (start_cycle only fires
+              # from idle, and never again — start_new_cycle is the path back
+              # for subsequent cycles) and never rolls forward. It catches
+              # slow cross-cycle deletions that the per-cycle baseline misses
+              # (add 5 tests over 5 cycles, delete 5 over the next 5 —
+              # per-cycle math is fine, but the suite is back where it
+              # started).
+              session_baseline_count: "$.output.json.count"
+
+      # ───────────────────────────────────────────────────────────────────
+      red_pending:
+        description: |
+          Run the suite via the runner and confirm at least one test
+          fails. If tests pass, the workflow stays here — TDD requires a
+          failing test before implementation.
+        transitions:
+          confirm_red:
+            title: Run tests; confirm they fail.
+            target: red_pending
+            executor:
+              kind: cli
+              connection: shell
+              args:
+                - "$.workflow.input.runner_path"
+                - "$.workflow.input.test_cmd"
+                - "$.workflow.input.count_cmd"
+              treatNonZeroAsFailure: false
+            output:
+              last_passed: "$.output.json.passed"
+              last_count:  "$.output.json.count"
+              last_output: "$.output.json.output"
+            branches:
+              # CHEATING: count dropped below the never-rolling session baseline.
+              # Catches "delete an existing test to make the suite easier."
+              - when:
+                  kind: expr
+                  expr: "$.context.last_count < $.context.session_baseline_count"
+                target: cheated
+
+              # CHEATING: count dropped below this cycle's baseline.
+              - when:
+                  kind: expr
+                  expr: "$.context.last_count < $.context.baseline_count"
+                target: cheated
+
+              # Tests failed AND a NEW test was added (strict count increase).
+              # Just "tests failing" isn't enough — the existing suite might
+              # already have unrelated failures, and we'd rubber-stamp the
+              # advance without proof of a new failing test.
+              - when:
+                  kind: all_of
+                  guards:
+                    - { kind: expr, expr: "$.context.last_passed == false" }
+                    - { kind: expr, expr: "$.context.last_count > $.context.baseline_count" }
+                target: red
+
+              # default fallback → stays in red_pending. Covers:
+              #   - tests passed (caller didn't write a failing test)
+              #   - tests failed but count didn't increase (no new test)
+              # In both cases, the agent needs to actually author a failing
+              # test before they can advance.
+
+      # ───────────────────────────────────────────────────────────────────
+      red:
+        description: |
+          A failing test exists. Now write the minimum implementation to
+          make it pass. When you're ready, submit `confirm_green`. The
+          gateway will reject if you (a) didn't make tests pass, or (b)
+          made them pass by deleting / trivializing tests.
+        transitions:
+          confirm_green:
+            title: Run tests; verify pass + count strictly increased.
+            target: red                    # default fallback (tests still failing)
+            executor:
+              kind: cli
+              connection: shell
+              args:
+                - "$.workflow.input.runner_path"
+                - "$.workflow.input.test_cmd"
+                - "$.workflow.input.count_cmd"
+              treatNonZeroAsFailure: false
+            output:
+              last_passed: "$.output.json.passed"
+              last_count:  "$.output.json.count"
+              last_output: "$.output.json.output"
+            branches:
+              # CHEATING: count below the never-rolling session baseline →
+              # tests were deleted across cycles.
+              - when:
+                  kind: expr
+                  expr: "$.context.last_count < $.context.session_baseline_count"
+                target: cheated
+
+              # CHEATING: tests pass but count didn't go up this cycle →
+              # the "new test" was trivialized or never existed.
+              - when:
+                  kind: all_of
+                  guards:
+                    - { kind: expr, expr: "$.context.last_passed == true" }
+                    - { kind: expr, expr: "$.context.last_count <= $.context.baseline_count" }
+                target: cheated
+
+              # LEGITIMATE GREEN: tests pass AND count strictly increased.
+              - when:
+                  kind: all_of
+                  guards:
+                    - { kind: expr, expr: "$.context.last_passed == true" }
+                    - { kind: expr, expr: "$.context.last_count > $.context.baseline_count" }
+                target: green
+
+              # tests still failing → stay in red (default fallback)
+
+      # ───────────────────────────────────────────────────────────────────
+      green:
+        linkFilter: byGuards
+        description: |
+          Tests pass and at least one new test exists this cycle. From
+          here you can start another cycle, refactor, or finish.
+        onEnter:
+          executor: { kind: noop }
+          output:
+            cycles_completed: { add: ["$.context.cycles_completed", 1] }
+            # Roll the baseline forward — next cycle's "before" count is
+            # this cycle's "after" count.
+            baseline_count:   "$.context.last_count"
+        transitions:
+          start_new_cycle:
+            title: Start the next red-green-refactor cycle.
+            target: red_pending
+          start_refactor:
+            title: Refactor; tests must stay green and count must not drop.
+            target: refactoring
+          finish:
+            title: End the TDD session.
+            target: done
+            guards:
+              - { kind: expr, expr: "$.context.cycles_completed >= 1" }
+
+      # ───────────────────────────────────────────────────────────────────
+      refactoring:
+        description: |
+          Make code changes that don't add behavior. The runner re-checks
+          tests AND verifies count didn't drop (no test deletion under
+          cover of "refactoring").
+        transitions:
+          confirm_refactor:
+            title: Re-run tests; confirm green and count preserved.
+            target: refactoring          # default fallback (tests broke)
+            executor:
+              kind: cli
+              connection: shell
+              args:
+                - "$.workflow.input.runner_path"
+                - "$.workflow.input.test_cmd"
+                - "$.workflow.input.count_cmd"
+              treatNonZeroAsFailure: false
+            output:
+              last_passed: "$.output.json.passed"
+              last_count:  "$.output.json.count"
+              last_output: "$.output.json.output"
+            branches:
+              # CHEATING: dropped below the never-rolling session baseline.
+              - when:
+                  kind: expr
+                  expr: "$.context.last_count < $.context.session_baseline_count"
+                target: cheated
+
+              # CHEATING: dropped below this cycle's baseline → deleted tests
+              # under cover of "refactoring".
+              - when:
+                  kind: expr
+                  expr: "$.context.last_count < $.context.baseline_count"
+                target: cheated
+
+              # legitimate refactor: tests pass and count preserved
+              - when:
+                  kind: all_of
+                  guards:
+                    - { kind: expr, expr: "$.context.last_passed == true" }
+                    - { kind: expr, expr: "$.context.last_count >= $.context.baseline_count" }
+                target: green
+              # default fallback (tests broke) → stay in refactoring
+
+      # ───────────────────────────────────────────────────────────────────
+      cheated:
+        terminal: true
+        description: |
+          The runner reported a test count below the baseline, which
+          means tests were deleted or skipped between checkpoints. The
+          session is over; the audit log preserves the evidence.
+
+      # ───────────────────────────────────────────────────────────────────
+      done:
+        terminal: true
+        description: TDD session complete. Cycles completed → see context.cycles_completed.

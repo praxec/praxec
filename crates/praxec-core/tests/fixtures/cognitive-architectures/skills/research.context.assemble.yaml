@@ -1,0 +1,45 @@
+# skills/research.context.assemble.yaml
+#
+# v0.3 reconnaissance verb. Coaching note for the cognitive phase that
+# precedes planning — gather what's known before you commit to a fix.
+skills:
+  research.context.assemble:
+    verb: research
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Assemble context before you act
+
+      Before you decide, build a working understanding of what's already
+      known. The fastest way to ship the wrong fix is to skip this step.
+
+      ## What to gather
+
+      - **The exact ask.** Re-read the issue / ticket / message verbatim.
+        Don't paraphrase yet; you'll do that in `plan.specify.change-request`.
+        Note what's literal vs implied.
+      - **The system as it stands.** Read the relevant code, configs, and
+        audit trails. Note which interfaces are public (stable) vs
+        internal (changeable). Note what's already on the blackboard from
+        upstream phases.
+      - **The history.** Has this come up before? Check the audit log for
+        prior runs against this subject. Check CHANGELOG / commit messages
+        for the most recent changes touching this surface.
+      - **The neighbours.** What else depends on this code? What else does
+        this code depend on? Don't fix one thing and break two.
+
+      ## What NOT to do
+
+      - Don't propose a fix yet. Research is a different cognitive posture
+        from planning. Trying to do both at once produces shallow plans.
+      - Don't gather indefinitely. Time-box: 5-10 minutes of focused
+        reconnaissance, then write down what you found and hand off to
+        `plan.*`. If 10 minutes isn't enough, the problem is too vague —
+        return a `triage` verdict instead and ask for narrowing.
+
+      ## What to emit
+
+      Write to the blackboard: `researchFindings` (a structured object
+      with `relevant_files`, `prior_runs`, `dependencies`, `unknowns`).
+      The planner will read this verbatim — make it useful, not a wall
+      of text.

@@ -1,0 +1,41 @@
+{
+  "query": "",
+  "items": [
+    {
+      "score": 1.0,
+      "item": {
+        "id": "cognitive/flow.safe-refactor",
+        "kind": "workflow",
+        "title": "Safe refactor",
+        "description": "Smallest safe extraction with review gates."
+      }
+    },
+    {
+      "score": 1.0,
+      "item": {
+        "id": "cognitive/cap.plan.vet",
+        "kind": "capability",
+        "title": "Vet a plan",
+        "description": "Structural + risk vet before work begins."
+      }
+    },
+    {
+      "score": 1.0,
+      "item": {
+        "id": "acme/flow.deploy",
+        "kind": "workflow",
+        "title": "Deploy service",
+        "description": "Company deploy pipeline with approvals."
+      }
+    },
+    {
+      "score": 1.0,
+      "item": {
+        "id": "authoring",
+        "kind": "workflow",
+        "title": "Author a definition",
+        "description": "Draft, structurally check, dry-run, publish."
+      }
+    }
+  ]
+}

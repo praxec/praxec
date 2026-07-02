@@ -1,0 +1,213 @@
+# scripts-library/fetch.provider-model-inventory.yaml
+#
+# Probe each named provider's `/v1/models` (or equivalent) endpoint
+# and emit the typed inventory that `cap.research.model-inventory`
+# projects. Real implementation — the wrapping cap's snippet output
+# carries actual provider response data.
+#
+# Subject root is `fetch` (SPEC §22.4 blessed verb) — the work is
+# HTTP-fetching provider catalogs. The wrapping cap's verb is
+# `research`, which is operator-semantics (you're researching what
+# models are reachable); these are two different verb taxonomies.
+#
+# Environment overrides (optional, for proxies / test harnesses):
+#   ANTHROPIC_BASE_URL  (default https://api.anthropic.com)
+#   OPENAI_BASE_URL     (default https://api.openai.com)
+#   GOOGLE_BASE_URL     (default https://generativelanguage.googleapis.com)
+#   OLLAMA_BASE_URL     (default http://127.0.0.1:11434)
+#   LMSTUDIO_BASE_URL   (default http://127.0.0.1:1234)
+#
+# Operators with custom providers, on-prem proxies, or alternate
+# endpoints replace this script body; the JSON envelope contract
+# stays the same:
+#
+#   {
+#     "inventory": {
+#       "<provider>": [
+#         { "id": "<model-id>", "family": "<optional>" },
+#         ...
+#       ],
+#       ...
+#     },
+#     "errors": [
+#       { "provider": "<provider>", "kind": "<class>", "detail": "<text>" }
+#     ]
+#   }
+#
+# Per the FMECA classifier: 401/403/404/429/network/timeout → `errors`
+# with the binding's failure class so the operator sees exactly which
+# provider's auth surface is misconfigured. Other failures surface
+# the raw status + body. No silent skips.
+#
+# Inputs (argv): the first argument is a comma-separated list of
+# provider names; supported set is closed at v0.3 (anthropic, openai,
+# google, ollama, lmstudio). Unknown names go to `errors` with kind
+# UNSUPPORTED_PROVIDER.
+
+scripts:
+  fetch.provider-model-inventory:
+    verb: fetch
+    lifecycle: stable
+    source: praxec-meta
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      PROVIDERS_CSV="${1:-anthropic,openai,google}"
+
+      die_with_kind() {
+        # Emit a single error to stderr; the cap surfaces stderr in
+        # its evidence trail.
+        printf '%s\n' "$1" >&2
+      }
+
+      INVENTORY=$(mktemp)
+      ERRORS=$(mktemp)
+      printf '{}' > "$INVENTORY"
+      printf '[]' > "$ERRORS"
+
+      add_models() {
+        # $1 = provider, $2 = JSON array of {id, family?}
+        local p="$1" arr="$2" tmp
+        tmp=$(mktemp)
+        jq --arg p "$p" --argjson arr "$arr" '. + {($p): $arr}' "$INVENTORY" > "$tmp"
+        mv "$tmp" "$INVENTORY"
+      }
+
+      add_error() {
+        # $1 = provider, $2 = kind, $3 = detail
+        local p="$1" k="$2" d="$3" tmp
+        tmp=$(mktemp)
+        jq --arg p "$p" --arg k "$k" --arg d "$d" \
+          '. + [{provider: $p, kind: $k, detail: $d}]' \
+          "$ERRORS" > "$tmp"
+        mv "$tmp" "$ERRORS"
+      }
+
+      classify_status() {
+        # Maps HTTP status to the FailureClass enum string the
+        # operator sees. Unknown → ContentOther so failures surface.
+        case "$1" in
+          401) printf 'Auth401' ;;
+          403) printf 'Auth403' ;;
+          404) printf 'NotFound404' ;;
+          429) printf 'RateLimit429' ;;
+          200|201|204) printf 'Ok' ;;
+          *) printf 'ContentOther' ;;
+        esac
+      }
+
+      probe_anthropic() {
+        if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+          add_error anthropic Auth401 "ANTHROPIC_API_KEY not set"
+          return
+        fi
+        local resp status
+        resp=$(curl -sS -w '\n%{http_code}' \
+          -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+          -H "anthropic-version: 2023-06-01" \
+          "${ANTHROPIC_BASE_URL:-https://api.anthropic.com}/v1/models" 2>&1 || true)
+        status=$(printf '%s\n' "$resp" | tail -n1)
+        local body
+        body=$(printf '%s\n' "$resp" | sed '$d')
+        local class
+        class=$(classify_status "$status")
+        if [ "$class" = "Ok" ]; then
+          local ids
+          ids=$(printf '%s' "$body" | jq '[.data[] | {id: .id, family: (.id | split("-")[0])}]')
+          add_models anthropic "$ids"
+        else
+          add_error anthropic "$class" "HTTP $status: $(printf '%s' "$body" | head -c 200)"
+        fi
+      }
+
+      probe_openai() {
+        if [ -z "${OPENAI_API_KEY:-}" ]; then
+          add_error openai Auth401 "OPENAI_API_KEY not set"
+          return
+        fi
+        local resp status body class
+        resp=$(curl -sS -w '\n%{http_code}' \
+          -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+          "${OPENAI_BASE_URL:-https://api.openai.com}/v1/models" 2>&1 || true)
+        status=$(printf '%s\n' "$resp" | tail -n1)
+        body=$(printf '%s\n' "$resp" | sed '$d')
+        class=$(classify_status "$status")
+        if [ "$class" = "Ok" ]; then
+          local ids
+          ids=$(printf '%s' "$body" | jq '[.data[] | {id: .id, family: (.id | split("-")[0])}]')
+          add_models openai "$ids"
+        else
+          add_error openai "$class" "HTTP $status: $(printf '%s' "$body" | head -c 200)"
+        fi
+      }
+
+      probe_google() {
+        if [ -z "${GOOGLE_API_KEY:-}" ]; then
+          add_error google Auth401 "GOOGLE_API_KEY not set"
+          return
+        fi
+        local resp status body class
+        resp=$(curl -sS -w '\n%{http_code}' \
+          "${GOOGLE_BASE_URL:-https://generativelanguage.googleapis.com}/v1beta/models?key=${GOOGLE_API_KEY}" \
+          2>&1 || true)
+        status=$(printf '%s\n' "$resp" | tail -n1)
+        body=$(printf '%s\n' "$resp" | sed '$d')
+        class=$(classify_status "$status")
+        if [ "$class" = "Ok" ]; then
+          local ids
+          ids=$(printf '%s' "$body" | jq '[.models[]? | {id: (.name | sub("^models/"; "")), family: ((.name | sub("^models/"; "")) | split("-")[0])}]')
+          add_models google "$ids"
+        else
+          add_error google "$class" "HTTP $status: $(printf '%s' "$body" | head -c 200)"
+        fi
+      }
+
+      probe_ollama() {
+        local base="${OLLAMA_BASE_URL:-http://127.0.0.1:11434}"
+        local resp status body class
+        resp=$(curl -sS -w '\n%{http_code}' "${base}/api/tags" 2>&1 || true)
+        status=$(printf '%s\n' "$resp" | tail -n1)
+        body=$(printf '%s\n' "$resp" | sed '$d')
+        class=$(classify_status "$status")
+        if [ "$class" = "Ok" ]; then
+          local ids
+          ids=$(printf '%s' "$body" | jq '[.models[]? | {id: .name, family: (.name | split(":")[0])}]')
+          add_models ollama "$ids"
+        else
+          add_error ollama NetworkTimeout "GET ${base}/api/tags failed (status=${status})"
+        fi
+      }
+
+      probe_lmstudio() {
+        local base="${LMSTUDIO_BASE_URL:-http://127.0.0.1:1234}"
+        local resp status body class
+        resp=$(curl -sS -w '\n%{http_code}' "${base}/v1/models" 2>&1 || true)
+        status=$(printf '%s\n' "$resp" | tail -n1)
+        body=$(printf '%s\n' "$resp" | sed '$d')
+        class=$(classify_status "$status")
+        if [ "$class" = "Ok" ]; then
+          local ids
+          ids=$(printf '%s' "$body" | jq '[.data[]? | {id: .id, family: (.id | split("-")[0])}]')
+          add_models lmstudio "$ids"
+        else
+          add_error lmstudio NetworkTimeout "GET ${base}/v1/models failed (status=${status})"
+        fi
+      }
+
+      IFS=',' read -ra PARR <<< "$PROVIDERS_CSV"
+      for raw_p in "${PARR[@]}"; do
+        p=$(printf '%s' "$raw_p" | tr -d '[:space:]')
+        case "$p" in
+          anthropic) probe_anthropic ;;
+          openai)    probe_openai ;;
+          google)    probe_google ;;
+          ollama)    probe_ollama ;;
+          lmstudio)  probe_lmstudio ;;
+          *)         add_error "$p" UNSUPPORTED_PROVIDER "v0.3 closed-enum providers: anthropic|openai|google|ollama|lmstudio" ;;
+        esac
+      done
+
+      jq -n --slurpfile inv "$INVENTORY" --slurpfile errs "$ERRORS" \
+        '{ inventory: $inv[0], errors: $errs[0] }'
+
+      rm -f "$INVENTORY" "$ERRORS"

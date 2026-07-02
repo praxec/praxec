@@ -1,0 +1,76 @@
+# Pattern: concurrent in-step sub-agents (`kind: agent`) on a shared blackboard.
+#
+# Demonstrates two autonomous Aether sub-agents running CONCURRENTLY under a
+# `parallel` step, each with its own affinity (model), scoped skills
+# (instructions), goal (task), and DISJOINT `owned_files`. Concurrency falls
+# out of the existing `parallel` executor + the version-stamped store — no core
+# changes. The agents are subprocess-isolated (Option A): each returns a
+# structured result projected to the blackboard via `output:`; neither holds a
+# praxec write handle.
+#
+# Run the agents for real with `gateway.models_yaml` pointing at a models.yaml
+# that defines the `coding` / `reasoning` affinities, and the `aether` binary
+# on PATH (or AETHER_BIN set).
+
+version: "1.0.0"
+
+# Demo config: ephemeral store + stderr audit. Do NOT copy `allow_ephemeral`
+# into a real deployment.
+gateway:
+  allow_ephemeral: true
+  models_yaml: ./models.yaml
+
+audit:
+  sink: stderr
+
+skills:
+  implement.api.house-style:
+    verb: implement
+    lifecycle: stable
+    body: |
+      # House API style
+      Endpoints return typed errors, never bare strings. Validate input at the
+      boundary. Emit an audit event for every state-changing call.
+  review.security.checklist:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Security review checklist
+      No secrets in output. Input validation present. No privilege-escalation
+      path. Audit log emitted for all side effects.
+
+workflows:
+  multi_agent_demo:
+    initialState: dispatch
+    blackboard:
+      implementation: { type: object }
+      security_review: { type: object }
+    states:
+      dispatch:
+        # Workflow-scope skill is in scope for both agents; each transition/
+        # branch adds its own narrower instruction set.
+        transitions:
+          fan_out:
+            target: collected
+            # Two autonomous agents, concurrent, file-disjoint. The
+            # config-doctor rejects this at `check` if their owned_files
+            # overlap (FM13).
+            executor:
+              kind: parallel
+              join: all
+              max_concurrency: 2
+              branches:
+                - kind: agent
+                  affinity: coding
+                  goal: "Implement the `/widgets` POST endpoint per the house style."
+                  owned_files: ["src/api/widgets.rs"]
+                  tools: []
+                  max_seconds: 600
+                - kind: agent
+                  affinity: reasoning
+                  goal: "Review the widgets endpoint design for security issues."
+                  owned_files: ["docs/security/widgets.md"]
+                  tools: []
+                  max_seconds: 300
+      collected:
+        terminal: true

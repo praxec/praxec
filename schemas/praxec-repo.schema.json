@@ -1,0 +1,45 @@
+{
+  "$id": "https://praxec.dev/schemas/praxec-repo.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PraxecRepoManifest",
+  "description": "Per-repo manifest declaring namespace + layout for a praxec resource repo. Loaded from <repo-root>/praxec.repo.yaml when the gateway config references the repo via a `repos:` entry. Every definitionId discovered under the layout directories is namespace-prefixed (`<namespace>/<id>`) before being merged into the top-level gateway registry. See docs/architecture/capability-orchestrator.md §9.",
+  "type": "object",
+  "required": ["schema", "name", "namespace", "version"],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "praxec.repo/v1",
+      "description": "Manifest schema identifier. Currently exactly `praxec.repo/v1`; new schema versions will use new constant values so loaders can refuse forward-incompatible manifests at load time."
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "Human-readable repo identifier. Lowercase kebab. Distinct from `namespace`; used for diagnostics and `gateway.describe` listings."
+    },
+    "namespace": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]*$",
+      "description": "The prefix praxec uses to disambiguate this repo's definitionIds from other repos. Lowercase kebab, no `/` (a single segment). Two repos declaring the same namespace fail at config-load."
+    },
+    "version": {
+      "type": "string",
+      "description": "Repo version, semver-shaped by convention (not strictly enforced at v1). Surfaced via `gateway.describe`."
+    },
+    "description": {
+      "type": "string",
+      "description": "Free-form prose describing what the repo ships."
+    },
+    "layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-tier directory locations. All keys are optional; defaults match the directory names exactly.",
+      "properties": {
+        "capabilities":  { "type": "string", "default": "capabilities" },
+        "orchestrators": { "type": "string", "default": "orchestrators" },
+        "skills":        { "type": "string", "default": "skills" },
+        "scripts":       { "type": "string", "default": "scripts" },
+        "connections":   { "type": "string", "default": "connections" }
+      }
+    }
+  }
+}

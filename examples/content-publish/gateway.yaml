@@ -1,0 +1,217 @@
+# Governed content publishing workflow.
+#
+# An LLM helps draft, review, and publish a piece of content — but it
+# cannot skip brand review, compliance, or human approval. The workflow
+# is the same shape as any other governed process: states gate the
+# legal next moves, executors are MCP/REST/human calls, evidence
+# proves preconditions, audit records every step.
+#
+# This example demonstrates that the gateway is a **general** tool-use
+# control layer, not a coding-agent tool. The LLM here is calling
+# tools (write to docs, request brand review, request approval) — not
+# generating code — so every action is gateway-visible and the
+# workflow's gates are airtight.
+#
+# Connections in this file are placeholders (replace with real ones
+# for your stack). Run `praxec check --config gateway.yaml` to
+# validate the shape; running serve requires reachable connections.
+
+version: "1.0.0"
+
+connections:
+  # Replace with your real document store (Notion, Google Docs, a
+  # filesystem MCP, etc).
+  docs:
+    kind: rest
+    baseUrl: https://docs.example.com
+    headers:
+      Authorization: "Bearer ${DOCS_TOKEN}"
+
+  # An MCP server that runs brand-voice / SEO / readability checks and
+  # returns a structured pass/fail.
+  brand:
+    kind: mcp
+    command: brand-checker-mcp
+
+  # The CMS that actually publishes.
+  cms:
+    kind: rest
+    baseUrl: https://cms.example.com
+    headers:
+      Authorization: "Bearer ${CMS_TOKEN}"
+
+audit:
+  sink: stderr
+
+workflows:
+  content_publish:
+    description: |
+      Draft a piece, run brand review, request human approval, publish.
+      The LLM cannot skip any step; the workflow's links are the only
+      legal next moves.
+    tags: [content, governed, publishing, demo]
+
+    inputSchema:
+      type: object
+      required: [topic, audience]
+      properties:
+        topic:    { type: string, description: "What the piece is about." }
+        audience: { type: string, description: "Who it's for." }
+      additionalProperties: false
+
+    initialState: idea
+
+    states:
+
+      idea:
+        description: |
+          Workflow started. Generate an outline based on topic + audience.
+        transitions:
+          create_outline:
+            title: Generate an outline for the piece.
+            target: outlined
+            executor:
+              kind: mcp
+              connection: brand
+              tool: create_outline
+              map:
+                topic:    "$.workflow.input.topic"
+                audience: "$.workflow.input.audience"
+            output:
+              outline: "$.output.outline"
+
+      outlined:
+        description: |
+          Outline ready. Write the draft and store it in the document
+          backend; the workflow keeps the document id for later steps.
+        transitions:
+          write_draft:
+            title: Write the draft and store it.
+            target: drafted
+            inputSchema:
+              type: object
+              required: [draft]
+              properties:
+                draft: { type: string, description: "The full draft body." }
+              additionalProperties: false
+            prefill:
+              outline: "$.context.outline"
+            executor:
+              kind: rest
+              connection: docs
+              method: POST
+              path: /documents
+              body:
+                title:   "$.workflow.input.topic"
+                content: "$.arguments.draft"
+            output:
+              documentId: "$.output.id"
+              draftUrl:   "$.output.url"
+
+      drafted:
+        description: |
+          Draft stored. Run the brand-review check before any human
+          spends time looking at it.
+        transitions:
+          run_brand_review:
+            title: Run automated brand and style review.
+            target: brand_reviewed
+            executor:
+              kind: mcp
+              connection: brand
+              tool: brand_review
+              map:
+                documentId: "$.context.documentId"
+            output:
+              brandPassed: "$.output.passed"
+              brandNotes:  "$.output.notes"
+
+      brand_reviewed:
+        linkFilter: byGuards
+        description: |
+          Either the draft passed brand review and is ready for human
+          approval, or it didn't and needs revision. The workflow only
+          surfaces the path that's currently legal.
+        transitions:
+          revise_draft:
+            title: Revise the draft against the brand notes.
+            target: drafted
+            guards:
+              - { kind: expr, expr: "$.context.brandPassed == false" }
+            inputSchema:
+              type: object
+              required: [revisedDraft]
+              properties:
+                revisedDraft: { type: string }
+              additionalProperties: false
+            prefill:
+              brandNotes: "$.context.brandNotes"
+            executor:
+              kind: rest
+              connection: docs
+              method: PUT
+              path: "/documents/{documentId}"
+              body:
+                content: "$.arguments.revisedDraft"
+
+          request_approval:
+            title: Request human approval.
+            target: awaiting_approval
+            guards:
+              - { kind: expr, expr: "$.context.brandPassed == true" }
+            executor:
+              kind: human
+              queue: content-approvals
+
+      awaiting_approval:
+        description: |
+          A human watching the `content-approvals` queue decides.
+          The LLM has no path forward here — only a human can advance.
+        transitions:
+          approve:
+            title: Approve the content for publication.
+            actor: human
+            target: approved
+
+          request_changes:
+            title: Send the piece back for revision.
+            actor: human
+            target: drafted
+
+      approved:
+        description: |
+          Approved. The publish step is idempotent and retried up to
+          three times on transient failures. The `evidence` guard
+          requires that a human approval was logged earlier in this
+          workflow — defense-in-depth even if state ordering were
+          tampered with.
+        transitions:
+          publish:
+            title: Publish the approved content.
+            target: published
+            guards:
+              - kind: evidence
+                requires: [human_request]
+            executor:
+              kind: rest
+              connection: cms
+              method: POST
+              path: /publish
+              body:
+                documentId: "$.context.documentId"
+              idempotencyKey: true
+            reliability:
+              timeoutMs: 30000
+              retry:
+                maxAttempts: 3
+                backoff: exponential
+                initialDelayMs: 500
+                maxDelayMs: 5000
+                retryOn: [transient_error, timeout, rate_limited]
+
+      published:
+        terminal: true
+        description: |
+          Live. The audit log records the full trail from idea to
+          publish: who drafted, what brand review said, who approved,
+          and when CMS confirmed.

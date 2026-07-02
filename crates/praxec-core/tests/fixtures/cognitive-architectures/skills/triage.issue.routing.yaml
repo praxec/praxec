@@ -1,0 +1,60 @@
+# skills/triage.issue.routing.yaml
+#
+# Authored: severity classification + routing rubric. Triage is the
+# cheapest decision in the incident lifecycle and the easiest to skip
+# under pressure. Make it mechanical.
+skills:
+  triage.issue.routing:
+    verb: triage
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Severity classification and routing rubric
+
+      Classify by **customer-visible impact**, not by internal anxiety level.
+      Pick the lowest severity whose description matches; "when in doubt,
+      escalate one" applies only after you have honestly run the test below.
+
+      ## Severity definitions
+
+      | Sev | Impact | Time-to-respond | Notification |
+      |---|---|---|---|
+      | **S1** | All / most customers cannot use a core flow. Revenue / safety / data-integrity loss in progress. | 5 min | Page on-call + page secondary + incident channel + status page |
+      | **S2** | A material customer segment is impaired, OR a single high-tier customer is hard-blocked, OR a core flow is degraded (slow, intermittent). No data loss. | 30 min | Page on-call + incident channel |
+      | **S3** | A non-core feature is broken, OR a workaround exists, OR fewer than ~1% of customers are affected and the problem is bounded. | Next business day | Ticket; mention in oncall handoff |
+      | **S4** | Cosmetic, documentation, internal-only, or "nice to fix." | Backlog | Ticket only |
+
+      ## Owner determination
+
+      1. **Service ownership comes first.** If the failing component has a
+         declared owner team, route there. Do not route by who wrote the
+         code; route by who runs the system.
+      2. **No owner declared → platform team.** If service ownership is
+         genuinely ambiguous, the platform / SRE team accepts as triage
+         owner and re-routes within one response cycle. Triage owner is
+         never "nobody."
+      3. **Cross-service incidents** get an **incident commander** (single
+         named human), not a team. The IC pulls in component owners as
+         needed; component owners do not coordinate among themselves.
+
+      ## Escalation triggers
+
+      Escalate severity up one level if any are true:
+
+      - Reproduction frequency has increased since first report.
+      - A second independent customer reports symptoms consistent with the
+        same root cause.
+      - Estimated time-to-fix exceeds the time-to-respond budget for the
+        current severity.
+      - The current owner is unreachable for the response window AND no
+        deputy has acknowledged.
+      - The fix requires a deploy outside the normal change window.
+
+      ## Anti-patterns
+
+      - "Sev-2-but-really-Sev-1" — pick the right number; the response is
+        proportional to the label.
+      - Severity-by-loudness — the complaint volume of one engineer is not
+        a customer-impact signal.
+      - Self-assigned ownership without acknowledgment — assignment without
+        an "ack" is just hope.

@@ -1,0 +1,33 @@
+[package]
+name = "praxec-llm-executor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "In-runtime LLM executor for praxec (SPEC §33)"
+
+[lib]
+name = "praxec_llm_executor"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+praxec-core = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+# The streaming LLM engine — rig (the same crate the cockpit + embeddings use),
+# replacing aether-llm in the governed `kind: llm` execution path.
+rig = { package = "rig-core", version = "0.38" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

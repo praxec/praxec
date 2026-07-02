@@ -1,0 +1,75 @@
+# skills/authoring.skill.script-shape.yaml
+#
+# v0.3 authoring guidance for an LLM writing a new curated script.
+# Uses `{{$.praxec.authoring.preferred_script_language}}` to substitute
+# the operator's preferred runtime at template-render time (SPEC §23.8).
+# Operators set the preference once in their gateway config:
+#
+#   praxec:
+#     authoring:
+#       preferred_script_language: python3   # or bash / powershell / node
+#
+# Skill stays useful even when no preference is set — the resolver emits
+# `(preferred_script_language: unset)` as a stub, which the LLM can read
+# as "pick whatever fits."
+skills:
+  authoring.skill.script-shape:
+    verb: implement
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Writing a new curated script
+
+      A curated script is a small, hash-pinned executable that workflows
+      invoke through the `script` executor. You're authoring one when an
+      authoring workflow has handed you a state goal like "produce a
+      script that runs <task>."
+
+      ## Pick the runtime
+
+      Default to **{{$.praxec.authoring.preferred_script_language}}**
+      unless the task explicitly demands a different runtime
+      (cross-platform need, missing interpreter, performance constraint,
+      ecosystem fit). When you deviate, write a one-line comment in the
+      script body saying why.
+
+      ## Script shape
+
+      Every script body:
+      - Starts with a shebang naming the interpreter (`#!/usr/bin/env bash`,
+        `#!/usr/bin/env python3`, `#!/usr/bin/env pwsh`).
+      - Sets fail-fast options for the language (`set -euo pipefail` for
+        bash, equivalent strictness for the chosen language).
+      - Accepts arguments through the language's normal argv mechanism;
+        the workflow's `args:` array is rendered + passed in order.
+      - Reads `$PRAXEC_SCRIPT_SUBJECT` and `$PRAXEC_SCRIPT_HASH` from
+        the env when it needs to self-identify in logs.
+      - Emits structured JSON on stdout when the workflow's output
+        mapping needs to read fields; emits human-readable logs on
+        stderr.
+
+      ## Script metadata
+
+      The YAML wrapper carries:
+      - `verb`: pick from the closed twelve — `build` / `test` / `deploy`
+        / `format` / `lint` / `install` / `verify` / `run` / `inspect` /
+        `search` / `fetch` / `audit`. Pick the most specific one. If
+        you're tempted by `run`, look harder.
+      - `subject`: dotted, lowercase-kebab, first segment is a blessed
+        root (matching the verb where natural). `build.cargo.release`,
+        `inspect.deps.tree`, `search.codebase.ripgrep`.
+      - `lifecycle`: `experimental` for unproven scripts, `stable` once
+        the contract has held across ≥2 different workflows.
+      - `source`: where this script came from. `config` if inlined here;
+        `cognitive-architectures` if upstreaming to the curated library.
+
+      ## What NOT to do
+
+      - Don't reach for `bash` reflexively if the operator prefers
+        something else. The whole point of the preference is to keep
+        the harness consistent with their environment.
+      - Don't ship a script under verb `run` because you couldn't decide.
+        Spend 30 seconds on the disambiguation table in SPEC §22.3.
+      - Don't embed secrets in the script body. The body is hash-pinned
+        and surfaced via `gateway.describe` — anything in the body is
+        readable by anyone who can fetch the script.

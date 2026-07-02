@@ -1,0 +1,9 @@
+{
+  "anthropic:claude-opus-4-7":           { "input_usd_per_million_tokens": 15.0, "output_usd_per_million_tokens": 75.0, "verified_at": "2026-05-29" },
+  "anthropic:claude-sonnet-4-6":         { "input_usd_per_million_tokens": 3.0,  "output_usd_per_million_tokens": 15.0, "verified_at": "2026-05-29" },
+  "anthropic:claude-haiku-4-5-20251001": { "input_usd_per_million_tokens": 1.0,  "output_usd_per_million_tokens": 5.0,  "verified_at": "2026-05-29" },
+  "openai:gpt-4o":                       { "input_usd_per_million_tokens": 2.5,  "output_usd_per_million_tokens": 10.0, "verified_at": "2026-05-29" },
+  "ollama:llama3.1":                     { "input_usd_per_million_tokens": 0.0,  "output_usd_per_million_tokens": 0.0,  "verified_at": "2026-05-29" },
+  "ollama:llama3.2":                     { "input_usd_per_million_tokens": 0.0,  "output_usd_per_million_tokens": 0.0,  "verified_at": "2026-05-29" },
+  "ollama:mistral":                      { "input_usd_per_million_tokens": 0.0,  "output_usd_per_million_tokens": 0.0,  "verified_at": "2026-05-29" }
+}

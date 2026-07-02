@@ -1,0 +1,27 @@
+# Smithery listing config for praxec.
+#
+# SCOPE: this declares the *stdio* launch form. It lets Smithery list
+# praxec and install it locally through the Smithery CLI.
+#
+# It does NOT configure Smithery's *hosted* container deployment. That
+# path requires the server to speak MCP Streamable HTTP on a `/mcp`
+# endpoint and listen on $PORT. praxec currently serves over
+# stdio only (`praxec serve`), so hosted deployment would need an
+# HTTP server transport added to the crate first. See docs/development/publishing.md.
+
+startCommand:
+    type: stdio
+    configSchema:
+        type: object
+        required: ['configPath']
+        properties:
+            configPath:
+                type: string
+                description: Absolute path to the gateway YAML config file.
+    commandFunction: |-
+        (config) => ({
+          command: 'praxec',
+          args: ['serve', '--config', config.configPath]
+        })
+    exampleConfig:
+        configPath: /absolute/path/to/gateway.yaml

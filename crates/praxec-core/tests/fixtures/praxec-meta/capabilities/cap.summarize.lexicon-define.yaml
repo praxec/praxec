@@ -1,0 +1,35 @@
+# capabilities/cap.summarize.lexicon-define.yaml
+
+workflows:
+  cap.summarize.lexicon-define:
+    verb: summarize
+    lifecycle: experimental
+    description: >
+      Register a new term in the gateway's lexicon overlay. Thin
+      wrapper over gateway.lexicon.define.
+    snippet:
+      inputs:
+        term:       { type: string, required: true }
+        definition: { type: string, required: true }
+        governance: { type: string, default: "advisory" }
+      outputs:
+        registered: { type: object }
+    skills: [summarize.lexicon-extend]
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          define:
+            target: done
+            actor: deterministic
+            executor:
+              kind: mcp
+              connection: gateway_self
+              tool: gateway.lexicon.define
+              arguments:
+                term:       "$.context.term"
+                definition: "$.context.definition"
+                governance: "$.context.governance"
+            output:
+              registered: "$.output"
+      done: { terminal: true }

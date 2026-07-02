@@ -1,0 +1,9 @@
+version: "1.0.0"
+
+# Reference fixture for `praxec check` smoke testing the multi-repo
+# loader end-to-end (SPEC §9, PR1). Pair with the swe-core/ and
+# quality-core/ fixtures in this directory. Paths are relative to this
+# config file — same base-dir convention as `include:`.
+repos:
+  - path: ./swe-core
+  - path: ./quality-core

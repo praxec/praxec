@@ -1,0 +1,32 @@
+[package]
+name = "praxec-mcp-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server tool surface for praxec (workflow.start/get/submit/explain)"
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+praxec-core = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+rmcp = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+praxec-executors = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }

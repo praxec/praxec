@@ -1,0 +1,21 @@
+version: "1.0.0"
+# DEFECT 2: dangling_target
+# The 'go' transition targets 'nonexistent' which is not declared in states.
+# Expected detection: load_resolved_with_repos Err (validate.rs raises an error-level diagnostic),
+# or the validate step returns an error-class diagnostic causing bail.
+workflows:
+  dangling_flow:
+    version: "1.0.0"
+    initialState: start
+    states:
+      start:
+        goal: "Begin"
+        transitions:
+          go:
+            target: nonexistent
+            actor: agent
+            executor: { kind: noop }
+      done:
+        goal: "Finished"
+        terminal: true
+        transitions: {}

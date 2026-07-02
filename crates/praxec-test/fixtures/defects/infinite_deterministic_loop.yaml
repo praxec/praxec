@@ -1,0 +1,31 @@
+version: "1.0.0"
+# DEFECT 6: infinite_deterministic_loop
+# States A and B each have exactly one actor:deterministic transition (A->B, B->A).
+# No terminal state is reachable from either A or B.
+# When the fuzz engine submits the A->B transition, the runtime auto-chains:
+#   A -> B (deterministic, auto-fires B's transition) -> A -> B -> ...
+# Expected: the runtime's max-chain-depth limit triggers an abort, returning
+# an Errored result (CHAIN_MAX_DEPTH or similar error code).
+# The fuzz harness classifies non-BLACKBOARD_TYPE_ERROR Errored results as
+# ok=false with detail "errored: <code>".
+# NOTE: Both states are reachable from initialState (a->b via ab, b->a via ba),
+# so neither is an orphan. The defect is purely the unbounded loop.
+workflows:
+  infinite_loop_flow:
+    version: "1.0.0"
+    initialState: a
+    states:
+      a:
+        goal: "Loop state A"
+        transitions:
+          ab:
+            target: b
+            actor: deterministic
+            executor: { kind: noop }
+      b:
+        goal: "Loop state B"
+        transitions:
+          ba:
+            target: a
+            actor: deterministic
+            executor: { kind: noop }

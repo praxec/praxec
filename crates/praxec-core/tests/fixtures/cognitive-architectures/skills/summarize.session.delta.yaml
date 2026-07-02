@@ -1,0 +1,45 @@
+# skills/summarize.session.delta.yaml
+#
+# v0.3 condensation verb. Coaching note for phase-boundary handoffs —
+# compress what just happened into a structured delta the next agent
+# can navigate.
+skills:
+  summarize.session.delta:
+    verb: summarize
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Summarize what changed in this phase
+
+      At a phase boundary, the next agent (or the next session) needs a
+      compact view of what just happened — not the full transcript, not a
+      pretty paragraph, but a structured delta.
+
+      ## What goes in a delta summary
+
+      - **Inputs you received.** Which blackboard slots were set when you
+        started? Cite specific values, not abstractions.
+      - **What you decided.** One sentence per decision. If you had to
+        choose between alternatives, name what you rejected and why
+        (briefly — one phrase per rejection).
+      - **Outputs you wrote.** Which blackboard slots did you set?
+        Include the values verbatim where small; cite hash/length where
+        large.
+      - **What you noticed but didn't act on.** Edge cases, smell
+        warnings, follow-ups. The next phase decides whether to act; you
+        just flag.
+
+      ## What NOT to do
+
+      - Don't restate the goal. The next reader already has it.
+      - Don't justify yourself. The audit trail is the justification —
+        your summary is a navigation aid, not a defense.
+      - Don't include every detail. Compression is the whole point. If
+        the summary is longer than the underlying transcript, you've
+        explained, not summarized.
+
+      ## Length budget
+
+      4-8 bullet points or 100-200 words. If you need more, you're either
+      summarizing the wrong scope or this is a `compose.*` task, not a
+      `summarize.*` task — split the work.

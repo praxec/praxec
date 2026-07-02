@@ -1,0 +1,7 @@
+schema: praxec.repo/v1
+name: quality-core
+namespace: quality
+version: 0.6.0
+description: |
+  Test fixture — second repo with a same-named capability `cap.plan.vet`,
+  proving that distinct namespaces let both coexist without collision.

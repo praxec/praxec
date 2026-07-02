@@ -1,0 +1,70 @@
+[package]
+name = "praxec-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core runtime for praxec: workflow engine, ports, audit, reliability"
+
+[features]
+# Marker feature: enabled (alongside aether-llm's `bedrock` feature) by builds
+# that wire AWS Bedrock end-to-end. Off by default; `ProviderId::Bedrock` is
+# nameable but reports `available_in_build() == false` until this is set.
+bedrock = []
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+jsonschema = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+# SPEC §22.2 — load-time HTTP fetch for https:// script URIs.
+# Blocking client because config loading is synchronous and we don't
+# want to bubble async up through every load_yaml call. The fetch
+# happens exactly once at load + snapshot-stamp time; the body is
+# then materialized into the snapshot per §8.2 so the network is not
+# touched again for that script. We override the workspace reqwest
+# locally to add `blocking` (the workspace dep is async-only because
+# the executors crate uses the async client).
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls", "blocking"] }
+
+# SPEC §28 — path_allowlist constraint kind uses gitignore-syntax
+# glob matching. `globset` is the same matcher ripgrep/cargo use;
+# proven, fast (compiled trie).
+globset = "0.4"
+
+# Provider-keys file backend (resolve_path / atomic write). `dirs` resolves
+# the per-OS config dir; `tempfile` backs the atomic write-then-rename.
+dirs = "5"
+tempfile = "3"
+
+[[bench]]
+name = "workflow_bench"
+harness = false
+
+[[bench]]
+name = "gateway_overhead"
+harness = false
+
+[dev-dependencies]
+rstest = { workspace = true }
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
+rand = "0.10"
+serde_yaml = { workspace = true }
+tracing-subscriber = { workspace = true }

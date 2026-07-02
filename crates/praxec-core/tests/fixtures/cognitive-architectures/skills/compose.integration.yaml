@@ -1,0 +1,78 @@
+# skills/compose.integration.yaml
+#
+# Authored: integration-test assembly guidance. Integration tests fail in
+# more ways than unit tests, so the design decisions matter more. Make
+# the seams explicit before you write the test, not while debugging it.
+skills:
+  compose.integration:
+    verb: compose
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Assembling an integration test
+
+      An integration test composes two or more units across a real boundary.
+      The design choices below are made *before* the first assertion; making
+      them after the fact produces tests that are slow, flaky, or test the
+      wrong thing.
+
+      ## 1. Name the boundary
+
+      State, in one sentence, which boundary you are crossing: HTTP, database,
+      message broker, filesystem, subprocess, third-party API, browser DOM.
+      An integration test that crosses two boundaries is two tests pretending
+      to be one — split them.
+
+      ## 2. Pick the seam: real, fake, or stub
+
+      For each external dependency on the path:
+
+      - **Real** — the production implementation, in a test environment. Use
+        when the dependency's behavior IS what the test asserts (you are
+        proving the integration works). Costs: slowness, flakiness, setup.
+      - **Fake** — an in-memory implementation with the same contract
+        (sqlite for postgres, in-memory queue for SQS, `httptest` server for
+        a third-party API). Use when the contract is stable and the
+        dependency is incidental to what the test proves.
+      - **Stub / mock** — a hand-rolled response for a specific call. Use
+        ONLY at the edges of the test, where the seam is a single function
+        and the alternative is a network call. A test that mocks the unit
+        under test is no longer an integration test; collapse it to a unit
+        test or fix the design.
+
+      Default to **fakes**. Reach for real only when proving the integration
+      itself; reach for stubs only at the network edge.
+
+      ## 3. Data fixtures: builder, not blob
+
+      Fixtures as JSON blobs decay — a field added in production silently
+      drifts from the blob, and the test passes against a schema that no
+      longer exists. Use builders or factories that take only the
+      test-relevant fields and default everything else from the production
+      type. The test reads as "given a user with role=admin and
+      status=active" — not "given the contents of fixtures/user-7.json."
+
+      ## 4. Isolation strategy
+
+      Pick one per test, declare it in setup:
+
+      - **Transactional rollback** — wrap the test in a transaction, roll
+        back at teardown. Fastest, but breaks if the code under test commits
+        explicitly.
+      - **Per-test schema or namespace** — each test gets a fresh schema /
+        keyspace / topic prefix. Slower setup, but supports tests that
+        commit.
+      - **Cleanup hook** — explicit teardown that deletes what setup
+        created. Use only when neither of the above fits; cleanup hooks are
+        the leading cause of leaked state between flaky test runs.
+
+      Never share mutable state across tests in the same file without a
+      declared reset point. Order-dependent integration tests are a debt
+      that compounds.
+
+      ## 5. One assertion class per test
+
+      Each test asserts one *class* of property (the API returned 200, OR
+      the row landed in the DB, OR the downstream queue saw the message).
+      Multi-assertion tests obscure which boundary actually broke when the
+      test fails — the test name should already tell you.

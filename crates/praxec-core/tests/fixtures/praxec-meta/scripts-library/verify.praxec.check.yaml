@@ -1,0 +1,36 @@
+scripts:
+  verify.praxec.check:
+    verb: verify
+    lifecycle: stable
+    source: praxec-meta
+    body: |
+      #!/usr/bin/env bash
+      # Wrap `praxec check` and emit a JSON envelope the
+      # cap.verify.check-config cap projects: { ok: bool,
+      # diagnostics: [string] }.
+      #
+      # The CLI flag is the only required input; PRAXEC_BIN may
+      # override the binary path if the operator hasn't installed
+      # praxec to PATH.
+      set -euo pipefail
+      : "${CONFIG_PATH:?CONFIG_PATH must name the YAML to check}"
+      BIN="${PRAXEC_BIN:-praxec}"
+
+      RAW=$(mktemp)
+      if $BIN check --config "$CONFIG_PATH" > "$RAW" 2>&1; then
+        OK=true
+        DIAGS="[]"
+      else
+        OK=false
+        # Each error/warning line becomes one diagnostic string. JSON-encode each
+        # with python3 to handle quoting safely; fall back to literal if no python3.
+        if command -v python3 >/dev/null 2>&1; then
+          DIAGS=$(grep -E '^\s*(error|warning):' "$RAW" \
+            | python3 -c 'import sys, json; print(json.dumps([l.rstrip() for l in sys.stdin]))')
+        else
+          DIAGS="[\"see-raw-output\"]"
+        fi
+      fi
+
+      printf '{"ok": %s, "diagnostics": %s}\n' "$OK" "$DIAGS"
+      rm -f "$RAW"

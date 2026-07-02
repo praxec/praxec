@@ -1,0 +1,5 @@
+schema: praxec.repo/v1
+name: dupe-a
+namespace: dupe
+version: 0.6.0
+description: "First of a pair sharing `namespace: dupe` — proves V20 fires."

@@ -1,0 +1,30 @@
+version: "1.0.0"
+workflows:
+  wedge_flow:
+    initialState: start
+    version: "1.0.0"
+    blackboard:
+      approved: { type: boolean }
+    states:
+      start:
+        goal: "Begin"
+        transitions:
+          go:
+            target: gated
+            actor: agent
+            executor: { kind: noop }
+            output:
+              approved: false
+      gated:
+        goal: "Stuck — the only move requires evidence the mock never provides"
+        transitions:
+          finish:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+            guards:
+              - kind: expr
+                expr: "$.context.approved == true"
+      done:
+        terminal: true
+        transitions: {}

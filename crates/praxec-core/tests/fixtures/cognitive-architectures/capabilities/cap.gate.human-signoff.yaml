@@ -1,0 +1,41 @@
+# capabilities/cap.gate.human-signoff.yaml
+#
+# HITL approval gate. The primary transition uses `actor: human`
+# which satisfies V6 for the `gate` verb. The HumanExecutor surfaces
+# the prompt to the operator via whatever HITL surface the gateway
+# is wired to (dashboard, client, etc.); the human submits decision +
+# rationale.
+
+workflows:
+  cap.gate.human-signoff:
+    verb: gate
+    lifecycle: experimental
+    description: >
+      Block until a human approves the supplied artifact. Emits the
+      decision + rationale.
+    snippet:
+      inputs:
+        artifact: { type: object, required: true }
+        prompt:   { type: string, default: "Approve?" }
+      outputs:
+        decision:  { type: string, enum: [approved, rejected] }
+        rationale: { type: string }
+    initialState: awaiting_human
+    states:
+      awaiting_human:
+        goal: Block; surface the artifact + prompt to the operator.
+        transitions:
+          signoff:
+            target: done
+            actor: human
+            inputSchema:
+              type: object
+              required: [decision]
+              properties:
+                decision:  { type: string, enum: [approved, rejected] }
+                rationale: { type: string, default: "" }
+            executor: { kind: human }
+            output:
+              decision:  "$.arguments.decision"
+              rationale: "$.arguments.rationale"
+      done: { terminal: true }

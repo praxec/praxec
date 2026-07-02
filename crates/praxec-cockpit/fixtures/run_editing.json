@@ -1,0 +1,37 @@
+{
+  "workflow": {
+    "id": "wf_safe_refactor_01",
+    "definitionId": "cognitive/flow.safe-refactor",
+    "definitionVersion": "2026-05-25",
+    "state": "editing",
+    "version": 4
+  },
+  "result": { "status": "running" },
+  "context": {
+    "plan": "extract TokenStore from AuthService",
+    "candidate_patch": "(pending)"
+  },
+  "summary": "Refactoring AuthService; structure guard flagged god-file risk.",
+  "delegate": "reasoning",
+  "guidance": {
+    "goal": "Produce the smallest safe extraction.",
+    "instructions": "Never widen scope beyond the named file.",
+    "refs": [{ "verb": "refactor", "subject": "refactor-scope-bounded" }]
+  },
+  "links": [
+    {
+      "rel": "edits_produced",
+      "title": "Edits complete",
+      "method": "praxec.command",
+      "actor": "agent",
+      "args": { "workflowId": "wf_safe_refactor_01", "expectedVersion": 4, "transition": "edits_produced" }
+    },
+    {
+      "rel": "request_review",
+      "title": "Request review",
+      "method": "praxec.command",
+      "actor": "human",
+      "args": { "workflowId": "wf_safe_refactor_01", "expectedVersion": 4, "transition": "request_review" }
+    }
+  ]
+}

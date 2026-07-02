@@ -1,0 +1,90 @@
+version: "1.0.0"
+
+# Multi-tenant identity-wiring example.
+#
+# In a multi-tenant deployment, different humans share one gateway.
+# The gateway needs to know WHO is calling so it can enforce
+# per-tenant permissions and roles.
+#
+# This config demonstrates the pattern. See
+# docs/architecture/mcp-control-architecture.md#identity-in-multi-tenant-deployments
+# for the full design.
+
+connections:
+  tenant_a_db:
+    kind: cli
+    command: psql
+    args: ["-h", "db-a.internal", "-d", "app_a"]
+  tenant_b_db:
+    kind: cli
+    command: psql
+    args: ["-h", "db-b.internal", "-d", "app_b"]
+
+capabilities:
+  tenant.read:
+    title: Read tenant data
+    description: Execute a read-only query against the tenant's database.
+    inputSchema:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: SQL SELECT query
+      additionalProperties: false
+    guards:
+      - kind: role
+        role: tenant_admin
+    executor:
+      kind: cli
+      connection: tenant_a_db
+      args: ["-c", "$.arguments.query"]
+
+  tenant.write:
+    title: Write tenant data
+    description: Execute a write query against the tenant's database.
+    inputSchema:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+          description: SQL INSERT/UPDATE/DELETE query
+      additionalProperties: false
+    guards:
+      - kind: permission
+        permission: tenant.write
+      - kind: role
+        role: tenant_admin
+    executor:
+      kind: cli
+      connection: tenant_a_db
+      args: ["-c", "$.arguments.query"]
+
+proxy:
+  expose:
+    - capability: tenant.read
+      as: tenant_a.read
+      description: Read data from tenant A's database.
+    - capability: tenant.write
+      as: tenant_a.write
+      description: Write data to tenant A's database.
+    - capability: tenant.read
+      as: tenant_b.read
+      description: Read data from tenant B's database.
+      executor:
+        kind: cli
+        connection: tenant_b_db
+        args: ["-c", "$.arguments.query"]
+    - capability: tenant.write
+      as: tenant_b.write
+      description: Write data to tenant B's database.
+      executor:
+        kind: cli
+        connection: tenant_b_db
+        args: ["-c", "$.arguments.query"]
+      guards:
+        - kind: permission
+          permission: tenant.write
+        - kind: role
+          role: super_admin

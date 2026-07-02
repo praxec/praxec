@@ -1,0 +1,17 @@
+version: "1.0.0"
+workflows:
+  sound_flow:
+    initialState: start
+    version: "1.0.0"
+    states:
+      start:
+        goal: "Begin"
+        transitions:
+          go:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+      done:
+        goal: "Finished"
+        terminal: true
+        transitions: {}

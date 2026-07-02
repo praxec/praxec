@@ -1,0 +1,82 @@
+# skills/implement.emit-praxec-yaml.yaml
+#
+# Render a chosen shape into a v0.2-conformant YAML body. The
+# downstream check-config step verifies the result; this skill
+# tells the agent how to produce something that has a chance of
+# passing.
+
+skills:
+  implement.emit-praxec-yaml:
+    verb: implement
+    lifecycle: stable
+    source: praxec-meta
+    body: |
+      # Emitting praxec.repo/v1-conformant YAML
+
+      You have a chosen shape. Render it into a YAML body that will
+      pass `praxec check`. The downstream verify step will
+      catch most authoring slips; your job is to minimise round-trips.
+
+      ## Hard checklist (matches V1-V16 validation cloud)
+
+      ### Both capabilities and flows
+
+      - `version: "1.0.0"` at the top (gateway-config convention),
+        UNLESS the file is destined for a `repos:` manifest layout
+        directory — in that case omit `version` and `include`
+        (load_repo ignores them but they're noise).
+      - The top-level block must be `workflows:`.
+      - Workflow id must match the tier prefix exactly:
+        - Capabilities: `cap.<verb>.<name>` where `<verb>` is one
+          of the 24 cap verbs (V1, V2).
+        - Flows: `flow.<name>` (V7).
+      - Every workflow must declare `initialState` and a `states:`
+        map; the initial state must exist in the map.
+
+      ### Capabilities (`cap.*`)
+
+      - `verb:` — one of `triage`, `diagnose`, `plan`, `implement`,
+        `review`, `refactor`, `explain`, `compose`, `research`,
+        `summarize` (cognitive); `build`, `test`, `deploy`,
+        `format`, `lint`, `install`, `verify`, `run`, `inspect`,
+        `search`, `fetch`, `audit` (deterministic); `gate`,
+        `coordinate` (coordination).
+      - `snippet:` block with BOTH `inputs:` AND `outputs:` keys
+        (V3, V4). Each entry MUST be a JSON-schema-shaped object
+        (V5) — `{ type: ..., ... }`.
+      - V6 primary-executor verb-shape: cognitive caps use
+        `kind: noop` (with a `skills:` ref) or `kind: mcp`;
+        deterministic caps use `kind: script` or `kind: mcp`;
+        `gate` caps need at least one initial-state transition with
+        `actor: human` OR `purpose: ask`; `coordinate` caps need
+        `kind: mcp`.
+      - V10: capabilities MAY NOT invoke other workflows via
+        `kind: workflow`. They are composition leaves.
+
+      ### Flows (`flow.*`)
+
+      - NO `snippet:` block (V8). NO `verb:` field (V9). Flows
+        are entry points, not composable snippets.
+      - V11: flows MAY NOT invoke other flows. They
+        only invoke capabilities (or use other executor kinds
+        directly).
+      - V12: every `kind: workflow` executor targeting a `cap.*`
+        id MUST include a `use: { inputs, outputs }` binding.
+      - V13: every `use.inputs` path must resolve to a slot
+        declared in the flow's `inputs:` block OR written
+        by an earlier state's `use.outputs`.
+
+      ## Discipline
+
+      - **Generate one definition per file.** Don't bundle multiple
+        caps or flows in a single YAML body — load_repo
+        permits it but it makes review harder.
+      - **Inline schemas where small.** A JSON schema fragment
+        with a single `type: string` is fine inline; one with
+        nested properties is more readable in its own block.
+      - **Default to `lifecycle: experimental`** unless the operator
+        explicitly asked for stable. Stable lifecycle commits to
+        the contract hash; that's a meaningful obligation.
+      - **No comments referencing this skill** in the emitted YAML.
+        Operator-facing YAML should document its OWN design, not
+        the meta-process that produced it.

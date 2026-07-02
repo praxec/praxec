@@ -1,0 +1,42 @@
+target/
+node_modules/
+__pycache__/
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+.vscode
+.idea
+
+# Local-only MCP server registrations (per-developer; not part of the repo
+# contract). Each contributor wires their own MCP tooling in `.mcp.json` and
+# Claude Code reads it on startup.
+.mcp.json
+
+# StructureOS scratch directory — backups, scan cache, generated context.
+.structureos/
+
+# Agent-skill installs (opensrc, etc.) + Claude Code local settings —
+# per-developer tooling, not part of the repo contract.
+.agents/
+.claude/
+skills-lock.json
+
+# Provider API keys — NEVER commit. The store is ~/.praxec/providers.env
+# (0600, owner-only); a project-local override or fallback must also stay out of
+# git. (Keys also live in the OS keyring where available — see secure storage.)
+**/providers.env
+praxec-providers.env
+
+# structureos working dir
+.frontrails/
+
+# Agent working artifacts (plans/specs scaffolding) — keep local, not in the public repo
+docs/superpowers/
+
+# Live development scratch — never committed
+WIP/
+
+# Local dogfooding harness — runtime state (sqlite, audit logs, elicit state)
+# with machine-absolute paths; never part of the repo contract.
+.fg-harness/
+.px-harness/

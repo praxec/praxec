@@ -1,0 +1,7 @@
+tests:
+  - name: guarded reaches done
+    workflow: guarded_flow
+    iterations: 30
+    expect:
+      reaches: [done]
+      never_reaches: [nonexistent_state]

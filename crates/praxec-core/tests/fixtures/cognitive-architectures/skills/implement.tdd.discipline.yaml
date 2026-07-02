@@ -1,0 +1,56 @@
+# skills/implement.tdd.discipline.yaml
+#
+# TDD as a hard discipline. The cap that uses this skill runs a
+# red-green-refactor self-loop with a `lastCount > baselineCount` guard
+# that catches the "deleted the failing test" anti-pattern by
+# construction. The skill body is what the implementing agent reads
+# at each loop iteration.
+
+skills:
+  implement.tdd.discipline:
+    verb: implement
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # TDD red-green-refactor discipline
+
+      You are inside a TDD loop. The flow already declared
+      the scope; you may only touch files inside `scope_paths`.
+
+      ## The discipline (per iteration)
+
+      1. **RED** — Write or update ONE failing test that covers the
+         next slice of the plan. Run the test suite; the new test
+         MUST fail. If it passes, you wrote a tautology — delete and
+         re-write. Do NOT proceed to implementation until red.
+      2. **GREEN** — Write the MINIMUM code that makes the failing
+         test pass. Resist refactoring during green; keep the diff
+         laser-focused on the assertion. Run the suite; the new test
+         must pass AND no previously-passing test may now fail.
+      3. **REFACTOR** — With green tests, improve the structure
+         without changing behavior. Run the suite after every
+         structural change. Stop refactoring when no further
+         improvement is obvious; do NOT refactor toward speculative
+         requirements.
+
+      ## Hard rules
+
+      - **Test count is monotonic** — every loop iteration leaves the
+         test count >= the previous iteration's. Deleting a failing
+         test is a `tdd.no_convergence` error; the loop will reject
+         it.
+      - **Scope discipline** — out-of-scope writes are rejected by
+         the underlying edit tool. Don't try to work around it; if
+         the fix requires out-of-scope changes, escalate to
+         `cap.gate.human-signoff` for a scope expansion.
+      - **No speculative tests** — write tests for behavior the
+         current plan slice requires. "We'll need this later" tests
+         drift from intent.
+
+      ## Termination
+
+      The loop terminates when the implementation result satisfies
+      the plan AND all tests pass. Convergence within `max_iterations`
+      is required; otherwise the cap terminates with
+      `error_kind: tdd_no_convergence` and the flow routes
+      to `cap.gate.human-signoff` for a scope review.

@@ -1,0 +1,12 @@
+version: "1.0.0"
+scripts:
+  build.cargo.release:
+    verb: build
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # Release build of a Rust crate or workspace. Locked deps for reproducibility.
+      # Pass extra cargo args (e.g. `-p mycrate`) as "$@".
+      set -euo pipefail
+      cargo build --release --locked "$@"

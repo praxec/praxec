@@ -1,0 +1,26 @@
+# contracts/reasoning-arithmetic-v1.yaml
+#
+# Golden contract for the `reasoning` affinity. The prompt asks for an
+# exact arithmetic result; the verifier confirms the response contains
+# that number. Designed to be cheap (1-5 tokens of output) and
+# unambiguous (no judgment call about format).
+#
+# Format reference: see capabilities/cap.verify.capability-harness.yaml.
+# Verifier kinds today:
+#   - exact_number:  extract first integer from response, compare equals.
+#   - regex_match:   response (full body) must match the given regex.
+
+contract:
+  id: reasoning-arithmetic-v1
+  affinity: reasoning
+  description: |
+    Three-digit multiplication with a verifiable single-number answer.
+    Tests the model's basic chain-of-thought + arithmetic without
+    needing any external tools.
+  prompt: |
+    What is 123 multiplied by 456?
+
+    Respond with ONLY the number — no units, no commas, no explanation.
+  verifier:
+    kind: exact_number
+    expected: 56088

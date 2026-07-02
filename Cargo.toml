@@ -1,0 +1,94 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/praxec-schema",
+    "crates/praxec-core",
+    "crates/praxec-executors",
+    "crates/praxec-agents",
+    "crates/praxec-mcp-server",
+    "crates/praxec-llm-executor",
+    "crates/praxec",
+    "crates/praxec-test",
+    "crates/praxec-tui",
+    "crates/praxec-cockpit",
+    "crates/praxec-cockpit-mcp",
+    "crates/praxec-embeddings",
+]
+
+[workspace.package]
+version = "0.0.13"
+edition = "2021"
+rust-version = "1.83"
+license = "BSD-3-Clause"
+repository = "https://github.com/praxec/praxec"
+
+[workspace.dependencies]
+praxec-core = { path = "crates/praxec-core", version = "0.0.13" }
+praxec-executors = { path = "crates/praxec-executors", version = "0.0.13" }
+praxec-mcp-server = { path = "crates/praxec-mcp-server", version = "0.0.13" }
+praxec-test = { path = "crates/praxec-test", version = "0.0.13" }
+praxec-llm-executor = { path = "crates/praxec-llm-executor", version = "0.0.13" }
+praxec-agents = { path = "crates/praxec-agents", version = "0.0.13" }
+praxec-cockpit = { path = "crates/praxec-cockpit", version = "0.0.13" }
+praxec-embeddings = { path = "crates/praxec-embeddings", version = "0.0.13" }
+# praxec-tui and praxec-agents are workspace members in this repo.
+# The praxec-pro-gateway binary was retired; its wiring was folded into
+# the praxec binary behind the default-on `agents` cargo feature.
+
+# SPEC §33 D4 — aether-llm pinned to ~0.7.6 (patches only) per FMECA F13.
+# Minor bumps require explicit review + smoke contract test re-run.
+llm = { version = "~0.7.6", package = "aether-llm" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+futures = "0.3"
+jsonschema = { version = "0.46", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+rmcp = { version = "1.7", default-features = false, features = ["server", "client", "macros", "transport-io", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rpassword = "7"
+rstest = "0.23"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+# ratatui 0.28 (not 0.29): 0.29 hard-pins `unicode-width = "=0.2.0"`, which
+# conflicts with the wisp chat stack (aether-tui needs `^0.2.2`). 0.28 uses
+# unicode-width 0.1.x — a separate major that coexists in one lockfile.
+ratatui = "0.28"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# build-deps
+typify = "0.6"
+prettyplease = "0.2"
+syn = { version = "2", features = ["full"] }
+schemars = "0.8"
+
+# T26 — clippy::unwrap_used is enabled per-crate via
+# `#![cfg_attr(not(test), warn(clippy::unwrap_used))]` in each lib.rs.
+# Workspace-wide enablement would catch integration-test files too
+# (where unwrap() is the deliberate panic pattern); the cfg-not-test
+# trick keeps the lint on production code only. See each crate's
+# lib.rs for the directive.
+[workspace.lints.clippy]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+debug = true
+
+[profile.dev]
+opt-level = 0
+debug = 1

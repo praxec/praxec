@@ -1,0 +1,96 @@
+# Publish all workspace crates to crates.io when a `v*` tag is pushed.
+#
+# Required repository secret:
+#   CRATES_IO_TOKEN — a crates.io API token with publish scope on this
+#   namespace. Generate at https://crates.io/me, add at
+#   Settings → Secrets and variables → Actions → New repository secret.
+#
+# Usage:
+#   git tag v0.1.0
+#   git push origin v0.1.0
+#
+# Safety:
+#   - The workflow fails fast if the tag (`v0.1.0`) does not match the
+#     workspace version in `Cargo.toml` — prevents accidental mis-tags.
+#   - `cargo test --workspace` runs before any publish step. A failing
+#     test stops the workflow before anything reaches crates.io.
+
+name: Publish to crates.io
+
+on:
+    push:
+        tags:
+            - 'v*'
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    publish:
+        name: cargo publish (tag-triggered)
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install system dependencies
+              # libdbus-1-dev is required by libdbus-sys (transitive dep
+              # via aether-auth's OS keyring abstraction on Linux).
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libdbus-1-dev pkg-config
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Cache cargo registry + build
+              uses: Swatinem/rust-cache@v2
+
+            - name: Verify tag matches workspace version
+              run: |
+                  tag="${GITHUB_REF#refs/tags/v}"
+                  ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  if [ "$tag" != "$ver" ]; then
+                    echo "::error::Tag v$tag does not match workspace version $ver"
+                    exit 1
+                  fi
+                  echo "Tag v$tag matches workspace version $ver — OK."
+
+            - name: cargo test (final safety net)
+              run: cargo test --workspace
+
+            # Publish in topological order. `praxec-core` does not
+            # depend on `-schema`, but publishing schema first costs nothing
+            # and keeps the sequence linear. Sleep between publishes gives
+            # the crates.io index a moment to surface the just-uploaded
+            # crate before its dependents resolve.
+
+            - name: Publish praxec-schema
+              run: cargo publish -p praxec-schema --token "${{ secrets.CRATES_IO_TOKEN }}"
+
+            - name: Wait for index propagation
+              run: sleep 30
+
+            - name: Publish praxec-core
+              run: cargo publish -p praxec-core --token "${{ secrets.CRATES_IO_TOKEN }}"
+
+            - name: Wait for index propagation
+              run: sleep 30
+
+            - name: Publish praxec-executors
+              run: cargo publish -p praxec-executors --token "${{ secrets.CRATES_IO_TOKEN }}"
+
+            - name: Publish praxec-mcp-server
+              run: cargo publish -p praxec-mcp-server --token "${{ secrets.CRATES_IO_TOKEN }}"
+
+            # llm-executor depends only on -core (already published above).
+            # The gateway binary's `llm-executor` feature depends on
+            # -llm-executor, so it must precede the binary.
+            - name: Publish praxec-llm-executor
+              run: cargo publish -p praxec-llm-executor --token "${{ secrets.CRATES_IO_TOKEN }}"
+
+            - name: Wait for index propagation
+              run: sleep 30
+
+            - name: Publish praxec (binary)
+              run: cargo publish -p praxec --token "${{ secrets.CRATES_IO_TOKEN }}"

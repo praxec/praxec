@@ -1,0 +1,14 @@
+# skills/diagnose.codebase.search.yaml
+#
+# Lifted verbatim from the SWE-agent reference workflow.
+skills:
+  diagnose.codebase.search:
+    verb: diagnose
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Composing precise codebase queries
+      Use `search_symbol`, `resolve_dependencies`, `find_tests`, `lookup_owner`
+      against the codebase_graph executor. Assemble an evidence pack that names
+      the smallest set of files implicated by the problem. Cite each finding
+      with a symbol id and a file:line range.

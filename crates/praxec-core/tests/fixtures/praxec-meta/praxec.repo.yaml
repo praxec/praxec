@@ -1,0 +1,49 @@
+schema: praxec.repo/v1
+name: praxec-meta
+namespace: meta
+version: 0.2.0
+description: |
+  Meta-authoring workflows for praxec v0.6+: capabilities and
+  flows whose job is to author or optimize other capabilities
+  and flows.
+
+  Operators load this repo alongside cognitive-architectures (or any
+  other resource repo) to get a self-bootstrapping authoring loop:
+
+      repos:
+        - path: /repos/cognitive-architectures
+        - path: /repos/praxec-meta
+
+  Loaded ids land under `meta/<id>` — e.g. `meta/flow.author-capability`,
+  `meta/cap.research.tool-inventory`.
+
+  The meta flows (v0.1 + v0.2):
+    - meta/flow.author-capability
+    - meta/flow.author-flow
+    - meta/flow.optimize-capability
+    - meta/flow.optimize-flow
+    - meta/flow.configure-models       (v0.2 — agents.yaml setup)
+
+  The first four share a small cap stack: tool-inventory (introspect
+  what's reachable), compose-implementation (propose shapes),
+  emit-yaml (generate snippet-contract-compliant YAML), check-config
+  (run `praxec check` on the result), audit-mine-transitions
+  (for the optimize variants), plus thin typed wrappers over the
+  existing `gateway.lexicon.*` MCP tools so authored content stays
+  vocabulary-consistent.
+
+  `flow.configure-models` adds five caps for the LLM-binding setup
+  flow: research.model-inventory, plan.suggest-bindings,
+  gate.human-approve-plan, implement.write-agents-config,
+  verify.auth-only-smoke-test. Wires the FMECA-vetted agent
+  resolver design from praxec v0.3.
+
+layout:
+  capabilities:  capabilities
+  flows: flows
+  skills:        skills
+  scripts:       scripts-library
+  # Operators wire their own MCP connections (gateway_self,
+  # github_mcp, etc.) in the gateway config; this repo ships no
+  # connection definitions of its own at v0.1.
+  connections:   ._unused_v01_connections

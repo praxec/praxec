@@ -1,0 +1,36 @@
+# capabilities/cap.research.lexicon-lookup.yaml
+#
+# Typed wrapper over the gateway.lexicon.lookup MCP tool. Operators
+# wire a connection that surfaces the in-process gateway as an MCP
+# server (the same gateway can self-call); ships a reference
+# connection definition in `connections/gateway-self.yaml`.
+
+workflows:
+  cap.research.lexicon-lookup:
+    verb: research
+    lifecycle: experimental
+    description: >
+      Look up a term in the gateway's lexicon overlay; emit definition
+      + governance metadata. Thin contract over the existing
+      gateway.lexicon.lookup MCP tool.
+    snippet:
+      inputs:
+        term: { type: string, required: true }
+      outputs:
+        entry: { type: object }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          lookup:
+            target: done
+            actor: deterministic
+            executor:
+              kind: mcp
+              connection: gateway_self
+              tool: gateway.lexicon.lookup
+              arguments:
+                term: "$.context.term"
+            output:
+              entry: "$.output"
+      done: { terminal: true }

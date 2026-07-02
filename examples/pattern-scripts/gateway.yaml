@@ -1,0 +1,93 @@
+# Pattern: Scripts + script_acknowledged guard (Spec §22)
+#
+# Demonstrates:
+#   1. Inline script body with auto-computed hash
+#   2. script executor with env and args
+#   3. script_acknowledged guard — gate dangerous ops behind review
+
+version: "1.0.0"
+audit:
+  sink: stderr
+
+# Lexicon entries for subjects referenced in scripts keys (SPEC §30.10.4).
+lexicon:
+  production.rollout:
+    definition_short: "Production deployment rollout procedure."
+  compliance.scan:
+    definition_short: "Compliance audit scan against regulatory requirements."
+
+scripts:
+  deploy.production.rollout:
+    verb: deploy
+    lifecycle: stable
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      echo "[${PRAXEC_SCRIPT_SUBJECT}] deploying to production..."
+      # In a real script: kubectl apply, terraform plan, etc.
+      echo "rollout complete"
+
+  audit.compliance.scan:
+    verb: audit
+    lifecycle: experimental
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      echo '{"findings": 0, "severity": "none"}'
+
+workflows:
+  governed_script:
+    initialState: review
+    blackboard:
+      deploy_output: { type: string }
+      audit_result:  { type: object }
+      acked:         { type: boolean }
+    initialContext:
+      acked: false
+
+    states:
+      review:
+        goal: Review the deploy script before execution
+        guidance: >
+          Call `gateway.describe` with subject `deploy.production.rollout`
+          to review the script body. Then submit `acknowledge` — the
+          `script_acknowledged` guard checks that you did.
+        transitions:
+          acknowledge:
+            target: execute_deploy
+            guards:
+              - kind: script_acknowledged
+                subject: deploy.production.rollout
+            executor: { kind: noop }
+            output:
+              acked: { set: true }
+
+      execute_deploy:
+        goal: Run the production deploy script
+        transitions:
+          deploy:
+            target: verify
+            actor: deterministic
+            executor:
+              kind: script
+              subject: deploy.production.rollout
+              env:
+                REGION: "us-east-1"
+              treatNonZeroAsFailure: true
+            output:
+              deploy_output: "$.output.stdout"
+
+      verify:
+        goal: Run compliance audit
+        transitions:
+          audit:
+            target: done
+            actor: deterministic
+            executor:
+              kind: script
+              subject: audit.compliance.scan
+            output:
+              audit_result: "$.output"
+
+      done:
+        terminal: true

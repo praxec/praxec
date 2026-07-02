@@ -1,0 +1,63 @@
+# A minimal, fully self-contained workflow for testing — no LLM, no external MCP
+# tools (only `kind: noop` + a human gate). The shared fixture for the testing
+# strategy (docs/development/testing-strategy.md): it exercises the ADR-0008 status + outcomes
+# and the ADR-0009 human gate / mediator inbox in a single launch.
+#
+#   start --begin--> review (actor: human) --approve--> done (success)
+#                                           --reject---> start
+#
+# Drive headless:  praxec orchestrate --config examples/hello-flow.yaml \
+#                    --definition hello_flow --model <provider:model>
+version: "1.0.0"
+
+# CMP-001 — a single-operator fixture: the human running this gateway *is* the
+# reviewer, so the gateway asserts a default `human` identity (the cockpit's
+# deployment model — config-only identity). This lets a live caller drive the
+# `review` human gate. `allow_ephemeral` lets the in-memory store boot for a
+# throwaway run (tests, demos) without a durable backend.
+gateway:
+  allow_ephemeral: true
+  principal:
+    subject: operator
+    roles: [human]
+
+workflows:
+  hello_flow:
+    initialState: start
+
+    # ADR-0008 — the measurable definition of done: a human approved.
+    outcomes:
+      - id: approved
+        statement: A human approved the change.
+        check: "$.context.approved == true"
+
+    blackboard:
+      approved: { type: boolean }
+
+    states:
+      start:
+        goal: Begin the hello flow.
+        transitions:
+          begin:
+            target: review
+            executor: { kind: noop }
+
+      # The human gate — a `waiting` mission with a human move (the mediator inbox).
+      review:
+        goal: Review and approve the change.
+        actor: human
+        transitions:
+          approve:
+            target: done
+            actor: human
+            executor: { kind: noop }
+            output:
+              approved: true
+          reject:
+            target: start
+            actor: human
+            executor: { kind: noop }
+
+      done:
+        terminal: true
+        outcome: success

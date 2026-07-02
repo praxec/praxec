@@ -1,0 +1,35 @@
+# capabilities/cap.gate.human-pick-shape.yaml
+
+workflows:
+  cap.gate.human-pick-shape:
+    verb: gate
+    lifecycle: experimental
+    description: >
+      Block while the operator picks one of the candidate
+      implementation shapes from the compose step.
+    snippet:
+      inputs:
+        candidates: { type: array,  required: true }
+        prompt:     { type: string, default: "Pick the shape you want to implement" }
+      outputs:
+        chosen:    { type: object }
+        rationale: { type: string }
+    initialState: awaiting_human
+    states:
+      awaiting_human:
+        goal: Surface the candidate list + prompt; wait for the operator's pick.
+        transitions:
+          pick:
+            target: done
+            actor: human
+            inputSchema:
+              type: object
+              required: [chosen]
+              properties:
+                chosen:    { type: object }
+                rationale: { type: string, default: "" }
+            executor: { kind: human }
+            output:
+              chosen:    "$.arguments.chosen"
+              rationale: "$.arguments.rationale"
+      done: { terminal: true }

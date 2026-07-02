@@ -1,0 +1,8 @@
+workflows:
+  cap.plan.vet:
+    title: Plan vet (swe-core fixture)
+    description: Minimal capability for multi-repo loading tests.
+    initialState: ready
+    states:
+      ready:
+        terminal: true

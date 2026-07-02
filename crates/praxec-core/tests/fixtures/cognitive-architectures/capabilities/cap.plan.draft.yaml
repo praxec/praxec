@@ -1,0 +1,42 @@
+# capabilities/cap.plan.draft.yaml
+#
+# Draft a structured implementation plan from a feature brief + lexicon.
+# Cognitive cap: the agent driving the gateway sees the
+# `plan.specify.change-request` skill guidance and produces a typed plan,
+# submitting it as transition arguments.
+
+workflows:
+  cap.plan.draft:
+    verb: plan
+    lifecycle: experimental
+    description: >
+      Produce a structured implementation plan from a brief + lexicon.
+      Required output fields: { normalizedProblem, acceptanceCriteria,
+      risk, blastRadius }.
+    snippet:
+      inputs:
+        brief:   { type: string, required: true }
+        lexicon: { type: object, default: {} }
+      outputs:
+        plan:      { type: object }
+        artifacts: { type: array }
+    skills: [plan.specify.change-request]
+    initialState: ready
+    states:
+      ready:
+        goal: Read the brief; emit a typed plan + supporting artifacts.
+        transitions:
+          submit_plan:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [plan]
+              properties:
+                plan:      { type: object }
+                artifacts: { type: array, default: [] }
+            executor: { kind: noop }
+            output:
+              plan:      "$.arguments.plan"
+              artifacts: "$.arguments.artifacts"
+      done: { terminal: true }

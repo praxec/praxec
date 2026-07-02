@@ -1,0 +1,62 @@
+# skills/research.tool-inventory.assemble.yaml
+#
+# Survey the operator's reachable tools before composing a new
+# capability or flow. Without this step every authoring loop
+# either hard-codes a tool stack (brittle) or fabricates tools that
+# don't exist (worse).
+
+skills:
+  research.tool-inventory.assemble:
+    verb: research
+    lifecycle: stable
+    source: praxec-meta
+    body: |
+      # Surveying the operator's reachable tools
+
+      You are about to author a new capability or flow. Before
+      proposing any shape, build a typed inventory of what the operator
+      actually has reachable. Cover all five categories:
+
+      1. **MCP tools.** Call `gateway.describe` (or equivalent
+         introspection) to enumerate declared connections + the tools
+         each exposes. Capture connection name, tool name, and input
+         schema for every reachable tool.
+      2. **CLI scripts.** Walk the `scripts:` block of the live config.
+         Each entry has a `verb`, `subject`, and either an inline
+         `body` or external `uri + hash`. The verb tells you what kind
+         of work the script does; the body tells you what runtime it
+         needs (bash, python, etc).
+      3. **Skills.** Walk the `skills:` block. Each entry has a `verb`,
+         `subject`, and `body`. Useful for cognitive caps you might
+         compose: a skill is a ready-made guidance fragment a noop
+         executor can surface.
+      4. **Capabilities.** Walk the `workflows:` block; filter to
+         `cap.*` ids. Each cap's `snippet:` block tells you its input
+         contract; you can compose existing caps into new flows
+         without reauthoring them.
+      5. **Connections (transport metadata).** For each connection,
+         capture its kind (`mcp` / `cli` / `rest`), endpoint or
+         command, and any externally-visible flag (`external: true`
+         marks it as a side-effecting connection per SPEC §4.1's
+         `coordinate` verb shape check).
+
+      Emit `inventory` as `{ mcp_tools, cli_scripts, skills,
+      capabilities, connections }` — each a typed array. The downstream
+      compose-implementation cap reasons over this inventory; the
+      better-characterized your inventory, the better-shaped the
+      candidate implementations.
+
+      Anti-patterns:
+
+      - **Assuming tool availability.** "Operators usually have a
+        GitHub MCP server" — sometimes they have GitLab, or no PR
+        platform at all. The inventory's job is to find out, not to
+        assume.
+      - **Filtering too aggressively.** If your `filter:` input
+        narrows by verb, that's fine, but DON'T filter by name
+        substring — you'll miss the operator's
+        `acme-corp-github-mcp` because they didn't use the word
+        "github."
+      - **Inventory without provenance.** Each entry should record
+        WHERE you found it (which repo / namespace / config file) so
+        the downstream review step can audit the assertion.

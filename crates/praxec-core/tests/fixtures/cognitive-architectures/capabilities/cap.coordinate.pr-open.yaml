@@ -1,0 +1,42 @@
+# capabilities/cap.coordinate.pr-open.yaml
+#
+# Coordination cap: opens a PR via the operator-supplied `github_mcp`
+# MCP connection. V6 requires `kind: mcp` for the `coordinate` verb;
+# operators wire up their actual GitHub MCP server in their gateway
+# config (an example connection definition ships in
+# `connections/github-mcp.yaml`).
+
+workflows:
+  cap.coordinate.pr-open:
+    verb: coordinate
+    lifecycle: experimental
+    description: >
+      Open a PR with the declared title/body against base. Emits the
+      created PR URL + number.
+    snippet:
+      inputs:
+        title: { type: string, required: true }
+        body:  { type: string, default: "" }
+        base:  { type: string, default: "main" }
+      outputs:
+        url:       { type: string }
+        pr_number: { type: integer }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          open:
+            target: done
+            actor: deterministic
+            executor:
+              kind: mcp
+              connection: github_mcp
+              tool: create_pr
+              arguments:
+                title: "$.context.title"
+                body:  "$.context.body"
+                base:  "$.context.base"
+            output:
+              url:       "$.output.url"
+              pr_number: "$.output.number"
+      done: { terminal: true }

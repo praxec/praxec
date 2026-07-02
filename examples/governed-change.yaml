@@ -1,0 +1,150 @@
+version: "1.0.0"
+
+connections:
+  planner:
+    kind: mcp
+    command: planner-mcp
+
+  risk:
+    kind: mcp
+    command: risk-mcp
+
+  scheduler:
+    kind: mcp
+    command: scheduler-mcp
+
+  dotnet:
+    kind: cli
+    command: dotnet
+
+audit:
+  sink: stderr
+
+workflows:
+  engineering_change:
+    description: Plan, risk-review, approve, execute, and verify an engineering change.
+    tags: [governed, change-management]
+
+    inputSchema:
+      type: object
+      required: [goal]
+      properties:
+        goal:
+          type: string
+      additionalProperties: false
+
+    initialState: planning
+
+    states:
+      planning:
+        transitions:
+          submit_plan:
+            title: Submit implementation plan
+            target: risk_review
+            inputSchema:
+              type: object
+              required: [plan]
+              properties:
+                plan:
+                  type: string
+              additionalProperties: false
+            executor:
+              kind: mcp
+              connection: planner
+              tool: normalize_plan
+              map:
+                goal: "$.workflow.input.goal"
+                plan: "$.arguments.plan"
+            output:
+              plan: "$.output.plan"
+
+      risk_review:
+        onEnter:
+          executor:
+            kind: mcp
+            connection: risk
+            tool: fmeca_analyze
+            map:
+              plan: "$.context.plan"
+          output:
+            fmeca: "$.output"
+
+        transitions:
+          remediate:
+            title: Apply poka-yoke remediation
+            target: risk_review
+            guards:
+              - kind: expr
+                expr: "$.context.fmeca.maxResidualRpn > 80"
+            inputSchema:
+              type: object
+              required: [remediation]
+              properties:
+                remediation:
+                  type: string
+              additionalProperties: false
+            executor:
+              kind: mcp
+              connection: planner
+              tool: remediate_plan
+            output:
+              plan: "$.output.plan"
+
+          request_approval:
+            title: Request human approval
+            target: awaiting_approval
+            guards:
+              - kind: expr
+                expr: "$.context.fmeca.maxResidualRpn <= 80"
+            executor:
+              kind: human
+              queue: engineering-approvals
+
+      awaiting_approval:
+        transitions:
+          approve:
+            title: Approve plan
+            actor: human
+            target: cpm
+            guards:
+              - kind: permission
+                permission: workflow.approve
+
+          request_changes:
+            title: Request changes
+            actor: human
+            target: planning
+
+      cpm:
+        onEnter:
+          executor:
+            kind: mcp
+            connection: scheduler
+            tool: create_cpm_plan
+          output:
+            cpm: "$.output"
+
+        transitions:
+          run_tests:
+            title: Run tests
+            target: tested
+            executor:
+              kind: cli
+              connection: dotnet
+              args:
+                - test
+                - "$.context.cpm.solution"
+
+      tested:
+        transitions:
+          verify:
+            title: Verify work
+            target: done
+            guards:
+              - kind: evidence
+                requires:
+                  - tests_passed
+                  - acceptance_criteria_met
+
+      done:
+        terminal: true

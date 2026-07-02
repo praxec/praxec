@@ -1,0 +1,100 @@
+# Pattern: Evidence quorum guard (Spec §20)
+#
+# Demonstrates:
+#   1. Transitions that emit Evidence records
+#   2. evidence guard with requires: [{kind, count}]
+#   3. Quorum-based gating — multiple attestations required
+
+version: "1.0.0"
+audit:
+  sink: stderr
+
+workflows:
+  evidence_quorum:
+    initialState: collect_a
+    blackboard:
+      reports:       { type: array }
+      all_collected: { type: boolean }
+
+    states:
+      collect_a:
+        goal: Run report A
+        transitions:
+          run:
+            target: collect_b
+            actor: deterministic
+            executor:
+              kind: cli
+              command: ["echo", '{"kind":"report_a","status":"pass"}']
+              evidence:
+                kind: report_a
+                id: "{{$.workflow.id}}-a"
+                summary: Report A completed
+            output:
+              reports: { concat: [ "$.context.reports", "a" ] }
+
+      collect_b:
+        goal: Run report B
+        transitions:
+          run:
+            target: collect_c
+            actor: deterministic
+            executor:
+              kind: cli
+              command: ["echo", '{"kind":"report_b","status":"pass"}']
+              evidence:
+                kind: report_b
+                id: "{{$.workflow.id}}-b"
+                summary: Report B completed
+            output:
+              reports: { concat: [ "$.context.reports", "b" ] }
+
+      collect_c:
+        goal: Run report C
+        transitions:
+          run:
+            target: gate
+            actor: deterministic
+            executor:
+              kind: cli
+              command: ["echo", '{"kind":"report_c","status":"pass"}']
+              evidence:
+                kind: report_c
+                id: "{{$.workflow.id}}-c"
+                summary: Report C completed
+            output:
+              reports: { concat: [ "$.context.reports", "c" ] }
+
+      gate:
+        goal: All three reports must be present
+        transitions:
+          proceed:
+            target: done
+            guards:
+              - kind: evidence
+                requires:
+                  - { kind: report_a, count: 1 }
+                  - { kind: report_b, count: 1 }
+                  - { kind: report_c, count: 1 }
+            executor: { kind: noop }
+      done:
+        terminal: true
+
+  # ── quorum with confidence threshold ──
+  evidence_with_confidence:
+    initialState: gate
+    blackboard:
+      model_review: { type: string }
+    states:
+      gate:
+        goal: Model-reviewed evidence with confidence filter
+        transitions:
+          proceed:
+            target: done
+            guards:
+              - kind: evidence
+                requires:
+                  - { kind: human_review, count: 1, min_confidence: 0.8 }
+            executor: { kind: noop }
+      done:
+        terminal: true

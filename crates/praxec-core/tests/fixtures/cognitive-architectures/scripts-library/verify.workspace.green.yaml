@@ -1,0 +1,23 @@
+version: "1.0.0"
+scripts:
+  verify.workspace.green:
+    verb: verify
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # Composed check: format, lint, test must all pass. The "green workspace"
+      # gate — workflows use this on a `verifying` state to gate a critique.
+      # Exits 0 only if all three pass; emits a JSON summary on stdout.
+      set -euo pipefail
+
+      stage_fail() {
+        echo "{\"passed\": false, \"failed_stage\": \"$1\", \"subject\": \"$PRAXEC_SCRIPT_SUBJECT\"}"
+        exit 1
+      }
+
+      cargo fmt --all -- --check >&2 || stage_fail "format"
+      cargo clippy --workspace --all-targets -- -D warnings >&2 || stage_fail "lint"
+      cargo test --workspace >&2 || stage_fail "test"
+
+      echo "{\"passed\": true, \"stages\": [\"format\", \"lint\", \"test\"], \"subject\": \"$PRAXEC_SCRIPT_SUBJECT\"}"

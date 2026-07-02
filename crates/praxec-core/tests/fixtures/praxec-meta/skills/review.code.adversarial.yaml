@@ -1,0 +1,25 @@
+# skills/review.code.adversarial.yaml
+#
+# LOCAL FALLBACK shadow of the cognitive-architectures skill with
+# the same subject. praxec-meta needs this so `cap.review.adversarial`
+# loads standalone. Operators who also load cognitive-architectures
+# get its richer skill body via the manifest's load order — the
+# library loaded LAST wins on identical bare-subject keys.
+
+skills:
+  review.code.adversarial:
+    verb: review
+    lifecycle: stable
+    source: praxec-meta
+    body: |
+      # Adversarial review (meta fallback)
+
+      Attack the candidate artifact. Find missed cases, hidden
+      regressions, style issues, contract violations. Cite each
+      finding with a file:line and a counterexample input. Return
+      `verdict: approved | needs-revision | rejected`.
+
+      Operators with cognitive-architectures loaded should rely on
+      its `review.code.adversarial` skill body — this fallback
+      exists so praxec-meta is loadable standalone for operators
+      who haven't installed the broader library yet.

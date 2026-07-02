@@ -1,0 +1,48 @@
+version: "1.0.0"
+scripts:
+  test.baseline.snapshot:
+    verb: test
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # Capture a pre-refactor / pre-change baseline of the workspace
+      # test state. Emits JSON to stdout: { passed: [...], failed: [...],
+      # durations: { test_name: seconds } }.
+      #
+      # Pairs with `test.baseline.compare`: snapshot before any edit,
+      # compare after.
+      #
+      # Environment overrides:
+      #   TEST_CMD       — defaults to "cargo test --workspace --no-fail-fast"
+      #                    (operator can swap to npm/pytest/etc.)
+      #   BASELINE_FILE  — defaults to /tmp/praxec-test-baseline.json;
+      #                    persists baseline for `test.baseline.compare`.
+      set -euo pipefail
+      TEST_CMD="${TEST_CMD:-cargo test --workspace --no-fail-fast}"
+      BASELINE_FILE="${BASELINE_FILE:-/tmp/praxec-test-baseline.json}"
+
+      START_TS=$(date +%s)
+      # Capture full output; rely on grep-based extraction (works across
+      # cargo / npm / pytest with reasonable consistency).
+      RAW_LOG=$(mktemp)
+      $TEST_CMD 2>&1 | tee "$RAW_LOG" || true
+      ELAPSED=$(( $(date +%s) - START_TS ))
+
+      PASSED_COUNT=$(grep -cE '(^test .* \.\.\. ok$|PASSED|passed)' "$RAW_LOG" || echo 0)
+      FAILED_COUNT=$(grep -cE '(^test .* \.\.\. FAILED$|FAILED|failed)' "$RAW_LOG" || echo 0)
+
+      cat > "$BASELINE_FILE" <<JSON
+      {
+        "captured_at":  $(date +%s),
+        "test_cmd":     "$TEST_CMD",
+        "passed_count": $PASSED_COUNT,
+        "failed_count": $FAILED_COUNT,
+        "elapsed_sec":  $ELAPSED
+      }
+      JSON
+
+      # Echo the captured baseline so the calling workflow can grab it
+      # via stdout instead of reading $BASELINE_FILE.
+      cat "$BASELINE_FILE"
+      rm -f "$RAW_LOG"

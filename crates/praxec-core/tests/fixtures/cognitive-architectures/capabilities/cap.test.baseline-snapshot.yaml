@@ -1,0 +1,29 @@
+# capabilities/cap.test.baseline-snapshot.yaml
+#
+# Deterministic cap bound to the `test.baseline.snapshot` script.
+
+workflows:
+  cap.test.baseline-snapshot:
+    verb: test
+    lifecycle: experimental
+    description: >
+      Capture the workspace's pre-edit test baseline. Cheap; pair with
+      cap.test.compare-baseline downstream.
+    snippet:
+      inputs:
+        scope_paths: { type: array, default: [] }
+      outputs:
+        baseline: { type: object }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          snapshot:
+            target: done
+            actor: deterministic
+            executor:
+              kind: script
+              subject: test.baseline.snapshot
+            output:
+              baseline: "$.output"
+      done: { terminal: true }

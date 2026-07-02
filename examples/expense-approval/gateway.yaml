@@ -1,0 +1,252 @@
+# Expense reimbursement workflow with two-tier approval.
+#
+# An employee submits an expense; an LLM-driven assistant classifies
+# it against policy; a manager approves; finance approves anything
+# above the high-value threshold; payroll issues the reimbursement.
+#
+# This example is the **multi-tenant** counterpart to content-publish:
+# the manager and finance reviewer are different humans, so
+# `permission` and `role` guards become load-bearing. To run this end
+# to end you need identity wired (see
+# `docs/architecture/mcp-control-architecture.md` § "Identity in multi-tenant
+# deployments"); with the bundled binary's anonymous principal,
+# every approval rejects.
+#
+# What this example demonstrates that the others don't:
+#   - Two distinct human roles (manager, finance) — RBAC matters
+#   - Branching by classifier output — high-value items take a
+#     different path than low-value items
+#   - Idempotent payment via REST — retries don't double-pay
+#   - Quorum-style evidence (the `requires: [{ kind: approval, count: 2 }]`
+#     form) for very-high-value claims
+
+version: "1.0.0"
+
+connections:
+  # An MCP server that knows your expense policy: takes
+  # {category, amount, currency} and returns
+  # {policyOk, requiresFinance, requiresQuorum, reasons}.
+  classifier:
+    kind: mcp
+    command: expense-policy-mcp
+
+  # A notification MCP for sending rejection / status messages.
+  notifier:
+    kind: mcp
+    command: notifier-mcp
+
+  # The payroll system that issues the actual reimbursement.
+  payroll:
+    kind: rest
+    baseUrl: https://payroll.example.com
+    headers:
+      Authorization: "Bearer ${PAYROLL_TOKEN}"
+
+audit:
+  sink: stderr
+
+workflows:
+  expense_approval:
+    description: |
+      Submit, classify, approve, and reimburse an employee expense.
+      Two human roles gate the action: a manager for ordinary claims,
+      finance additionally for high-value claims, and a quorum of
+      approvers for very-high-value claims.
+    tags: [expense, finance, governed, multi-tenant, demo]
+
+    inputSchema:
+      type: object
+      required: [employee, amount, currency, category, receiptUrl]
+      properties:
+        employee:   { type: string, description: "Employee identifier (e.g. email)." }
+        amount:     { type: number, minimum: 0 }
+        currency:   { type: string, enum: [USD, EUR, GBP] }
+        category:   { type: string, description: "e.g. travel, meals, equipment." }
+        receiptUrl: { type: string }
+      additionalProperties: false
+
+    initialState: submitted
+
+    initialContext:
+      policyOk:        null
+      requiresFinance: null
+      requiresQuorum:  null
+
+    states:
+
+      submitted:
+        description: |
+          Just submitted. The classifier evaluates against policy on
+          entry and stores its verdict in context.
+        onEnter:
+          executor:
+            kind: mcp
+            connection: classifier
+            tool: classify_expense
+            map:
+              employee: "$.workflow.input.employee"
+              amount:   "$.workflow.input.amount"
+              currency: "$.workflow.input.currency"
+              category: "$.workflow.input.category"
+          output:
+            policyOk:        "$.output.policyOk"
+            requiresFinance: "$.output.requiresFinance"
+            requiresQuorum:  "$.output.requiresQuorum"
+            reasons:         "$.output.reasons"
+
+        linkFilter: byGuards
+        transitions:
+          to_manager_review:
+            title: Send to manager for approval.
+            target: manager_review
+            guards:
+              - { kind: expr, expr: "$.context.policyOk == true" }
+
+          policy_reject:
+            title: Reject for policy violation.
+            target: rejected
+            guards:
+              - { kind: expr, expr: "$.context.policyOk == false" }
+            executor:
+              kind: mcp
+              connection: notifier
+              tool: send_rejection
+              map:
+                employee: "$.workflow.input.employee"
+                reasons:  "$.context.reasons"
+
+      manager_review:
+        description: |
+          Awaiting the employee's manager. Three exits:
+          approve to finance (high-value), approve direct (low-value),
+          or reject. RBAC: only managers can take any of these.
+        linkFilter: byGuards
+        transitions:
+          manager_approve_to_finance:
+            title: Approve and forward to finance review.
+            actor: human
+            target: finance_review
+            guards:
+              - { kind: permission, permission: expense.approve.manager }
+              - { kind: expr,   expr: "$.context.requiresFinance == true" }
+            executor:
+              kind: human
+              queue: expense-manager-approvals
+
+          manager_approve_low_value:
+            title: Approve directly (under finance threshold).
+            actor: human
+            target: reimbursement
+            guards:
+              - { kind: permission, permission: expense.approve.manager }
+              - { kind: expr,   expr: "$.context.requiresFinance == false" }
+            executor:
+              kind: human
+              queue: expense-manager-approvals
+
+          manager_reject:
+            title: Reject the expense.
+            actor: human
+            target: rejected
+            guards:
+              - { kind: permission, permission: expense.approve.manager }
+            executor:
+              kind: mcp
+              connection: notifier
+              tool: send_rejection
+              map:
+                employee: "$.workflow.input.employee"
+                reasons:  "manager rejected"
+
+      finance_review:
+        description: |
+          High-value path. Finance reviewer approves or rejects.
+          Very-high-value claims (`requiresQuorum`) need a second
+          finance approver — the workflow loops here until two
+          `approval` evidence records exist.
+        linkFilter: byGuards
+        transitions:
+          finance_approve:
+            title: Finance approval (single approver path).
+            actor: human
+            target: reimbursement
+            guards:
+              - { kind: permission, permission: expense.approve.finance }
+              - { kind: expr,   expr: "$.context.requiresQuorum == false" }
+            executor:
+              kind: human
+              queue: expense-finance-approvals
+
+          finance_approve_quorum:
+            title: Finance approval (one of two; quorum required).
+            actor: human
+            target: finance_review
+            guards:
+              - { kind: permission, permission: expense.approve.finance }
+              - { kind: expr,   expr: "$.context.requiresQuorum == true" }
+            executor:
+              kind: human
+              queue: expense-finance-approvals
+
+          finance_quorum_complete:
+            title: Advance once two finance approvals exist.
+            target: reimbursement
+            guards:
+              - kind: evidence
+                requires:
+                  - { kind: human_request, count: 2 }
+              - { kind: expr, expr: "$.context.requiresQuorum == true" }
+
+          finance_reject:
+            title: Finance rejection.
+            actor: human
+            target: rejected
+            guards:
+              - { kind: permission, permission: expense.approve.finance }
+            executor:
+              kind: mcp
+              connection: notifier
+              tool: send_rejection
+              map:
+                employee: "$.workflow.input.employee"
+                reasons:  "finance rejected"
+
+      reimbursement:
+        description: |
+          Approved. Issue the reimbursement via payroll. Idempotent
+          (retries don't create duplicate payments) and retried on
+          transient errors.
+        onEnter:
+          executor:
+            kind: rest
+            connection: payroll
+            method: POST
+            path: /reimbursements
+            body:
+              employee:   "$.workflow.input.employee"
+              amount:     "$.workflow.input.amount"
+              currency:   "$.workflow.input.currency"
+              receiptUrl: "$.workflow.input.receiptUrl"
+            idempotencyKey: true
+          output:
+            paymentId: "$.output.id"
+          reliability:
+            timeoutMs: 30000
+            retry:
+              maxAttempts: 3
+              backoff: exponential
+              initialDelayMs: 1000
+              maxDelayMs: 8000
+              retryOn: [transient_error, timeout, rate_limited, connection_error]
+        transitions:
+          mark_paid:
+            title: Record payment and finish.
+            target: paid
+
+      paid:
+        terminal: true
+        description: Payment issued. `context.paymentId` holds the payroll reference.
+
+      rejected:
+        terminal: true
+        description: Expense rejected. Audit log preserves the reason.

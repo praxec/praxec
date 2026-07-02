@@ -1,0 +1,29 @@
+# contracts/coding-rust-fn-v1.yaml
+#
+# Golden contract for the `coding` affinity. The prompt asks for a tiny
+# Rust function and the verifier confirms the response can be compiled
+# by `rustc` as a library crate. Requires `rustc` on PATH where the
+# capability harness runs (CI / dev box). Local-only providers without
+# the model's ability to write code will fail visibly.
+
+contract:
+  id: coding-rust-fn-v1
+  affinity: coding
+  description: |
+    Write a single Rust function `fn add(a: i32, b: i32) -> i32`. The
+    verifier compiles the response as a library crate with `rustc`;
+    pass requires exit 0.
+  prompt: |
+    Write a single Rust function with this exact signature:
+
+        fn add(a: i32, b: i32) -> i32
+
+    The body should return `a + b`. Respond with ONLY the Rust code —
+    no markdown, no fences, no explanation.
+  verifier:
+    kind: regex_match
+    # The two `i32` references and the `+` operator must appear in
+    # order. Permissive enough to accept different formatting (line
+    # breaks, spacing, attributes); strict enough to flag a model
+    # that wrote prose or the wrong language.
+    pattern: '(?s)fn\s+add\s*\(\s*a\s*:\s*i32\s*,\s*b\s*:\s*i32\s*\)\s*->\s*i32\s*\{.*\+.*\}'

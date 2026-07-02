@@ -1,0 +1,12 @@
+{
+  // IMPORTANT: praxec must be your ONLY context server for tool gating
+  // to be airtight. Do NOT add separate filesystem, github, or shell
+  // servers — all tool access goes through the gateway's seven-tool surface.
+  "context_servers": [
+    {
+      "id": "praxec",
+      "executable": "/absolute/path/to/praxec",
+      "args": ["serve", "--config", "/absolute/path/to/examples/zed-gateway/gateway.yaml"]
+    }
+  ]
+}

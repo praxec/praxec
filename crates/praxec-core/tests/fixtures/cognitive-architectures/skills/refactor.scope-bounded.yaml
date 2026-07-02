@@ -1,0 +1,48 @@
+# skills/refactor.scope-bounded.yaml
+#
+# Refactoring discipline: declare scope, declare behavior-preservation
+# expectations, refuse to wander. The baseline-snapshot + compare-baseline
+# bracket around the actual edit operation is what makes "safe" refactors
+# safe — without that bracket, "refactor" is just "change."
+
+skills:
+  refactor.scope-bounded:
+    verb: refactor
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Scope-bounded refactoring
+
+      You have a code-context bundle for the declared scope. Produce
+      a refactor plan with these required fields:
+
+      - **`moves`** — array of `{ from_path, to_path, reason }` for
+        every file or symbol move. Empty if no moves are planned.
+      - **`renames`** — array of `{ from_symbol, to_symbol, reason }`.
+        Renames inside a single file are fine; renames that cross
+        public-API boundaries are higher-risk; renames that change
+        exported names need an explicit migration note.
+      - **`extractions`** — array of `{ from_symbol, to_new_symbol,
+        target_path }` for extract-function / extract-module
+        operations. Each extraction MUST cite the call sites it
+        affects.
+      - **`scope_paths`** — exact paths the refactor may touch.
+        The compare-baseline downstream check will reject any
+        change to a path NOT in this list.
+      - **`expected_behavior_preservation`** — one sentence in
+        plain English describing the observable behavior that
+        MUST stay identical. The test suite verifies this; you're
+        articulating it so reviewers can audit the claim.
+
+      Anti-patterns:
+
+      - **"While I'm refactoring, I'll fix this bug too."** No.
+        Refactors and fixes mix poorly under review and risk losing
+        the baseline-preservation guarantee.
+      - **Renames as a substitute for understanding.** If you're
+        renaming because the current name is unclear, that's good.
+        If you're renaming to avoid reading the existing code,
+        that's a tell.
+      - **Cross-cutting changes labeled "refactor."** Adding a new
+        cross-cutting concern (logging, metrics, validation) is
+        feature work, not refactoring. Surface separately.

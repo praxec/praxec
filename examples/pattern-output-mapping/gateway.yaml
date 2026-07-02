@@ -1,0 +1,131 @@
+# Pattern: Output-mapping operator reference
+#
+# Every operator from mapping.rs, each in its own workflow.
+# All executors are `kind: noop` — the point is the output: block,
+# not the execution.
+#
+# Path roots:
+#   $.output.*       — executor result
+#   $.arguments.*    — LLM-provided arguments
+#   $.context.*      — current blackboard
+#   $.workflow.input.* — initial workflow input
+
+version: "1.0.0"
+audit:
+  sink: stderr
+
+workflows:
+  # ── set (literal) ──
+  mapping_set:
+    initialState: write
+    blackboard:
+      mode:     { type: string }
+      flag:     { type: boolean }
+      enabled:  { type: boolean }
+    states:
+      write:
+        goal: Write literal values
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor: { kind: noop }
+            output:
+              mode:    { set: "production" }
+              flag:    { set: true }
+              enabled: { set: false }
+      done:
+        terminal: true
+
+  # ── arithmetic ──
+  mapping_arithmetic:
+    initialState: compute
+    blackboard:
+      base:    { type: integer }
+      sum:     { type: integer }
+      diff:    { type: integer }
+      product: { type: integer }
+      quotient:{ type: integer }
+    initialContext:
+      base: 10
+    states:
+      compute:
+        goal: Arithmetic operators
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor: { kind: noop }
+            output:
+              base:     { add:      ["$.context.base", 5] }
+              sum:      { add:      [3, 7] }
+              diff:     { subtract: [20, 8] }
+              product:  { multiply: [6, 7] }
+              quotient: { divide:   [100, 4] }
+      done:
+        terminal: true
+
+  # ── concat ──
+  mapping_concat:
+    initialState: build
+    blackboard:
+      label:   { type: string }
+      version: { type: string }
+    initialContext:
+      version: "1."
+    states:
+      build:
+        goal: String concatenation
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor: { kind: noop }
+            output:
+              version: { concat: ["$.context.version", "0.0"] }
+              label:   { concat: ["build-", "$.context.version"] }
+      done:
+        terminal: true
+
+  # ── path resolution ──
+  mapping_paths:
+    initialState: resolve
+    blackboard:
+      executor_result: { type: string }
+      copied:          { type: string }
+    states:
+      resolve:
+        goal: Path resolution against scopes
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor: { kind: noop }
+            output:
+              executor_result: "$.output.description"
+              copied:          "$.context.executor_result"
+      done:
+        terminal: true
+
+  # ── array projection [*] ──
+  mapping_projection:
+    initialState: project
+    blackboard:
+      branch_statuses: { type: array }
+      all_ok:          { type: boolean }
+    states:
+      project:
+        goal: Pluck .ok from each branch
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor: { kind: noop }
+            output:
+              # In a real workflow, $.output.branches comes from a
+              # parallel executor. Here, noop produces {} so the path
+              # resolves to null. Swap in a parallel executor to see
+              # [*] projection work.
+              branch_statuses: "$.output.branches[*].ok"
+      done:
+        terminal: true

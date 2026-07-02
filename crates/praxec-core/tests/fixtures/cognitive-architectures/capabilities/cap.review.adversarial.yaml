@@ -1,0 +1,35 @@
+# capabilities/cap.review.adversarial.yaml
+
+workflows:
+  cap.review.adversarial:
+    verb: review
+    lifecycle: experimental
+    description: >
+      Adversarial review of the diff against the declared base ref;
+      surface findings + overall verdict.
+    snippet:
+      inputs:
+        diff_against: { type: string, required: true }
+      outputs:
+        verdict:  { type: string, enum: [approved, needs-revision, rejected] }
+        findings: { type: array }
+    skills: [review.code.adversarial]
+    initialState: ready
+    states:
+      ready:
+        goal: Attack the diff; cite findings; emit verdict.
+        transitions:
+          submit_review:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [verdict]
+              properties:
+                verdict:  { type: string, enum: [approved, needs-revision, rejected] }
+                findings: { type: array, default: [] }
+            executor: { kind: noop }
+            output:
+              verdict:  "$.arguments.verdict"
+              findings: "$.arguments.findings"
+      done: { terminal: true }

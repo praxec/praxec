@@ -1,0 +1,17 @@
+# cargo-audit configuration — tracked, JUSTIFIED advisory exceptions.
+#
+# This is not a silence switch. Any entry here must carry a reachability
+# analysis and an upstream-tracking note so `cargo audit` still fails CI on any
+# NEW advisory. The list is currently EMPTY:
+#
+#   - RUSTSEC-2023-0071 (rsa 0.9.x, Marvin timing side-channel) was dropped on
+#     2026-06-16 when the postgres store backend — and with it the `sqlx`
+#     meta-crate that dragged `rsa` into the lockfile — was removed. `cargo tree
+#     -i rsa` is now empty.
+#   - The rustls-webpki 0.101 advisories were retired earlier with the
+#     AWS/Bedrock TLS path (only rustls 0.23 / rustls-webpki 0.103 remain).
+#
+# Last reviewed: 2026-06-16.
+
+[advisories]
+ignore = []

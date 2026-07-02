@@ -1,0 +1,83 @@
+# scripts-library/install.agents-config.yaml
+#
+# Atomic write of an `agents.yaml` file + round-trip validation
+# through the same `agents.yaml` loader the runtime uses at startup.
+# FMECA U3 / U6
+# mitigation: temp-file + rename keeps the on-disk file consistent
+# under crash; the round-trip check refuses to leave a syntactically
+# wrong file behind.
+#
+# Subject root is `install` (SPEC §22.4 blessed verb) — the work
+# is installing a config file at a target path. The wrapping cap's
+# verb is `implement`, which is operator-semantics.
+#
+# Inputs (argv):
+#   $1 — YAML text to write (the rendered plan)
+#   $2 — target path on disk
+#
+# Output (stdout JSON):
+#   {
+#     "written_path":   "<resolved-absolute-path>",
+#     "round_trip_ok":  true|false,
+#     "validation":     { "ok": ..., "error_kind": ..., "detail": ... }
+#   }
+#
+# Exit code: 0 if both write and round-trip succeed; 1 otherwise.
+# A failing round-trip ROLLS BACK the temp file rather than leave a
+# broken `agents.yaml` in place.
+
+scripts:
+  install.agents-config:
+    verb: install
+    lifecycle: stable
+    source: praxec-meta
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      YAML_TEXT="${1:?missing YAML text}"
+      TARGET="${2:?missing target path}"
+
+      BIN="${PRAXEC_BIN:-praxec}"
+
+      # Resolve the absolute target so the JSON envelope is unambiguous.
+      TARGET_DIR=$(dirname "$TARGET")
+      mkdir -p "$TARGET_DIR"
+      ABS_TARGET=$(cd "$TARGET_DIR" && pwd)/$(basename "$TARGET")
+
+      # Atomic write: temp file in the SAME directory (cross-fs
+      # rename would not be atomic), fsync, rename. Same-directory
+      # is the only guarantee POSIX gives us for atomic-rename.
+      TMP=$(mktemp -p "$TARGET_DIR" .agents.yaml.XXXXXX)
+      printf '%s' "$YAML_TEXT" > "$TMP"
+
+      # Round-trip BEFORE the rename so a bad write never replaces a
+      # good file on disk. The CLI exit code is the contract.
+      if VALIDATION=$($BIN validate-agents-config "$TMP" 2>/dev/null); then
+        OK=true
+      else
+        VALIDATION=$($BIN validate-agents-config "$TMP" 2>/dev/null || true)
+        OK=false
+      fi
+
+      if [ "$OK" = "true" ]; then
+        mv "$TMP" "$ABS_TARGET"
+        jq -n \
+          --arg path "$ABS_TARGET" \
+          --argjson validation "$VALIDATION" \
+          '{
+            written_path:   $path,
+            round_trip_ok:  true,
+            validation:     $validation
+          }'
+      else
+        rm -f "$TMP"
+        jq -n \
+          --arg path "$ABS_TARGET" \
+          --argjson validation "$VALIDATION" \
+          '{
+            written_path:   $path,
+            round_trip_ok:  false,
+            validation:     $validation
+          }'
+        exit 1
+      fi

@@ -1,0 +1,32 @@
+# capabilities/cap.plan.track-gaps.yaml
+
+workflows:
+  cap.plan.track-gaps:
+    verb: plan
+    lifecycle: experimental
+    description: >
+      Diff plan vs. implementation result; report unresolved gaps.
+    snippet:
+      inputs:
+        plan:   { type: object, required: true }
+        result: { type: object, required: true }
+      outputs:
+        report: { type: object }
+    skills: [plan.gap-reconciliation]
+    initialState: ready
+    states:
+      ready:
+        goal: Compare plan to result; emit a structured gap report.
+        transitions:
+          submit_report:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [report]
+              properties:
+                report: { type: object }
+            executor: { kind: noop }
+            output:
+              report: "$.arguments.report"
+      done: { terminal: true }

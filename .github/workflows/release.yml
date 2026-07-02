@@ -1,0 +1,142 @@
+# Build cross-platform binaries and publish a GitHub Release when a
+# `v*` tag is pushed.
+#
+# Runs alongside publish.yml (crates.io) — both trigger on v* tags.
+# This workflow produces binaries + checksums; publish.yml handles
+# crate publishing.
+
+name: Release binaries
+
+on:
+    push:
+        tags:
+            - 'v*'
+
+permissions:
+    contents: write
+
+env:
+    CARGO_TERM_COLOR: always
+
+jobs:
+    build:
+        name: build (${{ matrix.target }})
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: x86_64-unknown-linux-gnu
+                      os: ubuntu-latest
+                      use_cross: false
+                    - target: aarch64-unknown-linux-gnu
+                      os: ubuntu-latest
+                      use_cross: true
+                    - target: x86_64-apple-darwin
+                      os: macos-13
+                      use_cross: false
+                    - target: aarch64-apple-darwin
+                      os: macos-latest
+                      use_cross: false
+                    - target: x86_64-pc-windows-msvc
+                      os: windows-latest
+                      use_cross: false
+        runs-on: ${{ matrix.os }}
+        timeout-minutes: 60
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Linux system dependencies
+              # libdbus-1-dev is required by libdbus-sys (transitive dep
+              # via aether-auth's OS keyring abstraction on Linux). Only
+              # needed for native Linux builds; cross uses its own
+              # container; macOS / Windows don't pull libdbus-sys.
+              if: matrix.os == 'ubuntu-latest' && !matrix.use_cross
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y libdbus-1-dev pkg-config
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: ${{ matrix.target }}
+
+            - name: Cache cargo registry + build
+              uses: Swatinem/rust-cache@v2
+              with:
+                  key: ${{ matrix.target }}
+
+            - name: Install cross
+              if: matrix.use_cross
+              run: cargo install cross --git https://github.com/cross-rs/cross
+
+            # The release bundle ships the `praxec` gateway binary.
+            - name: Build (native)
+              if: "!matrix.use_cross"
+              run: cargo build --release -p praxec --target ${{ matrix.target }}
+
+            - name: Build (cross)
+              if: matrix.use_cross
+              run: cross build --release -p praxec --target ${{ matrix.target }}
+
+            - name: Archive (tar.gz)
+              if: "!contains(matrix.target, 'windows')"
+              shell: bash
+              run: |
+                  name="praxec-${{ matrix.target }}.tar.gz"
+                  tar czf "$name" -C "target/${{ matrix.target }}/release" praxec
+                  echo "ASSET=$name" >> "$GITHUB_ENV"
+
+            - name: Archive (zip)
+              if: contains(matrix.target, 'windows')
+              shell: bash
+              run: |
+                  name="praxec-${{ matrix.target }}.zip"
+                  ( cd "target/${{ matrix.target }}/release" \
+                      && 7z a "$OLDPWD/$name" praxec.exe )
+                  echo "ASSET=$name" >> "$GITHUB_ENV"
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ matrix.target }}
+                  path: ${{ env.ASSET }}
+                  retention-days: 5
+
+    release:
+        name: Create GitHub Release
+        needs: build
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Verify tag matches workspace version
+              run: |
+                  tag="${GITHUB_REF#refs/tags/v}"
+                  ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+                  if [ "$tag" != "$ver" ]; then
+                    echo "::error::Tag v$tag does not match workspace version $ver"
+                    exit 1
+                  fi
+
+            - name: Download all artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  path: artifacts
+
+            - name: Collect release assets
+              run: |
+                  mkdir -p release
+                  find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} release/ \;
+                  cd release
+                  sha256sum * > checksums.sha256
+                  cat checksums.sha256
+
+            - name: Create release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  tag="${GITHUB_REF#refs/tags/}"
+                  gh release create "$tag" \
+                    --title "$tag" \
+                    --generate-notes \
+                    release/*

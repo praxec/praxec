@@ -1,0 +1,48 @@
+# capabilities/cap.review.adversarial.yaml
+#
+# STUB SHADOW of the cognitive-architectures cap with the same
+# definitionId stem. Operators who also load cognitive-architectures
+# should declare this in their top-level `overrides:` block to win the
+# collision deliberately:
+#
+#   overrides:
+#     - cognitive/cap.review.adversarial
+#
+# This shadow exists so praxec-meta is loadable standalone. It binds
+# to the cognitive-architectures review skill IF that library is also
+# loaded; falls back to the shape-only skill body otherwise.
+
+workflows:
+  cap.review.adversarial:
+    verb: review
+    lifecycle: experimental
+    description: >
+      Adversarial review of the authored YAML. Operators with
+      cognitive-architectures loaded should override this with
+      `cognitive/cap.review.adversarial` for the richer version.
+    snippet:
+      inputs:
+        diff_against: { type: string, default: "" }
+      outputs:
+        verdict:  { type: string, enum: [approved, needs-revision, rejected] }
+        findings: { type: array }
+    skills: [review.code.adversarial]
+    initialState: ready
+    states:
+      ready:
+        goal: Attack the authored YAML; cite findings; emit verdict.
+        transitions:
+          submit_review:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [verdict]
+              properties:
+                verdict:  { type: string, enum: [approved, needs-revision, rejected] }
+                findings: { type: array, default: [] }
+            executor: { kind: noop }
+            output:
+              verdict:  "$.arguments.verdict"
+              findings: "$.arguments.findings"
+      done: { terminal: true }

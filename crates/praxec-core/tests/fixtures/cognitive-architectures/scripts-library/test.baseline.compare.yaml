@@ -1,0 +1,60 @@
+version: "1.0.0"
+scripts:
+  test.baseline.compare:
+    verb: test
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # Re-run the workspace tests + compare against the baseline captured
+      # by `test.baseline.snapshot`. Emits JSON: { ok: bool, drift: { ... } }.
+      #
+      # Used by flow.safe-refactor to assert "no observable behavior change."
+      # `ok: true` requires that the post-refactor failed-test count is
+      # exactly equal to the baseline's (new failures = old failures, no
+      # regressions, no newly-broken tests).
+      set -euo pipefail
+      TEST_CMD="${TEST_CMD:-cargo test --workspace --no-fail-fast}"
+      BASELINE_FILE="${BASELINE_FILE:-/tmp/praxec-test-baseline.json}"
+
+      if [[ ! -f "$BASELINE_FILE" ]]; then
+        echo "{\"ok\": false, \"drift\": {\"error\": \"no baseline at $BASELINE_FILE — run test.baseline.snapshot first\"}}" >&2
+        exit 2
+      fi
+
+      BASELINE_PASSED=$(grep -oE '"passed_count":\s*[0-9]+' "$BASELINE_FILE" | grep -oE '[0-9]+')
+      BASELINE_FAILED=$(grep -oE '"failed_count":\s*[0-9]+' "$BASELINE_FILE" | grep -oE '[0-9]+')
+      BASELINE_ELAPSED=$(grep -oE '"elapsed_sec":\s*[0-9]+' "$BASELINE_FILE" | grep -oE '[0-9]+')
+
+      START_TS=$(date +%s)
+      RAW_LOG=$(mktemp)
+      $TEST_CMD 2>&1 | tee "$RAW_LOG" || true
+      ELAPSED=$(( $(date +%s) - START_TS ))
+
+      POST_PASSED=$(grep -cE '(^test .* \.\.\. ok$|PASSED|passed)' "$RAW_LOG" || echo 0)
+      POST_FAILED=$(grep -cE '(^test .* \.\.\. FAILED$|FAILED|failed)' "$RAW_LOG" || echo 0)
+
+      NEW_FAILURES=$(( POST_FAILED - BASELINE_FAILED ))
+      [[ "$NEW_FAILURES" -lt 0 ]] && NEW_FAILURES=0
+      LOST_PASSES=$(( BASELINE_PASSED - POST_PASSED ))
+      [[ "$LOST_PASSES" -lt 0 ]] && LOST_PASSES=0
+
+      OK=$([[ "$NEW_FAILURES" -eq 0 && "$LOST_PASSES" -eq 0 ]] && echo true || echo false)
+
+      cat <<JSON
+      {
+        "ok": $OK,
+        "drift": {
+          "baseline_passed":  $BASELINE_PASSED,
+          "baseline_failed":  $BASELINE_FAILED,
+          "post_passed":      $POST_PASSED,
+          "post_failed":      $POST_FAILED,
+          "new_failures":     $NEW_FAILURES,
+          "lost_passes":      $LOST_PASSES,
+          "baseline_elapsed": $BASELINE_ELAPSED,
+          "post_elapsed":     $ELAPSED,
+          "timing_delta_sec": $(( ELAPSED - BASELINE_ELAPSED ))
+        }
+      }
+      JSON
+      rm -f "$RAW_LOG"

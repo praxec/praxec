@@ -1,0 +1,42 @@
+# skills/plan.fix.scope-bounded.yaml
+#
+# Plan a bugfix the same way you plan a feature: declare scope before
+# you touch code, and refuse to expand scope mid-fix. Bug-fix scope creep
+# is the leading cause of "while I was in there, I fixed five things and
+# now the PR is unreviewable."
+
+skills:
+  plan.fix.scope-bounded:
+    verb: plan
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      # Planning a scope-bounded fix
+
+      You have a parsed defect, repro steps, and a localized defect
+      location. Produce a fix plan with these required fields:
+
+      - **`approach`** — one of `minimal-bounded`, `refactor-first`,
+        or `revert-then-rebuild`. Default `minimal-bounded`.
+      - **`scope_paths`** — exact file paths (or glob patterns) the
+        fix may touch. Empty means "no files outside the defect
+        location itself." Out-of-scope edits will be rejected at
+        write time by the scope-bounded edit tool.
+      - **`regression_tests`** — names of tests to add that cover
+        the specific repro path. AT LEAST ONE. A fix without a
+        regression test ships with a known re-occurrence vector.
+      - **`risk`** — `low | medium | high`. Bias toward `high` when
+        the fix touches auth, schema, payment, or anything that
+        crosses a process / service boundary.
+
+      Anti-patterns:
+
+      - **"While I'm in here"** edits. Surface drive-by improvements
+        as a separate ticket; do not fold them into the fix PR.
+      - **Defensive refactors** ("let me clean this up first").
+        Refactors and fixes mix poorly under review. Refactor in a
+        separate PR with `flow.safe-refactor`.
+      - **Regression tests that pass without the fix.** Run the new
+        test against the unfixed code first; it must fail. Then run
+        with the fix; it must pass. If the test passes both ways,
+        it's not regression coverage.

@@ -1,0 +1,39 @@
+# capabilities/cap.plan.vet.yaml
+#
+# Adversarial review of a draft plan. Cognitive cap — agent reads
+# the `compose.plan.vet` skill, evaluates the input plan, submits
+# verdict + findings.
+
+workflows:
+  cap.plan.vet:
+    verb: plan
+    lifecycle: experimental
+    description: >
+      Adversarial review of a draft plan; emit verdict + findings.
+    snippet:
+      inputs:
+        plan:           { type: object,  required: true }
+        max_iterations: { type: integer, default: 3 }
+      outputs:
+        verdict:  { type: string, enum: [pass, fail, needs-revision] }
+        findings: { type: array }
+    skills: [compose.plan.vet]
+    initialState: ready
+    states:
+      ready:
+        goal: Vet the plan adversarially; cite each finding.
+        transitions:
+          submit_vet:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [verdict]
+              properties:
+                verdict:  { type: string, enum: [pass, fail, needs-revision] }
+                findings: { type: array, default: [] }
+            executor: { kind: noop }
+            output:
+              verdict:  "$.arguments.verdict"
+              findings: "$.arguments.findings"
+      done: { terminal: true }

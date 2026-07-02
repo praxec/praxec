@@ -1,0 +1,30 @@
+version: "1.0.0"
+workflows:
+  guarded_flow:
+    initialState: start
+    version: "1.0.0"
+    blackboard:
+      approved: { type: boolean }
+    states:
+      start:
+        goal: "Produce a verdict"
+        transitions:
+          decide:
+            target: review
+            actor: agent
+            executor: { kind: noop }
+            output:
+              approved: "$.output.approved"
+      review:
+        goal: "Advance only when approved"
+        transitions:
+          approve:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+            guards:
+              - kind: expr
+                expr: "$.context.approved == true"
+      done:
+        terminal: true
+        transitions: {}

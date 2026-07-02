@@ -1,0 +1,202 @@
+# flows/flow.configure-models.yaml
+#
+# The guided agents.yaml setup flow. Inventories the operator's
+# reachable providers → composes a binding plan → gets approval →
+# writes atomically + round-trip-validates → smoke-tests auth.
+#
+# v0.3 deliverable per the FMECA-vetted plan
+# (the design plan):
+#   - five caps + this flow
+#   - mode=auto for unattended runs; mode=review_plan (default)
+#     for HITL approval
+#   - per-binding smoke-test surfaces the FailureClass enum, never
+#     a silent "all green"
+
+workflows:
+  flow.configure-models:
+    description: |
+      Inventory providers → suggest bindings → approve plan →
+      write agents.yaml atomically with round-trip → smoke-test
+      auth per binding.
+
+      Inputs let operators run unattended (mode=auto) or guided
+      (mode=review_plan, default). The flow branches to
+      `failed` on round-trip rejection so a broken agents.yaml
+      never replaces a good one.
+    inputs:
+      providers:
+        type: string
+        default: "anthropic,openai,google"
+      delegates:
+        type: array
+        default: ["coding-frontier", "reasoning-frontier", "prose-standard"]
+      mode:
+        type: string
+        enum: [auto, review_plan]
+        default: review_plan
+      target_path:
+        type: string
+        default: ".praxec/agents.yaml"
+      # Optional capability verification after the auth-only smoke
+      # passes. Set to a contract path (e.g. contracts/reasoning-
+      # arithmetic-v1.yaml) to run that contract against the matching
+      # bindings; empty string skips. Verification incurs real token
+      # spend per matching binding.
+      capability_contract:
+        type: string
+        default: ""
+    initialState: inventorying
+    states:
+      inventorying:
+        transitions:
+          inventory:
+            target: planning
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.research.model-inventory
+              use:
+                inputs:
+                  providers: "$.context.providers"
+                outputs:
+                  "$.context.inventory":        inventory
+                  "$.context.inventory_errors": errors
+
+      planning:
+        transitions:
+          plan:
+            target: gating
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.plan.suggest-bindings
+              use:
+                inputs:
+                  inventory: "$.context.inventory"
+                  delegates: "$.context.delegates"
+                  errors:    "$.context.inventory_errors"
+                outputs:
+                  "$.context.plan":        plan
+                  "$.context.rationale":   rationale
+                  "$.context.tradeoffs":   tradeoffs
+                  "$.context.assumptions": assumptions
+
+      gating:
+        transitions:
+          gate:
+            target: gated
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.gate.human-approve-plan
+              use:
+                inputs:
+                  plan:        "$.context.plan"
+                  rationale:   "$.context.rationale"
+                  tradeoffs:   "$.context.tradeoffs"
+                  assumptions: "$.context.assumptions"
+                  mode:        "$.context.mode"
+                outputs:
+                  "$.context.approved":       approved
+                  "$.context.plan_final":     plan_final
+                  "$.context.gate_rationale": rationale
+
+      gated:
+        transitions:
+          advance:
+            target: writing
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.approved == true"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.approved == false"
+
+      writing:
+        transitions:
+          write:
+            target: written
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.implement.write-agents-config
+              use:
+                inputs:
+                  plan_final:  "$.context.plan_final"
+                  target_path: "$.context.target_path"
+                outputs:
+                  "$.context.written_path":  written_path
+                  "$.context.round_trip_ok": round_trip_ok
+                  "$.context.validation":    validation
+
+      written:
+        transitions:
+          advance:
+            target: smoking
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.round_trip_ok == true"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.round_trip_ok == false"
+
+      smoking:
+        transitions:
+          smoke:
+            target: smoked
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.verify.auth-only-smoke-test
+              use:
+                inputs:
+                  agents_config_path: "$.context.written_path"
+                outputs:
+                  "$.context.smoke_results":    results
+                  "$.context.smoke_disclaimer": disclaimer
+
+      smoked:
+        transitions:
+          run_capability_harness:
+            target: capability_verifying
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.workflow.input.capability_contract != ''"
+          skip_capability_harness:
+            target: done
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.workflow.input.capability_contract == ''"
+
+      capability_verifying:
+        transitions:
+          verify:
+            target: done
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.verify.capability-harness
+              use:
+                inputs:
+                  agents_config_path: "$.context.written_path"
+                  contract_path:      "$.workflow.input.capability_contract"
+                outputs:
+                  "$.context.capability_contract_id": contract_id
+                  "$.context.capability_affinity":    affinity
+                  "$.context.capability_results":     results
+
+      done:
+        terminal: true
+
+      failed:
+        terminal: true

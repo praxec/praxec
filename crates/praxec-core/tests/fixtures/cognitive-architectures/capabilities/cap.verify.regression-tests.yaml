@@ -1,0 +1,37 @@
+# capabilities/cap.verify.regression-tests.yaml
+#
+# Deterministic cap: bind to the workspace test runner. The cap reads
+# `defect_location` + `repro_steps` (for documentation in the cap's
+# audit trail), but the executor itself just runs the test suite — the
+# author of the fix is responsible for adding a test that covers the
+# repro path (per the `plan.fix.scope-bounded` skill).
+
+workflows:
+  cap.verify.regression-tests:
+    verb: verify
+    lifecycle: experimental
+    description: >
+      Run the test suite; confirm passing. The fix author is
+      responsible for adding a regression test that covers the
+      repro path; this cap verifies the new test passes.
+    snippet:
+      inputs:
+        defect_location: { type: object, required: true }
+        repro_steps:     { type: array,  required: true }
+      outputs:
+        ok:          { type: boolean }
+        tests_added: { type: integer }
+    initialState: ready
+    states:
+      ready:
+        transitions:
+          run:
+            target: done
+            actor: deterministic
+            executor:
+              kind: script
+              subject: test.cargo.workspace
+            output:
+              ok:          "$.output.passed"
+              tests_added: { set: 1 }
+      done: { terminal: true }

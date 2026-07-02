@@ -1,0 +1,8 @@
+schema: praxec.repo/v1
+name: swe-core
+namespace: swe
+version: 0.6.0
+description: |
+  Test fixture — SPEC §9 multi-repo loading.
+  Single capability + single flow that references it via an
+  unprefixed name (rewriting target).

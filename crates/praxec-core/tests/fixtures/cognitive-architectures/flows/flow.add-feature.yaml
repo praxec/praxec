@@ -1,0 +1,219 @@
+# flows/flow.add-feature.yaml
+#
+# Plan-driven feature delivery, eight capabilities (SPEC §10 + §12.6).
+#
+# State-shape note (v0.2). The runtime evaluates guards BEFORE the
+# transition's executor fires (runtime_chain::select_deterministic_transition),
+# so a guard can't read a slot the same transition's `use.outputs`
+# writes. Each "execute + branch" sequence therefore splits into two
+# states: the first runs the capability; the second's guarded
+# transitions branch on the cap's output. The `abort` branches all
+# target `failed` — operators relying on this flow in
+# production wire recovery loops via `flow.author-flow` derivatives or
+# patch the state machine post-load.
+
+workflows:
+  flow.add-feature:
+    description: |
+      Plan-driven feature delivery: draft → vet → signoff →
+      TDD implementation → gap reconciliation → verify → review → PR.
+    inputs:
+      feature_brief: { type: string, required: true }
+      base_ref:      { type: string, default: main }
+      lexicon:       { type: object, default: {} }
+    initialState: drafting_plan
+    states:
+      drafting_plan:
+        transitions:
+          draft:
+            target: vetting_plan
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.plan.draft
+              use:
+                inputs:
+                  brief:   "$.context.feature_brief"
+                  lexicon: "$.context.lexicon"
+                outputs:
+                  "$.context.draft_plan":      plan
+                  "$.context.draft_artifacts": artifacts
+
+      vetting_plan:
+        transitions:
+          vet:
+            target: vetted_plan
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.plan.vet
+              use:
+                inputs:
+                  plan:           "$.context.draft_plan"
+                  max_iterations: 3
+                outputs:
+                  "$.context.vet_verdict":  verdict
+                  "$.context.vet_findings": findings
+
+      vetted_plan:
+        transitions:
+          advance:
+            target: awaiting_signoff
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.vet_verdict == 'pass'"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.vet_verdict == 'fail'"
+
+      awaiting_signoff:
+        transitions:
+          signoff:
+            target: signoff_received
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.gate.human-signoff
+              use:
+                inputs:
+                  artifact: "$.context.draft_plan"
+                  prompt:   "Approve plan for implementation?"
+                outputs:
+                  "$.context.signoff_decision": decision
+
+      signoff_received:
+        transitions:
+          advance:
+            target: implementing
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.signoff_decision == 'approved'"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.signoff_decision == 'rejected'"
+
+      implementing:
+        transitions:
+          tdd_loop:
+            target: tracking_gaps
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.implement.tdd-loop
+              use:
+                inputs:
+                  plan:        "$.context.draft_plan"
+                  scope_paths: "$.context.draft_plan"
+                outputs:
+                  "$.context.implementation_result": result
+                  "$.context.tests_added":           tests_added
+
+      tracking_gaps:
+        # Gap reconciliation is informational at v0.2 — the cap surfaces
+        # `gap_report` but the flow doesn't branch on its
+        # `unresolved_gaps` field (deep-field guards land in v0.3).
+        # Operators with stricter gap-closure discipline can patch a
+        # post-tracking branch state in their gateway config.
+        transitions:
+          track:
+            target: verifying
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.plan.track-gaps
+              use:
+                inputs:
+                  plan:   "$.context.draft_plan"
+                  result: "$.context.implementation_result"
+                outputs:
+                  "$.context.gap_report": report
+
+      verifying:
+        transitions:
+          verify:
+            target: verified
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.verify.workspace-green
+              use:
+                inputs:  {}
+                outputs:
+                  "$.context.verify_ok":      ok
+                  "$.context.verify_summary": summary
+
+      verified:
+        transitions:
+          advance:
+            target: reviewing
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.verify_ok == true"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.verify_ok == false"
+
+      reviewing:
+        transitions:
+          review:
+            target: reviewed
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.review.adversarial
+              use:
+                inputs:
+                  diff_against: "$.context.base_ref"
+                outputs:
+                  "$.context.review_verdict":  verdict
+                  "$.context.review_findings": findings
+
+      reviewed:
+        transitions:
+          advance:
+            target: opening_pr
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.review_verdict == 'approved'"
+          abort:
+            target: failed
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.review_verdict == 'rejected'"
+
+      opening_pr:
+        transitions:
+          open:
+            target: done
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.coordinate.pr-open
+              use:
+                inputs:
+                  title: "$.context.feature_brief"
+                  body:  "$.context.feature_brief"
+                  base:  "$.context.base_ref"
+                outputs:
+                  "$.context.pr_url":       url
+                  "$.context.pr_number":    pr_number
+
+      done:
+        terminal: true
+
+      failed:
+        terminal: true

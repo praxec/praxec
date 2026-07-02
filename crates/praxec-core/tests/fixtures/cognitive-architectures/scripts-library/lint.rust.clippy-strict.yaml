@@ -1,0 +1,12 @@
+version: "1.0.0"
+scripts:
+  lint.rust.clippy-strict:
+    verb: lint
+    lifecycle: stable
+    source: cognitive-architectures
+    body: |
+      #!/usr/bin/env bash
+      # Clippy as errors: every workspace target, every warning becomes a hard fail.
+      # Use this as the lint gate on PRs; pair with format.rust.check.
+      set -euo pipefail
+      cargo clippy --workspace --all-targets -- -D warnings "$@"

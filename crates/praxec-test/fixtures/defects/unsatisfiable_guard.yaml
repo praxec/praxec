@@ -1,0 +1,31 @@
+version: "1.0.0"
+# DEFECT 5: unsatisfiable_guard
+# Two contradictory ALL-required guards on the same transition:
+#   $.context.n == 1  AND  $.context.n == 2
+# The satisfying_context builder processes guards in order, so it sets n=1 for
+# the first guard. The second guard sees n=1 != 2 and rejects. The runtime
+# evaluates both guards as a conjunction (all must pass), so the transition
+# can never fire.
+# Expected detection: fuzz 'go' transition fires GUARD_REJECTED on satisfying
+# context → verdict ok=false, detail "could not satisfy guard".
+workflows:
+  unsatisfiable_flow:
+    version: "1.0.0"
+    initialState: start
+    states:
+      start:
+        goal: "Transition with mutually exclusive guards"
+        transitions:
+          go:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+            guards:
+              - kind: expr
+                expr: "$.context.n == 1"
+              - kind: expr
+                expr: "$.context.n == 2"
+      done:
+        goal: "Unreachable"
+        terminal: true
+        transitions: {}

@@ -1,0 +1,31 @@
+[package]
+name = "praxec-embeddings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "rig-backed embedding provider for praxec — implements core's EmbeddingProvider over the rig crate"
+
+[lib]
+name = "praxec_embeddings"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+praxec-core = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = "5"
+# The embedding engine. rig treats embeddings as first-class (EmbeddingModel +
+# vector stores), independent of the chat SDK (aether-llm). Renamed to `rig`
+# (the crate's lib is `rig_core`) so imports follow the ecosystem convention.
+rig = { package = "rig-core", version = "0.38" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"

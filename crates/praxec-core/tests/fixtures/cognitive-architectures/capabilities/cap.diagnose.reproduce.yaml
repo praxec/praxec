@@ -1,0 +1,32 @@
+# capabilities/cap.diagnose.reproduce.yaml
+
+workflows:
+  cap.diagnose.reproduce:
+    verb: diagnose
+    lifecycle: experimental
+    description: >
+      Derive minimal reproduction steps from a parsed error using the
+      five-field reproduction discipline.
+    snippet:
+      inputs:
+        parsed: { type: object, required: true }
+      outputs:
+        repro_steps: { type: array }
+    skills: [diagnose.reproduction]
+    initialState: ready
+    states:
+      ready:
+        goal: Produce minimal steps + expected/actual + environment + frequency + isolation.
+        transitions:
+          submit_repro:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [repro_steps]
+              properties:
+                repro_steps: { type: array }
+            executor: { kind: noop }
+            output:
+              repro_steps: "$.arguments.repro_steps"
+      done: { terminal: true }

@@ -1,0 +1,79 @@
+# Spec §24.2 — dynamic fan-out via for_each
+#
+# Expands a blackboard array into parallel branches at runtime.
+# Each branch gets $.branch.value + $.branch.index substituted
+# into the `do:` template.
+
+version: "1.0.0"
+audit:
+  sink: stderr
+
+workflows:
+  dynamic_fanout:
+    initialState: setup
+    blackboard:
+      items:          { type: array }
+      results:        { type: array }
+      ok_count:       { type: integer }
+    initialContext:
+      items: ["alpha", "beta", "gamma", "delta"]
+
+    states:
+      setup:
+        goal: Set up the work items
+        transitions:
+          start:
+            target: fanout
+            actor: deterministic
+            executor: { kind: noop }
+
+      fanout:
+        goal: Process every item concurrently
+        transitions:
+          process_all:
+            target: done
+            actor: deterministic
+            executor:
+              kind: parallel
+              branches:
+                for_each: "$.context.items"
+                do:
+                  kind: noop
+              join: all
+              on_branch_failure: bail
+              total_timeout_ms: 60000
+              max_concurrency: 4
+            output:
+              results:  "$.output.branches"
+              ok_count: "$.output.summary.ok_count"
+
+      done:
+        terminal: true
+
+  # ── empty array case ──
+  dynamic_fanout_empty:
+    initialState: fanout
+    blackboard:
+      items:   { type: array }
+      results: { type: array }
+    initialContext:
+      items: []
+
+    states:
+      fanout:
+        goal: Empty array — vacuous success
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor:
+              kind: parallel
+              branches:
+                for_each: "$.context.items"
+                do:
+                  kind: noop
+              join: all
+            output:
+              results: "$.output.summary"
+      done:
+        terminal: true

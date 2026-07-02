@@ -1,0 +1,74 @@
+[package]
+name = "praxec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP gateway with HATEOAS workflow governance, audit, and reliability policies"
+default-run = "praxec"
+
+[lib]
+name = "praxec"
+path = "src/lib.rs"
+
+[[bin]]
+name = "praxec"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+praxec-core = { workspace = true }
+praxec-executors = { workspace = true }
+# Shipped as a first-class CLI subcommand (`praxec fuzz`), not a test-only helper — keep in [dependencies].
+praxec-test = { workspace = true }
+praxec-mcp-server = { workspace = true }
+# Activates semantic discovery: the rig-backed embedder built from the persisted
+# bootstrap choice, injected via with_embedder in the serve path.
+praxec-embeddings = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rmcp = { workspace = true }
+# ADR-0007 — the production ToolHost converts rmcp tools → rig ToolDefinitions.
+rig = { package = "rig-core", version = "0.38" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# SPEC §33 D4 — optional in-runtime LLM executor; default-on so
+# `cargo install praxec` ships with `kind: llm` available.
+# Opt out with `--no-default-features` for builds that should not
+# pull aether-llm.
+praxec-llm-executor = { workspace = true, optional = true }
+# SPEC §33 D4 — kind: agent overlay; default-on so the single praxec
+# binary ships with autonomous sub-agent support available.
+praxec-agents = { workspace = true }
+# async-trait backs the production `AffinityResolver` impl in
+# `affinity_resolver.rs`; needed when either the LLM executor or agents are
+# compiled in.
+async-trait = { workspace = true }
+
+[features]
+default = ["llm-executor"]
+llm-executor = ["dep:praxec-llm-executor"]
+# ADR-0007 — agents are first-class: `praxec-agents` + `async-trait` are
+# non-optional deps and the `kind: agent` overlay is always wired (no feature).
+
+# Tests for the LLM-executor end-to-end pipeline need the
+# adversarial mock provider (futures::stream::iter), the aether-llm
+# enum re-exports, and the executors crate to satisfy the runtime
+# registry's `noop` kind. The praxec-llm-executor crate ships
+# the LlmExecutor entry points the e2e wiring composes.
+[dev-dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+praxec-executors = { workspace = true }
+praxec-llm-executor = { workspace = true }
+tempfile = "3"

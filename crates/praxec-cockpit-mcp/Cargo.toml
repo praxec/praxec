@@ -1,0 +1,30 @@
+[package]
+name = "praxec-cockpit-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MCP representation of the Mission Control cockpit's interaction model — exposes the cockpit's navigation ops as MCP tools so an external agent can drive it"
+
+[lib]
+name = "praxec_cockpit_mcp"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+praxec-cockpit = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "praxec-cockpit-mcp"
+path = "src/bin/server.rs"

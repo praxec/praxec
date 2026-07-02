@@ -1,0 +1,28 @@
+version: "1.0.0"
+# DEFECT 1: orphan_state
+# 'dead' is declared but has no incoming transition from the reachable graph.
+# BFS from 'start' reaches 'done' but never 'dead'.
+# Expected detection: fuzz_coverage orphan_states non-empty.
+workflows:
+  orphan_flow:
+    version: "1.0.0"
+    initialState: start
+    states:
+      start:
+        goal: "Begin"
+        transitions:
+          go:
+            target: done
+            actor: agent
+            executor: { kind: noop }
+      done:
+        goal: "Finished"
+        terminal: true
+        transitions: {}
+      dead:
+        goal: "Unreachable orphan — no incoming transition"
+        transitions:
+          exit:
+            target: done
+            actor: agent
+            executor: { kind: noop }

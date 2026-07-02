@@ -1,0 +1,160 @@
+# SPEC §17 — reference authoring workflow.
+#
+# Drives the LLM through proposing → structural-checking → dry-running →
+# publishing a new workflow or skill fragment. All four authoring-tier
+# executor kinds (structural_analysis, dry_run, ingest, registry) plug in
+# here; users fork this file to opinionate their own authoring policy.
+#
+# Requires the gateway to be started with:
+#   praxec.authoring.write_enabled: true   # gate for the registry write
+#
+# The authoring workflow itself is just a workflow — it sits in the
+# definition store alongside everything else.
+
+version: "1.0.0"
+
+# Lexicon entries for subjects referenced in skills keys (SPEC §30.10.4).
+lexicon:
+  rubric.workflow-shape:
+    definition_short: "Structural rubric for well-formed workflow definitions."
+  rubric.skill-shape:
+    definition_short: "Structural rubric for well-formed skill fragments."
+  pitfall.common-failures:
+    definition_short: "Catalogue of common authoring mistakes to avoid."
+
+praxec:
+  # Enable both gates below to make this workflow actually publish.
+  # Default is off in production; opt in deliberately.
+  authoring:
+    write_enabled: false
+
+skills:
+  authoring.rubric.workflow-shape:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Workflow-shape rubric
+      A good workflow has:
+      - A small number of states with intent-revealing names.
+      - A linear happy path with named exits at decision points.
+      - One terminal state per outcome class (done, failed, cancelled).
+      - Guards that read declared blackboard slots; no `$.context.summary` reads.
+  authoring.rubric.skill-shape:
+    verb: review
+    lifecycle: stable
+    body: |
+      # Skill-shape rubric
+      A good skill fragment:
+      - Has a subject under a blessed root (review.*, debug.*, plan.*, etc).
+      - Uses one of the 8 closed verbs.
+      - Has a body that reads as a focused 100-400 word coaching note.
+      - Declares lifecycle: experimental | stable | deprecated honestly.
+  authoring.pitfall.common-failures:
+    verb: explain
+    lifecycle: stable
+    body: |
+      # Common authoring failures
+      - State with no inbound transition and not initial (dead state).
+      - Guards referencing slots no transition writes (undeclared slot read).
+      - Self-loop without guard (unbounded loop).
+      - Skill subject outside the blessed roots (taxonomy rot).
+
+workflows:
+  authoring:
+    initialState: drafting
+    skills: [authoring.rubric.workflow-shape, authoring.pitfall.common-failures]
+    blackboard:
+      candidate_definition_id:    { type: string }
+      candidate_definition:       { type: object }
+      structural_issues:          { type: array }
+      structural_issues_count:    { type: integer }
+      dry_run_failed:             { type: boolean }
+    states:
+      drafting:
+        goal: Propose a candidate definition (workflow or skill fragment).
+        guidance: >
+          Draft a candidate definition and call `submit propose_candidate` with
+          `definitionId` and `definition` arguments. The runtime will
+          structural-check it next.
+        skills: [authoring.rubric.workflow-shape, authoring.rubric.skill-shape]
+        transitions:
+          propose_candidate:
+            target: reviewing_structure
+            inputSchema:
+              type: object
+              required: [definitionId, definition]
+              properties:
+                definitionId: { type: string }
+                definition:   { type: object }
+            executor: { kind: noop }
+            output:
+              candidate_definition_id: $.arguments.definitionId
+              candidate_definition:    $.arguments.definition
+
+      reviewing_structure:
+        goal: Run structural analysis on the candidate.
+        skills: [authoring.pitfall.common-failures]
+        transitions:
+          run_struct_check:
+            target: reviewed_structure
+            actor: deterministic
+            executor:
+              kind: structural_analysis
+            output:
+              structural_issues:       $.output.issues
+              structural_issues_count: $.output.issue_count
+
+      reviewed_structure:
+        goal: Either advance to dry-run if clean, or loop back to drafting.
+        transitions:
+          to_dry_run:
+            target: validating
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.structural_issues_count == 0"
+            executor: { kind: noop }
+          back_to_drafting:
+            target: drafting
+            actor: deterministic
+            guards:
+              - kind: expr
+                expr: "$.context.structural_issues_count > 0"
+            executor: { kind: noop }
+
+      validating:
+        goal: Dry-run the candidate against a small fixture script.
+        transitions:
+          run_dry_run:
+            target: ready
+            actor: deterministic
+            executor:
+              kind: dry_run
+            output:
+              dry_run_failed: { set: false }
+
+      ready:
+        goal: Acknowledge the rubric and publish.
+        skills: [authoring.rubric.workflow-shape, authoring.rubric.skill-shape]
+        transitions:
+          publish:
+            # Default actor is `agent` so the ack guard is the effective
+            # gate. Set this transition to `actor: human` in your fork if
+            # you want a human-in-the-loop sign-off in addition to the ack
+            # gate.
+            #
+            # No inputSchema: publish takes NO arguments. The registry executor
+            # publishes the validated candidate already on the blackboard
+            # (`candidate_definition_id` / `candidate_definition`) — exactly
+            # what structural_analysis + dry_run checked. Re-accepting a fresh
+            # definition here would let a caller validate one thing and publish
+            # another.
+            target: published
+            guards:
+              - kind: guidance_acknowledged
+                subject: authoring.rubric.workflow-shape
+            executor:
+              kind: registry
+
+      published:
+        terminal: true

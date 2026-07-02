@@ -1,0 +1,35 @@
+# capabilities/cap.triage.classify-severity.yaml
+
+workflows:
+  cap.triage.classify-severity:
+    verb: triage
+    lifecycle: experimental
+    description: >
+      Classify an inbound issue into S1/S2/S3/S4 by customer-visible
+      impact per the triage rubric.
+    snippet:
+      inputs:
+        issue: { type: object, required: true }
+      outputs:
+        severity:   { type: string, enum: [S1, S2, S3, S4] }
+        confidence: { type: number }
+    skills: [triage.issue.routing]
+    initialState: ready
+    states:
+      ready:
+        goal: Read the issue; pick the lowest severity whose definition matches.
+        transitions:
+          submit_severity:
+            target: done
+            actor: agent
+            inputSchema:
+              type: object
+              required: [severity]
+              properties:
+                severity:   { type: string, enum: [S1, S2, S3, S4] }
+                confidence: { type: number, minimum: 0, maximum: 1, default: 0.8 }
+            executor: { kind: noop }
+            output:
+              severity:   "$.arguments.severity"
+              confidence: "$.arguments.confidence"
+      done: { terminal: true }
