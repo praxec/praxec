@@ -5,14 +5,32 @@
 [![docs.rs](https://docs.rs/praxec/badge.svg)](https://docs.rs/praxec)
 [![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
-praxec is an MCP gateway that puts an AI agent's tool use behind
-declarative, governed workflows. You describe what's allowed as small YAML state
-machines; any MCP client — Claude Code, Cursor, or your own — drives them through
-a fixed two-tool surface, and at each step the agent is offered only the
-transitions that are legal right now. An illegal move isn't rejected after the
-fact — it's never presented. The same YAML gives you schema validation, guards,
-human-approval gates, deterministic step-chaining, and an audit log, with your
-tools staying in whatever language they already use.
+**The AI execution kernel for deterministic, policy-gated workflows.**
+
+praxec runs deterministic workflows over pluggable capabilities — MCP tools, CLIs,
+HTTP services, scripts, and native modules — while holding the LLM inside a bounded
+execution context. You describe what's allowed as small YAML state machines; at
+each step the model is offered only the transitions that are legal right now. An
+illegal move isn't rejected after the fact — it's never presented.
+
+It inverts the usual arrangement. Instead of an agent choosing tools from an
+ever-growing list while a prompt hopes to keep it in line, the **workflow** chooses
+the capability, the **kernel** grants bounded access, the capability executes, and
+the kernel **validates the output before the state advances**:
+
+| Most agent systems | praxec |
+|---|---|
+| LLM chooses tools | Workflow chooses capabilities |
+| Prompt governs behavior | Kernel enforces transitions |
+| Tool list grows with complexity | Capability surface stays controlled |
+| Agent is the orchestrator | Workflow engine is primary |
+| Best-effort guardrails | Validated state transitions |
+
+The same YAML gives you schema validation, guards, human-approval gates,
+deterministic step-chaining, and an audit log — with your capabilities staying in
+whatever language they already use. MCP is one transport into the kernel, not the
+whole story: any MCP client (Claude Code, Cursor, or your own) drives it through a
+fixed two-tool surface.
 
 Conceptual guides and deeper narrative live at [praxec.dev](https://praxec.dev);
 this README covers what it is, how to install it, and how to use it.
@@ -234,8 +252,8 @@ Full guide: [docs/guides/checking-workflows.md](docs/guides/checking-workflows.m
 
 ## When to use it
 
-Use praxec when you have multiple tools and any of these matter: fewer tokens in
-context, audit, retries, approval gates, schema validation, or multi-step
+Use praxec when you have multiple capabilities and any of these matter: fewer
+tokens in context, audit, retries, approval gates, schema validation, or multi-step
 workflows. If you have a single MCP server with no governance needs, point the host
 at it directly instead.
 
