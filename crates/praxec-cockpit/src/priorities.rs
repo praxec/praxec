@@ -125,10 +125,10 @@ impl Priorities {
     /// On-disk path. Precedence: `$PRAXEC_PRIORITIES_FILE`, then
     /// `~/.praxec/priorities.json`, then a CWD fallback.
     pub fn path() -> PathBuf {
-        if let Ok(p) = std::env::var("PRAXEC_PRIORITIES_FILE") {
-            if !p.trim().is_empty() {
-                return PathBuf::from(p);
-            }
+        if let Ok(p) = std::env::var("PRAXEC_PRIORITIES_FILE")
+            && !p.trim().is_empty()
+        {
+            return PathBuf::from(p);
         }
         match dirs::home_dir() {
             Some(d) => d.join(".praxec").join("priorities.json"),

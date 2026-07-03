@@ -111,9 +111,10 @@ mod tests {
         assert!(h.starts_with("sha256:"));
         let hex = &h["sha256:".len()..];
         assert_eq!(hex.len(), 64);
-        assert!(hex
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            hex.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]

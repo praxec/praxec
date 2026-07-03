@@ -9,8 +9,8 @@
 use chrono::NaiveDate;
 use praxec_core::validate::Diagnostic;
 use praxec_llm_executor::cost::{
-    compute_cost_usd, doctor_check, lookup, validate_for_workflow, CostCatalogError,
-    COST_CATALOG_MISSING_ENTRY, COST_CATALOG_STALE, LAST_VERIFIED, STALENESS_THRESHOLD_DAYS,
+    COST_CATALOG_MISSING_ENTRY, COST_CATALOG_STALE, CostCatalogError, LAST_VERIFIED,
+    STALENESS_THRESHOLD_DAYS, compute_cost_usd, doctor_check, lookup, validate_for_workflow,
 };
 use serde_json::json;
 

@@ -5,7 +5,7 @@ use praxec_core::audit::{AuditEvent, AuditSink, NullAuditSink};
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// Human-in-the-loop executor. Records `human.approval.requested` and returns

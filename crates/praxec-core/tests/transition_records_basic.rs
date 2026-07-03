@@ -11,12 +11,12 @@
 
 use std::sync::Arc;
 
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditEvent, AuditSink, MemoryAuditSink};
 use praxec_core::model::{GetWorkflow, Principal, StartWorkflow, SubmitTransition};
 use praxec_core::ports::WorkflowStore;
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 mod common;
 use common::transition_records::*;

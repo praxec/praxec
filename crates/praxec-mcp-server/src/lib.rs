@@ -30,17 +30,17 @@ use praxec_core::discovery::{DiscoveryIndex, InMemoryDiscoveryIndex};
 use praxec_core::embeddings::{EmbeddingProvider, NoopEmbedder};
 use praxec_core::model::Principal;
 use praxec_core::runtime::WorkflowRuntime;
+use rmcp::ErrorData as McpError;
+use rmcp::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Implementation, InitializeRequestParams,
     InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
     ServerInfo, Tool,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
-use rmcp::ErrorData as McpError;
-use rmcp::ServerHandler;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-pub use progress::{progress_bridge, ProgressPeer};
+pub use progress::{ProgressPeer, progress_bridge};
 pub use tools::tool_definitions;
 
 /// SPEC §32 — read tool. Args dispatched by present-field shape via

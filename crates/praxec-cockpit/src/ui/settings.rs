@@ -5,10 +5,10 @@
 
 use crate::app::App;
 use crate::theme;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
-use ratatui::Frame;
 
 pub fn render_settings(f: &mut Frame, area: Rect, app: &App) {
     // Drilled into the priorities sub-panel → render that (shared renderer).

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, ExecuteResult};

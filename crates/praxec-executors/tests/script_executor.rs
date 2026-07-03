@@ -11,7 +11,7 @@ use chrono::Utc;
 use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::Executor;
 use praxec_executors::ScriptExecutor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn instance_with_scripts_library(lib: Value) -> WorkflowInstance {
     let definition = json!({

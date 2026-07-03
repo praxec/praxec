@@ -56,8 +56,8 @@ use praxec_core::audit::{AuditEvent, AuditSink};
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult};
 use praxec_core::ports::{Executor, ExecutorRegistry};
-use praxec_core::reliability::{execute_with_reliability, ReliabilityPolicy};
-use serde_json::{json, Value};
+use praxec_core::reliability::{ReliabilityPolicy, execute_with_reliability};
+use serde_json::{Value, json};
 use tokio::time::timeout;
 
 pub struct PipelineExecutor {
@@ -300,8 +300,8 @@ async fn run_steps(
             .unwrap_or_else(|e| tracing::warn!(error = %e, "audit emit failed; event dropped"));
 
         let _ = parent_idem; // segmentation happens via the threaded input + step index in audit
-                             // A present-but-malformed `reliability:` block on a step fails the
-                             // step (rather than silently running it with default reliability).
+        // A present-but-malformed `reliability:` block on a step fails the
+        // step (rather than silently running it with default reliability).
         let result = match ReliabilityPolicy::from_value(step_cfg.get("reliability")) {
             Ok(policy) => {
                 execute_with_reliability(

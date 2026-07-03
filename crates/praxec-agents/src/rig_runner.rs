@@ -18,18 +18,18 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use praxec_core::error::{ErrorClass, ExecutorError};
 
-use crate::error::{permanent, AgentErrorCode};
+use crate::error::{AgentErrorCode, permanent};
 use praxec_llm_executor::{ProviderFactory, StreamEvent, TurnRequest};
+use rig::OneOrMany;
 use rig::completion::{AssistantContent, Message, ToolDefinition};
 use rig::message::{ToolResult, ToolResultContent, UserContent};
-use rig::OneOrMany;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::session::{
     AgentResult, AgentRunOutcome, AgentRunReport, AgentSession, AgentSessionRunner, AgentStatus,
 };
+pub use crate::tool_budget::{MAX_TOOL_RESULT_BYTES, ToolHost, tool_definition_from};
 pub(crate) use crate::tool_budget::{enforce_history_budget, is_transient};
-pub use crate::tool_budget::{tool_definition_from, ToolHost, MAX_TOOL_RESULT_BYTES};
 // Test-only: a budget test asserts on `history_bytes` directly; re-export it for
 // `tests`' `use super::*` without flagging an unused import in the non-test build.
 #[cfg(test)]
@@ -734,7 +734,7 @@ async fn drain_turn(
                                 return Err(permanent(
                                     AgentErrorCode::MalformedResult,
                                     format!("final_answer payload is not JSON: {e}"),
-                                ))
+                                ));
                             }
                         },
                     }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use praxec_core::audit::{AuditEvent, AuditSink};
 use praxec_core::capability::{Capability, CapabilityRegistry, CapabilitySource};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::mcp::McpExecutor;
 

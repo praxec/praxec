@@ -12,13 +12,13 @@ use chrono::{Duration, Utc};
 use praxec_core::error::{ExecutorError, LlmErrorCode};
 use praxec_core::model::WorkflowInstance;
 use praxec_llm_executor::caps::{
-    apply_caps, build_post_turn_slot_updates, read_snapshot, session_started_at_key, SlotSnapshot,
-    RESERVED_LLM_PREFIX,
+    RESERVED_LLM_PREFIX, SlotSnapshot, apply_caps, build_post_turn_slot_updates, read_snapshot,
+    session_started_at_key,
 };
 use praxec_llm_executor::config::LlmExecutorConfig;
 use praxec_llm_executor::response::DrainedResponse;
 use praxec_llm_executor::stream_event::{StopReason, TokenUsage, ToolCallRequest};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn cfg() -> LlmExecutorConfig {
     LlmExecutorConfig {

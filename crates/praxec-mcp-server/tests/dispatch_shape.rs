@@ -10,16 +10,16 @@
 
 use std::sync::Arc;
 
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::Principal;
 use praxec_core::ports::ExecutorRegistry;
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
-use praxec_mcp_server::args::{CommandArgs, QueryArgs};
 use praxec_mcp_server::PraxecServer;
+use praxec_mcp_server::args::{CommandArgs, QueryArgs};
 use rmcp::model::{CallToolRequestParams, JsonObject};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── Test server helper ────────────────────────────────────────────────────────
 
@@ -544,10 +544,10 @@ async fn lexicon_define_via_dispatch_call_is_blocked_when_writes_disabled() {
 /// NOT return LEXICON_WRITES_DISABLED (human principal passes governance gate).
 #[tokio::test]
 async fn lexicon_define_via_dispatch_call_succeeds_when_writes_enabled() {
+    use praxec_core::WorkflowRuntime;
     use praxec_core::audit::{AuditSink, MemoryAuditSink};
     use praxec_core::guards::DefaultGuardEvaluator;
     use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-    use praxec_core::WorkflowRuntime;
 
     let cfg = json!({ "version": "1.0.0", "workflows": {} });
     let resolved = praxec_core::config::resolve(cfg).expect("resolve");

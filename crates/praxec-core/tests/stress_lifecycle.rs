@@ -357,10 +357,11 @@ async fn s14_transition_auto_branches() {
     s.start("demo", json!({}), anon()).await;
     s.submit("run_tests", json!({}), anon()).await;
     assert_eq!(s.last()["workflow"]["state"], "green");
-    assert!(s
-        .audit_event_types()
-        .iter()
-        .any(|t| t == "transition.branched"));
+    assert!(
+        s.audit_event_types()
+            .iter()
+            .any(|t| t == "transition.branched")
+    );
 
     // Tests fail → stay in red.
     let mut s = Scenario::build(yaml, Arc::new(AnyKind(Arc::new(ReturnsBool(false)))));

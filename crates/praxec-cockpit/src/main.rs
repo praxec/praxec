@@ -11,13 +11,13 @@ use anyhow::Result;
 use praxec_cockpit::agent::{self, AgentEvent, Turn};
 use praxec_cockpit::app::{App, ChatLine, Key, Mode};
 use praxec_cockpit::{snapshot, ui};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::Terminal;
 
 /// The value following `flag` in `args` (e.g. `--workflow wf_x` → `Some("wf_x")`).
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
@@ -222,28 +222,28 @@ fn run_loop(
             Duration::from_millis(120)
         };
         if event::poll(poll)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    let mapped = match key.code {
-                        // Ctrl-C is the global quit (printable keys now type).
-                        KeyCode::Char('c') if ctrl => Key::Quit,
-                        // Ctrl-E edits the selected Build-mode definition (⏎ launches).
-                        KeyCode::Char('e') if ctrl => Key::Edit,
-                        KeyCode::Tab => Key::ToggleMode,
-                        KeyCode::Enter => Key::Enter,
-                        KeyCode::Up => Key::Up,
-                        KeyCode::Down => Key::Down,
-                        KeyCode::Right => Key::Right,
-                        KeyCode::Left => Key::Left,
-                        KeyCode::Backspace => Key::Backspace,
-                        KeyCode::Esc => Key::Escape,
-                        // Printable keys feed the always-on chat input.
-                        KeyCode::Char(c) => Key::Char(c),
-                        _ => Key::Other,
-                    };
-                    app.on_key(mapped);
-                }
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let mapped = match key.code {
+                    // Ctrl-C is the global quit (printable keys now type).
+                    KeyCode::Char('c') if ctrl => Key::Quit,
+                    // Ctrl-E edits the selected Build-mode definition (⏎ launches).
+                    KeyCode::Char('e') if ctrl => Key::Edit,
+                    KeyCode::Tab => Key::ToggleMode,
+                    KeyCode::Enter => Key::Enter,
+                    KeyCode::Up => Key::Up,
+                    KeyCode::Down => Key::Down,
+                    KeyCode::Right => Key::Right,
+                    KeyCode::Left => Key::Left,
+                    KeyCode::Backspace => Key::Backspace,
+                    KeyCode::Esc => Key::Escape,
+                    // Printable keys feed the always-on chat input.
+                    KeyCode::Char(c) => Key::Char(c),
+                    _ => Key::Other,
+                };
+                app.on_key(mapped);
             }
         } else {
             app.tick(); // idle: advance the spinner

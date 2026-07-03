@@ -9,15 +9,15 @@ use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
-use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::{RoleClient, ServiceExt};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::idle::{with_idle_timeout, ActivityClock, ActivityTracked};
+use crate::idle::{ActivityClock, ActivityTracked, with_idle_timeout};
 
 /// Per-connection idle (no-activity) ceiling on connect/`initialize` and each
 /// tool call when the connection does not set `idleTimeoutMs`. This is an
@@ -701,7 +701,7 @@ mod transport_happy_path_tests {
         ServerCapabilities, ServerInfo, Tool,
     };
     use rmcp::service::{RequestContext, RoleServer};
-    use rmcp::{serve_server, ErrorData as McpError, ServerHandler};
+    use rmcp::{ErrorData as McpError, ServerHandler, serve_server};
     use std::time::Duration;
 
     #[derive(Clone)]

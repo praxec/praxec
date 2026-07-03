@@ -221,7 +221,7 @@ mod tests {
                     break MissionEvent::Status {
                         mission_id: String::new(),
                         status: String::new(),
-                    }
+                    };
                 }
             }
         };

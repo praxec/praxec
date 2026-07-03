@@ -6,7 +6,7 @@
 //! the surface is stable across configs — all workflow and discovery
 //! operations are reached by varying args, not the tool name.
 
-use praxec_mcp_server::{tool_definitions, STABLE_TOOL_NAMES};
+use praxec_mcp_server::{STABLE_TOOL_NAMES, tool_definitions};
 
 #[test]
 fn tool_list_matches_stable_names_exactly() {

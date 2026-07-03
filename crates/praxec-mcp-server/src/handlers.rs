@@ -4,16 +4,16 @@
 
 use praxec_core::audit::AuditEvent;
 use praxec_core::discovery::{DiscoveryKind, SearchRequest};
-use praxec_core::embeddings::{entry_embed_text, EmbeddingProvider};
+use praxec_core::embeddings::{EmbeddingProvider, entry_embed_text};
 use praxec_core::model::{GetWorkflow, Principal, StartWorkflow, SubmitTransition};
 use serde::de::DeserializeOwned;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::PraxecServer;
 use crate::args::{
     CommandArgs, DescribeArgs, ExplainArgs, GetArgs, QueryArgs, SearchArgs, StartArgs, SubmitArgs,
 };
 use crate::tools::parse_kind;
-use crate::PraxecServer;
 
 /// Caller-supplied argument errors that must surface at the MCP boundary as
 /// `invalid_params (-32602)` rather than `internal_error (-32603)`. The

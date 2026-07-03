@@ -61,11 +61,7 @@ impl Affinity {
             Affinity::Recon => scores.recon,
             Affinity::Agentic => scores.agentic,
         };
-        if v > 0.0 {
-            v
-        } else {
-            overall
-        }
+        if v > 0.0 { v } else { overall }
     }
 }
 

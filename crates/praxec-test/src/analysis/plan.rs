@@ -6,8 +6,8 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 use crate::analysis::dummy::dummy_for_schema;
-use crate::analysis::expr::{parse_clause, satisfying_value, GuardClause};
-use crate::analysis::output_map::{analyze_output, OutputSource};
+use crate::analysis::expr::{GuardClause, parse_clause, satisfying_value};
+use crate::analysis::output_map::{OutputSource, analyze_output};
 
 /// transitionName -> { outputField -> value }
 pub type OutputPlan = HashMap<String, Map<String, Value>>;

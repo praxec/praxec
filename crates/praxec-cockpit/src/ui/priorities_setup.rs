@@ -8,12 +8,12 @@
 //! first-run gate and the Settings entry — only the footer differs.
 
 use crate::app::App;
-use crate::priorities::{budget_label, Stance};
+use crate::priorities::{Stance, budget_label};
 use crate::theme;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
-use ratatui::Frame;
 
 const STANCE_ROWS: usize = Stance::ALL.len();
 const BUDGET_ROW: usize = STANCE_ROWS;

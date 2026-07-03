@@ -16,9 +16,9 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rmcp::Peer;
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::RoleServer;
-use rmcp::Peer;
 use serde_json::json;
 
 use praxec_core::audit::{AuditEvent, AuditSink};

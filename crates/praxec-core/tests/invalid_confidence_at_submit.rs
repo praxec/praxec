@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::error::ExecutorError;
 use praxec_core::guards::DefaultGuardEvaluator;
@@ -13,8 +14,7 @@ use praxec_core::model::{
 };
 use praxec_core::ports::{Executor, ExecutorRegistry};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Executor that returns one evidence record with the supplied confidence
 /// (which the test can set out-of-range to trigger SPEC §20.1 validation).

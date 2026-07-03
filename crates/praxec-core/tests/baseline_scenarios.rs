@@ -256,10 +256,11 @@ async fn b07_fallback_succeeds_after_primary_exhausts() {
     s.submit("go", json!({}), anon()).await;
 
     assert_eq!(s.last()["result"]["status"], "succeeded");
-    assert!(s
-        .audit_event_types()
-        .iter()
-        .any(|e| e == "fallback.selected"));
+    assert!(
+        s.audit_event_types()
+            .iter()
+            .any(|e| e == "fallback.selected")
+    );
 }
 
 /// **B-08.** Capability reference: same definition reused in proxy and

@@ -12,7 +12,7 @@
 //! the cockpit actually reads survived. One read per test (atomic).
 
 use praxec_cockpit::model::GatewayResponse;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const SCHEMA: &str = include_str!("../../../schemas/workflow-response.schema.json");
 

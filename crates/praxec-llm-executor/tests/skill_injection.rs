@@ -19,7 +19,7 @@ use praxec_core::error::{ExecutorError, LlmErrorCode};
 use praxec_core::model::{ExecuteRequest, ExecuteResult, Principal, WorkflowInstance};
 use praxec_core::ports::{Executor, TransitionResolver};
 use praxec_llm_executor::LlmExecutor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Resolver offering exactly the `advance` transition — matches the tool
 /// call the `happy_path` mock scenario emits, so execution reaches the

@@ -50,14 +50,14 @@ use praxec_agents::rig_runner::tool_definition_from;
 use praxec_llm_executor::{
     DefaultProviderFactory, ProviderFactory, StreamEvent, ToolCallRequest, TurnRequest,
 };
+use rig::OneOrMany;
 use rig::completion::{AssistantContent, Message, ToolDefinition};
 use rig::message::{ToolResult, ToolResultContent, UserContent};
-use rig::OneOrMany;
+use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{Peer, RoleClient};
 use rmcp::transport::TokioChildProcess;
-use rmcp::ServiceExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const CONFIG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -600,11 +600,7 @@ fn model_panel() -> Vec<String> {
 }
 
 fn b(v: bool) -> &'static str {
-    if v {
-        " ✓"
-    } else {
-        " ·"
-    }
+    if v { " ✓" } else { " ·" }
 }
 
 /// Print a recorded run verbatim — the model's prose and every tool call/result,

@@ -18,7 +18,7 @@ use praxec_core::model::{
 use praxec_core::ports::{Executor, ExecutorRegistry, WorkflowStore};
 use praxec_core::runtime::WorkflowRuntime;
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const SCHEMA: &str = include_str!("../../../schemas/workflow-response.schema.json");
 

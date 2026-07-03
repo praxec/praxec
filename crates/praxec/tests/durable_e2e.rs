@@ -12,11 +12,11 @@
 
 use std::io::Write;
 
+use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{Peer, RoleClient};
 use rmcp::transport::TokioChildProcess;
-use rmcp::ServiceExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The shared fixture (human-operator hello-flow) + an on-disk SQLite store.
 const HELLO_FLOW: &str = include_str!("../../../examples/hello-flow.yaml");

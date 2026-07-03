@@ -818,15 +818,19 @@ mod tests {
     }
     #[test]
     fn from_response_yields_no_outcomes_when_absent() {
-        assert!(MissionState::from_response(&serde_json::json!({}))
-            .outcomes
-            .is_empty());
+        assert!(
+            MissionState::from_response(&serde_json::json!({}))
+                .outcomes
+                .is_empty()
+        );
     }
     #[test]
     fn from_response_yields_no_legal_actions_when_absent() {
-        assert!(MissionState::from_response(&serde_json::json!({}))
-            .legal_actions
-            .is_empty());
+        assert!(
+            MissionState::from_response(&serde_json::json!({}))
+                .legal_actions
+                .is_empty()
+        );
     }
 
     // ── drive_mission outcomes ───────────────────────────────────────────────

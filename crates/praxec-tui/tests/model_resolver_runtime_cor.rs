@@ -15,10 +15,10 @@ use praxec_core::model_resolver::{
     Binding, ConfigSource, FailureClass, ModelRef, ModelsFile, Provider, ProviderFeatures, Resolver,
 };
 use praxec_tui::interpreter::{
-    classify_spawn_error, spawn_with_cor, AgentRegistry, InterpreterError, ResolutionError,
-    ResolvedAgent, ResolvedBindingList, SubAgentSpawner, YamlAgentRegistry,
+    AgentRegistry, InterpreterError, ResolutionError, ResolvedAgent, ResolvedBindingList,
+    SubAgentSpawner, YamlAgentRegistry, classify_spawn_error, spawn_with_cor,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 // ── test double ────────────────────────────────────────────────────────────

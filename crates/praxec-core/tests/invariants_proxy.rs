@@ -8,7 +8,7 @@ mod common;
 use common::invariants::*;
 
 use praxec_core::model::{Principal, StartWorkflow, SubmitTransition};
-use praxec_core::proxy_workflow::{compile_proxy_workflow, DEFAULT_PROXY_WORKFLOW_ID};
+use praxec_core::proxy_workflow::{DEFAULT_PROXY_WORKFLOW_ID, compile_proxy_workflow};
 use serde_json::json;
 
 // ---- 1. Proxy exposure compiles to a null-op workflow transition -----------

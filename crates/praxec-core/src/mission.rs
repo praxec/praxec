@@ -8,7 +8,7 @@
 //! `completed`, `failed`, `cancelled`, `timed_out`) that conflated the two and
 //! collapsed every terminal to a success-shaped `"completed"`.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Why a mission `failed`. Kept as a *reason* on `Failed` (not a peer status) so
 /// the top-level enum stays at four and the cockpit badges four colors.
@@ -178,11 +178,11 @@ pub fn derive_mission_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rstest::rstest;
     use FailReason::{Cancelled, Error, GuardUnmet, TimedOut};
     use MissionStatus::{Failed, Running, Succeeded, Waiting};
     use StatusHint as H;
     use TerminalOutcome::{Failure, Success};
+    use rstest::rstest;
 
     // G1 — the full status-derivation truth table (testing-strategy). Each row is
     // an equivalence class or a key interaction; each compiles to its own test.

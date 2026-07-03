@@ -5,11 +5,12 @@ use std::io::Write;
 fn raw_content_sha256_has_sha256_prefix_and_64_hex() {
     let h = raw_content_sha256("a: 1\n");
     assert_eq!(h.len(), "sha256:".len() + 64);
-    assert!(h
-        .strip_prefix("sha256:")
-        .unwrap()
-        .chars()
-        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    assert!(
+        h.strip_prefix("sha256:")
+            .unwrap()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    );
 }
 
 #[test]
@@ -177,9 +178,10 @@ fn malformed_git_https_include_is_rejected_with_shape_error() {
 fn raw_content_sha256_has_sha256_prefix_and_64_lowercase_hex() {
     let h = raw_content_sha256("a: 1\n");
     assert_eq!(h.len(), "sha256:".len() + 64);
-    assert!(h
-        .strip_prefix("sha256:")
-        .unwrap()
-        .chars()
-        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    assert!(
+        h.strip_prefix("sha256:")
+            .unwrap()
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    );
 }

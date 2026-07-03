@@ -19,7 +19,7 @@ use praxec_core::error::{ExecutorError, LlmErrorCode};
 use praxec_core::model::{ExecuteRequest, Principal, WorkflowInstance};
 use praxec_core::ports::{Executor, TransitionResolver};
 use praxec_llm_executor::LlmExecutor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Minimal `TransitionResolver` mock for D4 — the shell never invokes
 /// it (execute() short-circuits on the config-parse boundary), so an

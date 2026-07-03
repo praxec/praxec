@@ -6,11 +6,11 @@
 
 use crate::model::{DefinitionDetail, GatewayResponse, LibraryEntry, LibraryListing};
 use anyhow::{Context, Result};
+use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
-use rmcp::ServiceExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The cockpit's gateway surface: read a mission, and submit a transition (the
 /// governed write — exactly the two stable tools the model uses, SPEC §32).

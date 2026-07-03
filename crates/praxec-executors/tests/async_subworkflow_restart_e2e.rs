@@ -30,7 +30,7 @@ use praxec_core::runtime::WorkflowRuntime;
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
 use praxec_executors::default_registry_with_late_workflow;
 use praxec_executors::{CliConnections, McpConnections, McpExecutor};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Build a runtime over a CALLER-SUPPLIED store, so two successive runtimes can
 /// share one store (the restart simulation: same durable state, fresh process).

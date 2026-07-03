@@ -18,13 +18,13 @@ use std::net::SocketAddr;
 use async_trait::async_trait;
 use praxec_core::{
     embeddings::{
-        cosine_similarity, entry_embed_text, parse_embeddings_config, EmbeddingError,
-        EmbeddingProvider, HttpEmbedder, NoopEmbedder, RequestFormat, EMBEDDING_COSINE_THRESHOLD,
+        EMBEDDING_COSINE_THRESHOLD, EmbeddingError, EmbeddingProvider, HttpEmbedder, NoopEmbedder,
+        RequestFormat, cosine_similarity, entry_embed_text, parse_embeddings_config,
     },
     lexicon::build_entry,
     lexicon_candidates::rank_candidates_with_embedding,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

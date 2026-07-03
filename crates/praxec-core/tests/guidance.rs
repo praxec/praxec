@@ -4,11 +4,11 @@
 //! the live workflow instance at render time. Unresolved paths render as a
 //! marked stub. Interpolation is single-pass and non-recursive.
 
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::{Principal, StartWorkflow};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
 use serde_json::json;
 use std::sync::Arc;
 

@@ -9,7 +9,7 @@
 //! ranks candidates by [`affinity_fit`](crate::model_resolver::affinity_fit)
 //! against a step's needed affinities.
 
-use crate::model_resolver::{affinity_fit, Affinity, AffinityScores};
+use crate::model_resolver::{Affinity, AffinityScores, affinity_fit};
 use serde::{Deserialize, Serialize};
 
 /// The canonical reachability check (keyless/local, or key present). Re-exported

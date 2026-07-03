@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use praxec_core::model::{Principal, StartWorkflow, SubmitTransition};
 use praxec_core::ports::Executor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---- 5. Depth limit stops chain early ---------------------------------------
 

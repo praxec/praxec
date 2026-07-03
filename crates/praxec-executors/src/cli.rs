@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
 use uuid::Uuid;
 

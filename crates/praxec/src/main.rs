@@ -38,8 +38,8 @@ mod agent {
     use std::sync::Arc;
 
     use praxec::gateway::{DiagnosticProvider, OverlayCtx, OverlayRegistrar};
-    use praxec_core::ports::Executor;
     use praxec_core::SingleKindOverlay;
+    use praxec_core::ports::Executor;
     use serde_json::Value;
 
     struct RejectingAgentModelResolver;
@@ -237,12 +237,16 @@ mod agent {
             // untrusted is disabled rather than run against a divergent authority.
             let bwrap = praxec_core::sandbox::BwrapProvider::new();
             if praxec_core::sandbox::SandboxProvider::preflight(&bwrap).usable {
-                if let Some(locks) = ctx.runtime.repo_locks() {
-                    agent_executor = agent_executor.with_untrusted_support(Arc::new(bwrap), locks);
-                } else {
-                    tracing::warn!(
-                        "untrusted kind: agent disabled: runtime has no repo_locks to share"
-                    );
+                match ctx.runtime.repo_locks() {
+                    Some(locks) => {
+                        agent_executor =
+                            agent_executor.with_untrusted_support(Arc::new(bwrap), locks);
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "untrusted kind: agent disabled: runtime has no repo_locks to share"
+                        );
+                    }
                 }
             }
 

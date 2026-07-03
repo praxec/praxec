@@ -9,8 +9,8 @@ use chrono::{Duration, Utc};
 use praxec_core::model_resolver::{Binding, ModelsFile, Provider, ProviderFeatures};
 use praxec_core::providers::ProviderId;
 use praxec_tui::doctor_probe_cache::{
-    probe_binding, read_cache, refresh_cache, write_cache, BindingProbeRecord, ProbeCache,
-    ProbeStatus,
+    BindingProbeRecord, ProbeCache, ProbeStatus, probe_binding, read_cache, refresh_cache,
+    write_cache,
 };
 use std::time::Duration as StdDuration;
 
@@ -168,7 +168,8 @@ async fn cloud_provider_without_credential_reports_no_credential() {
     // Make sure these are unset for this test — env mutations are
     // serial-unsafe with other env tests in the same file, so we keep
     // this one explicit + local.
-    std::env::remove_var("ANTHROPIC_API_KEY");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
     let client = reqwest::Client::new();
     let b = Binding {
         provider: Provider::Known(ProviderId::Anthropic),
@@ -187,7 +188,8 @@ async fn openrouter_is_probed_not_skipped() {
     // a dead key). Without a key it reports NoCredential — an honest
     // "unverified", never a passing Skipped. We assert it is no longer
     // Skipped; the no-key path drives the classification without network I/O.
-    std::env::remove_var("OPENROUTER_API_KEY");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("OPENROUTER_API_KEY") };
     let client = reqwest::Client::new();
     let b = Binding {
         provider: Provider::Known(ProviderId::Openrouter),

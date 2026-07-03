@@ -21,11 +21,11 @@
 use std::sync::Arc;
 
 use rmcp::model::JsonObject;
-use schemars::gen::{SchemaGenerator, SchemaSettings};
-use schemars::schema::{InstanceType, Schema, SchemaObject};
 use schemars::JsonSchema;
+use schemars::r#gen::{SchemaGenerator, SchemaSettings};
+use schemars::schema::{InstanceType, Schema, SchemaObject};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -116,8 +116,8 @@ pub(crate) fn integer_schema(_: &mut SchemaGenerator) -> Schema {
     .into()
 }
 
-pub(crate) fn limit_schema(gen: &mut SchemaGenerator) -> Schema {
-    let mut schema = match integer_schema(gen) {
+pub(crate) fn limit_schema(r#gen: &mut SchemaGenerator) -> Schema {
+    let mut schema = match integer_schema(r#gen) {
         Schema::Object(o) => o,
         Schema::Bool(_) => unreachable!("integer_schema always returns Schema::Object"),
     };

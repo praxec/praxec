@@ -4,7 +4,7 @@
 //! `praxec.command`. Any change to either is a visible MCP surface
 //! change and must be intentional.
 
-use praxec_mcp_server::{tool_definitions, TOOL_COMMAND, TOOL_QUERY};
+use praxec_mcp_server::{TOOL_COMMAND, TOOL_QUERY, tool_definitions};
 use serde_json::Value;
 
 fn schema_of(name: &str) -> Value {

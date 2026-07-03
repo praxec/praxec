@@ -19,8 +19,8 @@ use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::ExecutorRegistry;
-use praxec_executors::{default_registry_with_mcp, CliConnections, McpConnections, McpExecutor};
-use serde_json::{json, Value};
+use praxec_executors::{CliConnections, McpConnections, McpExecutor, default_registry_with_mcp};
+use serde_json::{Value, json};
 
 fn instance_stub() -> WorkflowInstance {
     WorkflowInstance {
@@ -390,7 +390,8 @@ async fn join_any_emits_cancelled_event_for_dropped_siblings() {
         .collect();
     let total_concluded = cancelled.len() + completed.len();
     assert_eq!(
-        total_concluded, 4,
+        total_concluded,
+        4,
         "every branch must conclude as either completed or cancelled; got: {} completed + {} cancelled",
         completed.len(),
         cancelled.len()

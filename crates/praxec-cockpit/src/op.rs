@@ -11,9 +11,9 @@
 //! around). *Action* ops (act on a HITL ask, start/advance a mission) are added
 //! later and route through the runtime's governed `praxec.command`.
 
-use crate::map::fleet::Fleet;
 use crate::map::Level;
-use serde_json::{json, Value};
+use crate::map::fleet::Fleet;
+use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CockpitOp {

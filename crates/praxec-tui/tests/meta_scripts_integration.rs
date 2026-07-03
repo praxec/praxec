@@ -28,7 +28,7 @@ use chrono::Utc;
 use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::Executor;
 use praxec_executors::ScriptExecutor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Locate the `px` binary. This test lives in `praxec-tui`, the
 /// crate that OWNS the `px` binary, so Cargo sets `CARGO_BIN_EXE_px`
@@ -267,8 +267,7 @@ async fn install_agents_config_writes_atomically_and_rolls_back_on_invalid() {
     let praxec_bin = praxec_bin_path();
 
     // Valid YAML — should write and round-trip OK
-    let valid_yaml =
-        "version: 1\ndefault:\n  - provider:\n      name: anthropic\n    model: claude-sonnet-4-6\n";
+    let valid_yaml = "version: 1\ndefault:\n  - provider:\n      name: anthropic\n    model: claude-sonnet-4-6\n";
     let req = exec_request(
         "install.agents-config",
         vec![json!(valid_yaml), json!(target.to_str().unwrap())],

@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::config;
 use praxec_core::guards::DefaultGuardEvaluator;
@@ -23,14 +24,13 @@ use praxec_core::store::{
     ConfigDefinitionStore, InMemoryGuidanceAcknowledgmentStore, InMemoryWorkflowStore,
     InMemoryWritableDefinitionStore,
 };
-use praxec_core::WorkflowRuntime;
 use praxec_executors::{
     DryRunExecutor, HashMapExecutorRegistry, NoopExecutor, RegistryExecutor,
     StructuralAnalysisExecutor,
 };
 use praxec_mcp_server::{PraxecServer, TOOL_COMMAND, TOOL_QUERY};
 use rmcp::model::{CallToolRequestParams, JsonObject};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn authoring_workflow_yaml() -> Value {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

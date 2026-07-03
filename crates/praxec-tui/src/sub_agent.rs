@@ -42,7 +42,7 @@
 
 use std::time::Duration;
 
-use aether_cli::headless::{run::run as run_aether_headless, OutputFormat, RunConfig};
+use aether_cli::headless::{OutputFormat, RunConfig, run::run as run_aether_headless};
 use aether_cli::mcp_config_args::McpConfigArgs;
 use aether_core::agent_spec::AgentSpec;
 use async_trait::async_trait;
@@ -106,16 +106,15 @@ impl SubAgentSpawner for AetherSubAgentSpawner {
         if let ProviderFeatures::OpenAI(OpenAIFeatures {
             reasoning_effort: Some(raw),
         }) = &agent.features
+            && reasoning_effort.is_none()
         {
-            if reasoning_effort.is_none() {
-                tracing::warn!(
-                    agent = %agent.label,
-                    provider = %agent.provider,
-                    raw = %raw,
-                    "OpenAI reasoning_effort `{raw}` not recognized — passing through with no \
-                     effort level (valid: low|medium|high|xhigh)"
-                );
-            }
+            tracing::warn!(
+                agent = %agent.label,
+                provider = %agent.provider,
+                raw = %raw,
+                "OpenAI reasoning_effort `{raw}` not recognized — passing through with no \
+                 effort level (valid: low|medium|high|xhigh)"
+            );
         }
 
         let workflow_state = workflow_response

@@ -5,7 +5,7 @@
 //!  - `write_atomic`: filesystem-touching helper. Verified via tempdir.
 
 use praxec_core::model_resolver::ModelsFile;
-use praxec_tui::migrate::{cli_args_to_yaml, write_atomic, MigrationError};
+use praxec_tui::migrate::{MigrationError, cli_args_to_yaml, write_atomic};
 
 fn flag(s: &str) -> String {
     s.to_string()
@@ -64,10 +64,12 @@ fn duplicate_names_last_wins() {
     // The promoted default is the FIRST CLI arg by build order, even
     // though `coding` was redefined later — we promote based on CLI
     // order, not by-name-resolution order.
-    assert!(parsed
-        .overrides
-        .iter()
-        .any(|(_, v)| v.iter().any(|b| b.model == "gpt-5")));
+    assert!(
+        parsed
+            .overrides
+            .iter()
+            .any(|(_, v)| v.iter().any(|b| b.model == "gpt-5"))
+    );
 }
 
 // ── error cases ────────────────────────────────────────────────────────────

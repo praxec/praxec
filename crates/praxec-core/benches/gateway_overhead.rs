@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 use praxec_core::audit::{AuditEvent, AuditSink, MemoryAuditSink, NullAuditSink};
 use praxec_core::model::WorkflowInstance;

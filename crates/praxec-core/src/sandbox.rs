@@ -632,7 +632,8 @@ mod tests {
         // A host secret in the ambient env must NOT be visible; an explicitly
         // passed var must be.
         // SAFETY: test-local, unique name.
-        std::env::set_var("PRAXEC_SANDBOX_SECRET_T", "leaked");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("PRAXEC_SANDBOX_SECRET_T", "leaked") };
         let spec = SandboxSpec {
             workspace: None,
             command: vec![

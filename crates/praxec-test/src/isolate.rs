@@ -174,11 +174,11 @@ fn classify(resp: &Value) -> SubmitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use praxec_core::WorkflowRuntime;
     use praxec_core::audit::MemoryAuditSink;
     use praxec_core::guards::DefaultGuardEvaluator;
     use praxec_core::ports::{DefinitionStore, ExecutorRegistry};
     use praxec_core::store::ConfigDefinitionStore;
-    use praxec_core::WorkflowRuntime;
     use serde_json::json;
 
     async fn build() -> (WorkflowRuntime, Arc<InMemoryWorkflowStore>, Value) {

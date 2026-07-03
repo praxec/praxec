@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use praxec_core::discovery::DiscoveryKind;
 use rmcp::model::Tool;
 
-use crate::args::{schema_for_args, CommandArgs, QueryArgs};
+use crate::args::{CommandArgs, QueryArgs, schema_for_args};
 use crate::{TOOL_COMMAND, TOOL_QUERY};
 
 pub(crate) fn parse_kind(s: &str) -> Option<DiscoveryKind> {

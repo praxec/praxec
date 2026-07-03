@@ -32,7 +32,7 @@ impl ExecutorRegistry for MockRegistry {
 mod tests {
     use super::*;
     use praxec_core::model::WorkflowInstance;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn instance_stub() -> WorkflowInstance {
         WorkflowInstance {

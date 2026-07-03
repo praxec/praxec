@@ -35,12 +35,12 @@ pub mod walk;
 
 pub use classify::FailureClass;
 pub use config::{
-    affinity_fit, Affinity, AffinityScores, AnthropicFeatures, Binding, GoogleFeatures,
-    ModelConfigError, ModelsFile, OpenAIFeatures, OverrideKey, Provider, ProviderFeatures, Tier,
+    Affinity, AffinityScores, AnthropicFeatures, Binding, GoogleFeatures, ModelConfigError,
+    ModelsFile, OpenAIFeatures, OverrideKey, Provider, ProviderFeatures, Tier, affinity_fit,
 };
 pub use preflight::{
-    api_key_env_for, api_key_env_for_slug, verify_all_primary_bindings, verify_primary_bindings,
-    PreflightError,
+    PreflightError, api_key_env_for, api_key_env_for_slug, verify_all_primary_bindings,
+    verify_primary_bindings,
 };
 pub use walk::{
     AttemptRecord, ConfigSource, ModelRef, ModelRefParseError, ModelResolutionExhausted, Resolver,

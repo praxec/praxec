@@ -14,7 +14,7 @@ use chrono::Utc;
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::{Evidence, Principal, WorkflowInstance};
 use praxec_core::ports::{EvidenceStore, GuardEvaluator};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// In-memory evidence store seeded at construction time so tests can pin
 /// exactly which records the guard sees.

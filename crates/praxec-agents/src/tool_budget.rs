@@ -1,10 +1,10 @@
-use crate::rig_runner::{RigSessionRunner, DEFAULT_MAX_HISTORY_BYTES, DEFAULT_MAX_TURNS};
+use crate::rig_runner::{DEFAULT_MAX_HISTORY_BYTES, DEFAULT_MAX_TURNS, RigSessionRunner};
 use crate::spill::SpillStore;
 use async_trait::async_trait;
 use praxec_core::error::{ErrorClass, ExecutorError};
 use praxec_llm_executor::{DefaultProviderFactory, ProviderFactory};
-use rig::completion::{AssistantContent, Message, ToolDefinition};
 use rig::OneOrMany;
+use rig::completion::{AssistantContent, Message, ToolDefinition};
 use serde_json::json;
 use std::sync::Arc;
 /// Exposes + executes the MCP tools an agent may call. **Stateless** by design:

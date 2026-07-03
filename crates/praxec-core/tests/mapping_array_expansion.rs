@@ -5,7 +5,7 @@
 //! Atomic FMECA-style assertions: one path-shape per test.
 
 use praxec_core::mapping::read_in_scopes;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn no_args() -> Value {
     json!({})

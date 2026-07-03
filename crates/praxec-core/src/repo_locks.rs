@@ -320,10 +320,12 @@ mod tests {
             .await
             .unwrap();
         advance(&t, 20); // past the 10s TTL
-        assert!(space
-            .acquire(&[p("a")], "h2", Duration::from_secs(10))
-            .await
-            .is_ok());
+        assert!(
+            space
+                .acquire(&[p("a")], "h2", Duration::from_secs(10))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -337,10 +339,12 @@ mod tests {
         advance(&t, 8);
         space.heartbeat(&[p("a")], "h1").await; // expires now extends to t+18
         advance(&t, 4); // t=12: past original t10, but within the heartbeat-extended t18
-        assert!(space
-            .acquire(&[p("a")], "h2", Duration::from_secs(10))
-            .await
-            .is_err());
+        assert!(
+            space
+                .acquire(&[p("a")], "h2", Duration::from_secs(10))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

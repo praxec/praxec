@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
+use praxec_core::InMemoryWorkflowStore;
 use praxec_core::model::WorkflowInstance;
 use praxec_core::ports::WorkflowStore;
-use praxec_core::InMemoryWorkflowStore;
 
 fn instance(id: &str, version: u64) -> WorkflowInstance {
     WorkflowInstance {

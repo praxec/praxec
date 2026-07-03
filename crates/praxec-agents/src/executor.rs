@@ -19,16 +19,16 @@ use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult, ExecutorTeleme
 use praxec_core::model_resolver::FailureClass;
 use praxec_core::ports::Executor;
 use praxec_core::promotion::{
-    run_untrusted_agent, PromotionOutcome, UntrustedAgentRun, UntrustedOutcome,
+    PromotionOutcome, UntrustedAgentRun, UntrustedOutcome, run_untrusted_agent,
 };
 use praxec_core::repo_locks::RepoLocks;
 use praxec_core::sandbox::{Egress, ResourceLimits, SandboxProvider};
-use praxec_core::skills::{assemble_system_message, SkillAssemblyError};
+use praxec_core::skills::{SkillAssemblyError, assemble_system_message};
 use praxec_core::templating::render_template;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::AgentExecutorConfig;
-use crate::error::{permanent, AgentErrorCode};
+use crate::error::{AgentErrorCode, permanent};
 use crate::session::{
     AgentModelResolver, AgentRunOutcome, AgentSession, AgentSessionRunner, AgentStatus,
 };
@@ -286,7 +286,9 @@ impl Executor for AgentExecutor {
         .map_err(|e| match e {
             SkillAssemblyError::SubjectUnknown(s) => permanent(
                 AgentErrorCode::SkillSubjectUnknown,
-                format!("skill '{s}' is declared in scope but absent from the snapshot `_skillsLibrary`"),
+                format!(
+                    "skill '{s}' is declared in scope but absent from the snapshot `_skillsLibrary`"
+                ),
             ),
             SkillAssemblyError::BodyMissing(s) => permanent(
                 AgentErrorCode::SkillBodyMissing,
@@ -819,14 +821,16 @@ mod tests {
     fn setup_repo(d: &Path) {
         use std::process::Command;
         let g = |args: &[&str]| {
-            assert!(Command::new("git")
-                .arg("-C")
-                .arg(d)
-                .args(args)
-                .output()
-                .unwrap()
-                .status
-                .success());
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(d)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
         };
         Command::new("git")
             .args(["init", "-q", "-b", "main"])
@@ -863,9 +867,11 @@ mod tests {
             .await
             .expect("untrusted run");
         assert_eq!(result.output["outcome"], "promoted");
-        assert!(std::fs::read_to_string(repo.path().join("a.txt"))
-            .unwrap()
-            .contains("agent-edited"));
+        assert!(
+            std::fs::read_to_string(repo.path().join("a.txt"))
+                .unwrap()
+                .contains("agent-edited")
+        );
     }
 
     #[tokio::test]
