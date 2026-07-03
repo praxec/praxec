@@ -36,9 +36,9 @@ use praxec_core::error::ExecutorError;
 use praxec_core::mapping::read_in_scopes;
 use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
 use reqwest::Method;
-use serde_json::{json, Value};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// `restConnection` entries from the gateway config, keyed by name.
@@ -391,10 +391,10 @@ fn render_template(template: &Value, request: &ExecuteRequest) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_status, render_path, StatusClass};
+    use super::{StatusClass, classify_status, render_path};
     use praxec_core::error::ExecutorError;
     use praxec_core::model::{ExecuteRequest, WorkflowInstance};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn req(args: Value, context: Value) -> ExecuteRequest {
         ExecuteRequest {

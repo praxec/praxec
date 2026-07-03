@@ -401,14 +401,16 @@ fn seed_origin_repo(dir: &std::path::Path) {
     )
     .unwrap();
     let git = |args: &[&str]| {
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success());
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
     };
     Command::new("git")
         .arg("init")

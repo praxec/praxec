@@ -416,10 +416,10 @@ impl MissionView {
                     return Some(n);
                 }
                 *cur += 1;
-                if n.expanded {
-                    if let Some(hit) = walk(&mut n.children, target, cur) {
-                        return Some(hit);
-                    }
+                if n.expanded
+                    && let Some(hit) = walk(&mut n.children, target, cur)
+                {
+                    return Some(hit);
                 }
             }
             None
@@ -436,10 +436,10 @@ impl MissionView {
                     return Some(n);
                 }
                 *cur += 1;
-                if n.expanded {
-                    if let Some(hit) = walk(&n.children, target, cur) {
-                        return Some(hit);
-                    }
+                if n.expanded
+                    && let Some(hit) = walk(&n.children, target, cur)
+                {
+                    return Some(hit);
                 }
             }
             None

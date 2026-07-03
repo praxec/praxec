@@ -27,7 +27,7 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Subcommand;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use praxec_core::model::Principal;
 
@@ -182,17 +182,16 @@ fn run_define(args: DefineArgs) -> Result<ExitCode> {
     )?;
 
     // Add optional fields to the entry object.
-    if let Some(long) = &args.definition_long {
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("definition_long".to_string(), json!(long));
-        }
+    if let Some(long) = &args.definition_long
+        && let Some(obj) = entry.as_object_mut()
+    {
+        obj.insert("definition_long".to_string(), json!(long));
     }
-    if let Some(aliases_vec) = &aliases {
-        if !aliases_vec.is_empty() {
-            if let Some(obj) = entry.as_object_mut() {
-                obj.insert("aliases".to_string(), json!(aliases_vec));
-            }
-        }
+    if let Some(aliases_vec) = &aliases
+        && !aliases_vec.is_empty()
+        && let Some(obj) = entry.as_object_mut()
+    {
+        obj.insert("aliases".to_string(), json!(aliases_vec));
     }
 
     // Build in-memory overlay (initialised from config base, if available).
@@ -203,10 +202,9 @@ fn run_define(args: DefineArgs) -> Result<ExitCode> {
     // Since CLI uses a human principal, this always passes (humans bypass the gate).
     let is_human = principal.is_human();
     let merged = build_merged_definition(&overlay, args.config.as_deref())?;
-    if !is_human {
-        if let Err(msg) = praxec_core::lexicon::define_allowed(&merged, &args.term, false) {
-            anyhow::bail!("{msg}");
-        }
+    if !is_human && let Err(msg) = praxec_core::lexicon::define_allowed(&merged, &args.term, false)
+    {
+        anyhow::bail!("{msg}");
     }
 
     // Write to overlay.

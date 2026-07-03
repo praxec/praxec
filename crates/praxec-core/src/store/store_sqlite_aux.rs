@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::model::Evidence;
 use crate::ports::{EvidenceStore, GuidanceAcknowledgmentStore, ScriptAcknowledgmentStore};

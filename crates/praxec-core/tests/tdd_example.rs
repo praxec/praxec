@@ -14,6 +14,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::config::load_resolved;
 use praxec_core::error::ExecutorError;
@@ -23,8 +24,7 @@ use praxec_core::model::{
 };
 use praxec_core::ports::{Executor, ExecutorRegistry};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// One result from a stubbed test runner: did the suite pass, and what
 /// was the test count at that moment.

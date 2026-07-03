@@ -2,8 +2,8 @@
 //! into the discovery index so the catalog is filterable by task-class (via the
 //! existing `tags` search) and the Phase-3 selector can read it back.
 
-use praxec_core::discovery::discovery_indexer::index_from_config;
 use praxec_core::discovery::PROCESS_TAG_PREFIX;
+use praxec_core::discovery::discovery_indexer::index_from_config;
 use serde_json::json;
 
 fn ship_flow(process: Option<&str>) -> serde_json::Value {

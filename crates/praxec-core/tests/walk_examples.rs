@@ -14,6 +14,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use praxec_core::{
+    WorkflowRuntime,
     audit::{AuditSink, MemoryAuditSink},
     config,
     error::ExecutorError,
@@ -21,9 +22,8 @@ use praxec_core::{
     model::{ExecuteRequest, ExecuteResult, Principal, StartWorkflow, SubmitTransition},
     ports::{Executor, ExecutorRegistry},
     store::{ConfigDefinitionStore, InMemoryWorkflowStore},
-    WorkflowRuntime,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── Always-noop executor & registry ────────────────────────────────────────
 

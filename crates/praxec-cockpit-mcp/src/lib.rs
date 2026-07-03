@@ -36,9 +36,10 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use praxec_cockpit::map::fleet::Fleet;
 use praxec_cockpit::map::Level;
+use praxec_cockpit::map::fleet::Fleet;
 use praxec_cockpit::op::{self, CockpitOp, OpTool};
+use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, Implementation, InitializeRequestParams,
     InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
@@ -46,9 +47,8 @@ use rmcp::model::{
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::transport::stdio;
-use rmcp::ErrorData as McpError;
 use rmcp::{ServerHandler, ServiceExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The cockpit ops as MCP [`Tool`]s, projected from the canonical
 /// [`op::op_tools`] catalog.

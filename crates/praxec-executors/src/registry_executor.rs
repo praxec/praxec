@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, ExecuteResult};
 use praxec_core::ports::{DefinitionStoreWritable, Executor};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Construct with `Some(writable)` when the flag is on, `None` when off.
 /// The executor's behavior is governed by the variant: when `None`, every

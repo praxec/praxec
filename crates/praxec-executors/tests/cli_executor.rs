@@ -11,7 +11,7 @@ use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::Executor;
 use praxec_executors::{CliConnections, CliExecutor};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn executor() -> CliExecutor {
     CliExecutor::new(Arc::new(CliConnections::from_config(&json!({}))))

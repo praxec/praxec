@@ -16,7 +16,7 @@
 //! never a panic), in line with the runtime leaving `cost_usd: null`.
 
 use crate::audit::AuditEvent;
-use crate::model_catalog::{cost_usd_in, ModelEntry};
+use crate::model_catalog::{ModelEntry, cost_usd_in};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -320,7 +320,7 @@ pub fn render_human(r: &CostReport) -> String {
 mod tests {
     use super::*;
     use crate::model_resolver::AffinityScores;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     /// A catalogued model with explicit prices so the arithmetic is checkable.
     fn model(name: &str, intelligence: f64, input: f64, output: f64) -> ModelEntry {

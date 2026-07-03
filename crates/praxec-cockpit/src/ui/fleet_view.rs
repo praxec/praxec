@@ -2,11 +2,11 @@
 
 use crate::map::fleet::{Fleet, Health, Mission};
 use crate::theme;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
-use ratatui::Frame;
 
 const TILE_W: u16 = 34;
 const TILE_H: u16 = 5;
@@ -93,9 +93,9 @@ fn render_tile(f: &mut Frame, area: Rect, m: &Mission, selected: bool) {
 mod tests {
     use super::*;
     use crate::map::fleet::Fleet;
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
-    use ratatui::Terminal;
 
     fn render_fleet_to_string(fleet: &Fleet, cursor: usize, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
@@ -114,9 +114,11 @@ mod tests {
         let area = Rect::new(0, 0, 80, 24);
         let rects = tile_rects(area, 4);
         assert_eq!(rects.len(), 4);
-        assert!(rects
-            .iter()
-            .all(|r| r.right() <= area.right() && r.bottom() <= area.bottom()));
+        assert!(
+            rects
+                .iter()
+                .all(|r| r.right() <= area.right() && r.bottom() <= area.bottom())
+        );
     }
 
     #[test]

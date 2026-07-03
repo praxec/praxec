@@ -90,7 +90,7 @@ impl ProviderFactory for DefaultProviderFactory {
         // Each arm builds the provider's typed client + agent; `collect_rig` is
         // generic over the resulting model so the drain is written once.
         macro_rules! run {
-            ($client:expr) => {{
+            ($client:expr_2021) => {{
                 let client = $client.map_err(provider_factory_err)?;
                 let mut b = client.agent(model);
                 if let Some(s) = system.as_deref() {

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::model::{Principal, StartWorkflow, SubmitTransition};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 mod common;
 use common::transition_records::*;

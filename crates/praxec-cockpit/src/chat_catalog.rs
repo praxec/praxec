@@ -13,7 +13,7 @@ use praxec_embeddings::CostMagnitude;
 // model, shared by the cockpit picker and a `kind: llm` step's `needs:`). The
 // cockpit reads `ModelEntry` under its local name and layers stance on top.
 pub use praxec_core::model_catalog::ModelEntry as ChatModelOption;
-pub use praxec_core::model_resolver::{affinity_fit as fit, Affinity, AffinityScores};
+pub use praxec_core::model_resolver::{Affinity, AffinityScores, affinity_fit as fit};
 
 /// Output-token multiplier for a reasoning level (configurable —
 /// `tuning.reasoning_multipliers`). An unlisted level falls back to `medium`.

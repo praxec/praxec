@@ -43,7 +43,7 @@
 //! transition.
 
 use aether_cli::mcp_config_args::McpConfigArgs;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// Make praxec the **sole** MCP server.
 ///
@@ -95,32 +95,32 @@ fn sole_mcp_config() -> Result<String> {
 /// Pub(crate) so the binary_discovery test suite can exercise it directly.
 pub(crate) fn find_praxec_binary() -> Result<String> {
     // 1. Operator override via env var — strict.
-    if let Ok(override_path) = std::env::var("MCP_PRAXEC_PATH") {
-        if !override_path.trim().is_empty() {
-            let p = std::path::Path::new(&override_path);
-            if !p.exists() {
-                return Err(anyhow!(
-                    "MCP_PRAXEC_NOT_FOUND: MCP_PRAXEC_PATH is set to \
+    if let Ok(override_path) = std::env::var("MCP_PRAXEC_PATH")
+        && !override_path.trim().is_empty()
+    {
+        let p = std::path::Path::new(&override_path);
+        if !p.exists() {
+            return Err(anyhow!(
+                "MCP_PRAXEC_NOT_FOUND: MCP_PRAXEC_PATH is set to \
                      '{override_path}' but no file exists at that path. \
                      Unset the env var to fall back to discovery, or build the \
                      px binary."
-                ));
-            }
-            return Ok(override_path);
+            ));
         }
+        return Ok(override_path);
     }
 
     // 2. Sibling next to our own binary (bundled deployment).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join("px");
-            if sibling.exists() {
-                return Ok(sibling.to_string_lossy().to_string());
-            }
-            let sibling_exe = dir.join("px.exe");
-            if sibling_exe.exists() {
-                return Ok(sibling_exe.to_string_lossy().to_string());
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("px");
+        if sibling.exists() {
+            return Ok(sibling.to_string_lossy().to_string());
+        }
+        let sibling_exe = dir.join("px.exe");
+        if sibling_exe.exists() {
+            return Ok(sibling_exe.to_string_lossy().to_string());
         }
     }
 

@@ -2,14 +2,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub(crate) use crate::gateway_config::{
-    ack_guards_used, apply_overlays, build_audit_sink, build_workflow_store, cli_principal,
-    headless_policy_from, is_ephemeral_path, load_config, parse_since, resolve_embedder,
     ApprovalsCommand, AuditCommand, Cli, Command, CostCommand, InspectCommand, IntentCommand,
-    OneshotServer,
+    OneshotServer, ack_guards_used, apply_overlays, build_audit_sink, build_workflow_store,
+    cli_principal, headless_policy_from, is_ephemeral_path, load_config, parse_since,
+    resolve_embedder,
 };
 pub use crate::gateway_config::{
-    build_evidence_store, build_guidance_ack_store, build_script_ack_store,
-    collect_diagnostics_with, GatewayOverlays, OverlayCtx,
+    GatewayOverlays, OverlayCtx, build_evidence_store, build_guidance_ack_store,
+    build_script_ack_store, collect_diagnostics_with,
 };
 // `llm_overlay_registrar` is gated on the optional llm-executor feature; its
 // only caller (main.rs) is also gated, so the re-export must carry the same
@@ -18,6 +18,8 @@ pub use crate::gateway_config::{
 pub use crate::gateway_config::llm_overlay_registrar;
 use anyhow::Context;
 use clap::Parser;
+use praxec_core::SingleKindOverlay;
+use praxec_core::WorkflowRuntime;
 use praxec_core::capability::CapabilityRegistry;
 use praxec_core::discovery::{
     DiscoveryIndex, DiscoveryKind, InMemoryDiscoveryIndex, SemanticDiscoveryIndex,
@@ -28,16 +30,14 @@ use praxec_core::ports::{
 };
 use praxec_core::sandbox::{BwrapProvider, OciProvider, SandboxProvider};
 use praxec_core::store::ConfigDefinitionStore;
-use praxec_core::SingleKindOverlay;
-use praxec_core::WorkflowRuntime;
 use praxec_executors::{
-    default_registry_with_late_workflow, import_capabilities, CliConnections, McpConnections,
-    McpExecutor, RegistryExecutor, ScriptExecutor,
+    CliConnections, McpConnections, McpExecutor, RegistryExecutor, ScriptExecutor,
+    default_registry_with_late_workflow, import_capabilities,
 };
 use praxec_mcp_server::PraxecServer;
-use rmcp::transport::stdio;
 use rmcp::ServiceExt;
-use serde_json::{json, Value};
+use rmcp::transport::stdio;
+use serde_json::{Value, json};
 use tracing_subscriber::EnvFilter;
 
 // ── Overlay seam ─────────────────────────────────────────────────────────────
@@ -266,8 +266,8 @@ async fn orchestrate(
     overlays: GatewayOverlays,
 ) -> anyhow::Result<()> {
     use praxec_agents::orchestrator::{
-        drive_mission, run_headless_consumer, AgentChooser, DriveOutcome, MissionGateway,
-        RuntimeMissionGateway,
+        AgentChooser, DriveOutcome, MissionGateway, RuntimeMissionGateway, drive_mission,
+        run_headless_consumer,
     };
     use praxec_agents::rig_runner::RigSessionRunner;
     use praxec_agents::session::AgentSessionRunner;
@@ -1653,8 +1653,8 @@ async fn fuzz_live(
     overlays: GatewayOverlays,
 ) -> anyhow::Result<()> {
     use praxec_agents::orchestrator::{
-        drive_mission, run_headless_consumer, AgentChooser, HeadlessPolicy, MissionGateway,
-        RuntimeMissionGateway,
+        AgentChooser, HeadlessPolicy, MissionGateway, RuntimeMissionGateway, drive_mission,
+        run_headless_consumer,
     };
     use praxec_agents::rig_runner::RigSessionRunner;
     use praxec_agents::session::AgentSessionRunner;
@@ -1715,7 +1715,9 @@ async fn fuzz_live(
             {
                 Some(mid) => mid,
                 None => {
-                    println!("✗ {id} [run {i}] — EngineError: started '{id}' but no workflow id was returned");
+                    println!(
+                        "✗ {id} [run {i}] — EngineError: started '{id}' but no workflow id was returned"
+                    );
                     any_violation = true;
                     continue;
                 }
@@ -1862,7 +1864,7 @@ async fn cost_report_cmd(
     since: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    use praxec_core::cost_report::{build_cost_report, render_human, ReportOptions};
+    use praxec_core::cost_report::{ReportOptions, build_cost_report, render_human};
 
     let config = load_config(config_path)?;
     let sink = build_audit_sink(&config)?;
@@ -1904,7 +1906,7 @@ async fn intent_report_cmd(
     json: bool,
 ) -> anyhow::Result<()> {
     use praxec_core::intent_index::{
-        aggregate, observations_from_audit, render_human, IntentParams,
+        IntentParams, aggregate, observations_from_audit, render_human,
     };
 
     let config = load_config(config_path)?;
@@ -1973,7 +1975,7 @@ async fn cost_propose_cmd(
 ) -> anyhow::Result<()> {
     use praxec_core::audit::AuditEvent;
     use praxec_core::deescalation::{
-        aggregate, apply_to_chain, observations_from_audit, propose, DeescalationParams,
+        DeescalationParams, aggregate, apply_to_chain, observations_from_audit, propose,
     };
 
     let config = load_config(config_path)?;
@@ -2334,10 +2336,10 @@ fn audit_tail(config_path: &PathBuf, filter: &Option<String>) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::{
-        ack_guards_used, aggregate_calls, build_audit_sink, build_evidence_store,
+        GatewayOverlays, ack_guards_used, aggregate_calls, build_audit_sink, build_evidence_store,
         build_runtime_for_orchestrate, build_workflow_store, drive_outcome_to_result,
         guard_durable_serve, headless_policy_from, is_ephemeral_path, maybe_enable_authoring,
-        maybe_enable_sandbox, resolve_embedder, GatewayOverlays,
+        maybe_enable_sandbox, resolve_embedder,
     };
     use praxec_agents::orchestrator::DriveOutcome;
     use praxec_agents::orchestrator::HeadlessPolicy;
@@ -2747,18 +2749,22 @@ mod tests {
         assert!(err.contains("ephemeral"), "{err}");
 
         // explicit opt-in overrides (dev/testing).
-        assert!(guard_durable_serve(&json!({
-            "gateway": { "allow_ephemeral": true },
-            "store": { "kind": "sqlite", "path": "/tmp/fg/praxec.db" }
-        }))
-        .is_ok());
+        assert!(
+            guard_durable_serve(&json!({
+                "gateway": { "allow_ephemeral": true },
+                "store": { "kind": "sqlite", "path": "/tmp/fg/praxec.db" }
+            }))
+            .is_ok()
+        );
 
         // a persistent path is accepted.
-        assert!(guard_durable_serve(&json!({
-            "store": { "kind": "sqlite", "path": "/home/u/.fg/praxec.db" },
-            "audit": { "sink": "file", "path": "/home/u/audit" }
-        }))
-        .is_ok());
+        assert!(
+            guard_durable_serve(&json!({
+                "store": { "kind": "sqlite", "path": "/home/u/.fg/praxec.db" },
+                "audit": { "sink": "file", "path": "/home/u/audit" }
+            }))
+            .is_ok()
+        );
     }
 
     // ── aggregate_calls — pure audit-record aggregation ─────────────────────

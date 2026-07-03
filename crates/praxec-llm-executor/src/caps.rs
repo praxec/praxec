@@ -35,7 +35,7 @@
 use chrono::{DateTime, Utc};
 use praxec_core::error::{ExecutorError, LlmErrorCode};
 use praxec_core::model::WorkflowInstance;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::LlmExecutorConfig;
 use crate::response::DrainedResponse;

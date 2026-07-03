@@ -23,7 +23,7 @@
 //! with no store or clock, exactly like [`cost_report`](crate::cost_report).
 
 use crate::audit::AuditEvent;
-use crate::cost_report::{build_cost_report, ReportOptions};
+use crate::cost_report::{ReportOptions, build_cost_report};
 use crate::model_catalog::ModelEntry;
 use serde::Serialize;
 use serde_json::Value;

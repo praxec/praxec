@@ -3,8 +3,8 @@
 //! row by row. Drives `praxec-cockpit --snapshot`.
 
 use crate::app::App;
-use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 /// Render `app` at `width`×`height` and return the screen as newline-separated
 /// rows (glyphs only — styling is not encoded in text output).

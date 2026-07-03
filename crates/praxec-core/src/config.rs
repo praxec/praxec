@@ -21,11 +21,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context};
-use serde_json::{json, Map, Value};
+use anyhow::{Context, anyhow, bail};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::discovery::{Lifecycle, ScriptVerb, Verb, BLESSED_SCRIPT_ROOTS, BLESSED_SUBJECT_ROOTS};
+use crate::discovery::{BLESSED_SCRIPT_ROOTS, BLESSED_SUBJECT_ROOTS, Lifecycle, ScriptVerb, Verb};
 
 /// Recursively load `path` as YAML and merge any `include:` files into it.
 /// Includes resolve relative to the file that lists them.

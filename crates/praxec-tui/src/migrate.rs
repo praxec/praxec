@@ -40,7 +40,9 @@ pub enum MigrationError {
     )]
     UnmappableNames(Vec<String>),
 
-    #[error("unknown provider `{provider}` in --agent {name}={provider}/{model}. Valid: anthropic | openai | gemini | openrouter | ollama | llamacpp | bedrock (use a `custom` endpoint in models.yaml for anything else; note: `google`→`gemini`, `lmstudio`→`custom`)")]
+    #[error(
+        "unknown provider `{provider}` in --agent {name}={provider}/{model}. Valid: anthropic | openai | gemini | openrouter | ollama | llamacpp | bedrock (use a `custom` endpoint in models.yaml for anything else; note: `google`→`gemini`, `lmstudio`→`custom`)"
+    )]
     UnknownProvider {
         name: String,
         provider: String,

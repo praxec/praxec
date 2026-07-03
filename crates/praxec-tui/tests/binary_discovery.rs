@@ -18,8 +18,10 @@ fn env_lock() -> &'static Mutex<()> {
 
 /// Helper: unset both env vars we care about so each test starts clean.
 fn clear_env() {
-    std::env::remove_var("MCP_PRAXEC_PATH");
-    std::env::remove_var("PRAXEC_LOG_DIR");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("MCP_PRAXEC_PATH") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("PRAXEC_LOG_DIR") };
 }
 
 // ── find_praxec_binary (B.3) ──────────────────────────────────────────────
@@ -35,7 +37,8 @@ fn clear_env() {
 fn praxec_path_with_nonexistent_file_should_fail_fast() {
     let _g = env_lock().lock().unwrap();
     clear_env();
-    std::env::set_var("MCP_PRAXEC_PATH", "/definitely/does/not/exist/praxec");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("MCP_PRAXEC_PATH", "/definitely/does/not/exist/praxec") };
     // The function is pub(crate); we can only run it through the binary.
     // This test documents the contract by spawning the TUI in
     // headless/agent mode and asserting the error message.
@@ -50,7 +53,8 @@ fn praxec_path_with_nonexistent_file_should_fail_fast() {
 fn praxec_path_empty_string_falls_through_to_discovery() {
     let _g = env_lock().lock().unwrap();
     clear_env();
-    std::env::set_var("MCP_PRAXEC_PATH", "");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("MCP_PRAXEC_PATH", "") };
     // Empty string is treated as unset — fall through to sibling/PATH.
     // (Documented in find_praxec_binary; covered by unit-test of the
     // function once it's exposed pub or moved to a lib target.)
@@ -65,10 +69,10 @@ fn praxec_path_empty_string_falls_through_to_discovery() {
 // honest as a behavioural mirror.
 
 fn replicate_resolve_log_dir() -> PathBuf {
-    if let Ok(override_path) = std::env::var("PRAXEC_LOG_DIR") {
-        if !override_path.trim().is_empty() {
-            return PathBuf::from(override_path);
-        }
+    if let Ok(override_path) = std::env::var("PRAXEC_LOG_DIR")
+        && !override_path.trim().is_empty()
+    {
+        return PathBuf::from(override_path);
     }
     match dirs::home_dir() {
         Some(cache) => cache.join(".praxec").join("logs"),
@@ -80,7 +84,8 @@ fn replicate_resolve_log_dir() -> PathBuf {
 fn praxec_log_dir_env_var_is_honored_when_set() {
     let _g = env_lock().lock().unwrap();
     clear_env();
-    std::env::set_var("PRAXEC_LOG_DIR", "/tmp/test-praxec-log-dir");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("PRAXEC_LOG_DIR", "/tmp/test-praxec-log-dir") };
     let resolved = replicate_resolve_log_dir();
     assert_eq!(resolved, PathBuf::from("/tmp/test-praxec-log-dir"));
     clear_env();
@@ -90,7 +95,8 @@ fn praxec_log_dir_env_var_is_honored_when_set() {
 fn praxec_log_dir_empty_value_falls_through_to_praxec_home() {
     let _g = env_lock().lock().unwrap();
     clear_env();
-    std::env::set_var("PRAXEC_LOG_DIR", "");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("PRAXEC_LOG_DIR", "") };
     let resolved = replicate_resolve_log_dir();
     let expected = dirs::home_dir()
         .map(|c| c.join(".praxec").join("logs"))
@@ -103,7 +109,8 @@ fn praxec_log_dir_empty_value_falls_through_to_praxec_home() {
 fn praxec_log_dir_whitespace_only_falls_through_to_praxec_home() {
     let _g = env_lock().lock().unwrap();
     clear_env();
-    std::env::set_var("PRAXEC_LOG_DIR", "   \t  ");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("PRAXEC_LOG_DIR", "   \t  ") };
     let resolved = replicate_resolve_log_dir();
     let expected = dirs::home_dir()
         .map(|c| c.join(".praxec").join("logs"))

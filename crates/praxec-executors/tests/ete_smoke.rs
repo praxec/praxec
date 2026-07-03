@@ -9,14 +9,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::config::load_resolved;
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::{Principal, StartWorkflow, SubmitTransition};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
-use praxec_executors::{default_registry_with_mcp, CliConnections, McpConnections, McpExecutor};
-use serde_json::{json, Value};
+use praxec_executors::{CliConnections, McpConnections, McpExecutor, default_registry_with_mcp};
+use serde_json::{Value, json};
 
 fn examples_dir() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

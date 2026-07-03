@@ -5,7 +5,7 @@ use chrono::Utc;
 use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::Executor;
 use praxec_executors::IngestExecutor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn instance_stub() -> WorkflowInstance {
     WorkflowInstance {
@@ -57,14 +57,18 @@ async fn frontmatter_with_explicit_verb_produces_fragment() {
     assert_eq!(f["subject"].as_str(), Some("review.style.house-voice"));
     assert_eq!(f["verb"].as_str(), Some("review"));
     assert_eq!(f["lifecycle"].as_str(), Some("experimental"));
-    assert!(f["body"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("reader's problem"));
-    assert!(f["hash"]
-        .as_str()
-        .unwrap_or_default()
-        .starts_with("sha256:"));
+    assert!(
+        f["body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reader's problem")
+    );
+    assert!(
+        f["hash"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("sha256:")
+    );
 }
 
 // ── Positive: verb synonym mapping with VERB_MAPPED diagnostic ──────────────

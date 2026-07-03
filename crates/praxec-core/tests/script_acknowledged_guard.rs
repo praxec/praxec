@@ -10,7 +10,7 @@ use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::{Principal, WorkflowInstance};
 use praxec_core::ports::{GuardEvaluator, ScriptAcknowledgmentStore};
 use praxec_core::store::InMemoryScriptAcknowledgmentStore;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn instance_with_script(subject: &str, hash: &str) -> WorkflowInstance {
     WorkflowInstance {

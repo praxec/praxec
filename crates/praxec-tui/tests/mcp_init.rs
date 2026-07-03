@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use praxec_tui::mcp_init::{run_init, McpInitArgs};
+use praxec_tui::mcp_init::{McpInitArgs, run_init};
 use tempfile::TempDir;
 
 fn args(dir: PathBuf) -> McpInitArgs {

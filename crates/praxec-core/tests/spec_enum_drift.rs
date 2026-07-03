@@ -14,7 +14,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use praxec_core::discovery::{ScriptVerb, Verb, BLESSED_SCRIPT_ROOTS, BLESSED_SUBJECT_ROOTS};
+use praxec_core::discovery::{BLESSED_SCRIPT_ROOTS, BLESSED_SUBJECT_ROOTS, ScriptVerb, Verb};
 
 fn workspace_root() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

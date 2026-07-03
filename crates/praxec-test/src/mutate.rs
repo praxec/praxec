@@ -27,7 +27,7 @@
 //! mis-navigates. All mutations use direct `Map::get_mut` calls on the
 //! `workflows` object to avoid this.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

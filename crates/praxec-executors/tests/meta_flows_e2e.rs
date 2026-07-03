@@ -18,7 +18,7 @@ use praxec_core::model::{ExecuteRequest, ExecuteResult, Principal, StartWorkflow
 use praxec_core::ports::{Executor, ExecutorRegistry, WorkflowStore};
 use praxec_core::runtime::WorkflowRuntime;
 use praxec_core::store::{ConfigDefinitionStore, InMemoryEvidenceStore, InMemoryWorkflowStore};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 struct CapShortCircuit;

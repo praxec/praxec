@@ -8,7 +8,7 @@
 //! tool — never praxec's own command tool — so an agent cannot drive its own
 //! blocked workflow. This doctor additionally rejects the reserved self name.
 
-use praxec_core::validate::{for_each_executor_site, Diagnostic};
+use praxec_core::validate::{Diagnostic, for_each_executor_site};
 use serde_json::Value;
 
 use crate::config::AgentExecutorConfig;

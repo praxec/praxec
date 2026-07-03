@@ -2,7 +2,7 @@
 //! mismatch detection, and surfacing on emitted refs.
 
 use praxec_core::config::{self, compute_skill_hash, normalize_for_hash};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn config_with_body(body: &str) -> Value {
     json!({
@@ -121,11 +121,11 @@ impl praxec_core::ExecutorRegistry for NoopRegistry {
 
 #[tokio::test]
 async fn emitted_ref_carries_hash_field() {
+    use praxec_core::WorkflowRuntime;
     use praxec_core::audit::{AuditSink, MemoryAuditSink};
     use praxec_core::guards::DefaultGuardEvaluator;
     use praxec_core::model::{Principal, StartWorkflow};
     use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-    use praxec_core::WorkflowRuntime;
     use std::sync::Arc;
 
     let resolved = config::resolve(config_with_body("ref-carry test")).expect("config resolves");

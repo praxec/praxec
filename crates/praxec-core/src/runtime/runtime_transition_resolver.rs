@@ -22,8 +22,8 @@ use serde_json::Value;
 
 use crate::model::{Principal, WorkflowInstance};
 use crate::ports::TransitionResolver;
-use crate::runtime::runtime_links::{link_filter_byguards, links};
 use crate::runtime::WorkflowRuntime;
+use crate::runtime::runtime_links::{link_filter_byguards, links};
 
 /// SPEC §33 D3 — runtime-backed transition resolver for the in-runtime
 /// LLM executor. Returns the same guard-filtered link list that

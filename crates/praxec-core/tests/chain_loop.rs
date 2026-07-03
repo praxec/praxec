@@ -9,11 +9,12 @@
 //!    surfaces `LLM_CHAIN_DEPTH_EXCEEDED`.
 
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::error::{ErrorClass, ExecutorError};
 use praxec_core::guards::DefaultGuardEvaluator;
@@ -22,8 +23,7 @@ use praxec_core::model::{
 };
 use praxec_core::ports::{Executor, ExecutorRegistry};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---- shared executors ------------------------------------------------------
 

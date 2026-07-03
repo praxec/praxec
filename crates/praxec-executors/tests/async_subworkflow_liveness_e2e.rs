@@ -21,7 +21,7 @@ use praxec_core::runtime::WorkflowRuntime;
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
 use praxec_executors::default_registry_with_late_workflow;
 use praxec_executors::{CliConnections, McpConnections, McpExecutor};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn human() -> Principal {
     Principal {

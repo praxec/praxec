@@ -34,7 +34,7 @@ use praxec_core::audit::MemoryAuditSink;
 use praxec_core::model::{ExecuteRequest, Principal, WorkflowInstance};
 use praxec_core::ports::{Executor, TransitionResolver};
 use praxec_llm_executor::{DefaultProviderFactory, LlmExecutor, ProviderFactory};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A static three-transition resolver matching the `examples/issue_triager.yaml`
 /// triage state. Hand-coded so the contract test is self-contained and

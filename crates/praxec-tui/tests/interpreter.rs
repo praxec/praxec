@@ -12,10 +12,10 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use praxec_tui::interpreter::{
-    walk_workflow, InterpreterError, LegacyAgentRegistry, McpToolCaller, ResolutionError,
-    ResolvedAgent, SubAgentSpawner, SUB_AGENT_RETRY_BUDGET,
+    InterpreterError, LegacyAgentRegistry, McpToolCaller, ResolutionError, ResolvedAgent,
+    SUB_AGENT_RETRY_BUDGET, SubAgentSpawner, walk_workflow,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── test doubles ───────────────────────────────────────────────────────────
 

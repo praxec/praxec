@@ -15,7 +15,7 @@ use praxec_core::discovery::Verb;
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub struct IngestExecutor;
 

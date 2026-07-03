@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use praxec_core::ConfigDefinitionStore;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::config::resolve;
 use praxec_core::error::ExecutorError;
@@ -17,8 +18,7 @@ use praxec_core::model::{Principal, StartWorkflow, SubmitTransition};
 use praxec_core::ports::{Executor, ExecutorRegistry};
 use praxec_core::runtime::WorkflowRuntime;
 use praxec_core::store::InMemoryWorkflowStore;
-use praxec_core::ConfigDefinitionStore;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct NoopExec;
 #[async_trait::async_trait]

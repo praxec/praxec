@@ -5,7 +5,7 @@
 //! any MCP server plumbing.
 
 use praxec_core::lexicon_candidates::{levenshtein, rank_candidates};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 

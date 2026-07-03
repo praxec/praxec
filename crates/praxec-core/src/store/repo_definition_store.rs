@@ -23,11 +23,11 @@ use std::process::Command;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::audit::{AuditEvent, AuditSink};
 use crate::ports::{DefinitionStore, DefinitionStoreWritable};
-use crate::repo::{load_manifest, RepoLayout};
+use crate::repo::{RepoLayout, load_manifest};
 
 /// One configured resource repo the store can route to.
 pub struct RepoEntry {
@@ -290,13 +290,15 @@ mod tests {
         audit: Arc<dyn AuditSink>,
     ) -> (tempfile::TempDir, RepoDefinitionStore) {
         let dir = tempfile::tempdir().unwrap();
-        assert!(Command::new("git")
-            .arg("init")
-            .arg(dir.path())
-            .output()
-            .unwrap()
-            .status
-            .success());
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg(dir.path())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
         std::fs::write(
             dir.path().join("praxec.repo.yaml"),
             "schema: praxec.repo/v1\nname: t\nnamespace: test\nversion: 0.0.0\n",
@@ -386,35 +388,41 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // A bare origin, and a working clone with a manifest (namespace `test`).
         let origin = tmp.path().join("origin.git");
-        assert!(Command::new("git")
-            .args(["init", "--bare", "-b", "main"])
-            .arg(&origin)
-            .output()
-            .unwrap()
-            .status
-            .success());
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", "-b", "main"])
+                .arg(&origin)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
         let work = tmp.path().join("work");
-        assert!(Command::new("git")
-            .args(["clone", &format!("file://{}", origin.display())])
-            .arg(&work)
-            .output()
-            .unwrap()
-            .status
-            .success());
+        assert!(
+            Command::new("git")
+                .args(["clone", &format!("file://{}", origin.display())])
+                .arg(&work)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
         std::fs::write(
             work.join("praxec.repo.yaml"),
             "schema: praxec.repo/v1\nname: t\nnamespace: test\nversion: 0.0.0\n",
         )
         .unwrap();
         let git = |args: &[&str]| {
-            assert!(Command::new("git")
-                .arg("-C")
-                .arg(&work)
-                .args(args)
-                .output()
-                .unwrap()
-                .status
-                .success());
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&work)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
         };
         git(&["add", "."]);
         git(&[

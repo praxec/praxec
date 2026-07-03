@@ -929,7 +929,7 @@ impl App {
     /// the exit: the first-run gate proceeds to the next gate; from Settings it
     /// returns to the menu. Either way the choice is persisted on exit.
     fn on_key_priorities(&mut self, key: Key, first_run: bool) {
-        use crate::priorities::{Stance, BUDGET_CAPS};
+        use crate::priorities::{BUDGET_CAPS, Stance};
         let stance_rows = Stance::ALL.len();
         match key {
             Key::Up => self.prio_cursor = self.prio_cursor.saturating_sub(1),
@@ -2360,10 +2360,11 @@ mod tests {
         let mut app = App::new();
         app.conn = Some(Box::new(gw));
         app.launch_definition("flow.x");
-        assert!(app
-            .chat_log
-            .last()
-            .is_some_and(|l| l.text.contains("Couldn't launch")));
+        assert!(
+            app.chat_log
+                .last()
+                .is_some_and(|l| l.text.contains("Couldn't launch"))
+        );
     }
 
     #[test]
@@ -2372,10 +2373,11 @@ mod tests {
         app.conn = None;
         app.inbox = vec![inbox_item("m1")];
         app.answer_inbox(0, "approve");
-        assert!(app
-            .chat_log
-            .last()
-            .is_some_and(|l| l.text.contains("not connected")));
+        assert!(
+            app.chat_log
+                .last()
+                .is_some_and(|l| l.text.contains("not connected"))
+        );
     }
 
     #[test]
@@ -2387,10 +2389,11 @@ mod tests {
         app.conn = Some(Box::new(gw));
         app.inbox = vec![inbox_item("m1")];
         app.answer_inbox(0, "approve");
-        assert!(app
-            .chat_log
-            .last()
-            .is_some_and(|l| l.text.contains("Couldn't answer")));
+        assert!(
+            app.chat_log
+                .last()
+                .is_some_and(|l| l.text.contains("Couldn't answer"))
+        );
     }
 
     #[test]
@@ -2596,12 +2599,13 @@ mod tests {
         app.on_key(Key::Char('y'));
         app.on_key(Key::Char('o'));
         app.on_key(Key::Enter); // send
-        assert!(app
-            .mission
-            .as_ref()
-            .unwrap()
-            .needs_you_with_context()
-            .is_empty());
+        assert!(
+            app.mission
+                .as_ref()
+                .unwrap()
+                .needs_you_with_context()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2634,12 +2638,13 @@ mod tests {
         app.on_key(Key::Enter); // → list
         app.on_key(Key::Enter); // → drill in
         app.on_key(Key::Enter); // → take the choice, resolving the ask
-        assert!(app
-            .mission
-            .as_ref()
-            .unwrap()
-            .needs_you_with_context()
-            .is_empty());
+        assert!(
+            app.mission
+                .as_ref()
+                .unwrap()
+                .needs_you_with_context()
+                .is_empty()
+        );
     }
 
     // ── map altitude (Fleet ⇄ Mission) ───────────────────────────────────────

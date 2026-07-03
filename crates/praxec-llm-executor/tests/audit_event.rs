@@ -8,7 +8,7 @@
 //! also "fix" without noticing.
 
 use praxec_core::error::LlmErrorCode;
-use praxec_llm_executor::audit::{build_invocation_event, InvocationContext, REASONING_ELIDED};
+use praxec_llm_executor::audit::{InvocationContext, REASONING_ELIDED, build_invocation_event};
 use praxec_llm_executor::response::DrainedResponse;
 use praxec_llm_executor::stream_event::{StopReason, TokenUsage, ToolCallRequest};
 use serde_json::Value;

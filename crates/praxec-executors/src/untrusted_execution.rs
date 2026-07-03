@@ -206,9 +206,10 @@ mod tests {
             })),
             &[],
         );
-        assert!(r
-            .expect("nested `do` raw cli must be rejected")
-            .contains("branch `do`"));
+        assert!(
+            r.expect("nested `do` raw cli must be rejected")
+                .contains("branch `do`")
+        );
     }
 
     #[test]
@@ -233,9 +234,11 @@ mod tests {
     fn own_connections_block_is_rejected() {
         let mut def = wf(json!({ "kind": "script", "subject": "build.x" }));
         def["connections"] = json!({ "evil": { "kind": "cli", "command": "curl" } });
-        assert!(untrusted_execution_reason(&def, &[])
-            .unwrap()
-            .contains("connections:"));
+        assert!(
+            untrusted_execution_reason(&def, &[])
+                .unwrap()
+                .contains("connections:")
+        );
     }
 
     #[test]

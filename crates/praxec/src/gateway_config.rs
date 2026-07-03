@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{
     AuditSink, FileAuditSink, MemoryAuditSink, NullAuditSink, RotationInterval, StderrAuditSink,
 };
@@ -23,15 +24,14 @@ use praxec_core::store::{
 };
 use praxec_core::store_file::FileWorkflowStore;
 use praxec_core::store_sqlite::SqliteWorkflowStore;
-use praxec_core::WorkflowRuntime;
 
 use crate::gateway::{DiagnosticProvider, OverlayRegistrar};
 
 // llm_overlay_registrar (gated on the optional llm-executor dep/feature).
 #[cfg(feature = "llm-executor")]
-use praxec_core::ports::Executor;
-#[cfg(feature = "llm-executor")]
 use praxec_core::SingleKindOverlay;
+#[cfg(feature = "llm-executor")]
+use praxec_core::ports::Executor;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -389,7 +389,7 @@ pub fn collect_diagnostics_with(
     diagnostics.extend(praxec_executors::kind_doctor::doctor_check(config));
     #[cfg(feature = "llm-executor")]
     {
-        use crate::affinity_resolver::{resolve_affinity_to_model, AgentsYamlAffinityResolver};
+        use crate::affinity_resolver::{AgentsYamlAffinityResolver, resolve_affinity_to_model};
 
         let today = chrono::Utc::now().date_naive();
 

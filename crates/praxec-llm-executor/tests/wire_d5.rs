@@ -15,7 +15,7 @@ use praxec_llm_executor::stream_event::{StopReason, StreamEvent, TokenUsage, Too
 use praxec_llm_executor::{
     config::LlmExecutorConfig,
     prompt::links_to_tool_definitions,
-    response::{drain_stream, validate, DrainedResponse},
+    response::{DrainedResponse, drain_stream, validate},
 };
 use serde_json::json;
 

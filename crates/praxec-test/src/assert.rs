@@ -115,9 +115,10 @@ mod tests {
             ..Default::default()
         };
         let out = evaluate(&e, &runs);
-        assert!(out
-            .iter()
-            .any(|a| !a.passed && a.label.contains("never_reaches")));
+        assert!(
+            out.iter()
+                .any(|a| !a.passed && a.label.contains("never_reaches"))
+        );
     }
 
     #[test]

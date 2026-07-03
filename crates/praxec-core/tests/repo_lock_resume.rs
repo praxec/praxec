@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::lock_scheduler::LockScheduler;
@@ -16,8 +17,7 @@ use praxec_core::model::{
 use praxec_core::ports::{Executor, ExecutorRegistry, WorkflowStore};
 use praxec_core::repo_locks::{RepoLockSpace, RepoLocks};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::PathBuf;
 
 // ── harness ──────────────────────────────────────────────────────────────────
@@ -367,9 +367,11 @@ async fn suspend_emits_lock_wait_audit() {
     );
     let (id, ver) = start(&r).await;
     submit(&r, &id, ver).await;
-    assert!(audit
-        .event_types()
-        .contains(&"lock.wait.suspended".to_string()));
+    assert!(
+        audit
+            .event_types()
+            .contains(&"lock.wait.suspended".to_string())
+    );
 }
 
 #[tokio::test]

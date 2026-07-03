@@ -2,10 +2,10 @@
 
 use crate::map::Level;
 use crate::theme;
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 /// The breadcrumb text. `Some(name)` = zoomed into that mission.
 pub fn chrome_line(mission: Option<&str>) -> String {

@@ -37,8 +37,7 @@ fn hash_of_realistic_plan_vet_snippet_is_stable() {
     });
     let hash = compute_contract_hash(&snippet);
     assert_eq!(
-        hash,
-        "sha256:9ec470db3e22c27d653a2f7770444d2ac5919ec83f8da0210fdce40213811d71",
+        hash, "sha256:9ec470db3e22c27d653a2f7770444d2ac5919ec83f8da0210fdce40213811d71",
         "regenerate with `cargo test --test contract_hash_canonical` and update if algorithm change is intentional"
     );
 }

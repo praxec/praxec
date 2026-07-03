@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
-use crate::cap_verb::{CapVerb, CapVerbCategory, BLESSED_CAP_VERBS};
+use crate::cap_verb::{BLESSED_CAP_VERBS, CapVerb, CapVerbCategory};
 use crate::contract_hash::compute_contract_hash;
 use crate::tier::Tier;
 
@@ -2344,9 +2344,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("nonexistent")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("nonexistent"))
+        );
     }
 
     #[test]
@@ -2366,9 +2367,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("nowhere")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("nowhere"))
+        );
     }
 
     #[test]
@@ -2394,9 +2396,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("ghost")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("ghost"))
+        );
     }
 
     #[test]
@@ -2422,9 +2425,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| !d.is_error() && d.message().contains("orphan")));
+        assert!(
+            d.iter()
+                .any(|d| !d.is_error() && d.message().contains("orphan"))
+        );
     }
 
     #[test]
@@ -2445,9 +2449,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| !d.is_error() && d.message().contains("stuck")));
+        assert!(
+            d.iter()
+                .any(|d| !d.is_error() && d.message().contains("stuck"))
+        );
     }
 
     #[test]
@@ -2563,9 +2568,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("missing_timeout")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("missing_timeout"))
+        );
     }
 
     #[test]
@@ -2585,9 +2591,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("missing 'target'")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("missing 'target'"))
+        );
     }
 
     #[test]
@@ -2635,25 +2642,28 @@ mod tests {
         let d = validate_workflows(&guarded_workflow(
             json!({ "kind": "permission", "permission": "" }),
         ));
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND"))
+        );
     }
 
     #[test]
     fn role_guard_missing_operand_rejected() {
         let d = validate_workflows(&guarded_workflow(json!({ "kind": "role" })));
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND"))
+        );
     }
 
     #[test]
     fn expr_guard_missing_expr_rejected() {
         let d = validate_workflows(&guarded_workflow(json!({ "kind": "expr" })));
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND"))
+        );
     }
 
     #[test]
@@ -2685,9 +2695,10 @@ mod tests {
             "kind": "all_of",
             "guards": [{ "kind": "role" }]
         })));
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND"))
+        );
     }
 
     // ---- CMP-037: capability lifecycle enum -------------------------------

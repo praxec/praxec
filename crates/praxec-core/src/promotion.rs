@@ -335,9 +335,11 @@ mod tests {
             matches!(outcome, PromotionOutcome::Applied { .. }),
             "{outcome:?}"
         );
-        assert!(std::fs::read_to_string(live.path().join("a.txt"))
-            .unwrap()
-            .contains("agent-added"));
+        assert!(
+            std::fs::read_to_string(live.path().join("a.txt"))
+                .unwrap()
+                .contains("agent-added")
+        );
         assert!(
             locks.held().await.is_empty(),
             "the apply-window lock is released"
@@ -417,9 +419,11 @@ mod tests {
                 promotion: PromotionOutcome::Applied { .. },
                 ..
             } => {
-                assert!(std::fs::read_to_string(live.path().join("a.txt"))
-                    .unwrap()
-                    .contains("agent-was-here"));
+                assert!(
+                    std::fs::read_to_string(live.path().join("a.txt"))
+                        .unwrap()
+                        .contains("agent-was-here")
+                );
             }
             other => panic!("expected Applied promotion, got {other:?}"),
         }
@@ -497,9 +501,11 @@ mod tests {
             matches!(outcome, PromotionOutcome::Applied { .. }),
             "{outcome:?}"
         );
-        assert!(std::fs::read_to_string(live.path().join("a.txt"))
-            .unwrap()
-            .contains("agent-explored"));
+        assert!(
+            std::fs::read_to_string(live.path().join("a.txt"))
+                .unwrap()
+                .contains("agent-explored")
+        );
         assert!(
             live.path().join("new.txt").exists(),
             "the agent's new file landed"
@@ -527,9 +533,11 @@ mod tests {
             TrustedOutcome::Promoted {
                 promotion: PromotionOutcome::Applied { .. },
             } => {
-                assert!(std::fs::read_to_string(live.path().join("a.txt"))
-                    .unwrap()
-                    .contains("trusted-edit"));
+                assert!(
+                    std::fs::read_to_string(live.path().join("a.txt"))
+                        .unwrap()
+                        .contains("trusted-edit")
+                );
                 assert!(live.path().join("new.txt").exists(), "new file landed");
             }
             other => panic!("expected Applied promotion, got {other:?}"),

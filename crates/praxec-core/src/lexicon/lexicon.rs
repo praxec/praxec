@@ -33,8 +33,8 @@
 
 use std::collections::HashMap;
 
-use anyhow::{anyhow, bail, Result};
-use serde_json::{json, Map, Value};
+use anyhow::{Result, anyhow, bail};
+use serde_json::{Map, Value, json};
 
 /// Default governance level when a lexicon entry omits the field.
 /// SPEC §30.6 — `human-only` is the load-bearing default. Agents

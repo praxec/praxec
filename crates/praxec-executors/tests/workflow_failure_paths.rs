@@ -26,7 +26,7 @@ use praxec_core::model::{
 use praxec_core::ports::{Executor, ExecutorRegistry, WorkflowStore};
 use praxec_core::runtime::WorkflowRuntime;
 use praxec_core::store::{ConfigDefinitionStore, InMemoryEvidenceStore, InMemoryWorkflowStore};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Shared executor impls

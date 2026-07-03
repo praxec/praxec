@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::NullAuditSink;
 use praxec_core::discovery::{DiscoveryItem, DiscoveryKind, DiscoveryLink, InMemoryDiscoveryIndex};
 use praxec_core::error::ExecutorError;
@@ -31,11 +32,10 @@ use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::{ExecuteRequest, ExecuteResult};
 use praxec_core::ports::{Executor, ExecutorRegistry};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
 use praxec_mcp_server::{PraxecServer, TOOL_COMMAND, TOOL_QUERY};
-use rmcp::model::{CallToolRequestParams, ErrorCode, JsonObject};
 use rmcp::ErrorData as McpError;
-use serde_json::{json, Value};
+use rmcp::model::{CallToolRequestParams, ErrorCode, JsonObject};
+use serde_json::{Value, json};
 
 struct InertExecutors;
 #[async_trait]

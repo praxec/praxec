@@ -50,7 +50,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use praxec_core::audit::{AuditEvent, AuditSink};
 use praxec_core::error::ExecutorError;

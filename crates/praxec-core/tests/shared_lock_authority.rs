@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::ports::{Executor, ExecutorRegistry};
 use praxec_core::repo_locks::{RepoLockSpace, RepoLocks};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
 use serde_json::json;
 
 /// Empty executor registry — this test never executes a transition, it only

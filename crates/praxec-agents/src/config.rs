@@ -11,7 +11,7 @@ use serde::Deserialize;
 use praxec_core::error::ExecutorError;
 use praxec_core::model_resolver::ModelRef;
 
-use crate::error::{permanent, AgentErrorCode};
+use crate::error::{AgentErrorCode, permanent};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -249,7 +249,9 @@ mod tests {
 
     #[test]
     fn rejects_empty_goal() {
-        assert!(err_str(json!({ "affinity": "coding", "goal": "   " }))
-            .contains("AGENT_CONFIG_PARSE_ERROR"));
+        assert!(
+            err_str(json!({ "affinity": "coding", "goal": "   " }))
+                .contains("AGENT_CONFIG_PARSE_ERROR")
+        );
     }
 }

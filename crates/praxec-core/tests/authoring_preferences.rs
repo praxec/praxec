@@ -180,12 +180,12 @@ workflows:
 
 #[tokio::test]
 async fn template_substitutes_preferred_script_language_into_skill_guidance() {
+    use praxec_core::WorkflowRuntime;
     use praxec_core::audit::{AuditSink, NullAuditSink};
     use praxec_core::guards::DefaultGuardEvaluator;
     use praxec_core::model::{Principal, StartWorkflow};
     use praxec_core::ports::ExecutorRegistry;
     use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-    use praxec_core::WorkflowRuntime;
     use std::sync::Arc;
 
     struct NoopRegistry;
@@ -259,12 +259,12 @@ async fn missing_preference_renders_as_unset_stub_not_panic() {
     // No praxec.authoring block declared, but skill body still references
     // the template. The resolver MUST emit a stub, not panic, not strip the
     // placeholder silently.
+    use praxec_core::WorkflowRuntime;
     use praxec_core::audit::{AuditSink, NullAuditSink};
     use praxec_core::guards::DefaultGuardEvaluator;
     use praxec_core::model::{Principal, StartWorkflow};
     use praxec_core::ports::ExecutorRegistry;
     use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-    use praxec_core::WorkflowRuntime;
     use std::sync::Arc;
 
     struct NoopRegistry;

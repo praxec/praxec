@@ -6,10 +6,10 @@
 
 use crate::app::App;
 use crate::theme;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
-use ratatui::Frame;
 
 pub fn render_inbox(f: &mut Frame, area: Rect, app: &App) {
     let card = centered(area, 76, 18);

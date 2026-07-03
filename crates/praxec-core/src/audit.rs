@@ -5,7 +5,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, IsoWeek, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::fs::{Filesystem, RealFilesystem};

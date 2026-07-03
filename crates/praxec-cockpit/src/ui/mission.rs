@@ -6,10 +6,10 @@
 
 use crate::model::GatewayResponse;
 use crate::theme;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
-use ratatui::Frame;
 
 /// Render a live mission from its gateway response. `action_cursor` selects among
 /// the legal next actions.
@@ -150,8 +150,8 @@ pub fn render_mission(f: &mut Frame, area: Rect, resp: &GatewayResponse, action_
 mod tests {
     use super::*;
     use crate::gateway::{FakeGateway, Gateway};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn render(resp: &GatewayResponse) -> String {
         let backend = TestBackend::new(90, 24);

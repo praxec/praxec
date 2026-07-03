@@ -115,7 +115,7 @@ pub use registry::HashMapExecutorRegistry;
 pub use registry_executor::RegistryExecutor;
 pub use rest::{RestConnection, RestConnections, RestExecutor};
 pub use script::ScriptExecutor;
-pub use structural_analysis::{StructuralAnalysisExecutor, REQUIRED_RULES};
+pub use structural_analysis::{REQUIRED_RULES, StructuralAnalysisExecutor};
 pub use workflow::WorkflowExecutor;
 
 use std::sync::Arc;
