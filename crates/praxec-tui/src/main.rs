@@ -570,7 +570,7 @@ async fn run_tui() -> Result<ExitCode> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("praxec"));
     let acp_command = format!("{} acp", exe.display());
 
-    let mut state: RuntimeState = RuntimeState::new(&acp_command)
+    let mut state: RuntimeState = RuntimeState::new(&acp_command, Default::default())
         .await
         .map_err(|e| anyhow::anyhow!("TUI initialization failed: {e}"))?;
 

@@ -70,6 +70,10 @@ impl AuditSink for PeerBridgeAuditSink {
                 "payload": event.payload,
             });
             // Best-effort push; ignore send errors (client gone / not subscribed).
+            // TODO(SEP-2577): rmcp deprecated logging notifications with no
+            // replacement yet — the durable audit record above is the source of
+            // truth. Migrate when rmcp ships an alternative transport.
+            #[allow(deprecated)]
             let _ = peer
                 .notify_logging_message(LoggingMessageNotificationParam {
                     level: LoggingLevel::Info,

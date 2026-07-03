@@ -42,8 +42,10 @@
 
 use std::time::Duration;
 
-use aether_cli::headless::{OutputFormat, RunConfig, run::run as run_aether_headless};
+use aether_auth::FakeOAuthCredentialStore;
+use aether_cli::headless::{RunConfig, run::run as run_aether_headless};
 use aether_cli::mcp_config_args::McpConfigArgs;
+use aether_cli::output::OutputFormat;
 use aether_core::agent_spec::AgentSpec;
 use async_trait::async_trait;
 use tokio::time::timeout;
@@ -174,6 +176,9 @@ impl SubAgentSpawner for AetherSubAgentSpawner {
             output: OutputFormat::Text,
             verbose: false,
             events: vec![],
+            // Sub-agents authenticate via provider keys, not OAuth — use an
+            // empty in-memory store (aether 0.7.20 added this required field).
+            oauth_credential_store: std::sync::Arc::new(FakeOAuthCredentialStore::new()),
         };
 
         let total_timeout = Duration::from_secs(self.config.max_sub_agent_seconds);
