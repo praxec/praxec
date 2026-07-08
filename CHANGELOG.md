@@ -83,6 +83,26 @@ covered by a stability commitment.
   source control; the ADR-0006 + source provenance notes that referenced it were
   updated to drop the dead path.
 
+## [0.0.14] — 2026-07-08 — HOP typed-core & the `hop_slot` primitive
+
+### Added — stack-aware specialization: the HOP typed-core (Spec A.1)
+
+- **Canonical HOP vocabulary (`schemas/hop.schema.json`), shipped and runtime-
+  registered.** A standalone JSON Schema (draft 2020-12) defining the shared
+  building blocks (`severity`, `gateStatus`, `schemaBound`, `stackProvenance`,
+  `finding`, `criterion`) and the ten per-slot `In`/`Out` contracts
+  (`verify`/`detect`/`scaffold`/`implement`/`lint_format`). It is embedded in
+  `praxec-core` and prepared once into a process-wide `jsonschema` registry under
+  the alias `praxec://hop`, forced at serve startup so a malformed shipped schema
+  fails at boot rather than mid-run.
+- **The `hop_slot:` primitive — the unbypassable contract.** A transition marked
+  `hop_slot: <name>` has, at config load, its canonical `In` contract injected as
+  the transition `inputSchema` and its `Out` contract injected as the
+  `$.context.<name>` typed blackboard slot; the existing per-transition input and
+  blackboard-write seams (now registry-aware, resolving `praxec://hop` `$ref`s)
+  then enforce both with no new runtime code. An unknown slot name is a hard
+  load-time error listing the valid names.
+
 ## [0.0.13] — 2026-06-16 — release hygiene
 
 Greenfield cleanup before consolidating onto `main`. Breaking config changes —

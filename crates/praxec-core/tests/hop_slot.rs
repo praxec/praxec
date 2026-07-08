@@ -12,13 +12,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::{Principal, StartWorkflow, SubmitTransition};
 use praxec_core::ports::{Executor, ExecutorRegistry};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── harness (mirrors tests/blackboard_typing.rs) ──────────────────────────────
 
@@ -281,10 +281,12 @@ async fn verify_out_with_bad_status_enum_is_rejected() {
         "a bad status enum must be rejected via the injected verifyOut slot; got: {}",
         resp["error"]
     );
-    assert!(resp["error"]["message"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("verify"));
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("verify")
+    );
     // Snapshot version unchanged — the transition was aborted, not committed.
     assert_eq!(
         resp["workflow"]["version"].as_u64(),
