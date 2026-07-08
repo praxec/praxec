@@ -41,6 +41,7 @@ pub mod embeddings;
 pub mod error;
 pub mod fs;
 pub mod guards;
+pub mod hop;
 pub mod hot_reload;
 pub mod intent_index;
 pub mod lexicon;
