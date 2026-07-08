@@ -63,6 +63,25 @@ pub fn force_init() {
     LazyLock::force(&HOP_REGISTRY);
 }
 
+/// Compile a `jsonschema::Validator` with [`HOP_REGISTRY`] attached, so a
+/// `$ref` into the shipped vocabulary (`praxec://hop#/$defs/<def>`) resolves.
+///
+/// This is the **strictly-widening** replacement for bare
+/// `jsonschema::validator_for(schema)` at the runtime validation seams
+/// (`validate_schema`, `validate_outputs_against_snippet`,
+/// `validate_blackboard_writes`): a schema with no `praxec://hop` `$ref`
+/// compiles and behaves exactly as before — the registry only adds the ability
+/// to resolve the alias, it changes nothing for refs that were already
+/// self-contained. Draft autodetection (`$schema`) is unchanged from
+/// `validator_for` (both defer to the same option defaults).
+pub(crate) fn compile_validator(
+    schema: &serde_json::Value,
+) -> Result<jsonschema::Validator, jsonschema::ValidationError<'static>> {
+    jsonschema::options()
+        .with_registry(&HOP_REGISTRY)
+        .build(schema)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +142,37 @@ mod tests {
             !validator.is_valid(&instance),
             "an out-of-enum status must be rejected via the resolved gateStatus $ref"
         );
+    }
+
+    #[test]
+    fn compile_validator_is_strictly_widening_for_plain_schemas() {
+        // A self-contained schema (no praxec://hop $ref) must behave IDENTICALLY
+        // under the registry-aware helper as under bare `validator_for`, for both
+        // matching and non-matching instances. This is the guarantee that swapping
+        // the three runtime seams changed nothing for existing configs.
+        let plain = json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer", "minimum": 0 } },
+            "required": ["n"],
+            "additionalProperties": false
+        });
+        let bare = jsonschema::validator_for(&plain).expect("bare compiles");
+        let widened = compile_validator(&plain).expect("registry-aware compiles");
+
+        for instance in [
+            json!({ "n": 5 }),
+            json!({ "n": -1 }),
+            json!({ "n": "x" }),
+            json!({}),
+            json!({ "n": 5, "extra": true }),
+            json!("not-an-object"),
+        ] {
+            assert_eq!(
+                bare.is_valid(&instance),
+                widened.is_valid(&instance),
+                "registry-aware validation diverged from bare for {instance}"
+            );
+        }
     }
 
     #[test]

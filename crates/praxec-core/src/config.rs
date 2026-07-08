@@ -312,6 +312,16 @@ pub fn resolve_with_diagnostics(mut config: Value) -> anyhow::Result<(Value, Vec
         }
     }
 
+    // 5b. Spec A / A.1 §3 — the `hop_slot:` primitive. For every transition that
+    //     declares `hop_slot: <name>`, inject the canonical `In` contract as the
+    //     transition `inputSchema` and the canonical `Out` contract as the
+    //     `$.context.<name>` typed blackboard slot, both by `$ref` into the
+    //     shipped HOP vocabulary (praxec://hop). The existing seams then enforce
+    //     both with no new runtime code: input via `validate_schema`
+    //     (runtime_submit.rs), output via `validate_blackboard_writes`
+    //     (runtime_records.rs). An unknown slot name is a hard load error.
+    inject_hop_slots(&mut config)?;
+
     // 6. Poka-yoke on `skills:` (SPEC §5.4). `verb` and the `skills:` keys
     //    must match `^[a-z][a-z0-9-]*$` — lowercase kebab, no whitespace.
     //    Enforced at config load so malformed descriptors are unrepresentable
@@ -452,6 +462,148 @@ fn synthesize_input_schema(def: &mut Map<String, Value>) {
         schema.insert("required".into(), Value::Array(required));
     }
     def.insert("inputSchema".into(), Value::Object(schema));
+}
+
+/// The five canonical specialization-slot names (Spec A §3). A `hop_slot:`
+/// marker MUST name one of these. Kept as the single closed set for the
+/// load-time poka-yoke (the doctor rule) and the `$defs` base mapping.
+pub const HOP_SLOT_NAMES: [&str; 5] = ["verify", "detect", "scaffold", "implement", "lint_format"];
+
+/// Map a `hop_slot:` name to its camelCase `$defs` base in `hop.schema.json`
+/// (`lint_format` → `lintFormat`); `<base>In` / `<base>Out` are the injected
+/// contracts. `None` marks an unknown slot name — the doctor rule (§3).
+///
+/// Exhaustive match (poka-yoke): the closed set lives here, not as a
+/// hand-maintained parallel string list.
+fn hop_def_base(slot: &str) -> Option<&'static str> {
+    match slot {
+        "verify" => Some("verify"),
+        "detect" => Some("detect"),
+        "scaffold" => Some("scaffold"),
+        "implement" => Some("implement"),
+        "lint_format" => Some("lintFormat"),
+        _ => None,
+    }
+}
+
+/// A canonical `$ref` into the shipped HOP vocabulary for one slot def.
+fn hop_ref(base: &str, dir: &str) -> Value {
+    json!({ "$ref": format!("praxec://hop#/$defs/{base}{dir}") })
+}
+
+/// Spec A / A.1 §3 — the `hop_slot:` load-time injector.
+///
+/// For each transition declaring `hop_slot: <name>`:
+///   (a) set the transition `inputSchema` to `{ "$ref": "…/<name>In" }` — only
+///       if the transition does not already declare an explicit `inputSchema`
+///       (the author may narrow, the engine supplies the default);
+///   (b) declare `$.context.<name>` as a typed blackboard slot with schema
+///       `{ "$ref": "…/<name>Out" }` on the workflow's `blackboard:` map — the
+///       engine OWNS the output contract, so this overwrites any authored
+///       schema for that key.
+///
+/// Enforcement is then entirely reuse: `runtime_submit`'s `validate_schema`
+/// checks the input, `runtime_records`'s `validate_blackboard_writes` checks
+/// the output (both now registry-aware so the `praxec://hop` refs resolve).
+///
+/// Precedents for this load-time move: [`synthesize_input_schema`] and
+/// `expand_use_bindings` (both synthesize schema/mappings onto a transition at
+/// load), and the V13 slot table (the typed blackboard the output check reads).
+///
+/// An unknown slot name, a non-string marker, or an array-form `blackboard:`
+/// that collides with a slot is a hard load error (`bail!`).
+fn inject_hop_slots(config: &mut Value) -> anyhow::Result<()> {
+    let Some(workflows) = config
+        .pointer_mut("/workflows")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+
+    for (wf_id, def) in workflows.iter_mut() {
+        let Some(def_obj) = def.as_object_mut() else {
+            continue;
+        };
+
+        // First pass: walk states→transitions, inject each transition's
+        // `inputSchema`, and collect the slot→Out ref for the blackboard.
+        // (Borrow split: mutate transitions here, mutate `blackboard` after.)
+        let mut out_slots: std::collections::BTreeMap<String, Value> =
+            std::collections::BTreeMap::new();
+
+        if let Some(states) = def_obj.get_mut("states").and_then(Value::as_object_mut) {
+            for (state_name, state) in states.iter_mut() {
+                let Some(transitions) = state.get_mut("transitions").and_then(Value::as_object_mut)
+                else {
+                    continue;
+                };
+                for (t_name, t) in transitions.iter_mut() {
+                    let Some(t_obj) = t.as_object_mut() else {
+                        continue;
+                    };
+                    let Some(marker) = t_obj.get("hop_slot") else {
+                        continue;
+                    };
+                    // Own the slot name and end the immutable borrow of `t_obj`
+                    // before injecting the input schema below.
+                    let slot = marker
+                        .as_str()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "HOP_SLOT_INVALID: workflow '{wf_id}' state '{state_name}' \
+                                 transition '{t_name}': `hop_slot` must be a string naming a \
+                                 slot; valid names: [{}]",
+                                HOP_SLOT_NAMES.join(", ")
+                            )
+                        })?
+                        .to_string();
+                    // Doctor rule (§3): the marker must name a known slot.
+                    let base = hop_def_base(&slot).ok_or_else(|| {
+                        anyhow!(
+                            "HOP_SLOT_UNKNOWN: workflow '{wf_id}' state '{state_name}' \
+                             transition '{t_name}': `hop_slot: {slot}` is not a known \
+                             specialization slot; valid names: [{}]",
+                            HOP_SLOT_NAMES.join(", ")
+                        )
+                    })?;
+
+                    // (a) Inject the input contract, honoring an explicit author schema.
+                    if !t_obj.contains_key("inputSchema") {
+                        t_obj.insert("inputSchema".into(), hop_ref(base, "In"));
+                    }
+
+                    // Record the Out ref; the engine owns this contract.
+                    out_slots.insert(slot, hop_ref(base, "Out"));
+
+                    // RESOLUTION HOOK (deferred slice): resolve the marker to the
+                    // concrete `cap.<slot>.<stack>` (additive repo layering /
+                    // `overrides:` / a dispatch flow) here. This slice injects the
+                    // contract only; it does not wire stack resolution.
+                }
+            }
+        }
+
+        // (b) Declare the typed blackboard slots for the collected Outs.
+        if !out_slots.is_empty() {
+            let bb = def_obj
+                .entry("blackboard")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let Some(bb_obj) = bb.as_object_mut() else {
+                bail!(
+                    "HOP_SLOT_BLACKBOARD_SHAPE: workflow '{wf_id}' declares `blackboard:` in \
+                     array (bare-name) form, but a `hop_slot:` transition needs an object-form \
+                     `blackboard:` to carry the typed slot contract. Convert `blackboard:` to \
+                     the object form (`{{ <name>: <schema> }}`)."
+                );
+            };
+            for (slot, out_ref) in out_slots {
+                // Engine owns the slot Out contract — overwrite any authored schema.
+                bb_obj.insert(slot, out_ref);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// SPEC §6 — Walk every workflow's transitions; for any `kind: workflow`

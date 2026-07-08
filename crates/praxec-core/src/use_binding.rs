@@ -180,7 +180,11 @@ pub fn validate_outputs_against_snippet(
             continue;
         };
         let value = projected.get(*host_path).cloned().unwrap_or(Value::Null);
-        let validator = match jsonschema::validator_for(schema) {
+        // Registry-aware (strictly widening): a slot cap's `snippet.outputs`
+        // fragment may `$ref` the shipped HOP vocabulary (e.g.
+        // `{ "$ref": "praxec://hop#/$defs/verifyOut" }`); the registry resolves
+        // it. Self-contained snippet schemas behave exactly as before.
+        let validator = match crate::hop::compile_validator(schema) {
             Ok(v) => v,
             Err(e) => {
                 // A snippet schema that itself fails to compile is a

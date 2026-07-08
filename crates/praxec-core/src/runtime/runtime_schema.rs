@@ -35,7 +35,11 @@ pub(crate) fn validate_schema(
         return Ok(());
     };
 
-    let validator = jsonschema::validator_for(schema)
+    // Registry-aware (strictly widening): resolves a `$ref` into the shipped
+    // HOP vocabulary (praxec://hop) — e.g. a `hop_slot:`-injected transition
+    // `inputSchema` `{ "$ref": "praxec://hop#/$defs/verifyIn" }`. Self-contained
+    // schemas behave exactly as bare `validator_for`.
+    let validator = crate::hop::compile_validator(schema)
         .map_err(|e| anyhow!("invalid {} schema: {}", label, e))?;
     if !validator.is_valid(value) {
         let errs: Vec<String> = validator

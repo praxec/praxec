@@ -76,7 +76,11 @@ pub(crate) fn validate_blackboard_writes(
             .and_then(|o| o.get(slot))
             .cloned()
             .unwrap_or(Value::Null);
-        let validator = match jsonschema::validator_for(slot_schema) {
+        // Registry-aware (strictly widening): a `hop_slot:`-injected typed slot
+        // carries `{ "$ref": "praxec://hop#/$defs/<name>Out" }`, so the shipped
+        // HOP vocabulary must resolve here for the existing seam to enforce the
+        // slot output. Plain blackboard schemas behave exactly as before.
+        let validator = match crate::hop::compile_validator(slot_schema) {
             Ok(v) => v,
             Err(e) => {
                 return Err((slot.clone(), format!("invalid blackboard schema: {e}")));
