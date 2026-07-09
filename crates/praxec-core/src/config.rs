@@ -430,7 +430,126 @@ pub fn resolve_with_diagnostics(mut config: Value) -> anyhow::Result<(Value, Vec
     //            exempt — the engine owns their slot write by construction.
     validate_slot_key_ownership(&config)?;
 
+    // 7-octies. Spec A.1 §4.2/§4.4 — SchemaBound L2 registry (`finding.fix`).
+    //           (1) every top-level `schemas:` entry must compile; (2) every
+    //           statically-referenced `schema_ref` must resolve (closed-world,
+    //           mirrors `validate_workflow_refs_resolve`); (3) stamp the merged
+    //           registry onto every workflow snapshot as `_schemasRegistry` so
+    //           the blackboard-write seam can validate a `finding.fix` inner
+    //           `value` at runtime without a side channel. The closed-world walk
+    //           runs BEFORE the stamp so it never sees the registry's own
+    //           schema-property definitions.
+    validate_schemas_registry(&config)?;
+    validate_schema_refs_resolve(&config)?;
+    stamp_schemas_registry(&mut config);
+
     Ok((config, diagnostics))
+}
+
+/// Spec A.1 §4.1 step 2 — every top-level `schemas:` entry must be a compilable
+/// JSON Schema (registry-aware, so an inner `$ref praxec://hop#/…` resolves). A
+/// bad pack schema fails at load, not mid-run.
+fn validate_schemas_registry(config: &Value) -> anyhow::Result<()> {
+    let Some(schemas) = config.pointer("/schemas").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for (name, schema) in schemas {
+        if let Err(e) = crate::hop::compile_validator(schema) {
+            bail!(
+                "SCHEMA_INVALID: `schemas:` entry '{name}' is not a valid JSON Schema: {e}. \
+                 A registered SchemaBound inner schema must compile at load."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Spec A.1 §4.1 step 4 — closed-world `schema_ref` check (mirrors
+/// [`validate_workflow_refs_resolve`]). Every `schema_ref` literal statically
+/// present in a workflow body must name a registered top-level `schemas:` entry.
+/// Unresolved → `SCHEMA_REF_UNRESOLVED` (the V22 fix-it voice).
+fn validate_schema_refs_resolve(config: &Value) -> anyhow::Result<()> {
+    let registered: HashSet<String> = config
+        .pointer("/schemas")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut unresolved: Vec<(String, String)> = Vec::new();
+    if let Some(workflows) = config.pointer("/workflows").and_then(Value::as_object) {
+        for (wf_id, wf_def) in workflows {
+            collect_unresolved_schema_refs(wf_def, &registered, wf_id, &mut unresolved);
+        }
+    }
+    if let Some((wf_id, sref)) = unresolved.first() {
+        bail!(
+            "SCHEMA_REF_UNRESOLVED: workflow '{wf_id}' statically references schema_ref '{sref}', \
+             but no `schemas:` entry registers it. Register the inner schema or fully qualify the \
+             ref as `<namespace>/<name>` (Spec A.1 §4.2)."
+        );
+    }
+    Ok(())
+}
+
+/// Walk a workflow body for `{ schema_ref: "<string>", … }` SchemaBound literals
+/// and record any whose ref is not registered. Engine-internal stamps
+/// (`_`-prefixed keys — e.g. `_schemasRegistry`, `_snippetOutputs`) are skipped:
+/// a registered inner schema may itself declare a property *named* `schema_ref`
+/// (whose value is a schema object, not a ref string), and must not be mistaken
+/// for a reference.
+fn collect_unresolved_schema_refs(
+    value: &Value,
+    registered: &HashSet<String>,
+    wf_id: &str,
+    out: &mut Vec<(String, String)>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(sref)) = map.get("schema_ref") {
+                if !registered.contains(sref) {
+                    out.push((wf_id.to_string(), sref.clone()));
+                }
+            }
+            for (k, child) in map {
+                if k.starts_with('_') {
+                    continue;
+                }
+                collect_unresolved_schema_refs(child, registered, wf_id, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                collect_unresolved_schema_refs(v, registered, wf_id, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Spec A.1 §4.1 step 6 — stamp the merged `schemas:` registry onto every
+/// workflow snapshot as `_schemasRegistry` (internal metadata; mirrors
+/// `_lexiconLibrary` / `_snippetOutputs`). The runtime blackboard-write seam
+/// reads it to validate `finding.fix` inner values without a side channel.
+/// No-op when no schemas are registered.
+fn stamp_schemas_registry(config: &mut Value) {
+    let Some(schemas) = config
+        .pointer("/schemas")
+        .and_then(Value::as_object)
+        .filter(|m| !m.is_empty())
+        .cloned()
+    else {
+        return;
+    };
+    let registry = Value::Object(schemas);
+    if let Some(workflows) = config
+        .pointer_mut("/workflows")
+        .and_then(Value::as_object_mut)
+    {
+        for def in workflows.values_mut() {
+            if let Some(obj) = def.as_object_mut() {
+                obj.insert("_schemasRegistry".into(), registry.clone());
+            }
+        }
+    }
 }
 
 /// Spec A.1 §7 (FM-7) — the poka-yoke that keeps slot-named context keys
@@ -806,9 +925,9 @@ fn parse_stack_chain(stack: Option<&Value>) -> anyhow::Result<Vec<String>> {
                     None | Some(Value::Null) => Ok(None),
                     Some(Value::String(s)) if s.is_empty() || s == "generic" => Ok(None),
                     Some(Value::String(s)) => Ok(Some(s.clone())),
-                    Some(other) => bail!(
-                        "HOP_STACK_INVALID: `stack.{key}` must be a string, got {other}"
-                    ),
+                    Some(other) => {
+                        bail!("HOP_STACK_INVALID: `stack.{key}` must be a string, got {other}")
+                    }
                 }
             };
             // Most-specific-first: project → primary_framework → language.

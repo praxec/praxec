@@ -64,6 +64,12 @@
     "embeddings": {
       "$ref": "#/$defs/embeddingsConfig"
     },
+    "schemas": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {},
+      "description": "Spec A.1 §4.2 — SchemaBound inner-schema registry. Each key is a (repo-namespaced) name; each value is a JSON Schema that a `finding.fix` SchemaBound `value` is validated against (the one v1 extension point). Every statically-referenced `schema_ref` must resolve at config load (closed-world, V24); every entry must compile. Stamped onto each workflow snapshot as `_schemasRegistry` for the runtime blackboard-write seam."
+    },
     "skills": {
       "type": "object",
       "additionalProperties": {
