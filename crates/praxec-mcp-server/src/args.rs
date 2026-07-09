@@ -275,4 +275,9 @@ pub struct CommandArgs {
     /// emitted by SPEC §30.10.5.
     #[serde(rename = "unknown_subject")]
     pub unknown_subject: Option<String>,
+    /// P6 — in-band config reload. `reload: true` fires the same gated
+    /// rebuild+swap as SIGHUP (re-reads the config + `repos:` from disk so a
+    /// post-startup repo becomes visible), without adding a third MCP tool.
+    /// Present-and-true → reload; all other fields are ignored for that call.
+    pub reload: Option<bool>,
 }
