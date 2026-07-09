@@ -589,13 +589,25 @@ fn validate_slot_key_ownership(config: &Value) -> anyhow::Result<()> {
                 if let Some(output) = t_obj.get("output").and_then(Value::as_object) {
                     for key in output.keys() {
                         if HOP_SLOT_NAMES.contains(&key.as_str()) {
+                            // Exempt: the resolved slot cap is the sanctioned typed
+                            // producer. A workflow that declares `snippet.outputs.<slot>`
+                            // as the canonical `<slot>Out` contract IS the cap a
+                            // `hop_slot: <slot>` flow resolves to; its `output.<slot>`
+                            // write is runtime-validated against that same contract by
+                            // `validate_outputs_against_snippet`, so it is not the
+                            // unvalidated forge this lint guards against.
+                            if declares_hop_typed_slot_output(def, key) {
+                                continue;
+                            }
                             bail!(
                                 "SLOT_KEY_ENGINE_OWNED: workflow '{wf_id}' state '{state_name}' \
                                  transition '{t_name}': `output:` writes the engine-owned slot key \
                                  '$.context.{key}', but the transition is not `hop_slot:`-declared. \
                                  Slot keys [{}] carry an engine-injected typed contract — only a \
-                                 `hop_slot: {key}` transition may produce one. Declare `hop_slot: \
-                                 {key}` or write a non-slot context key.",
+                                 `hop_slot: {key}` transition (in a flow), or the resolved slot cap \
+                                 declaring `snippet.outputs.{key}: {{ $ref: praxec://hop#/$defs/…Out }}`, \
+                                 may produce one. Declare `hop_slot: {key}`, add that typed \
+                                 `snippet.outputs.{key}`, or write a non-slot context key.",
                                 HOP_SLOT_NAMES.join(", ")
                             );
                         }
@@ -692,6 +704,23 @@ fn hop_def_base(slot: &str) -> Option<&'static str> {
 /// A canonical `$ref` into the shipped HOP vocabulary for one slot def.
 fn hop_ref(base: &str, dir: &str) -> Value {
     json!({ "$ref": format!("praxec://hop#/$defs/{base}{dir}") })
+}
+
+/// True when `def` declares `snippet.outputs.<slot>` as the canonical
+/// `praxec://hop#/$defs/<base>Out` contract — i.e. this workflow IS the resolved
+/// slot cap, the sanctioned typed producer of the slot value (Spec A §3.1). Such
+/// a cap's `output.<slot>` write is runtime-validated against that same contract
+/// by `validate_outputs_against_snippet`, so it is exempt from FM-7: it is a typed
+/// production, not the unvalidated forge the lint guards against. The `$ref` must
+/// match exactly — an untyped `snippet.outputs.<slot>` does NOT earn the exemption.
+fn declares_hop_typed_slot_output(def: &Value, slot: &str) -> bool {
+    let Some(base) = hop_def_base(slot) else {
+        return false;
+    };
+    let expected = format!("praxec://hop#/$defs/{base}Out");
+    def.pointer(&format!("/snippet/outputs/{slot}/$ref"))
+        .and_then(Value::as_str)
+        == Some(expected.as_str())
 }
 
 /// Spec A / A.1 §3 — the `hop_slot:` load-time injector.
