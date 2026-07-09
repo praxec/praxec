@@ -125,3 +125,68 @@ fn non_hop_slot_write_to_a_non_slot_key_is_clean() {
     }));
     resolve(cfg).expect("a write to a non-slot context key must load clean");
 }
+
+/// The resolved slot cap IS the sanctioned typed producer. A `snippet` capability
+/// that declares `snippet.outputs.verify: { $ref: …/verifyOut }` and writes
+/// `output.verify` is exactly what a `hop_slot: verify` flow resolves to — its
+/// write is runtime-validated against verifyOut, so FM-7 must exempt it. (Mirrors
+/// the shape of both shipped packs' `cap.verify.<stack>` — the regression that
+/// took down a live gateway with an opaque `-32000`.)
+#[test]
+fn resolved_slot_cap_producing_typed_out_is_clean() {
+    let cfg = json!({
+        "version": "1.0.0",
+        "workflows": {
+            "cap.verify.ts": {
+                "initialState": "ready",
+                "snippet": {
+                    "inputs": { "cwd": { "type": "string" } },
+                    "outputs": { "verify": { "$ref": "praxec://hop#/$defs/verifyOut" } }
+                },
+                "states": {
+                    "ready": { "transitions": { "run": {
+                        "target": "done",
+                        "actor": "deterministic",
+                        "executor": { "kind": "script", "subject": "verify.ui.green" },
+                        "output": { "verify": "$.output.json" }
+                    } } },
+                    "done": { "terminal": true }
+                }
+            }
+        }
+    });
+    resolve(cfg).expect("a slot cap declaring the typed snippet.outputs.<slot> must load clean");
+}
+
+/// The exemption is tight: an *untyped* `snippet.outputs.verify` (no canonical
+/// `verifyOut` `$ref`) does NOT license a `$.context.verify` write — that would
+/// reopen the forge hole. It must still fail FM-7.
+#[test]
+fn untyped_snippet_output_does_not_earn_exemption() {
+    let cfg = json!({
+        "version": "1.0.0",
+        "workflows": {
+            "cap.sneaky": {
+                "initialState": "ready",
+                "snippet": {
+                    "inputs": {},
+                    "outputs": { "verify": { "type": "object" } }
+                },
+                "states": {
+                    "ready": { "transitions": { "run": {
+                        "target": "done",
+                        "actor": "deterministic",
+                        "executor": { "kind": "noop" },
+                        "output": { "verify": "$.arguments.smuggled" }
+                    } } },
+                    "done": { "terminal": true }
+                }
+            }
+        }
+    });
+    let err = resolve(cfg).expect_err("an untyped snippet.outputs.verify must not earn the exemption");
+    assert!(
+        err.to_string().contains("SLOT_KEY_ENGINE_OWNED"),
+        "untyped slot output must still fail FM-7: {err}"
+    );
+}
