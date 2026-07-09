@@ -793,6 +793,12 @@ async fn build_oneshot_server(
 }
 
 pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyhow::Result<()> {
+    // Fail-at-boot for the shipped HOP vocabulary (Spec A.1 §4.2, FM-1): force the
+    // process-wide HOP registry to prepare now, so a malformed shipped
+    // `hop.schema.json` is a boot failure here rather than a latent mid-run panic
+    // on first slot validation.
+    praxec_core::hop::force_init();
+
     let config = load_config(&config_path)?;
 
     // Production safety (poka-yoke): refuse to boot a long-running gateway on an

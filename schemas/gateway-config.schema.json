@@ -768,6 +768,17 @@
         "inputSchema": {
           "$ref": "#/$defs/jsonSchema"
         },
+        "hop_slot": {
+          "type": "string",
+          "enum": [
+            "verify",
+            "detect",
+            "scaffold",
+            "implement",
+            "lint_format"
+          ],
+          "description": "Specialization-slot marker (Spec A §3). At config load the engine injects this slot's canonical `In` contract as the transition `inputSchema` and its `Out` contract as the `$.context.<name>` typed blackboard slot, both by `$ref` into the shipped HOP vocabulary (praxec://hop). The concrete `cap.<name>.<stack>` resolution is layered separately."
+        },
         "guards": {
           "type": "array",
           "items": {
