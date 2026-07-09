@@ -422,7 +422,91 @@ pub fn resolve_with_diagnostics(mut config: Value) -> anyhow::Result<(Value, Vec
     //           no schema lookup at run time.
     expand_use_bindings(&mut config)?;
 
+    // 7-septies. Spec A.1 §7 (FM-7) — slot-named context keys are engine-owned.
+    //            After `use:` expansion has normalized every projection into the
+    //            transition `output:` mapping, reject any *non*-`hop_slot`
+    //            transition that writes `$.context.<slot>` (an unvalidated write
+    //            to a typed, engine-owned slot). `hop_slot:` transitions are
+    //            exempt — the engine owns their slot write by construction.
+    validate_slot_key_ownership(&config)?;
+
     Ok((config, diagnostics))
+}
+
+/// Spec A.1 §7 (FM-7) — the poka-yoke that keeps slot-named context keys
+/// engine-owned.
+///
+/// The five [`HOP_SLOT_NAMES`] name typed blackboard slots whose `Out` contract
+/// only a `hop_slot:`-declared transition may produce (the engine injects the
+/// contract + wires the resolved cap). A non-`hop_slot` transition that writes
+/// `$.context.<slot>` — through an `output:` mapping key (which, post
+/// [`expand_use_bindings`], is the context-key tail) or a `kind: workflow`
+/// `use.outputs` LHS — is the FM-7/FM-13 hole: config surfaces an *unvalidated*
+/// write to a slot-named key. This is a hard load error.
+///
+/// A transition carrying a `hop_slot:` marker is exempt: its `$.context.<slot>`
+/// write is exactly the engine-owned production this lint protects.
+fn validate_slot_key_ownership(config: &Value) -> anyhow::Result<()> {
+    let Some(workflows) = config.pointer("/workflows").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for (wf_id, def) in workflows {
+        let Some(states) = def.pointer("/states").and_then(Value::as_object) else {
+            continue;
+        };
+        for (state_name, state) in states {
+            let Some(transitions) = state.pointer("/transitions").and_then(Value::as_object) else {
+                continue;
+            };
+            for (t_name, t) in transitions {
+                let Some(t_obj) = t.as_object() else {
+                    continue;
+                };
+                // Exempt: a hop_slot transition legitimately owns its slot write.
+                if t_obj.contains_key("hop_slot") {
+                    continue;
+                }
+                // (a) `output:` mapping keys are context-key tails after expansion.
+                if let Some(output) = t_obj.get("output").and_then(Value::as_object) {
+                    for key in output.keys() {
+                        if HOP_SLOT_NAMES.contains(&key.as_str()) {
+                            bail!(
+                                "SLOT_KEY_ENGINE_OWNED: workflow '{wf_id}' state '{state_name}' \
+                                 transition '{t_name}': `output:` writes the engine-owned slot key \
+                                 '$.context.{key}', but the transition is not `hop_slot:`-declared. \
+                                 Slot keys [{}] carry an engine-injected typed contract — only a \
+                                 `hop_slot: {key}` transition may produce one. Declare `hop_slot: \
+                                 {key}` or write a non-slot context key.",
+                                HOP_SLOT_NAMES.join(", ")
+                            );
+                        }
+                    }
+                }
+                // (b) A `kind: workflow` `use.outputs` LHS (`$.context.<slot>`).
+                if let Some(use_outputs) = t
+                    .pointer("/executor/use/outputs")
+                    .and_then(Value::as_object)
+                {
+                    for host_path in use_outputs.keys() {
+                        if let Some(tail) = host_path_tail(host_path) {
+                            if HOP_SLOT_NAMES.contains(&tail.as_str()) {
+                                bail!(
+                                    "SLOT_KEY_ENGINE_OWNED: workflow '{wf_id}' state \
+                                     '{state_name}' transition '{t_name}': `use.outputs` projects \
+                                     into the engine-owned slot key '$.context.{tail}', but the \
+                                     transition is not `hop_slot:`-declared. Slot keys [{}] carry \
+                                     an engine-injected typed contract — only a `hop_slot: {tail}` \
+                                     transition may produce one.",
+                                    HOP_SLOT_NAMES.join(", ")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// SPEC: compile a workflow's `inputs:` block into a synthesized `/inputSchema`
