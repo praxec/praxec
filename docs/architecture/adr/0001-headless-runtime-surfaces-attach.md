@@ -115,6 +115,17 @@ regression, not a refactor.
   it can't direct a real mission. Acceptable only as the current interim while
   the live client is the next increment.
 
+## Status update (2026-07)
+
+The "cockpit is fixture-backed / `FakeGateway` only, live client unbuilt" framing
+in **Context** and **Costs** is now closed. The live client exists:
+`crates/praxec-cockpit/src/gateway.rs::StdioGateway` is a thin rmcp **stdio
+client** that attaches to a running runtime over the same two-tool surface
+(`praxec.query` / `praxec.command`) — exactly the "client over the same
+two-tool surface" this ADR mandated, never an in-process engine reach-in.
+`FakeGateway` (and `ScriptedGateway`) are now **dev/test fixtures only**, not the
+default path.
+
 ## References
 
 - Runtime / serve path: `crates/praxec/src/gateway.rs`

@@ -59,12 +59,12 @@ manipulates and the at-a-glance state surface.
 
 4. **The chat LLM is the out-of-band Mission Control LLM**
    ([ADR-0002](0002-fleet-runtime-multiplexed-mission-context.md)'s distinguished
-   principal), running on the in-tree **`aether-llm`** crate — *separate* from
-   the execution LLMs that run inside workflows.
+   principal), running on **`rig`** (rig-core 0.38) as the chat engine — *separate*
+   from the execution LLMs that run inside workflows.
 
 5. **Setup gate (first run) — minimize time-to-first-value.** Before the chat is
    usable, a focused widget assigns **vendor (SDK) → model → key**, using
-   *pickers* (recognition over recall — choose from aether-llm's vendors and
+   *pickers* (recognition over recall — choose from rig's vendors and
    their models; don't type `provider:model`). It **detects existing config**
    (`models.yaml` / provider keys from the CLI) and pre-fills or skips entirely
    when a usable LLM already exists. The gate is the fewest steps to a working
@@ -84,12 +84,12 @@ manipulates and the at-a-glance state surface.
   LLM is a governed principal, nav stays local. Familiar REPL/notebook mental
   model → low onboarding. Keyboard parity preserved (mixed-initiative).
 - **Costs.** Real work: extract the operation surface (one API behind keys +
-  MCP); the chat-LLM loop (aether-llm + tool-calling); the in-process MCP
+  MCP); the chat-LLM loop (rig + tool-calling); the in-process MCP
   server; the setup gate + config tab; the two-region layout restructure (the
   current map becomes a stage widget).
 - **Sequencing (outside-in).** The shell — operation surface + chat-centric
   layout + a deterministic command driver — can land *before* the real LLM, to
-  de-risk the layout and ops; then `aether-llm` + the setup gate + MCP replace
+  de-risk the layout and ops; then `rig` + the setup gate + MCP replace
   the deterministic driver.
 
 ## Alternatives considered
@@ -140,8 +140,8 @@ the deterministic `op::parse_command` stays as the offline fallback.
 
 ## References
 
-- aether-llm (the chat LLM engine): in-tree dependency, providers
-  anthropic/openai/gemini/openrouter/ollama
+- rig (the chat LLM engine): `rig-core` 0.38 (`crates/praxec-cockpit/Cargo.toml`,
+  `src/agent.rs`), providers anthropic/openai/gemini/openrouter/ollama
 - Model config reused: `models.yaml` / `model_resolver`, `set-provider-keys`
 - Cockpit (UI + state + interaction model): `crates/praxec-cockpit`
 - Cockpit MCP face (external-agent seam): `crates/praxec-cockpit-mcp`

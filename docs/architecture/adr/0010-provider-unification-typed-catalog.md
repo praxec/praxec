@@ -44,7 +44,17 @@ adds no cost not already being paid, while `Custom` serves the config-only tail.
   tokens are explicitly out of scope (reconcile-only; add later as one-line
   catalog entries).
 
+## Status update (2026-07)
+
+The `agent_resolver::Provider` named in **Context** has since been renamed
+`model_resolver::Provider` (`crates/praxec-core/src/model_resolver.rs`); the
+`Custom { endpoint }` long-tail variant now lives there as
+`model_resolver::Provider::Custom`. The historical narrative above is left as
+written — this note only points the current reader at the present module name.
+
 ## References
 
 - Module: `crates/praxec-core/src/providers.rs`
+- Provider resolver (renamed from `agent_resolver`):
+  `crates/praxec-core/src/model_resolver.rs`
 - Authoritative seam: aether-llm `ModelProviderParser::default`
