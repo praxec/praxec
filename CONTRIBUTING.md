@@ -50,8 +50,9 @@ your time and ours land in the same place.
 
 ## What we're cautious about
 
-- **Surface-area additions to the seven-tool MCP surface or YAML
-  top-level keys.** These are Tier 1 stable; changes need a strong
+- **Surface-area additions to the two-tool MCP surface (`praxec.query`
+  + `praxec.command`) or YAML top-level keys.** These are Tier 1 stable;
+  changes need a strong
   motivating example and usually involve a deprecation cycle.
 - **New configuration knobs** when an existing knob composes to the
   same effect. We try to make the YAML small and orthogonal.
@@ -70,7 +71,7 @@ your time and ours land in the same place.
 ## Sign-off
 
 By submitting a PR you certify that your contribution is your own work
-and that you have the right to license it under BSD-3-Clause. We use
+and that you have the right to license it under Apache-2.0. We use
 the [Developer Certificate of Origin](https://developercertificate.org/) —
 sign commits with `git commit -s`.
 

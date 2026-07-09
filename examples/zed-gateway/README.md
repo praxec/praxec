@@ -1,14 +1,15 @@
 # Zed Editor Gateway
 
 A complete praxec configuration that gates all AI tool access
-in [Zed](https://zed.dev) behind a seven-tool governed surface.
+in [Zed](https://zed.dev) behind a governed proxy surface.
 
 ## What this does
 
 When you connect Zed to this gateway (and **only** this gateway), the AI
-assistant sees exactly seven tools. Every downstream capability — reading
-files, running tests, creating PRs — is a link in a response payload,
-not a separate tool.
+assistant sees exactly the tools named in the config's `proxy.expose`
+block. Every downstream capability — reading files, running tests,
+creating PRs — is a proxied tool or a link in a response payload, not a
+separate raw MCP server.
 
 | Action | How |
 |--------|-----|
@@ -55,7 +56,7 @@ Edit `~/.config/zed/settings.json`:
 ### 3. Verify
 
 Open Zed and ask: *"What tools do you have available?"* — should list
-exactly seven tools starting with `gateway.` and `workflow.`.
+exactly the tools named in the config's `proxy.expose` block.
 
 Or run the automated check:
 
