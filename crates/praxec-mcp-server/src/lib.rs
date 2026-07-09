@@ -17,9 +17,12 @@
 //!   plus shape-routers `dispatch_query` / `dispatch_command`.
 
 pub mod args;
+pub mod degraded;
 mod handlers;
 pub mod progress;
 mod tools;
+
+pub use degraded::{DegradedServer, HealthReport};
 
 use handlers::{run_id_already_running, subject_needs_definition};
 

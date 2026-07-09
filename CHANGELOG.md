@@ -17,6 +17,20 @@ covered by a stability commitment.
 > none were tagged at the time. Versions `0.0.1`–`0.0.5` are the earlier
 > development history, renumbered onto this line.
 
+### Added — misconfiguration is a live, self-documenting state (degraded serve)
+
+- **`serve` no longer hard-crashes on a bad config.** A config fault (parse
+  error, the durability guard, or a validation lint like `SLOT_KEY_ENGINE_OWNED`)
+  used to abort **before** the MCP transport came up, so the client saw an opaque
+  transport `-32000` with no diagnosis. Now `serve` captures the fault and comes
+  up **DEGRADED**: a live server that completes the handshake and answers **every**
+  call with a precise, self-documenting `HealthReport` — code, location, detail,
+  ordered remedies, and the reload path — as both a rich message and structured
+  `data`, so an LLM operator can self-heal and reconnect. It does zero governed
+  work; it refuses everything, loudly and precisely (not a fallback). Recovery is
+  a reconnect — a fresh process loads the corrected config. The declarative repair
+  loop lives in praxec-meta (`meta/flow.repair-workflow-health`).
+
 ### Added — default reasoning effort for agent turns
 
 - **`kind: agent` turns now default to `low` reasoning effort** via the new
