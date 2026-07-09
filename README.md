@@ -245,6 +245,9 @@ and [docs/reference/configuration.md](docs/reference/configuration.md):
   cloud catches dangling targets, unreachable states, type mismatches, and verb
   misuse at load, exiting non-zero. → [Validation rules](https://praxec.dev/reference/validation-rules/)
 - Hot reload: `SIGHUP` reloads config without dropping in-flight workflows.
+- Running agents in the workflow: point `gateway.models_yaml` at a `models.yaml`
+  and set provider keys before you flip on `kind: agent` steps or `auto_drive` —
+  `praxec check` fails fast without them. → [Agents & models](docs/guides/agents-and-models.md)
 
 Scope: single-host is production-ready; multiple processes on one host share a
 `sqlite` file (WAL). Cross-host HA isn't supported — there's no networked store
@@ -284,6 +287,7 @@ docs:
 | Full config reference | [docs/reference/configuration.md](docs/reference/configuration.md) · [/reference/configuration](https://praxec.dev/reference/configuration/) |
 | Connections (MCP/CLI/REST) | [docs/guides/connections.md](docs/guides/connections.md) · [/guides/connections](https://praxec.dev/guides/connections/) |
 | LLM-authoring guidance | [docs/guides/llm-guidance.md](docs/guides/llm-guidance.md) |
+| Agents & models setup | [docs/guides/agents-and-models.md](docs/guides/agents-and-models.md) |
 | Composing at scale | [docs/architecture/mcp-control-architecture.md](docs/architecture/mcp-control-architecture.md) |
 | Embedding as a library | [docs/guides/embeddings.md](docs/guides/embeddings.md) · [/advanced/embedding](https://praxec.dev/advanced/embedding/) |
 | Runtime invariants | [docs/reference/invariants.md](docs/reference/invariants.md) |

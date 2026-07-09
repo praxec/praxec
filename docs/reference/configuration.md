@@ -432,6 +432,64 @@ see [../architecture/mcp-control-architecture.md](../architecture/mcp-control-ar
 
 ---
 
+## Models & agents
+
+Steps that put an LLM in the loop — `kind: agent`, affinity-resolved `kind: llm`,
+and the auto-driven coding agent — resolve their model through a **models file**.
+
+```yaml
+gateway:
+  models_yaml: .praxec/models.yaml       # path to the ModelsFile (see below)
+
+praxec:
+  agents:
+    auto_drive: true                      # run an agent at every `actor: agent` gate (default false)
+    auto_drive_affinity: reasoning        # binding the agent's model resolves through (default "reasoning")
+    auto_drive_max_seconds: 300           # per-step deadline (default 0 → executor default)
+    auto_drive_tools:                      # tools appended to every wired connection; {{ }}-templated per leaf
+      - "file:{{ $.workflow.input.repo_path }}"
+```
+
+| Key | Notes |
+|-----|-------|
+| `gateway.models_yaml` | Path to the models file that resolves agent / affinity model bindings. **This is the only key read** — a top-level `models_yaml:` is inert. Canonical location `.praxec/models.yaml`. A config declaring a `kind: agent` step or `auto_drive: true` **fails `praxec check`** without it (`AGENT_MODELS_YAML_REQUIRED`). |
+| `praxec.agents.auto_drive` | Master switch (bool, default `false`). |
+| `praxec.agents.auto_drive_affinity` | Model binding for the auto-driven agent (default `"reasoning"`). |
+| `praxec.agents.auto_drive_max_seconds` | Fail-fast bound per agent step (u64 seconds; `0` = executor default). |
+| `praxec.agents.auto_drive_tools` | Extra tools appended to every wired connection. Entries are `{{ … }}` templates rendered per leaf against `$.workflow.input.*` / `$.context.*`. |
+
+`kind: agent` is an **in-process** rig session (no subprocess) — it reads the
+gateway process's environment for provider keys. The full walkthrough — models
+file schema, `orchestrate` vs `auto_drive`, templating, and troubleshooting — is
+in [../guides/agents-and-models.md](../guides/agents-and-models.md).
+
+---
+
+## Provider keys
+
+Once a binding resolves to a `provider` + `model`, the runtime needs that
+provider's credential from the environment:
+
+| Provider | Credential |
+|----------|-----------|
+| Anthropic | `ANTHROPIC_API_KEY` |
+| OpenAI | `OPENAI_API_KEY` |
+| OpenRouter | `OPENROUTER_API_KEY` |
+| Gemini | `GEMINI_API_KEY` |
+| Ollama (local) | `OLLAMA_HOST` (keyless) |
+
+Two backends, with the **environment winning over the file**:
+
+- **Environment variables** — set directly (ideal for CI).
+- **File** — `~/.praxec/providers.env` (mode `0600`), written by
+  `px set-provider-keys`. Override the path with `PRAXEC_PROVIDER_KEYS_FILE`.
+
+Both `px` and the `praxec` gateway load the file at startup, so `serve` /
+`orchestrate` pick up your keys the same way `px walk` does. Details in
+[../guides/agents-and-models.md](../guides/agents-and-models.md#provider-keys).
+
+---
+
 ## Persistent stores
 
 Workflow instance state across restarts:
