@@ -1,0 +1,13 @@
+workflows:
+  cap.verify.generic:
+    title: Verify (generic fixture)
+    description: Minimal generic verify slot cap for hop_slot resolution tests.
+    initialState: ready
+    states:
+      ready:
+        terminal: true
+    snippet:
+      inputs:
+        cwd: { type: string }
+      outputs:
+        verify: { $ref: "praxec://hop#/$defs/verifyOut" }

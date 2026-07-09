@@ -611,6 +611,10 @@
           "default": "experimental",
           "description": "SPEC \u00a76.2 \u2014 workflow lifecycle. Capabilities default to `experimental`; declaring `stable` is what makes `expects_contract_hash` mandatory on callers (V16, PR3)."
         },
+        "stack": {
+          "type": "string",
+          "description": "Spec A \u00a75 \u2014 the resolution stack (e.g. `rust`, `python`, `ts-react`) this workflow's `hop_slot:` transitions resolve against. At config load each `hop_slot: <slot>` resolves to `cap.<slot>.<stack>`, falling back to `cap.<slot>.generic`. Absent \u2192 `generic`."
+        },
         "initialState": {
           "type": "string"
         },
