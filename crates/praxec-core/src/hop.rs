@@ -82,6 +82,32 @@ pub(crate) fn compile_validator(
         .build(schema)
 }
 
+/// Public, registry-aware "validate this value against this schema" entry.
+///
+/// Executors (a different crate than the runtime seams) need the *same*
+/// registry-aware validation the runtime uses so a `praxec://hop` `$ref`
+/// resolves — e.g. the `parallel` executor's map-boundary per-item input check
+/// (Spec A §7.1). Mirrors `runtime_schema::validate_schema` but returns a plain
+/// `String` error (joining every violation) so callers can wrap it in whatever
+/// `ExecutorError` variant fits. Strictly widening: a self-contained schema
+/// behaves exactly as bare `jsonschema::validator_for`.
+pub fn validate_against_schema(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    label: &str,
+) -> Result<(), String> {
+    let validator =
+        compile_validator(schema).map_err(|e| format!("invalid {label} schema: {e}"))?;
+    if validator.is_valid(value) {
+        return Ok(());
+    }
+    let errs: Vec<String> = validator
+        .iter_errors(value)
+        .map(|e| e.to_string())
+        .collect();
+    Err(format!("{label}: {}", errs.join("; ")))
+}
+
 /// The parsed shipped HOP vocabulary, for structural lookups (e.g. a slot
 /// `In` contract's `required` field list). Parsed once; shares the same
 /// fail-at-boot invariant as [`HOP_REGISTRY`].
@@ -108,6 +134,41 @@ pub(crate) fn slot_in_required(base: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Parse a config-authored HOP `$ref` (`praxec://hop#/$defs/<def>`) into its
+/// `<def>` name (e.g. `verifyOut`). Returns `None` for any other string — a
+/// self-contained inline schema, a foreign `$ref`, etc.
+pub fn hop_ref_def(ref_uri: &str) -> Option<&str> {
+    ref_uri.strip_prefix("praxec://hop#/$defs/")
+}
+
+/// The declared `properties` field names of a HOP `$defs` entry (e.g.
+/// `hop_def_properties("verifyOut")` → the keys of `verifyOut.properties`).
+/// `None` when the def is unknown or declares no `properties` object.
+///
+/// Backs the Spec A §7.1 fan-in composition check: to prove "the reduce
+/// consumes what the map produces" the load-time checker needs the worker
+/// `<slot>Out` field set, which for a `$ref`-declared contract lives in the
+/// shipped vocabulary rather than inline on the transition.
+pub fn hop_def_properties(def: &str) -> Option<Vec<String>> {
+    HOP_SCHEMA_JSON
+        .pointer(&format!("/$defs/{def}/properties"))
+        .and_then(serde_json::Value::as_object)
+        .map(|o| o.keys().cloned().collect())
+}
+
+/// The declared `required` field names of a HOP `$defs` entry. `None` when the
+/// def is unknown or declares no `required` array.
+pub fn hop_def_required(def: &str) -> Option<Vec<String>> {
+    HOP_SCHEMA_JSON
+        .pointer(&format!("/$defs/{def}/required"))
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +184,47 @@ mod tests {
         );
         // Unknown base → empty (never panics).
         assert!(slot_in_required("nope").is_empty());
+    }
+
+    #[test]
+    fn hop_ref_def_parses_only_the_hop_alias() {
+        assert_eq!(
+            hop_ref_def("praxec://hop#/$defs/verifyOut"),
+            Some("verifyOut")
+        );
+        assert_eq!(
+            hop_ref_def("praxec://hop#/$defs/detectIn"),
+            Some("detectIn")
+        );
+        // A foreign / inline ref is not a HOP alias.
+        assert_eq!(hop_ref_def("#/definitions/Foo"), None);
+        assert_eq!(hop_ref_def("verifyOut"), None);
+    }
+
+    #[test]
+    fn hop_def_properties_and_required_read_the_vocabulary() {
+        // verifyOut declares `status` among its properties and requires it.
+        let props = hop_def_properties("verifyOut").expect("verifyOut has properties");
+        assert!(props.contains(&"status".to_string()), "got: {props:?}");
+        let req = hop_def_required("verifyOut").expect("verifyOut has required");
+        assert!(req.contains(&"status".to_string()), "got: {req:?}");
+        // Unknown def → None (never panics).
+        assert!(hop_def_properties("nope").is_none());
+        assert!(hop_def_required("nope").is_none());
+    }
+
+    #[test]
+    fn validate_against_schema_resolves_hop_ref() {
+        // A verifyIn contract requires `cwd`; a value missing it must fail via
+        // the registry, and a conforming value must pass.
+        let schema = json!({ "$ref": "praxec://hop#/$defs/verifyIn" });
+        assert!(validate_against_schema(&schema, &json!({ "cwd": "/tmp" }), "x").is_ok());
+        let err = validate_against_schema(&schema, &json!({ "nope": 1 }), "item")
+            .expect_err("missing cwd must fail the verifyIn contract");
+        assert!(
+            err.starts_with("item:"),
+            "label prefix expected, got: {err}"
+        );
     }
 
     /// A minimal schema that `$ref`s a slot-out through the alias URI, resolved

@@ -922,6 +922,15 @@ enum BranchesSpec {
         /// value. Falsy elements are dropped BEFORE branches spawn.
         /// Avoids the "add a state just to filter" antipattern.
         where_clause: Option<String>,
+        /// Spec A §7.1 — the **map boundary** typed contract. When the `do:`
+        /// worker template declares an `inputSchema`, every item that survives
+        /// the `where:` filter (i.e. is actually handed to a worker) is
+        /// validated against it BEFORE the branch spawns. Registry-aware, so a
+        /// `{ "$ref": "praxec://hop#/$defs/<slot>In" }` contract resolves
+        /// against the shipped HOP vocabulary. The schema is lifted OFF the
+        /// worker template here so it is a boundary contract only, never passed
+        /// down as a config field the worker executor would see.
+        item_input_schema: Option<Value>,
     },
 }
 
@@ -948,7 +957,7 @@ impl ParallelConfig {
                     )
                 })?
                 .to_string();
-            let do_template = obj
+            let mut do_template = obj
                 .get("do")
                 .ok_or_else(|| {
                     ExecutorError::Permanent(
@@ -958,6 +967,24 @@ impl ParallelConfig {
                     )
                 })?
                 .clone();
+            // Spec A §7.1 — lift the map-boundary `inputSchema` OFF the worker
+            // template so it is a boundary contract only, never a config field
+            // the worker executor sees. A non-object schema is a config error
+            // (a JSON Schema is always an object or a bool; we require object).
+            let item_input_schema = match do_template.as_object_mut() {
+                Some(do_obj) => match do_obj.remove("inputSchema") {
+                    None => None,
+                    Some(s @ Value::Object(_)) => Some(s),
+                    Some(_) => {
+                        return Err(ExecutorError::Permanent(
+                            "INVALID_PARALLEL_CONFIG: dynamic `branches.do.inputSchema` must be a \
+                             JSON Schema object (the map-boundary per-item input contract)"
+                                .into(),
+                        ));
+                    }
+                },
+                None => None,
+            };
             let where_clause = obj
                 .get("where")
                 .map(|w| {
@@ -984,6 +1011,7 @@ impl ParallelConfig {
                     for_each: for_each.clone(),
                     do_template,
                     where_clause,
+                    item_input_schema,
                 },
                 Some(for_each),
             )
@@ -1153,6 +1181,7 @@ fn resolve_branches(
             for_each,
             do_template,
             where_clause,
+            item_input_schema,
         } => {
             let resolved = read_in_scopes(
                 for_each,
@@ -1204,6 +1233,27 @@ fn resolve_branches(
             } else {
                 arr.iter().enumerate().collect()
             };
+            // Spec A §7.1 — MAP BOUNDARY. Each item that survives the filter is
+            // about to be handed to a worker; validate it against the worker's
+            // declared `<slot>In` (registry-aware, so a `praxec://hop` `$ref`
+            // resolves) BEFORE the branch spawns. Fail-fast on the first
+            // off-shape item, naming the source-array index. This is the typed
+            // fan-out edge: an off-shape item can never reach a worker.
+            if let Some(schema) = item_input_schema {
+                for (index, value) in &filtered {
+                    praxec_core::hop::validate_against_schema(
+                        schema,
+                        value,
+                        "parallel map-boundary item input",
+                    )
+                    .map_err(|e| {
+                        ExecutorError::Permanent(format!(
+                            "PARALLEL_MAP_INPUT_VIOLATION: for_each item at index {index} does not \
+                             conform to the worker's `do.inputSchema` — {e}"
+                        ))
+                    })?;
+                }
+            }
             // NB: branches keep the original element index (not the
             // post-filter position) so audit logs map back to the
             // source-array index unambiguously.
