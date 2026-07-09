@@ -60,7 +60,7 @@ state `onEnter.executor`, and reliability `fallback.executors[]`.
 | `human`  | Records a pending approval and emits `human.approval.requested`.              |
 | `script` | Runs a declared, verb-tagged script (SPEC §22) — a named command bundle resolved through a connection, distinct from raw `cli`. |
 | `llm`    | Governed in-runtime LLM call (SPEC §33); prompt + model binding resolved from config, output is a candidate subject to guards. |
-| `agent`  | Spawns a sub-agent (subprocess) bound to a model; added by the binary's overlay, not the default registry. |
+| `agent`  | Runs a governed **in-process** agent session (the rig runner) bound to a model — no subprocess; added by the binary's overlay, not the default registry. |
 | `parallel` | Fan-out / fan-in inside one transition (SPEC §24): runs `branches` concurrently and joins per the declared condition. |
 | `pipeline` | Sequential composition of N executor steps inside one transition (SPEC §25); each step's output threads as the next step's input. |
 | `workflow` | Starts a sub-workflow by `definitionId`, waits for completion, returns its final context. Supports `input` mapping and `timeoutMs`. |
