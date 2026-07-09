@@ -254,7 +254,7 @@ A Governance "harness" is therefore: a shipped MCP tool + a shipped skill that b
 - Sub-workflows + composition: `workflow` (`use:` I/O scoping, depth cap 10), `parallel`, `pipeline`.
 - Gateway = 2 MCP tools (`praxec.query` / `praxec.command`); links/affordances filtered by guards — `crates/praxec-mcp-server`, `runtime_links.rs`.
 - Guards: closed 10-kind set incl. `evidence` — `crates/praxec-core/src/guards.rs`.
-- Agents: `agents.yaml` bindings (closed Affinity×Tier) — `crates/praxec-core/src/agent_resolver`.
+- Agents: `agents.yaml` bindings (closed Affinity×Tier) — `crates/praxec-core/src/model_resolver`.
 - Pack/source model: `praxec.repo.yaml` manifest + `repos:` config + namespacing.
 - CPM planner: the standalone `cpm-planner` MCP server (separate repo).
 - Chat TUI: `aether-wisp` via `praxec-agent acp` handoff (`crates/praxec-tui/src/main.rs`).

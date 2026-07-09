@@ -53,7 +53,8 @@ are the contracts.
 
 ## Where the tests live
 
-- `crates/praxec-core/tests/invariants.rs` — invariants 1–8 and
+- `crates/praxec-core/tests/invariants_actor_audit.rs`,
+  `invariants_governance.rs`, `invariants_proxy.rs` — invariants 1–8 and
   10, plus audit-event emission for rejection / success / fallback paths.
 - `crates/praxec-mcp-server/tests/stable_tool_surface.rs` —
   invariant 9. Asserts the rmcp tool list has exactly the two
@@ -64,9 +65,10 @@ are the contracts.
 - `crates/praxec-core/tests/persistent_stores.rs` — round-trip
   + optimistic locking semantics for file-backed and SQLite stores.
   Proves invariants 6–7 hold across persistent backends.
-- `crates/praxec-core/tests/deterministic_chain.rs` —
+- `crates/praxec-core/tests/chain_basic.rs`, `chain_audit.rs`,
+  `chain_audit_criticality.rs`, `chain_guidance.rs`, `chain_loop.rs` —
   deterministic chaining (auto-execute, mixed-state stop, depth limit,
-  failure recovery, phase guidance, audit events). 16 scenarios.
+  failure recovery, phase guidance, audit events).
 
 Run them: `cargo test --workspace`.
 
