@@ -513,6 +513,16 @@ fn hop_ref(base: &str, dir: &str) -> Value {
 /// An unknown slot name, a non-string marker, or an array-form `blackboard:`
 /// that collides with a slot is a hard load error (`bail!`).
 fn inject_hop_slots(config: &mut Value) -> anyhow::Result<()> {
+    // Snapshot the resolution inputs BEFORE taking the mutable `workflows`
+    // borrow: the full set of loaded (namespace-prefixed) definition ids and
+    // the repo `namespace → priority` map stamped by `merge_declared_repos`.
+    let loaded_ids: Vec<String> = config
+        .pointer("/workflows")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let repo_priority = read_repo_priority(config);
+
     let Some(workflows) = config
         .pointer_mut("/workflows")
         .and_then(Value::as_object_mut)
@@ -525,9 +535,17 @@ fn inject_hop_slots(config: &mut Value) -> anyhow::Result<()> {
             continue;
         };
 
+        // The workflow's resolution stack (Spec A §5); absent → `generic`.
+        let stack = def_obj
+            .get("stack")
+            .and_then(Value::as_str)
+            .unwrap_or("generic")
+            .to_string();
+
         // First pass: walk states→transitions, inject each transition's
-        // `inputSchema`, and collect the slot→Out ref for the blackboard.
-        // (Borrow split: mutate transitions here, mutate `blackboard` after.)
+        // `inputSchema` + resolved executor, and collect the slot→Out ref for
+        // the blackboard. (Borrow split: mutate transitions here, mutate
+        // `blackboard` after.)
         let mut out_slots: std::collections::BTreeMap<String, Value> =
             std::collections::BTreeMap::new();
 
@@ -545,7 +563,7 @@ fn inject_hop_slots(config: &mut Value) -> anyhow::Result<()> {
                         continue;
                     };
                     // Own the slot name and end the immutable borrow of `t_obj`
-                    // before injecting the input schema below.
+                    // before mutating it below.
                     let slot = marker
                         .as_str()
                         .ok_or_else(|| {
@@ -567,18 +585,67 @@ fn inject_hop_slots(config: &mut Value) -> anyhow::Result<()> {
                         )
                     })?;
 
+                    // STRICT: a hop_slot transition never declares its own
+                    // executor — the engine owns wiring the resolved cap.
+                    if t_obj.contains_key("executor") {
+                        bail!(
+                            "HOP_SLOT_EXECUTOR_CONFLICT: workflow '{wf_id}' state \
+                             '{state_name}' transition '{t_name}': hop_slot transitions must \
+                             not declare an executor; the engine wires the resolved \
+                             `cap.{slot}.<stack>`. Remove the `executor:` block."
+                        );
+                    }
+
+                    // Resolve the marker to a concrete cap (stack-specific, then
+                    // `generic` fallback; repo-priority breaks multi-namespace
+                    // ties). A load error if nothing resolves.
+                    let resolved = resolve_hop_cap(
+                        &slot,
+                        &stack,
+                        &loaded_ids,
+                        &repo_priority,
+                        wf_id,
+                        state_name,
+                        t_name,
+                    )?;
+
                     // (a) Inject the input contract, honoring an explicit author schema.
                     if !t_obj.contains_key("inputSchema") {
                         t_obj.insert("inputSchema".into(), hop_ref(base, "In"));
                     }
 
+                    // Wire the resolved cap as a `kind: workflow` executor. The
+                    // `use:` block expands normally in `expand_use_bindings`
+                    // (which runs after this pass): `outputs` synthesizes the
+                    // `output:` mapping that lands the cap's `<slot>` output at
+                    // `$.context.<slot>`; `inputs` forwards the required
+                    // In-contract fields the actor supplied as arguments.
+                    let mut use_inputs = Map::new();
+                    for field in crate::hop::slot_in_required(base) {
+                        use_inputs
+                            .insert(field.clone(), Value::String(format!("$.arguments.{field}")));
+                    }
+                    let mut use_outputs = Map::new();
+                    use_outputs.insert(
+                        format!("$.context.{slot}"),
+                        // Convention (Spec A.1 §4.2): a `cap.<slot>.<stack>`
+                        // names its HOP output after the slot.
+                        Value::String(slot.clone()),
+                    );
+                    t_obj.insert(
+                        "executor".into(),
+                        json!({
+                            "kind": "workflow",
+                            "definitionId": resolved,
+                            "use": {
+                                "inputs": Value::Object(use_inputs),
+                                "outputs": Value::Object(use_outputs),
+                            }
+                        }),
+                    );
+
                     // Record the Out ref; the engine owns this contract.
                     out_slots.insert(slot, hop_ref(base, "Out"));
-
-                    // RESOLUTION HOOK (deferred slice): resolve the marker to the
-                    // concrete `cap.<slot>.<stack>` (additive repo layering /
-                    // `overrides:` / a dispatch flow) here. This slice injects the
-                    // contract only; it does not wire stack resolution.
                 }
             }
         }
@@ -604,6 +671,100 @@ fn inject_hop_slots(config: &mut Value) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Read the stamped `namespace → priority` map (`/praxec/_repoPriority`,
+/// [`stamp_repo_priority`]) into a lookup. Absent → empty (all namespaces
+/// default to priority `0`).
+fn read_repo_priority(config: &Value) -> HashMap<String, i64> {
+    config
+        .pointer("/praxec/_repoPriority")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(ns, v)| v.as_i64().map(|p| (ns.clone(), p)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Spec A §5 — resolve a `hop_slot: <slot>` marker to a concrete loaded cap id.
+///
+/// - Look for `cap.<slot>.<stack>` among loaded ids (host-local, or namespaced
+///   as `<ns>/cap.<slot>.<stack>`). If none and `stack != "generic"`, fall back
+///   to `cap.<slot>.generic`. Neither → `HOP_SLOT_UNRESOLVED`.
+/// - When several namespaces provide the matching cap, the highest `priority:`
+///   wins; a host-local (unprefixed) cap outranks any repo (the operator's own
+///   config is top authority). An equal-priority tie → `HOP_SLOT_AMBIGUOUS`.
+fn resolve_hop_cap(
+    slot: &str,
+    stack: &str,
+    loaded_ids: &[String],
+    repo_priority: &HashMap<String, i64>,
+    wf_id: &str,
+    state_name: &str,
+    t_name: &str,
+) -> anyhow::Result<String> {
+    // Stack-specific first, then the generic floor (only if distinct).
+    let mut candidates = matching_caps(slot, stack, loaded_ids);
+    if candidates.is_empty() && stack != "generic" {
+        candidates = matching_caps(slot, "generic", loaded_ids);
+    }
+
+    if candidates.is_empty() {
+        bail!(
+            "HOP_SLOT_UNRESOLVED: workflow '{wf_id}' state '{state_name}' transition '{t_name}': \
+             `hop_slot: {slot}` (stack '{stack}') resolves to no loaded capability — neither \
+             `cap.{slot}.{stack}` nor `cap.{slot}.generic` is loaded. Register a slot cap or \
+             declare the repo that provides it."
+        );
+    }
+
+    if candidates.len() == 1 {
+        return Ok(candidates.into_iter().next().expect("len checked == 1"));
+    }
+
+    // Multiple providers — break the tie by repo priority. Host-local
+    // (unprefixed) caps are the operator's own config: top authority.
+    let ranked: Vec<(i64, String)> = candidates
+        .into_iter()
+        .map(|id| {
+            let prio = match id.split_once('/') {
+                Some((ns, _)) => repo_priority.get(ns).copied().unwrap_or(0),
+                None => i64::MAX, // host-local wins outright
+            };
+            (prio, id)
+        })
+        .collect();
+    let top = ranked.iter().map(|(p, _)| *p).max().expect("non-empty");
+    let winners: Vec<&String> = ranked
+        .iter()
+        .filter(|(p, _)| *p == top)
+        .map(|(_, id)| id)
+        .collect();
+    if winners.len() > 1 {
+        let mut names: Vec<&str> = winners.iter().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        bail!(
+            "HOP_SLOT_AMBIGUOUS: workflow '{wf_id}' state '{state_name}' transition '{t_name}': \
+             `hop_slot: {slot}` (stack '{stack}') is provided by multiple repos at equal \
+             priority {top}: [{}]. Raise one repo's `priority:` to disambiguate.",
+            names.join(", ")
+        );
+    }
+    Ok(winners[0].clone())
+}
+
+/// Collect every loaded id that is `cap.<slot>.<stack>` — either host-local
+/// (exact match) or namespaced (`<ns>/cap.<slot>.<stack>`).
+fn matching_caps(slot: &str, stack: &str, loaded_ids: &[String]) -> Vec<String> {
+    let target = format!("cap.{slot}.{stack}");
+    let suffix = format!("/{target}");
+    loaded_ids
+        .iter()
+        .filter(|id| **id == target || id.ends_with(&suffix))
+        .cloned()
+        .collect()
 }
 
 /// SPEC §6 — Walk every workflow's transitions; for any `kind: workflow`
@@ -2325,11 +2486,15 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     // targets, carried forward to the gateway via the resolved config (see
     // `stamp_writable_repos`).
     let mut writable_repo_roots: Vec<(String, bool)> = Vec::new();
+    // Spec A §5 — namespace → priority, carried into the merged config for
+    // `hop_slot:` cap-resolution tie-breaking (see `stamp_repo_priority`).
+    let mut repo_priorities: Vec<(String, i64)> = Vec::new();
 
     for RepoDecl {
         source,
         writable,
         push,
+        priority,
     } in repos
     {
         // Resolve to a local path: a local dir relative to the host config (same
@@ -2370,6 +2535,7 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
                 manifest.name
             );
         }
+        repo_priorities.push((manifest.namespace.clone(), priority));
         for id in crate::repo::aggregate_ids(&repo_value) {
             repo_provided_ids.insert(id);
         }
@@ -2418,7 +2584,35 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     // `praxec.authoring.write_enabled` is set. Reads still flow through the
     // merged registry above; this records only the authoring write target(s).
     stamp_writable_repos(&mut merged, writable_repo_roots);
+
+    // Spec A §5 — carry namespace priorities forward for `hop_slot:` resolution.
+    stamp_repo_priority(&mut merged, repo_priorities);
     Ok(merged)
+}
+
+/// Spec A §5 — record declared repos' `namespace → priority` under
+/// `/praxec/_repoPriority` (internal resolved-config metadata, not an
+/// operator-authored key — mirrors [`stamp_writable_repos`]/`_writableRepos`).
+/// [`inject_hop_slots`] reads it to break `hop_slot:` cap-resolution ties.
+/// No-op when empty. Priority `0` entries are stamped too, so an explicit
+/// `priority: 0` reads back identically to the default.
+fn stamp_repo_priority(config: &mut Value, priorities: Vec<(String, i64)>) {
+    if priorities.is_empty() {
+        return;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let praxec = obj
+        .entry("praxec")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(fg) = praxec.as_object_mut() {
+        let mut map = Map::new();
+        for (ns, prio) in priorities {
+            map.insert(ns, Value::from(prio));
+        }
+        fg.insert("_repoPriority".into(), Value::Object(map));
+    }
 }
 
 /// SPEC §8.4 — record repos declared `writable: true` under
@@ -2453,6 +2647,12 @@ struct RepoDecl {
     source: RepoSource,
     writable: bool,
     push: bool,
+    /// Spec A §5 — repo-priority for `hop_slot:` cap resolution. When multiple
+    /// declared repos provide the same `cap.<slot>.<stack>`, the highest
+    /// `priority` wins; an equal-priority tie is a hard load error
+    /// (`HOP_SLOT_AMBIGUOUS`). Default `0`. Carried into the merged config as a
+    /// `namespace → priority` map (see [`stamp_repo_priority`]).
+    priority: i64,
 }
 
 /// Where a declared repo comes from.
@@ -2534,6 +2734,17 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
              only a writable repo has authored commits to push."
         );
     }
+    // Spec A §5 — optional numeric `priority:` (default 0) breaks `hop_slot:`
+    // cap-resolution ties between repos providing the same `cap.<slot>.<stack>`.
+    let priority = match entry.get("priority") {
+        None | Some(Value::Null) => 0,
+        Some(v) => v.as_i64().ok_or_else(|| {
+            anyhow!(
+                "INVALID_REPO_ENTRY: `repos[{index}].priority` must be an integer ({})",
+                short_value_kind(v)
+            )
+        })?,
+    };
     // SPEC §9 — a repo is either local (`path`) or remote (`uri`, imported via
     // git). Exactly one; a remote repo may pin a `ref` (default `main`).
     let path = entry.get("path").and_then(Value::as_str);
@@ -2565,6 +2776,7 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
         source,
         writable,
         push,
+        priority,
     })
 }
 

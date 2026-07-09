@@ -82,10 +82,48 @@ pub(crate) fn compile_validator(
         .build(schema)
 }
 
+/// The parsed shipped HOP vocabulary, for structural lookups (e.g. a slot
+/// `In` contract's `required` field list). Parsed once; shares the same
+/// fail-at-boot invariant as [`HOP_REGISTRY`].
+static HOP_SCHEMA_JSON: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    serde_json::from_str(HOP_SCHEMA).expect("invariant: shipped hop.schema.json parses as JSON")
+});
+
+/// The `required` field names of a slot's `In` contract (`<base>In`), read from
+/// the shipped vocabulary — e.g. `slot_in_required("verify")` → `["cwd"]`.
+///
+/// Used by the `hop_slot:` resolver to forward the parent transition's
+/// required arguments into the resolved cap's `use.inputs` (the actor validated
+/// them against `<base>In`, so a required field is always present at runtime).
+/// `base` is the camelCase `$defs` base from `config::hop_def_base`.
+pub(crate) fn slot_in_required(base: &str) -> Vec<String> {
+    HOP_SCHEMA_JSON
+        .pointer(&format!("/$defs/{base}In/required"))
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn slot_in_required_reads_the_vocabulary() {
+        assert_eq!(slot_in_required("verify"), vec!["cwd".to_string()]);
+        // detectIn requires cwd + ruleset (order per the schema).
+        assert_eq!(
+            slot_in_required("detect"),
+            vec!["cwd".to_string(), "ruleset".to_string()]
+        );
+        // Unknown base → empty (never panics).
+        assert!(slot_in_required("nope").is_empty());
+    }
 
     /// A minimal schema that `$ref`s a slot-out through the alias URI, resolved
     /// against the shipped vocabulary via the registry.

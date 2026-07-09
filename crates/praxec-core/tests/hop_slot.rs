@@ -1,29 +1,39 @@
-//! Slice-2 enforcement tests for the `hop_slot:` primitive (Spec A / A.1 §3).
+//! Enforcement + resolution tests for the `hop_slot:` primitive (Spec A / A.1).
 //!
-//! A transition declaring `hop_slot: <name>` has, at config load, its canonical
-//! `In` contract injected as `inputSchema` and its `Out` contract injected as
-//! the `$.context.<name>` typed blackboard slot — both by `$ref` into the
-//! shipped HOP vocabulary (`praxec://hop`). Enforcement is then pure reuse:
-//! the existing `validate_schema` (input) and `validate_blackboard_writes`
-//! (output) seams. These tests prove the contract is UNBYPASSABLE end-to-end:
-//! a malformed `verifyOut` written to `$.context.verify` is rejected before the
-//! transition advances, exactly as a hand-declared typed slot would be.
+//! STRICT model: a `hop_slot: <slot>` transition declares NO executor. At config
+//! load the engine (`inject_hop_slots`):
+//!   - injects the canonical `<slot>In` as the transition `inputSchema` and
+//!     `<slot>Out` as the `$.context.<slot>` typed blackboard slot;
+//!   - RESOLVES the marker to a concrete `cap.<slot>.<stack>` (stack from the
+//!     workflow's `stack:` field; `generic` fallback; repo-priority tie-break)
+//!     and wires it as a `kind: workflow` executor with a `use:` block.
+//!
+//! Enforcement is then pure reuse of the existing seams: `validate_schema`
+//! (input) and `validate_blackboard_writes` (output). These tests prove the
+//! contract is UNBYPASSABLE end-to-end — a malformed `verifyOut` produced by the
+//! resolved cap is rejected before the transition advances — AND that resolution
+//! picks the right cap.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
+use praxec_core::config::{load_resolved_with_repos, resolve};
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::{Principal, StartWorkflow, SubmitTransition};
 use praxec_core::ports::{Executor, ExecutorRegistry};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use tempfile::TempDir;
 
-// ── harness (mirrors tests/blackboard_typing.rs) ──────────────────────────────
+// ── harness ───────────────────────────────────────────────────────────────────
 
-/// Executor that returns a controlled `output` value, so the test can drive the
-/// post-write blackboard value into any shape.
+/// Executor substituted for `kind: workflow` so a test controls the value the
+/// resolved cap "produces" — the parent projects it into `$.context.<slot>`,
+/// where `validate_blackboard_writes` enforces `<slot>Out`. (This bypasses real
+/// sub-workflow launch; the enforcement seam under test is identical.)
 struct FixedOutputExecutor {
     output: Value,
 }
@@ -55,34 +65,6 @@ impl ExecutorRegistry for SingleExecRegistry {
     }
 }
 
-/// A workflow whose single `gate.run` transition is `hop_slot: verify`, writing
-/// the executor output into `$.context.verify`. Raw (pre-resolve) so the load
-/// pass performs the injection.
-fn hop_slot_verify_config() -> Value {
-    json!({
-        "version": "1.0.0",
-        "workflows": {
-            "sdlc": {
-                "initialState": "gate",
-                "states": {
-                    "gate": {
-                        "transitions": {
-                            "run": {
-                                "target": "done",
-                                "actor": "agent",
-                                "hop_slot": "verify",
-                                "executor": { "kind": "noop" },
-                                "output": { "verify": "$.output" }
-                            }
-                        }
-                    },
-                    "done": { "terminal": true }
-                }
-            }
-        }
-    })
-}
-
 fn build_runtime(config: Value, executor_output: Value) -> WorkflowRuntime {
     let definitions = Arc::new(ConfigDefinitionStore::from_config(&config));
     let store = Arc::new(InMemoryWorkflowStore::new());
@@ -102,7 +84,54 @@ fn build_runtime(config: Value, executor_output: Value) -> WorkflowRuntime {
     )
 }
 
-/// A well-formed `verifyOut` instance.
+/// A minimal `cap.verify.<stack>` workflow: a terminal state + the HOP-typed
+/// `snippet.outputs.verify` the resolver maps into `$.context.verify`.
+fn verify_cap() -> Value {
+    json!({
+        "initialState": "ready",
+        "states": { "ready": { "terminal": true } },
+        "snippet": {
+            "inputs": { "cwd": { "type": "string" } },
+            "outputs": { "verify": { "$ref": "praxec://hop#/$defs/verifyOut" } }
+        }
+    })
+}
+
+/// Host config: a `stack`-typed flow with one `hop_slot: verify` transition
+/// (NO executor — the engine resolves + wires the cap), plus the named caps.
+fn sdlc_config(stack: Option<&str>, caps: &[(&str, Value)]) -> Value {
+    let mut sdlc = json!({
+        "initialState": "gate",
+        "states": {
+            "gate": { "transitions": { "run": {
+                "target": "done",
+                "actor": "agent",
+                "hop_slot": "verify"
+            } } },
+            "done": { "terminal": true }
+        }
+    });
+    if let Some(s) = stack {
+        sdlc.as_object_mut()
+            .unwrap()
+            .insert("stack".into(), json!(s));
+    }
+    let mut workflows = Map::new();
+    workflows.insert("sdlc".into(), sdlc);
+    for (id, def) in caps {
+        workflows.insert((*id).to_string(), def.clone());
+    }
+    json!({ "version": "1.0.0", "workflows": Value::Object(workflows) })
+}
+
+/// The resolved `hop_slot: verify` transition after `resolve`.
+fn run_transition(resolved: &Value) -> Value {
+    resolved
+        .pointer("/workflows/sdlc/states/gate/transitions/run")
+        .cloned()
+        .expect("run transition present")
+}
+
 fn valid_verify_out() -> Value {
     json!({
         "status": "pass",
@@ -113,7 +142,7 @@ fn valid_verify_out() -> Value {
     })
 }
 
-async fn start_and_submit(runtime: &WorkflowRuntime, output_valid_input: bool) -> Value {
+async fn start_and_submit(runtime: &WorkflowRuntime, valid_input: bool) -> Value {
     let start = runtime
         .start(StartWorkflow {
             definition_id: "sdlc".into(),
@@ -128,9 +157,8 @@ async fn start_and_submit(runtime: &WorkflowRuntime, output_valid_input: bool) -
         .unwrap();
     let workflow_id = start["workflow"]["id"].as_str().unwrap().to_string();
     let version = start["workflow"]["version"].as_u64().unwrap();
-    // `arguments` must satisfy the injected `verifyIn` (requires `cwd`) — proves
-    // the input contract was injected too.
-    let arguments = if output_valid_input {
+    // `arguments` must satisfy the injected `verifyIn` (requires `cwd`).
+    let arguments = if valid_input {
         json!({ "cwd": "." })
     } else {
         json!({ "not_a_verify_in_field": true })
@@ -150,69 +178,122 @@ async fn start_and_submit(runtime: &WorkflowRuntime, output_valid_input: bool) -
         .unwrap()
 }
 
-// ── load-time injection ───────────────────────────────────────────────────────
+// ── resolution (load time) ────────────────────────────────────────────────────
 
 #[test]
-fn hop_slot_injects_input_and_output_contracts() {
-    let resolved = praxec_core::config::resolve(hop_slot_verify_config()).expect("resolves");
-    let t = resolved
-        .pointer("/workflows/sdlc/states/gate/transitions/run")
-        .expect("transition present");
+fn stack_specific_cap_resolves() {
+    let resolved = resolve(sdlc_config(
+        Some("rust"),
+        &[
+            ("cap.verify.rust", verify_cap()),
+            ("cap.verify.generic", verify_cap()),
+        ],
+    ))
+    .expect("resolves");
+    let t = run_transition(&resolved);
+    let exec = t.pointer("/executor").expect("executor injected");
 
-    // (a) inputSchema injected as the verifyIn $ref.
+    assert_eq!(exec.pointer("/kind"), Some(&json!("workflow")));
+    assert_eq!(
+        exec.pointer("/definitionId"),
+        Some(&json!("cap.verify.rust")),
+        "stack-specific cap must win over generic"
+    );
+    // The `use:` block the engine wires: outputs land the cap's `verify` output
+    // at $.context.verify; inputs forward the required verifyIn field.
+    assert_eq!(
+        exec.pointer("/use/outputs"),
+        Some(&json!({ "$.context.verify": "verify" }))
+    );
+    assert_eq!(
+        exec.pointer("/use/inputs"),
+        Some(&json!({ "cwd": "$.arguments.cwd" }))
+    );
+    // In/Out contracts still injected.
     assert_eq!(
         t.pointer("/inputSchema"),
-        Some(&json!({ "$ref": "praxec://hop#/$defs/verifyIn" })),
-        "verifyIn must be injected as the transition inputSchema"
+        Some(&json!({ "$ref": "praxec://hop#/$defs/verifyIn" }))
     );
-
-    // (b) typed blackboard slot `verify` injected as the verifyOut $ref.
     assert_eq!(
         resolved.pointer("/workflows/sdlc/blackboard/verify"),
-        Some(&json!({ "$ref": "praxec://hop#/$defs/verifyOut" })),
-        "verifyOut must be injected as the $.context.verify blackboard slot"
+        Some(&json!({ "$ref": "praxec://hop#/$defs/verifyOut" }))
+    );
+    // expand_use_bindings (runs after) synthesized the output mapping + embedded
+    // the cap's snippet outputs, so the resolved cap's `verify` lands correctly.
+    assert_eq!(
+        t.pointer("/output/verify"),
+        Some(&json!("$.output.verify")),
+        "use.outputs must expand into the transition output mapping"
+    );
+    assert!(
+        t.pointer("/executor/_snippetOutputs/verify").is_some(),
+        "cap snippet outputs must be embedded by expand_use_bindings"
     );
 }
 
 #[test]
-fn hop_slot_does_not_clobber_an_explicit_input_schema() {
-    let mut cfg = hop_slot_verify_config();
-    // Author supplies an explicit inputSchema — the engine must not overwrite it.
-    *cfg.pointer_mut("/workflows/sdlc/states/gate/transitions/run")
+fn generic_fallback_when_no_stack_cap() {
+    let resolved = resolve(sdlc_config(
+        Some("rust"),
+        &[("cap.verify.generic", verify_cap())],
+    ))
+    .expect("resolves");
+    assert_eq!(
+        run_transition(&resolved).pointer("/executor/definitionId"),
+        Some(&json!("cap.verify.generic")),
+        "with no cap.verify.rust, must fall back to cap.verify.generic"
+    );
+}
+
+#[test]
+fn absent_stack_resolves_generic() {
+    let resolved =
+        resolve(sdlc_config(None, &[("cap.verify.generic", verify_cap())])).expect("resolves");
+    assert_eq!(
+        run_transition(&resolved).pointer("/executor/definitionId"),
+        Some(&json!("cap.verify.generic")),
+        "absent `stack:` means the generic stack"
+    );
+}
+
+#[test]
+fn unresolved_cap_is_a_load_error() {
+    // stack rust, and NO cap.verify.rust or cap.verify.generic loaded.
+    let err = resolve(sdlc_config(Some("rust"), &[])).expect_err("must fail load");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("HOP_SLOT_UNRESOLVED")
+            && msg.contains("verify")
+            && msg.contains("rust")
+            && msg.contains("cap.verify.generic"),
+        "error must name slot, stack, and the missing caps: {msg}"
+    );
+}
+
+#[test]
+fn author_executor_is_a_conflict() {
+    let mut cfg = sdlc_config(Some("rust"), &[("cap.verify.rust", verify_cap())]);
+    cfg.pointer_mut("/workflows/sdlc/states/gate/transitions/run")
         .unwrap()
         .as_object_mut()
-        .unwrap() = {
-        let mut m = cfg
-            .pointer("/workflows/sdlc/states/gate/transitions/run")
-            .unwrap()
-            .as_object()
-            .unwrap()
-            .clone();
-        m.insert("inputSchema".into(), json!({ "type": "object" }));
-        m
-    };
-    let resolved = praxec_core::config::resolve(cfg).expect("resolves");
-    assert_eq!(
-        resolved.pointer("/workflows/sdlc/states/gate/transitions/run/inputSchema"),
-        Some(&json!({ "type": "object" })),
-        "an explicit inputSchema must be preserved (author may narrow)"
-    );
-    // But the Out slot is still engine-owned/injected.
-    assert_eq!(
-        resolved.pointer("/workflows/sdlc/blackboard/verify"),
-        Some(&json!({ "$ref": "praxec://hop#/$defs/verifyOut" }))
+        .unwrap()
+        .insert("executor".into(), json!({ "kind": "noop" }));
+    let err = resolve(cfg).expect_err("author executor must conflict");
+    assert!(
+        err.to_string().contains("HOP_SLOT_EXECUTOR_CONFLICT"),
+        "got: {err}"
     );
 }
 
 #[test]
 fn unknown_hop_slot_name_is_a_load_error() {
-    let mut cfg = hop_slot_verify_config();
+    let mut cfg = sdlc_config(Some("rust"), &[("cap.verify.rust", verify_cap())]);
     cfg.pointer_mut("/workflows/sdlc/states/gate/transitions/run")
         .unwrap()
         .as_object_mut()
         .unwrap()
         .insert("hop_slot".into(), json!("frobnicate"));
-    let err = praxec_core::config::resolve(cfg).expect_err("unknown slot must fail load");
+    let err = resolve(cfg).expect_err("unknown slot must fail load");
     let msg = err.to_string();
     assert!(
         msg.contains("HOP_SLOT_UNKNOWN") && msg.contains("frobnicate"),
@@ -224,12 +305,113 @@ fn unknown_hop_slot_name_is_a_load_error() {
     );
 }
 
-// ── runtime enforcement (the unbypassable guarantee) ──────────────────────────
+#[test]
+fn explicit_input_schema_is_not_clobbered() {
+    let mut cfg = sdlc_config(Some("rust"), &[("cap.verify.rust", verify_cap())]);
+    cfg.pointer_mut("/workflows/sdlc/states/gate/transitions/run")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("inputSchema".into(), json!({ "type": "object" }));
+    let resolved = resolve(cfg).expect("resolves");
+    let t = run_transition(&resolved);
+    assert_eq!(
+        t.pointer("/inputSchema"),
+        Some(&json!({ "type": "object" })),
+        "an explicit inputSchema must be preserved"
+    );
+    // Out slot still engine-owned; executor still resolved.
+    assert_eq!(
+        resolved.pointer("/workflows/sdlc/blackboard/verify"),
+        Some(&json!({ "$ref": "praxec://hop#/$defs/verifyOut" }))
+    );
+    assert_eq!(
+        t.pointer("/executor/definitionId"),
+        Some(&json!("cap.verify.rust"))
+    );
+}
+
+// ── repo-priority (end-to-end through load_resolved_with_repos) ────────────────
+
+fn fixtures_root() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("tests");
+    p.push("fixtures");
+    p.push("repos");
+    p
+}
+
+fn write_host(td: &TempDir, body: &str) -> PathBuf {
+    let p = td.path().join("praxec.yaml");
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+/// Host with two repos (`va`, `vb`) both shipping `cap.verify.generic`, at the
+/// given priorities, and an sdlc flow with a `hop_slot: verify` transition.
+fn priority_host(pa: i64, pb: i64) -> String {
+    format!(
+        r#"
+version: "1.0.0"
+repos:
+  - path: "{a}"
+    priority: {pa}
+  - path: "{b}"
+    priority: {pb}
+workflows:
+  sdlc:
+    initialState: gate
+    states:
+      gate:
+        transitions:
+          run:
+            target: done
+            actor: agent
+            hop_slot: verify
+      done:
+        terminal: true
+"#,
+        a = fixtures_root().join("verify-a").display(),
+        b = fixtures_root().join("verify-b").display(),
+    )
+}
+
+#[test]
+fn repo_priority_higher_namespace_wins() {
+    let td = TempDir::new().unwrap();
+    let path = write_host(&td, &priority_host(5, 3));
+    let (config, _diags) = load_resolved_with_repos(&path).expect("two-repo load");
+    assert_eq!(
+        config.pointer("/workflows/sdlc/states/gate/transitions/run/executor/definitionId"),
+        Some(&json!("va/cap.verify.generic")),
+        "the higher-priority repo (va=5 > vb=3) must win"
+    );
+}
+
+#[test]
+fn repo_priority_equal_is_ambiguous() {
+    let td = TempDir::new().unwrap();
+    let path = write_host(&td, &priority_host(5, 5));
+    let err = load_resolved_with_repos(&path).expect_err("equal priority must be ambiguous");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("HOP_SLOT_AMBIGUOUS")
+            && msg.contains("va/cap.verify.generic")
+            && msg.contains("vb/cap.verify.generic"),
+        "error must name the tied caps: {msg}"
+    );
+}
+
+// ── runtime enforcement (the unbypassable guarantee, via resolution) ───────────
 
 #[tokio::test]
 async fn valid_verify_out_advances_the_transition() {
-    let resolved = praxec_core::config::resolve(hop_slot_verify_config()).unwrap();
-    let runtime = build_runtime(resolved, valid_verify_out());
+    let resolved = resolve(sdlc_config(
+        Some("rust"),
+        &[("cap.verify.rust", verify_cap())],
+    ))
+    .unwrap();
+    let runtime = build_runtime(resolved, json!({ "verify": valid_verify_out() }));
     let resp = start_and_submit(&runtime, true).await;
     assert!(
         resp["error"].is_null(),
@@ -243,42 +425,18 @@ async fn valid_verify_out_advances_the_transition() {
 async fn verify_out_with_bad_status_enum_is_rejected() {
     let mut bad = valid_verify_out();
     bad["status"] = json!("green"); // not a member of gateStatus
-    let resolved = praxec_core::config::resolve(hop_slot_verify_config()).unwrap();
-    let runtime = build_runtime(resolved, bad);
-
-    let start = runtime
-        .start(StartWorkflow {
-            definition_id: "sdlc".into(),
-            input: json!({}),
-            principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
-            depth: 0,
-            parent: None,
-        })
-        .await
-        .unwrap();
-    let workflow_id = start["workflow"]["id"].as_str().unwrap().to_string();
-    let pre_version = start["workflow"]["version"].as_u64().unwrap();
-
-    let resp = runtime
-        .submit(SubmitTransition {
-            workflow_id,
-            expected_version: pre_version,
-            transition: "run".into(),
-            arguments: json!({ "cwd": "." }),
-            principal: Principal::anonymous(),
-            summary: None,
-            trace_id: None,
-            run_id: None,
-        })
-        .await
-        .unwrap();
+    let resolved = resolve(sdlc_config(
+        Some("rust"),
+        &[("cap.verify.rust", verify_cap())],
+    ))
+    .unwrap();
+    let runtime = build_runtime(resolved, json!({ "verify": bad }));
+    let resp = start_and_submit(&runtime, true).await;
 
     assert_eq!(
         resp["error"]["code"].as_str(),
         Some("BLACKBOARD_TYPE_ERROR"),
-        "a bad status enum must be rejected via the injected verifyOut slot; got: {}",
+        "a bad status enum from the resolved cap must be rejected; got: {}",
         resp["error"]
     );
     assert!(
@@ -287,19 +445,12 @@ async fn verify_out_with_bad_status_enum_is_rejected() {
             .unwrap_or_default()
             .contains("verify")
     );
-    // Snapshot version unchanged — the transition was aborted, not committed.
-    assert_eq!(
-        resp["workflow"]["version"].as_u64(),
-        Some(pre_version),
-        "version must not advance on a rejected slot write"
-    );
 }
 
 #[tokio::test]
 async fn verify_out_finding_fix_missing_schema_ref_is_rejected() {
     // A finding.fix (SchemaBound) missing its required `schema_ref` — proves the
-    // nested $ref chain (verifyOut -> finding -> schemaBound) resolves through the
-    // registry at the blackboard seam.
+    // nested $ref chain (verifyOut → finding → schemaBound) resolves at the seam.
     let mut bad = valid_verify_out();
     bad["status"] = json!("fail");
     bad["findings"] = json!([{
@@ -310,8 +461,12 @@ async fn verify_out_finding_fix_missing_schema_ref_is_rejected() {
         "message": "bad",
         "fix": { "value": { "kind": "manual" } }
     }]);
-    let resolved = praxec_core::config::resolve(hop_slot_verify_config()).unwrap();
-    let runtime = build_runtime(resolved, bad);
+    let resolved = resolve(sdlc_config(
+        Some("rust"),
+        &[("cap.verify.rust", verify_cap())],
+    ))
+    .unwrap();
+    let runtime = build_runtime(resolved, json!({ "verify": bad }));
     let resp = start_and_submit(&runtime, true).await;
     assert_eq!(
         resp["error"]["code"].as_str(),
@@ -323,10 +478,14 @@ async fn verify_out_finding_fix_missing_schema_ref_is_rejected() {
 
 #[tokio::test]
 async fn injected_verify_in_rejects_nonconforming_arguments() {
-    // The input contract is enforced too: arguments that violate verifyIn
+    // The input contract is enforced too: arguments violating verifyIn
     // (additionalProperties:false, missing required `cwd`) are rejected at submit.
-    let resolved = praxec_core::config::resolve(hop_slot_verify_config()).unwrap();
-    let runtime = build_runtime(resolved, valid_verify_out());
+    let resolved = resolve(sdlc_config(
+        Some("rust"),
+        &[("cap.verify.rust", verify_cap())],
+    ))
+    .unwrap();
+    let runtime = build_runtime(resolved, json!({ "verify": valid_verify_out() }));
     let resp = start_and_submit(&runtime, false).await;
     assert_eq!(
         resp["error"]["code"].as_str(),

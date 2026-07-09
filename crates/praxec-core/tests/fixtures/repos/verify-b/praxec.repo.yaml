@@ -1,0 +1,7 @@
+schema: praxec.repo/v1
+name: verify-b
+namespace: vb
+version: 0.6.0
+description: |
+  Test fixture — ships cap.verify.generic under namespace `vb`. Paired with
+  verify-a for hop_slot repo-priority tie-breaking (Spec A §5).
