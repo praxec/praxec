@@ -29,8 +29,8 @@ Reuse this verbatim everywhere so listings stay consistent:
 ## 1. Cut a release (prerequisite for everything else)
 
 ```bash
-git tag v0.0.14
-git push origin v0.0.14
+git tag v0.0.15
+git push origin v0.0.15
 ```
 
 The `v*` tag triggers three workflows:

@@ -2,7 +2,7 @@
 
 | Artifact | Version | Stability commitment |
 |----------|---------|----------------------|
-| Crate (`praxec` et al.) | 0.0.14 | Pre-1.0 — semver not yet in effect. Breaking changes may occur at any minor bump. |
+| Crate (`praxec` et al.) | 0.0.15 | Pre-1.0 — semver not yet in effect. Breaking changes may occur at any minor bump. |
 | Config schema (`version` field) | "1.0.0" | Tier 1 stable — backward-compatible within the same minor schema version. |
 | Two-tool MCP surface (`praxec.query` + `praxec.command`) | Stable | Fixed tool names, inputs, and output shapes. Operations are reached by varying args; removals follow a deprecation cycle. |
 

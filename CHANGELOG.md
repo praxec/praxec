@@ -17,6 +17,21 @@ covered by a stability commitment.
 > none were tagged at the time. Versions `0.0.1`–`0.0.5` are the earlier
 > development history, renumbered onto this line.
 
+## [0.0.15] — 2026-07-09 — resilient serve & self-healing misconfiguration
+
+### Fixed — HOP: FM-7 exempts the resolved slot cap (typed `snippet.outputs`)
+
+- **`SLOT_KEY_ENGINE_OWNED` no longer rejects the resolved slot cap.** FM-7
+  exempted only `hop_slot:`-declared transitions, but the cap a `hop_slot: <slot>`
+  flow resolves to (`cap.verify.<stack>`) declares
+  `snippet.outputs.<slot>: { $ref: praxec://hop#/$defs/<slot>Out }` and writes
+  `output.<slot>` — the sanctioned typed production, runtime-validated against the
+  same contract by `validate_outputs_against_snippet`. Both shipped packs use this
+  shape, so a live gateway failed config load (surfacing as an opaque MCP
+  `-32000`). The lint now exempts a slot-key write whose enclosing workflow
+  declares the canonical `<slot>Out` `snippet.outputs`; an untyped declaration does
+  **not** earn the exemption (the forge hole stays closed).
+
 ### Added — misconfiguration is a live, self-documenting state (degraded serve)
 
 - **`serve` no longer hard-crashes on a bad config.** A config fault (parse
