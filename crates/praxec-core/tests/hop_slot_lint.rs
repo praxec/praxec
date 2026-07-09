@@ -184,7 +184,8 @@ fn untyped_snippet_output_does_not_earn_exemption() {
             }
         }
     });
-    let err = resolve(cfg).expect_err("an untyped snippet.outputs.verify must not earn the exemption");
+    let err =
+        resolve(cfg).expect_err("an untyped snippet.outputs.verify must not earn the exemption");
     assert!(
         err.to_string().contains("SLOT_KEY_ENGINE_OWNED"),
         "untyped slot output must still fail FM-7: {err}"
