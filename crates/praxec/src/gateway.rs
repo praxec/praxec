@@ -814,13 +814,25 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
     // on first slot validation.
     praxec_core::hop::force_init();
 
-    let config = load_config(&config_path)?;
-
-    // Production safety (poka-yoke): refuse to boot a long-running gateway on an
-    // ephemeral store or non-durable audit sink rather than trusting operators
-    // to read the docs. Serve-only: a one-shot command/query against an
-    // ephemeral store is fine (like `inspect`); a long-running serve is not.
-    guard_durable_serve(&config)?;
+    // Misconfiguration is a first-class, live state — NOT a hard crash. A config
+    // fault (parse error, the durability guard, or a validation lint like
+    // SLOT_KEY_ENGINE_OWNED) used to abort here, BEFORE the MCP transport came up,
+    // so the client saw an opaque transport `-32000` with no diagnosis. Capture
+    // any such fault and come up DEGRADED instead: a live server that completes
+    // the handshake and answers every call with a precise, self-documenting
+    // HealthReport, so an LLM operator can self-heal (typically via the
+    // declarative `meta/flow.repair-workflow-health`) and reconnect. This does no
+    // governed work — it refuses everything, loudly and precisely.
+    let healthy = async {
+        let config = load_config(&config_path)?;
+        // Production safety (poka-yoke): refuse to run a long-running gateway on an
+        // ephemeral store or non-durable audit sink. Serve-only: a one-shot
+        // command/query against an ephemeral store is fine; a long-running serve
+        // is not. As a config fault, this now degrades rather than crashing.
+        guard_durable_serve(&config)?;
+        build_oneshot_server(&config, &overlays).await
+    }
+    .await;
 
     let OneshotServer {
         server,
@@ -829,7 +841,10 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         swappable_defs,
         swappable_executors,
         swappable_discovery,
-    } = build_oneshot_server(&config, &overlays).await?;
+    } = match healthy {
+        Ok(oneshot) => oneshot,
+        Err(err) => return serve_degraded(config_path, err).await,
+    };
 
     tracing::info!(
         path = %config_path.display(),
@@ -965,6 +980,31 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
 
     service.waiting().await?;
     signal_task.abort();
+    Ok(())
+}
+
+/// Serve the minimal DEGRADED gateway when config load failed. Completes the MCP
+/// handshake and answers every call with a [`praxec_mcp_server::HealthReport`]
+/// describing the fault and how to fix it. Recovery is a reconnect: once the
+/// config validates, a fresh process loads it and comes up healthy. Only a fault
+/// that prevents even reporting (the stdio transport itself failing to bind) is
+/// a hard error here.
+async fn serve_degraded(config_path: PathBuf, err: anyhow::Error) -> anyhow::Result<()> {
+    tracing::error!(
+        error = %format!("{err:#}"),
+        path = %config_path.display(),
+        "configuration invalid — starting DEGRADED gateway; every call returns a health report \
+         until the config is fixed and the server is reconnected"
+    );
+    let report = praxec_mcp_server::HealthReport::from_config_error(
+        &err,
+        &config_path.display().to_string(),
+    );
+    let service = praxec_mcp_server::DegradedServer::new(report)
+        .serve(stdio())
+        .await
+        .context("starting degraded MCP service over stdio")?;
+    service.waiting().await?;
     Ok(())
 }
 
