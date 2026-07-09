@@ -238,8 +238,11 @@ the `retryOn` enum.
 
 ### Idempotency keys
 
-Side-effecting executors should use idempotency keys so a retry of a
-timed-out call doesn't double-do the work:
+Side-effecting executors should use idempotency keys so a downstream
+service can dedupe a retried or failed-over call instead of double-doing
+the work. The runtime supplies a *stable* key across retries and
+fallbacks; deduplication itself happens downstream (retries are decided
+only by error class — see above — not by the key):
 
 ```yaml
 executor:
@@ -262,8 +265,8 @@ the convention its protocol expects:
 | `cli`    | `IDEMPOTENCY_KEY` environment variable                |
 | `mcp`    | `_idempotencyKey` field in tool arguments (if the downstream tool reads it) |
 
-The key also lands in every `executor.*` audit event under
-`payload.idempotencyKey` so you can correlate retries in logs.
+The key also lands in the `executor.started` audit event under
+`payload.idempotencyKey` so you can correlate a submit's attempts in logs.
 
 ---
 
