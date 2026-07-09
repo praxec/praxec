@@ -34,9 +34,11 @@ workflows:
         type: string
         enum: [auto, review_plan]
         default: review_plan
+      # Canonical models file the runtime reads via `gateway.models_yaml`
+      # and `px doctor` auto-discovers. One ModelsFile schema, one name.
       target_path:
         type: string
-        default: ".praxec/agents.yaml"
+        default: ".praxec/models.yaml"
       # Optional capability verification after the auth-only smoke
       # passes. Set to a contract path (e.g. contracts/reasoning-
       # arithmetic-v1.yaml) to run that contract against the matching

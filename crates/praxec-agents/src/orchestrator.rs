@@ -177,19 +177,26 @@ pub trait MissionGateway: Send + Sync {
     ) -> Result<MissionState, String>;
 }
 
-/// The orchestrator's decision: which transition advances toward the outcomes,
-/// or `None` to give up (no good move). The production impl runs one agent
-/// session; tests script the choice.
+/// The orchestrator's decision:
+/// - `Ok(Some(t))` — the transition that best advances the outcomes.
+/// - `Ok(None)` — no good move (give up honestly; an authoring dead-end).
+/// - `Err(source)` — the chooser itself FAILED (the runner errored: missing API
+///   key, 401, model-resolution, network). This is NOT "no move" — it must
+///   surface as its own signal, never be collapsed into a misleading give-up.
+///
+/// The production impl runs one agent session; tests script the choice.
 #[async_trait]
 pub trait TransitionChooser: Send + Sync {
-    async fn choose(&self, state: &MissionState) -> Option<String>;
+    async fn choose(&self, state: &MissionState) -> Result<Option<String>, String>;
 }
 
 /// The production [`TransitionChooser`]: runs ONE agent session per decision via
 /// an [`AgentSessionRunner`] (rig-backed in production), and reads the chosen
 /// transition from the agent's `final_answer` output
-/// (`{ "transition": "<name>" }`). A missing or illegal choice yields `None`
-/// (give up) — never a wrong submit.
+/// (`{ "transition": "<name>" }`). A missing or illegal choice yields `Ok(None)`
+/// (give up) — never a wrong submit. A runner ERROR (missing API key, 401,
+/// model-resolution, network) is PROPAGATED as `Err`, never swallowed into a
+/// misleading give-up.
 pub struct AgentChooser {
     runner: Arc<dyn AgentSessionRunner>,
     /// Resolved `"provider:model"` for the orchestrator's binding.
@@ -213,10 +220,10 @@ impl AgentChooser {
 
 #[async_trait]
 impl TransitionChooser for AgentChooser {
-    async fn choose(&self, state: &MissionState) -> Option<String> {
+    async fn choose(&self, state: &MissionState) -> Result<Option<String>, String> {
         let actions = state.agent_actions();
         if actions.is_empty() {
-            return None;
+            return Ok(None);
         }
         let session = AgentSession {
             model: self.model.clone(),
@@ -232,17 +239,25 @@ impl TransitionChooser for AgentChooser {
             expected_output_keys: vec![],
             expected_output_types: Default::default(),
         };
-        let report = self.runner.run(session).await.ok()?;
+        // PROPAGATE a runner error (missing API key, 401, model-resolution,
+        // network) as `Err` — the pre-fix `.ok()?` swallowed EVERY such error
+        // into `None`, which `drive_mission` turned into a misleading `GaveUp`
+        // ("no actionable move"). An honest error must reach the operator.
+        let report = self.runner.run(session).await.map_err(|e| e.to_string())?;
         let AgentRunOutcome::Completed(result) = report.outcome else {
-            return None;
+            // A non-erroring run that produced no conforming answer (NoResult /
+            // TimedOut) is a genuine "no good move" — give up, don't error.
+            return Ok(None);
         };
         // The agent names exactly one legal transition in `output.transition`;
         // anything else is treated as "no good move".
-        let chosen = result.output.get("transition").and_then(Value::as_str)?;
-        actions
+        let Some(chosen) = result.output.get("transition").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        Ok(actions
             .iter()
             .find(|a| a.transition == chosen)
-            .map(|a| a.transition.clone())
+            .map(|a| a.transition.clone()))
     }
 }
 
@@ -440,6 +455,11 @@ pub enum DriveOutcome {
     MaxSteps,
     /// A §32 call errored.
     Error(String),
+    /// The chooser itself FAILED — its agent runner errored (missing API key,
+    /// 401, model-resolution, network). Distinct from `GaveUp` (a legitimate "no
+    /// good move"): this is an infrastructure/config fault the operator must see,
+    /// not a dead-end flow.
+    ChooserFailed { source: String },
 }
 
 /// Drive a mission to resolution (ADR-0009 c). Each step: read state → publish
@@ -525,8 +545,12 @@ pub async fn drive_mission(
             // leave the instance running.
             return DriveOutcome::GaveUp;
         }
-        let Some(transition) = chooser.choose(&state).await else {
-            return DriveOutcome::GaveUp;
+        let transition = match chooser.choose(&state).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return DriveOutcome::GaveUp,
+            // The chooser's runner errored — surface the REAL fault (honest
+            // error) instead of masquerading it as a give-up.
+            Err(source) => return DriveOutcome::ChooserFailed { source },
         };
         bus.publish(MissionEvent::Chunk {
             mission_id: mission_id.to_string(),
@@ -650,16 +674,26 @@ mod tests {
     struct FirstActionChooser;
     #[async_trait]
     impl TransitionChooser for FirstActionChooser {
-        async fn choose(&self, state: &MissionState) -> Option<String> {
-            state.agent_actions().first().map(|a| a.transition.clone())
+        async fn choose(&self, state: &MissionState) -> Result<Option<String>, String> {
+            Ok(state.agent_actions().first().map(|a| a.transition.clone()))
         }
     }
 
     struct NoneChooser;
     #[async_trait]
     impl TransitionChooser for NoneChooser {
-        async fn choose(&self, _state: &MissionState) -> Option<String> {
-            None
+        async fn choose(&self, _state: &MissionState) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+    }
+
+    /// A chooser whose decision FAILS (its runner errored). Proves
+    /// `drive_mission` surfaces the fault as `ChooserFailed`, never `GaveUp`.
+    struct ErrChooser;
+    #[async_trait]
+    impl TransitionChooser for ErrChooser {
+        async fn choose(&self, _state: &MissionState) -> Result<Option<String>, String> {
+            Err("no API key configured".into())
         }
     }
 
@@ -901,6 +935,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn surfaces_a_chooser_failure_as_chooser_failed_not_gave_up() {
+        // FIX 1 — a chooser whose runner errors must surface the REAL error, not
+        // masquerade as `GaveUp` ("no actionable move"). Pre-fix `.ok()?`
+        // swallowed the error into `None` → GaveUp.
+        let gw = running_then(vec![ms("running", &[("go", "agent")])]);
+        let out = drive_mission(&gw, &ErrChooser, &Bus::new(), "m1", 10).await;
+        assert_eq!(
+            out,
+            DriveOutcome::ChooserFailed {
+                source: "no API key configured".into()
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn stops_at_the_step_bound() {
         let out = drive_mission(&LoopGateway, &FirstActionChooser, &Bus::new(), "m1", 3).await;
         assert_eq!(out, DriveOutcome::MaxSteps);
@@ -1112,21 +1161,21 @@ mod tests {
     async fn agent_chooser_returns_the_named_legal_transition() {
         let chooser = chooser_returning(serde_json::json!({ "transition": "go" }));
         let chosen = chooser.choose(&ms("running", &[("go", "agent")])).await;
-        assert_eq!(chosen, Some("go".to_string()));
+        assert_eq!(chosen, Ok(Some("go".to_string())));
     }
 
     #[tokio::test]
     async fn agent_chooser_declines_an_illegal_transition() {
         let chooser = chooser_returning(serde_json::json!({ "transition": "nope" }));
         let chosen = chooser.choose(&ms("running", &[("go", "agent")])).await;
-        assert_eq!(chosen, None);
+        assert_eq!(chosen, Ok(None));
     }
 
     #[tokio::test]
     async fn agent_chooser_declines_when_output_has_no_transition() {
         let chooser = chooser_returning(serde_json::json!({}));
         let chosen = chooser.choose(&ms("running", &[("go", "agent")])).await;
-        assert_eq!(chosen, None);
+        assert_eq!(chosen, Ok(None));
     }
 
     #[tokio::test]
@@ -1135,7 +1184,7 @@ mod tests {
         let chosen = chooser
             .choose(&ms("waiting", &[("approve", "human")]))
             .await;
-        assert_eq!(chosen, None);
+        assert_eq!(chosen, Ok(None));
     }
 
     #[tokio::test]
@@ -1144,7 +1193,8 @@ mod tests {
         let runner = Arc::new(MockSessionRunner::no_result());
         let chooser = AgentChooser::new(runner, "anthropic:claude", Duration::from_secs(5));
         let chosen = chooser.choose(&ms("running", &[("go", "agent")])).await;
-        assert_eq!(chosen, None);
+        // NoResult is a legitimate "no good move" — give up, not an error.
+        assert_eq!(chosen, Ok(None));
     }
 
     #[tokio::test]
@@ -1153,7 +1203,37 @@ mod tests {
         let runner = Arc::new(MockSessionRunner::timed_out());
         let chooser = AgentChooser::new(runner, "anthropic:claude", Duration::from_secs(5));
         let chosen = chooser.choose(&ms("running", &[("go", "agent")])).await;
-        assert_eq!(chosen, None);
+        assert_eq!(chosen, Ok(None));
+    }
+
+    #[tokio::test]
+    async fn agent_chooser_surfaces_a_runner_error_as_err() {
+        // FIX 1 — a runner ERROR (e.g. missing API key) must PROPAGATE as `Err`,
+        // never collapse into `Ok(None)` (give up). This is the root-cause test:
+        // pre-fix `.ok()?` erased the error here.
+        use crate::session::{AgentRunReport, AgentSession, AgentSessionRunner};
+        use praxec_core::error::ExecutorError;
+
+        struct ErroringRunner;
+        #[async_trait]
+        impl AgentSessionRunner for ErroringRunner {
+            async fn run(&self, _session: AgentSession) -> Result<AgentRunReport, ExecutorError> {
+                Err(ExecutorError::Permanent(
+                    "AGENT_NO_API_KEY: no provider key configured".into(),
+                ))
+            }
+        }
+
+        let chooser = AgentChooser::new(
+            Arc::new(ErroringRunner),
+            "anthropic:claude",
+            Duration::from_secs(5),
+        );
+        let chosen = chooser.choose(&ms("running", &[("go", "agent")])).await;
+        match chosen {
+            Err(e) => assert!(e.contains("AGENT_NO_API_KEY"), "unexpected error text: {e}"),
+            other => panic!("expected Err surfacing the runner error, got {other:?}"),
+        }
     }
 
     // ── end-to-end against a real in-memory runtime ──────────────────────────

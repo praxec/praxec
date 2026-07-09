@@ -25,7 +25,7 @@ workflows:
         plan_final:  { type: object, required: true }
         target_path:
           type: string
-          default: ".praxec/agents.yaml"
+          default: ".praxec/models.yaml"
       outputs:
         yaml_text:     { type: string }
         written_path:  { type: string }

@@ -168,6 +168,40 @@ pub fn load_into_env_with(
     Ok(())
 }
 
+/// Production wrapper. Loads the resolved provider-keys file into the process
+/// env (env vars already set win over the file). A missing file is a silent OK;
+/// a path-resolution or read error logs a single warning and continues.
+///
+/// MUST be called synchronously at the top of `main()`, before the first
+/// `.await`, so no spawned task can race on the process env. Both the `px`
+/// (praxec-tui) and `praxec` (gateway) binaries call this — the gateway used to
+/// skip it, so `serve` never picked up `~/.praxec/providers.env` and every
+/// `kind: agent` / `kind: llm` step failed for want of a key.
+pub fn load_into_env_if_present() {
+    let path = match resolve_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot locate provider-keys file; skipping load");
+            return;
+        }
+    };
+    let result = load_into_env_with(
+        &path,
+        |k| std::env::var(k).ok(),
+        // SAFETY: called synchronously at the top of `main()` before the first
+        // `.await`, so no `tokio::spawn`-ed task exists yet that could race on
+        // the process env.
+        |k, v| unsafe { std::env::set_var(k, v) },
+    );
+    if let Err(e) = result {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "failed to load provider-keys file"
+        );
+    }
+}
+
 /// Mask a secret value for `--list` display. Long values become
 /// `<7-char-prefix>***<last-4>`; values of 8 chars or less are masked
 /// entirely (the prefix-plus-last4 form would leak too much of the

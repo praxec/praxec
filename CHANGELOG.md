@@ -17,6 +17,28 @@ covered by a stability commitment.
 > none were tagged at the time. Versions `0.0.1`–`0.0.5` are the earlier
 > development history, renumbered onto this line.
 
+### Fixed — agent-execution setup: make it work and fail honestly
+
+- **Chooser failures surface honestly instead of masquerading as "gave up."**
+  `TransitionChooser::choose` now returns `Result`, and `drive_mission` maps a
+  runner failure (missing API key, 401, model-resolution, network) to a new
+  `DriveOutcome::ChooserFailed { source }` that renders the real error — instead
+  of the misleading "no actionable move… legal actions: […]" (the old `.ok()?`
+  swallowed every error into a false give-up). A legitimate no-move still reads
+  as give-up.
+- **`praxec check` flags agent steps with no `gateway.models_yaml`** at load
+  (`AGENT_MODELS_YAML_REQUIRED`), rather than only failing at first dispatch with
+  `AGENT_NO_AGENTS_YAML`.
+- **The `praxec` gateway binary loads `~/.praxec/providers.env` at startup**
+  (previously only `px` did), so provider keys set via `px set-provider-keys`
+  reach `serve`/`orchestrate`/`command`. Environment still wins over the file.
+- **One canonical models path.** `meta/flow.configure-models` now writes
+  `.praxec/models.yaml` (was `.praxec/agents.yaml`), matching `px doctor`
+  discovery and the `gateway.models_yaml` runtime key — one name for one
+  `ModelsFile` schema.
+- Corrected `docs/reference/configuration.md`: `kind: agent` runs a governed
+  in-process rig session, not a subprocess.
+
 ### Changed — relicensed Apache-2.0 → BSD-3-Clause
 
 - **The project is now under the BSD 3-Clause license.** `LICENSE`, the

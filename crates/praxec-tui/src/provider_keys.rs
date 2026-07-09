@@ -8,9 +8,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use praxec_core::provider_keys::{
-    load_into_env_with, mask_value, read, remove_provider, resolve_path, set_var,
-};
+pub use praxec_core::provider_keys::load_into_env_if_present;
+use praxec_core::provider_keys::{mask_value, read, remove_provider, resolve_path, set_var};
 use praxec_core::providers::ProviderId;
 
 /// CLI args for `px set-provider-keys`.
@@ -173,32 +172,7 @@ fn run_interactive(path: &Path) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Production wrapper. Calls [`load_into_env_with`] against the real
-/// process env, swallows missing-file (silent ok), logs other errors
-/// as a single warning and continues. Called once from `main()`
-/// before any CLI dispatch.
-pub fn load_into_env_if_present() {
-    let path = match resolve_path() {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot locate provider-keys file; skipping load");
-            return;
-        }
-    };
-    let result = load_into_env_with(
-        &path,
-        |k| std::env::var(k).ok(),
-        // SAFETY: called synchronously at the top of `main()` before
-        // the first `.await`, so no `tokio::spawn`-ed task exists yet
-        // that could race on the process env. The same invariant
-        // applies to `keyring::ensure_keyring_available`.
-        |k, v| unsafe { std::env::set_var(k, v) },
-    );
-    if let Err(e) = result {
-        tracing::warn!(
-            error = %e,
-            path = %path.display(),
-            "failed to load provider-keys file"
-        );
-    }
-}
+// The startup env-load wrapper now lives in `praxec_core::provider_keys`
+// (`load_into_env_if_present`, re-exported above) so BOTH the `px` and `praxec`
+// binaries share one implementation. The `px` `main()` calls it via this module
+// exactly as before.
