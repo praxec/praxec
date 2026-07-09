@@ -225,7 +225,12 @@ impl AgentExecutor {
         }];
 
         match report.outcome {
-            AgentRunOutcome::TimedOut => Err(ExecutorError::Timeout(max_seconds)),
+            // `ExecutorError::Timeout` carries milliseconds (its Display appends
+            // " ms"); `max_seconds` is seconds, so convert or a 600s wall prints
+            // as "600 ms".
+            AgentRunOutcome::TimedOut => {
+                Err(ExecutorError::Timeout(max_seconds.saturating_mul(1000)))
+            }
             AgentRunOutcome::NoResult => Err(permanent(
                 AgentErrorCode::NoResult,
                 "agent run ended without a conforming `final_answer` call",
