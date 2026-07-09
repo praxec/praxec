@@ -47,7 +47,7 @@ load. For production, prefer the file sink with a buffered writer.
 - **SQLite baseline:** add ~95 µs per submit for the optimistic-lock
   write. For SLA-sensitive paths, the store is the dominant cost.
 - **Audit cost:** the null sink is essentially free. The memory sink
-  is 100× costlier due to allocation. File and stdout sinks should be
+  is 100× costlier due to allocation. File and stderr sinks should be
   in the same ballpark as memory once writes are buffered.
 
 For typical workflows (3–5 transitions, 1–2 guards each), end-to-end

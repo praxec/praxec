@@ -21,14 +21,17 @@ crates/
   praxec-mcp-server/    PraxecServer (rmcp ServerHandler) — the two tools
   praxec-cockpit/       praxec-cockpit binary (mediator/cockpit)
   praxec-cockpit-mcp/   praxec-cockpit-mcp binary (cockpit MCP server)
-  praxec-tui/           praxec / praxec-tui binaries (ratatui cockpit)
+  praxec-tui/           px / praxec-tui binaries (ratatui cockpit)
   praxec-test/          shared test harness + fuzz fixtures
-  praxec/               binary: praxec (serve | check)
+  praxec/               binary: praxec — the gateway CLI. Subcommands:
+                              serve, check, health, observe, migrate,
+                              inspect, audit, approvals, orchestrate,
+                              command, query, fuzz, test, cost, intent
 
 The default-on `agents` cargo feature folds the retired pro-gateway
-wiring into the `praxec` binary. User-facing binaries: `praxec`
-and `praxec-tui` (same source), `praxec-cockpit`, plus the
-`praxec` server binary.
+wiring into the `praxec` binary. User-facing binaries: `praxec` (the
+gateway server CLI), `px` / `praxec-tui` (the ratatui cockpit, same
+source), and `praxec-cockpit`.
 
 schemas/
   praxec-repo.schema.json
@@ -126,6 +129,10 @@ What's implemented:
 - Evidence store backing the `evidence` guard.
 - Persistent `WorkflowStore`: in-memory, file-backed, SQLite.
 - Lexical `DiscoveryIndex` over workflows / capabilities / connections.
+- Vector / hybrid `DiscoveryIndex` (embeddings): `praxec-embeddings` ships a
+  `SemanticDiscoveryIndex`. Dormant/opt-in — the runtime stays on the free
+  lexical index until an embedding model is configured, then ranks by a hybrid
+  of the lexical score and cosine similarity.
 - Composability: named `capabilities:`, capability references in
   exposures and workflow executors, `wraps:` for stacking policy,
   `include:` for multi-file config composition.
@@ -133,7 +140,6 @@ What's implemented:
 Trait seams left for future work — implement the trait and drop in:
 
 - Distributed / networked `WorkflowStore` (Redis, a SQL database, …)
-- Vector / hybrid `DiscoveryIndex` (Tantivy, embeddings)
 - Persistent `EvidenceStore` (file / DB-backed)
 - Postgres / Kafka / OTel `AuditSink`
 - Domain-specific `Executor` and `GuardEvaluator` impls

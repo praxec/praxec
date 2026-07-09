@@ -167,6 +167,10 @@ validation. Failure terminals carry no such obligation.
 
 - [ADR-0007](0007-agents-first-class-workflow-executors.md) — the agent that drives
   a mission toward these outcomes.
+- `crates/praxec-core/src/mission.rs` — the primary implementation: the typed
+  `MissionStatus` enum (`running | waiting | succeeded | failed`), `FailReason`
+  (`cancelled | timed_out | guard_unmet | error`), and `TerminalOutcome`
+  (`success | failure`) this ADR defines.
 - `examples/swe-agent.yaml` — the real guards/terminals this generalizes.
 - `crates/praxec-core/src/runtime/runtime_response.rs`,
   `runtime_links.rs` (`is_terminal`), `validate.rs` — the touch points.

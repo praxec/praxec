@@ -509,20 +509,34 @@ store:
 The `WorkflowStore` is a trait, so a custom backend (Redis, a SQL database)
 plugs in without changing the runtime.
 
+**`serve` refuses ephemeral storage.** Durable governance state — evidence and
+acknowledgments — lives only in the `sqlite` backend. A `memory` store keeps
+nothing across restarts; a `file` store persists workflows but leaves evidence
+and acknowledgments in memory (a silent durable/ephemeral split). To protect a
+production deployment, `serve` refuses to start on `store.kind: memory` or
+`store.kind: file` — and refuses a `file`/`sqlite` `path` on an ephemeral
+filesystem (`/tmp`, `/var/tmp`, `/dev/shm`), which the OS wipes on cleanup or
+reboot. Use `store.kind: sqlite` on a persistent path for production. To
+override for dev/testing, set `gateway.allow_ephemeral: true` (or the env var
+`PRAXEC_ALLOW_EPHEMERAL=1`).
+
 ---
 
 ## Discovery
 
 ```yaml
 discovery:
-  index: memory                         # only "memory" is implemented today
+  index: memory                         # lexical in-memory (default)
   include: [proxy, workflows, connections]
 ```
 
 `praxec.query` lexically scores items against the query (title 6× /
-id 5× / tags 3× / description 2× / freeform indexed text 1×). The trait
-is `DiscoveryIndex` so a Tantivy or vector backend can replace the
-in-memory default.
+id 5× / tags 3× / description 2× / freeform indexed text 1×) — this is
+the default `InMemoryDiscoveryIndex`. When an embedding model is configured, a
+semantic embedding-backed index (`SemanticDiscoveryIndex`) activates and ranks
+by a hybrid of the lexical score and cosine similarity; with no embedding model
+the runtime stays on the free lexical index. The trait is `DiscoveryIndex`, so
+either backend plugs in without changing the runtime.
 
 ---
 

@@ -6,8 +6,8 @@ audit:
     rotation: daily
 
 store:
-    kind: file
-    path: ~/.local/share/praxec/workflows/
+    kind: sqlite
+    path: ~/.local/share/praxec/workflows.db
 
 connections:
     filesystem:

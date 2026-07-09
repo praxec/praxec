@@ -15,12 +15,15 @@ not let ad-hoc execution touch the host, production data, or secrets.
 
 Grounding the current spine (so this is designed against the real system):
 
-- **Nothing is sandboxed today.** `ScriptExecutor` writes a temp file and runs
-  `bash` in the gateway's own process environment
-  (`crates/praxec-executors/src/script.rs`); `kind: agent` `spawn()`s the
-  agent binary with full host privileges
-  (`crates/praxec-agents/src/runner.rs`). Either path runs with the keys to
-  the kingdom.
+- **Execution is unconfined by default.** `ScriptExecutor` writes a temp file and
+  runs `bash` in the gateway's own process environment
+  (`crates/praxec-executors/src/script.rs`); a governed `kind: agent` step runs as
+  an **in-process rig session** in the gateway
+  (`crates/praxec-agents/src/rig_runner.rs`, `crates/praxec-agents/src/executor.rs`)
+  — not a privileged subprocess. By default either path runs with the keys to the
+  kingdom. *(The deleted `crates/praxec-agents/src/runner.rs` — the old aether
+  subprocess this ADR was written against — is gone; see the 2026-07 status update
+  for what shipped.)*
 - **The promotion machinery, however, already exists** (built on
   `feat/mission-control`). The **provenance gate**
   (`untrusted_execution.rs::untrusted_execution_reason`) forbids a *published*
@@ -332,16 +335,51 @@ construction*, not discovered in production. These are binding on the build:
 `unwrap_or_default()` on the definition hash + diff serializers, and a
 presence-only repo-cache heuristic — were fixed to fail-fast in the same pass.)
 
+## Status update (2026-07)
+
+The Status line and Decision §5 mark the sandbox **runtime** as deferred to a
+spike; that spike has landed and the runtime is **built**:
+
+- **Confinement runtime.** `crates/praxec-core/src/sandbox.rs` ships the
+  `SandboxProvider` trait with a `BwrapProvider` (Linux bubblewrap) and an
+  `OciProvider` (docker/podman — `--network none`, `-v` mounts, `--pids-limit`,
+  unit-tested), matching the Decision §5 / cross-platform amendment shape.
+- **Confined `ScriptExecutor`.** `script.rs` takes an optional provider
+  (`with_sandbox`) and a `require_confinement` fail-fast — Decision §3b.
+- **Untrusted-agent branch.** `crates/praxec-agents/src/executor.rs`
+  (`with_untrusted_support` → `run_untrusted` → `run_untrusted_agent`) runs the
+  Tier-1 exploration in a confined disposable copy and promotes via
+  `crates/praxec-core/src/promotion.rs` (coordinate-at-promotion) — Decisions §3a
+  and the coordination section.
+
+Re-scope the Context/Decision "nothing sandboxed" claim to **"unconfined by
+default, confinement opt-in"**: the default execution path is still unconfined
+`bash`; confinement engages only when `praxec.execution.sandbox` selects a
+backend and a script declares a `confinement` profile.
+
+Preflight correction: the **Preflight & provisioning** amendment frames the
+capability check as running under `px doctor`. In the shipped code the fail-closed
+preflight runs at **gateway startup** — `maybe_enable_sandbox` in
+`crates/praxec/src/gateway.rs` calls each provider's `preflight()` and aborts
+startup with the remedy when a configured backend is unusable. (`px doctor`
+/ `crates/praxec-tui/src/doctor.rs` remains the reporting surface.)
+
 ## References
 
-- Unsandboxed execution today: `crates/praxec-executors/src/script.rs`
-  (bash in-process), `crates/praxec-agents/src/runner.rs` (agent subprocess).
+- Execution seam: `crates/praxec-executors/src/script.rs` (bash in-process, now
+  confinable via `with_sandbox` / `require_confinement`); the governed in-process
+  agent loop `crates/praxec-agents/src/rig_runner.rs` +
+  `crates/praxec-agents/src/executor.rs` (formerly the deleted `runner.rs` aether
+  subprocess).
 - Promotion machinery (already built): provenance gate
   (`crates/praxec-executors/src/untrusted_execution.rs`); authoring
   workflows (`examples/authoring-workflow.yaml`,
   `examples/authoring-edit-workflow.yaml`); `registry`/`dry_run`/`diff` executors;
   `script_acknowledged` guard + hash-flip (`crates/praxec-core/src/guards.rs`).
-- `kind: agent` = subprocess sub-agent (the exploratory-model seam).
+- `kind: agent` = an **in-process rig session** for governed agents; only the
+  untrusted exploration tier runs as a confined subprocess (the exploratory-model
+  seam) — `crates/praxec-agents/src/executor.rs` (`with_untrusted_support` /
+  `run_untrusted`).
 - TRIZ: physical contradiction → separation principles (space / time / condition).
 - Validating spike: the sandbox-exec mechanism proof (§Decision 5).
 - Relates to: [ADR-0001](0001-headless-runtime-surfaces-attach.md) (governed

@@ -50,7 +50,7 @@ separations that exceed it, each grounded in a TRIZ resolution:
    chokepoint, an oversized tool result is written to a session-scoped, ephemeral,
    content-addressed `SpillStore` and replaced in the transcript by a compact,
    self-describing **handle** (`head + summary + slot + bytes + read affordance`).
-   A synthetic injected `spill.read { slot, range }` tool (mirroring how
+   A synthetic injected `spill_read { slot, range }` tool (mirroring how
    `final_answer` is injected) gives transparent, on-demand read-back. The agent
    needs no prompt cooperation. *(TRIZ #34 discard-and-recover.)*
 
@@ -77,7 +77,7 @@ Working memory is ephemeral, ungoverned, content-addressed; durable memory is th
 Blackboard, governed, the output contract — the two never merge.
 
 `enforce_history_budget` is retained as defense-in-depth but demoted: it becomes
-**spill-then-drop** (elided turns are recoverable via `spill.read`, never silently
+**spill-then-drop** (elided turns are recoverable via `spill_read`, never silently
 lost) and should essentially never fire once results are handles. If it fires, that
 is a detectable defect that emits `Evidence`, not normal operation.
 
@@ -100,12 +100,32 @@ is a detectable defect that emits `Evidence`, not normal operation.
 - The embedding/semantic-index path (currently off) gains a concrete consumer as
   the fuzzy-recall fallback, justifying re-enabling it.
 
+## Status update (2026-07)
+
+Not all three separations shipped. What is **built** is the **recall ledger** —
+Decisions §1 (transparent spill, not truncation) and §2 (addressable handles as
+primary recall): the `SpillStore` chokepoint, the compact handle, and the injected
+`spill_read` tool (`crates/praxec-agents/src/rig_runner.rs`,
+`crates/praxec-agents/src/spill.rs`).
+
+**Not yet built:**
+
+- **Decision §3's running-state orientation object**
+  (`{done, pending, findings, next, open_questions}`, regenerated from source every
+  K turns, U-shaped assembly). No such struct exists in `crates/praxec-agents/`.
+- **The advisory `validate.rs` cap-shape check** (Warning that flags `kind: agent`
+  caps combining whole-file readers with long loops and no scratchpad). Not present
+  in `crates/praxec-core/src/validate.rs`.
+
+So the shipped state is spill-recovery (lossless spill + directed read-back), not
+the full orientation/detail split or the authoring-time advisory.
+
 ## References
 
 - `docs/poka-yoke-context-spill.md` — implementation design + full prior-art survey
 - `crates/praxec-agents/src/rig_runner.rs` — `drain_turn`, the result
   chokepoint (`truncate_tool_result`), `enforce_history_budget`, `final_answer`
-  injection (the model for `spill.read`)
+  injection (the model for `spill_read`)
 - `crates/praxec-agents/src/executor.rs` — `AgentExecutor` blackboard-purity
 - `crates/praxec-core/src/validate.rs` — advisory cap-shape check
 - Builds on ADR-0006 (execution sandbox: agent output is a candidate, not a command)

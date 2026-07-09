@@ -39,12 +39,6 @@ covered by a stability commitment.
 - Corrected `docs/reference/configuration.md`: `kind: agent` runs a governed
   in-process rig session, not a subprocess.
 
-### Changed — relicensed Apache-2.0 → BSD-3-Clause
-
-- **The project is now under the BSD 3-Clause license.** `LICENSE`, the
-  `[workspace.package]` `license` field (inherited by every crate), and all
-  doc/README/badge references were switched from Apache-2.0 to BSD-3-Clause.
-
 ### Added — value-based model selection
 
 - **`value = fit(needs) / blended_cost^β`** over the model catalog: among

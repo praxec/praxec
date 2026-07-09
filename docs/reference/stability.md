@@ -2,7 +2,7 @@
 
 | Artifact | Version | Stability commitment |
 |----------|---------|----------------------|
-| Crate (`praxec` et al.) | 0.0.13 | Pre-1.0 — semver not yet in effect. Breaking changes may occur at any minor bump. |
+| Crate (`praxec` et al.) | 0.0.14 | Pre-1.0 — semver not yet in effect. Breaking changes may occur at any minor bump. |
 | Config schema (`version` field) | "1.0.0" | Tier 1 stable — backward-compatible within the same minor schema version. |
 | Two-tool MCP surface (`praxec.query` + `praxec.command`) | Stable | Fixed tool names, inputs, and output shapes. Operations are reached by varying args; removals follow a deprecation cycle. |
 
@@ -66,7 +66,7 @@ we believe in but want room to refine based on real use.
 | Config hot-reload (SIGHUP) | Swappable definitions, executors, and discovery index. The set of swappable components may expand. |
 | Workflow graph validation | The set of `check` diagnostics (unreachable states, dangling targets, dead-ends) may grow. |
 | Link-filter semantics | The `byGuards` filter's exact behaviour may be refined. |
-| Stress-test scenarios | Test scenarios in `crates/praxec-core/tests/stress_scenarios.rs` — they document concurrency properties we commit to, but the exact scenario list may grow or shrink. |
+| Stress-test scenarios | Test scenarios in `crates/praxec-core/tests/stress_guards_mapping.rs` and `stress_lifecycle.rs` — they document concurrency properties we commit to, but the exact scenario list may grow or shrink. |
 | Examples | `examples/*` — illustrative and dogfooded, but the exact directory layout and filenames may change. |
 | `delegate` on workflow states (SPEC §21) | Pass-through string surfaced on every workflow response. The shape (non-empty string) and the response surfacing are stable. The gateway never reads or branches on it; consumption is left to harnesses (e.g. the in-repo agentic runtime, the `praxec` TUI). |
 | `scripts:` top-level block (SPEC §22) | Script library shape (verb / lifecycle / body \| uri+hash / source) is stable. The closed verb enum (12 values as of v0.3) is committed; adding verbs requires a spec amendment per SPEC §23.7. The blessed-script-roots set (15 values) may grow with the same strict-vs-lenient flag treatment as skill roots. |
@@ -101,7 +101,7 @@ standard.
 | Area | Verified | How |
 |------|----------|-----|
 | Two MCP tools | Yes | Invariant 9 test in `crates/praxec-mcp-server/tests/stable_tool_surface.rs` |
-| 10 core invariants | Yes | `crates/praxec-core/tests/invariants.rs` |
+| 10 core invariants | Yes | `crates/praxec-core/tests/invariants_actor_audit.rs`, `invariants_governance.rs`, `invariants_proxy.rs` |
 | Capability wrapping and `wraps:` chain | Yes | `crates/praxec-core/tests/capability.rs` |
 | `include:` multi-file composition | Yes | `crates/praxec-core/tests/composability.rs` |
 | Discovery indexing and search | Yes | `crates/praxec-core/tests/discovery.rs` |
@@ -110,14 +110,14 @@ standard.
 | REST executor | Yes | `crates/praxec-executors/tests/rest_executor.rs` |
 | Human executor audit event | Yes | `crates/praxec-executors/tests/human_audit.rs` |
 | TDD example dogfood transcript | Yes | CI runs `examples/tdd/dogfood-drive.py` |
-| Deterministic chaining | Yes | `crates/praxec-core/tests/deterministic_chain.rs` (16 scenarios) |
+| Deterministic chaining | Yes | `crates/praxec-core/tests/chain_basic.rs`, `chain_audit.rs`, `chain_audit_criticality.rs`, `chain_guidance.rs`, `chain_loop.rs` |
 | Phase guidance in responses | Yes | Covered by deterministic chain tests |
 
 ### Tier 2 — Deprecation-cycle surface
 
 | Area | Verified | How |
 |------|----------|-----|
-| Stress tests under concurrency | Yes | `crates/praxec-core/tests/stress_scenarios.rs` |
+| Stress tests under concurrency | Yes | `crates/praxec-core/tests/stress_guards_mapping.rs`, `stress_lifecycle.rs` |
 | Discovery prefix/fuzzy/alias matching | Yes | `crates/praxec-core/tests/discovery.rs` (3 new tests) |
 | Workflow graph validation | Yes | `crates/praxec-core/src/validate.rs` (10 unit tests) |
 | Hot-reload swap mechanism | Yes | `crates/praxec-core/src/hot_reload.rs` (unit test) |

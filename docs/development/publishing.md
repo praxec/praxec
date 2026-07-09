@@ -19,18 +19,18 @@ Reuse this verbatim everywhere so listings stay consistent:
 |-------------|-------|
 | Name        | `praxec` |
 | Registry name | `io.github.praxec/praxec` |
-| Tagline     | MCP gateway that fronts any number of tools, CLIs and APIs behind seven governed, audited tools. |
+| Tagline     | MCP gateway that fronts any number of tools, CLIs and APIs behind two governed, audited tools. |
 | Repository  | https://github.com/praxec/praxec |
 | Language    | Rust |
-| License     | BSD-3-Clause |
+| License     | Apache-2.0 |
 | Categories  | Aggregator / Gateway / Proxy |
 | Tags        | `mcp`, `gateway`, `proxy`, `hateoas`, `workflow`, `governance`, `audit`, `rust` |
 
 ## 1. Cut a release (prerequisite for everything else)
 
 ```bash
-git tag v0.0.13
-git push origin v0.0.13
+git tag v0.0.14
+git push origin v0.0.14
 ```
 
 The `v*` tag triggers three workflows:
@@ -96,7 +96,7 @@ the **Aggregators** section (servers that expose multiple tools through
 one MCP server), keeping alphabetical order.
 
 ```markdown
-- [praxec/praxec](https://github.com/praxec/praxec) 🦀 🏠 - MCP gateway that fronts any number of tools, CLIs and APIs behind seven governed, audited tools.
+- [praxec/praxec](https://github.com/praxec/praxec) 🦀 🏠 - MCP gateway that fronts any number of tools, CLIs and APIs behind two governed, audited tools.
 ```
 
 (`🦀` = Rust, `🏠` = runs locally — matches that list's emoji legend.)
@@ -107,10 +107,10 @@ PR description:
 Add praxec to Aggregators
 
 praxec is an MCP gateway: it fronts any number of MCP servers,
-CLI commands, and REST APIs while exposing a fixed surface of seven
+CLI commands, and REST APIs while exposing a fixed surface of two
 tools to the model. Capabilities are reached through search and
 HATEOAS-style response links instead of a flat tool list, and every
-call is schema-validated, guard-checked, and audited. BSD-3-Clause, Rust.
+call is schema-validated, guard-checked, and audited. Apache-2.0, Rust.
 ```
 
 ### mcp.so
@@ -118,7 +118,7 @@ call is schema-validated, guard-checked, and audited. BSD-3-Clause, Rust.
 Submit at https://mcp.so/submit (GitHub-based). Fields:
 
 - **URL:** `https://github.com/praxec/praxec`
-- **Description:** MCP gateway that fronts any number of tools, CLIs and APIs behind seven governed, audited tools. The model sees a fixed seven-tool surface; capabilities are reached by search and HATEOAS links, every call schema-validated and audited.
+- **Description:** MCP gateway that fronts any number of tools, CLIs and APIs behind two governed, audited tools. The model sees a fixed two-tool surface; capabilities are reached by search and HATEOAS links, every call schema-validated and audited.
 
 ### MCP.Directory
 

@@ -1,6 +1,10 @@
 # Poka-yoke: transparent spill — context explosion made unrepresentable
 
-Status: design · Scope: `praxec-agents` agent tool-loop · Author: dogfooding pass 2026-06-29
+Status: implemented ([ADR-0012](architecture/adr/0012-bounded-agent-working-set.md)) · Scope: `praxec-agents` agent tool-loop · Author: dogfooding pass 2026-06-29
+
+Implementation lives in `crates/praxec-agents/src/spill.rs` (the `SpillStore`
+trait + in-memory impl) and `crates/praxec-agents/src/rig_runner.rs` (the ingress
+chokepoint and history budget). Concrete anchors are cited inline below.
 
 ## Problem
 
@@ -12,7 +16,7 @@ guards today, both at the **wrong boundary** and both **lossy**:
 - `truncate_tool_result` (`rig_runner.rs:189`) — caps one result at
   `MAX_TOOL_RESULT_BYTES` (64 KiB) and appends a "re-run with a narrower scope"
   marker. **Information is discarded**; the agent must redo work to get it back.
-- `enforce_history_budget` (`rig_runner.rs:230`) — elides the oldest turn-pairs
+- `enforce_history_budget` (`rig_runner.rs:419`) — elides the oldest turn-pairs
   until the re-sent history fits `DEFAULT_MAX_HISTORY_BYTES` (1 MiB). **Earlier
   context is dropped on the floor.**
 
@@ -40,7 +44,7 @@ semantic-index / Evidence direction.
 
 The agent needs **no cooperation and no prompt instruction**. It calls a tool as
 usual; if the result is large, what comes back is a handle (head + summary + slot id
-+ schema), and the full payload is retrievable via an injected `spill.read` tool.
++ schema), and the full payload is retrievable via an injected `spill_read` tool.
 This is a stronger poka-yoke than "forbid raw reads and make the agent compose
 `search → read_range`," because correctness does not depend on the model behaving.
 
@@ -50,35 +54,36 @@ runner ingress chokepoint:
   result > threshold?  ── no ──→ inline as today
                        └─ yes ─→ SpillStore.put(payload) → slot
                                   return HANDLE { head, summary, slot, bytes, schema?,
-                                                  read: {tool:"spill.read", args:{slot, range}} }
-agent → (optionally) spill.read { slot, range: [a,b] }  → that window only
+                                                  read: {tool:"spill_read", args:{slot, range}} }
+agent → (optionally) spill_read { slot, range: [a,b] }  → that window only
 ```
 
 ## Mechanism
 
 ### 1. One universal chokepoint (prevent)
 
-Every tool result already flows through a single line — `rig_runner.rs:714`,
-`let out = truncate_tool_result(out)`. Replace that call with `spill_if_large`:
+Every tool result flows through a single line — `rig_runner.rs:612`,
+`spill_on_ingress(&spill, &c.name, raw)` (this replaced the old
+`truncate_tool_result` chokepoint):
 
 ```rust
 // session-scoped, injected into the runner alongside max_history_bytes
-let out = spill.ingest(&c.name, out); // returns the handle text if spilled, else `out`
+let out = spill_on_ingress(&spill, &c.name, out).await; // handle text if spilled, else `out`
 ```
 
-`spill.ingest` writes the payload to the `SpillStore` and returns the handle text
+`spill_on_ingress` writes the payload to the `SpillStore` and returns the handle text
 (below threshold → returns the input untouched). Because this is the runner's chokepoint,
 **no `ToolHost` implementation changes** — MCP tools (`CompositeToolHost`), file
 tools (`FileEditToolHost`), and any future host are covered identically. The cap is
 enforced once, where it cannot be bypassed.
 
-### 2. Injected `spill.read` tool (transparent read-back)
+### 2. Injected `spill_read` tool (transparent read-back)
 
 The runner already injects `final_answer` as a synthetic tool the agent always has.
-Inject a second synthetic tool, `spill.read`, backed by the same session `SpillStore`:
+Inject a second synthetic tool, `spill_read`, backed by the same session `SpillStore`:
 
 ```
-spill.read { slot: string, range?: [start, end] }  → bytes [start,end) of the slot
+spill_read { slot: string, range?: [start, end] }  → bytes [start,end) of the slot
 ```
 
 `range` defaults to the next window after the head already shown. This is the
@@ -98,7 +103,7 @@ What re-enters the transcript when a result spills — small, fixed-size, self-d
   "slot": "spill:7f3a…",
   "head": "use anyhow::Result;\npub struct …",        // first ~2 KiB, char-boundary safe
   "summary": "Rust source, 1.9 MB, 48k lines",          // optional; cheap heuristic now, model-free
-  "read": { "tool": "spill.read", "args": { "slot": "spill:7f3a…", "range": [2048, 66560] } }
+  "read": { "tool": "spill_read", "args": { "slot": "spill:7f3a…", "range": [2048, 66560] } }
 }
 ```
 
@@ -137,7 +142,7 @@ handle, not a blob), so `O(turns × max-fragment)` has a tiny `max-fragment` and
 `enforce_history_budget` should essentially **never fire**. Keep it as
 defense-in-depth, but make elision **spill-then-drop**: an elided turn-pair is
 written to the SpillStore under a `turn:<n>` slot before removal, and a single line
-is left in place — `[turns 3–6 elided to spill:… — spill.read to recover]`. No
+is left in place — `[turns 3–6 elided to spill:… — spill_read to recover]`. No
 information is silently lost; recovery is one tool call away. If it fires at all,
 that is a **detectable defect** (emit Evidence), not normal operation.
 
@@ -145,8 +150,8 @@ that is a **detectable defect** (emit Evidence), not normal operation.
 
 | Layer | Mechanism | Where |
 |---|---|---|
-| **Prevent** | spill-on-ingress replaces lossy truncate | `rig_runner.rs:714` (`spill.ingest`) |
-| **Prevent** | transparent read-back | injected `spill.read` tool (mirror `final_answer` injection) |
+| **Prevent** | spill-on-ingress replaces lossy truncate | `rig_runner.rs:612` (`spill_on_ingress`) |
+| **Prevent** | transparent read-back | injected `spill_read` tool (mirror `final_answer` injection) |
 | **Prevent** | working memory ≠ Blackboard | new `SpillStore`; `AgentExecutor` stays blackboard-pure |
 | **Detect** | unsafe cap shape flagged before launch | `validate.rs` — see below |
 | **Detect** | context-size + spill-rate visible | `Evidence` on each spill / elision |
@@ -177,13 +182,13 @@ Extend the existing virtual-time tool-loop tests (`#[tokio::test(start_paused = 
   `an_oversized_tool_result_is_truncated_before_it_reaches_the_model` →
   `…_is_spilled_…`: assert the transcript carries a `spilled: true` handle, **not**
   the payload, and that `history_bytes` stays bounded across the loop.
-- `spill_read_returns_the_requested_window` — agent calls `spill.read`, gets exactly
+- `spill_read_returns_the_requested_window` — agent calls `spill_read`, gets exactly
   `[start,end)`, char-boundary clamped; unknown slot → tool error string.
 - `transparent_spill_needs_no_prompt` — a host that returns a 2-MiB result with an
   agent that never mentions spill still completes without a 400 and without losing
   the head.
 - `history_elision_spills_before_dropping` — drive past `max_history_bytes` (using
-  `with_max_history_bytes`), assert elided turns are recoverable via `spill.read` and
+  `with_max_history_bytes`), assert elided turns are recoverable via `spill_read` and
   an Evidence event was emitted.
 - Keep `the_history_budget_bounds_the_request_across_a_long_tool_loop` green — it now
   rarely needs to elide because results are handles.

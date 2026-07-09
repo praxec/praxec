@@ -148,6 +148,17 @@ those rules/codes; clean cutover (no alias).
 - **Keeping `orchestrator` for the flow-tier program.** Rejected — the executing
   actor is the central, future-facing concept and should own the name.
 
+## Status update (2026-07)
+
+Decision §4 enumerated four tokio channel types (`broadcast`, `mpsc`, `oneshot`,
+`watch`). As built, the bus (`crates/praxec-core/src/bus.rs`) uses **only
+`broadcast` + `oneshot`**: `broadcast` fans every `MissionEvent` out to all
+subscribers (it subsumed the streaming role §4 sketched for `mpsc`), and
+`oneshot` is the HITL park/resume reply channel. `mpsc` and `watch` were **not
+needed** — `mpsc` was superseded by the cloning `broadcast` fan-out, and no
+`watch`-backed latest-status channel was required (fleet status is derived
+elsewhere). The two-channel shape is the frozen contract.
+
 ## References
 
 - [ADR-0007](0007-agents-first-class-workflow-executors.md) — the orchestrator is

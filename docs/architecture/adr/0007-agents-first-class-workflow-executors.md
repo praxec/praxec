@@ -10,8 +10,9 @@
 confinement + authored-promotion boundary for agentic execution. This ADR settles
 the layer above it: **what an agent _is_, how it executes, and how it relates to
 workflows, skills, and scripts** — so the agent subsystem is first-class rather
-than the aether-coupled, feature-gated artifact it is today
-(`crates/praxec-agents/src/runner.rs` spawns the `aether` binary).
+than the aether-coupled, feature-gated artifact it was when this ADR was written
+(then `crates/praxec-agents/src/runner.rs` spawned the `aether` binary; that
+runner is now deleted and the loop is in-process rig — see the status update).
 
 Grounding (this is designed against what the runtime already guarantees):
 
@@ -19,7 +20,8 @@ Grounding (this is designed against what the runtime already guarantees):
   / `_scriptsLibrary` stamped at `workflow.start` (SPEC §8.2). "A complete
   workflow has all its skills and scripts available" is an existing invariant.
 - Workflows **already** declare a top-level `inputSchema`, validate launch input
-  against it (`runtime.rs:438`), are discoverable (`DiscoveryKind::Workflow`),
+  against it (`crates/praxec-core/src/runtime/runtime.rs:513`), are discoverable
+  (`DiscoveryKind::Workflow`),
   embedding-searchable (`SemanticDiscoveryIndex`), and launchable (`start`).
 - `RepoLockSpace` is **in-memory, single-process** (`Mutex<HashMap>`) — correct
   within one process, not across processes.
@@ -129,12 +131,29 @@ richness — state, composition, parallelism — in the governed program.
   unnecessary under single-authority; adds machinery for a case that doesn't arise
   (only the gateway ever holds locks).
 
+## Status update (2026-07)
+
+- **Decision §5 (rig, not aether; decouple) is DONE.** The aether-coupled
+  `runner.rs` is deleted; the governed agent loop is an in-process rig session
+  (`crates/praxec-agents/src/rig_runner.rs`, `executor.rs`), no longer
+  feature-gated.
+- **0006↔0007 cross-ref.** The untrusted/confined-exploration branch (ADR-0006's
+  Tier-1 sandbox + coordinate-at-promotion) is *implemented under this ADR* — the
+  code carries `ADR-0007` on `with_untrusted_support` / `run_untrusted` in
+  `executor.rs`, consistent with Decision §3 here (execution substrate: confined
+  process only for untrusted). ADR-0006 owns the confinement *primitive*
+  (`sandbox.rs`, `promotion.rs`); ADR-0007 owns *wiring it into `kind: agent`*.
+  The attribution is intentional, not drift.
+
 ## References
 
-- Agent runner (aether-coupled, to decouple): `crates/praxec-agents/src/runner.rs`
+- Agent runner (aether decouple **DONE**): the in-process rig loop
+  `crates/praxec-agents/src/rig_runner.rs` + `crates/praxec-agents/src/executor.rs`
+  (replaced the deleted aether-coupled `runner.rs`)
 - Snapshot skills/scripts invariant (§8.2): `config.rs` `stamp_skills_library` /
   `stamp_scripts_library` (`_skillsLibrary` / `_scriptsLibrary`)
-- Workflow `inputSchema` validation at start: `runtime.rs:438`
+- Workflow `inputSchema` validation at start:
+  `crates/praxec-core/src/runtime/runtime.rs:513`
 - In-memory single-process lock: `repo_locks.rs` `RepoLockSpace`
 - Discovery + semantic search: `discovery/discovery.rs` (`DiscoveryKind`),
   `SemanticDiscoveryIndex`

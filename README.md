@@ -3,7 +3,7 @@
 [![CI](https://github.com/praxec/praxec/actions/workflows/ci.yml/badge.svg)](https://github.com/praxec/praxec/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/praxec.svg)](https://crates.io/crates/praxec)
 [![docs.rs](https://docs.rs/praxec/badge.svg)](https://docs.rs/praxec)
-[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 **The AI execution kernel for deterministic, policy-gated workflows.**
 
@@ -182,8 +182,9 @@ audit log; operators choose per step:
 - The MCP server your external agent drives. Point any MCP client at the gateway
   and it governs your existing coding agent — fixed two-tool surface, everything
   behind it.
-- The agentic runtime (`praxec` TUI, default-on `agents` feature on the single
-  binary) that runs workflows end-to-end on the platform. Its graph-walking
+- The agentic runtime (`px` TUI, plus the gateway's default-on in-process
+  `kind: agent` / `orchestrate` on the single binary) that runs workflows
+  end-to-end on the platform. Its graph-walking
   interpreter spawns an isolated sub-agent per state, so each model sees only its
   scoped guidance and blackboard — a Qwen-7B editor directed by Sonnet-grade
   planning and reviewed by an Opus-grade critic, each doing only what it's best
@@ -314,4 +315,4 @@ for a tour of the codebase.
 
 ## License
 
-Licensed under [BSD-3-Clause](LICENSE).
+Licensed under [Apache-2.0](LICENSE).

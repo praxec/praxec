@@ -94,6 +94,22 @@ are the map's zoom altitudes, traversed by zoom + pan + search.
   a tree-with-modes and fails the readability bar; the affordances in §2 are what
   make it a map.
 
+## Status update (2026-07)
+
+Of the five "mandatory" readability affordances in Decision §2, **three are built**
+and **two are not yet**:
+
+- **Built:** you-are-here breadcrumb + zoom-ladder
+  (`crates/praxec-cockpit/src/ui/map_chrome.rs`), object-constant zoom transitions
+  (`src/map/transition.rs`), and stable terrain (fixed layout + state colour + pins).
+- **Not yet built:** the **persistent minimap** (focus+context view of the
+  parent/whole) and the L1 **roads** (dependency edges + critical-path spine drawn
+  as connectors). Neither has an implementation under `crates/praxec-cockpit/src/`.
+
+So the map currently satisfies the "no instruction" read for altitude/location and
+object constancy, but not yet the never-lose-the-whole (minimap) and
+spatial-relationships (roads) affordances.
+
 ## References
 
 - Cockpit (the map lands here): `crates/praxec-cockpit`

@@ -1,8 +1,8 @@
 # The TUI agent — deterministic interpreter + sub-agent orchestration
 
-`praxec-tui` (also installed as `praxec`) wraps the Aether agent
-framework with one architectural rule: **praxec is the sole MCP
-server**. Aether's built-in tool surface is replaced. The model's only
+`praxec-tui` (also installed as `px`) wraps the Aether agent
+framework with one architectural rule: **the praxec gateway is the sole
+MCP server**. Aether's built-in tool surface is replaced. The model's only
 tools are the two Praxec tools — `praxec.query` for reads
 (home/search/describe/get/explain) and `praxec.command` for writes
 (start/submit/define). Every action is schema-
@@ -16,7 +16,7 @@ actor. Most states never invoke an LLM. The ones that do invoke an
 ## Architecture
 
 ```
-praxec (TUI binary)
+px (TUI binary)
   │
   ├─ Aether framework (TUI, model calling, session management)
   │
@@ -115,25 +115,29 @@ For each `delegate` state visited:
 
 ## Agent configuration
 
-Provided via repeated CLI flags:
+Agent→model bindings live in a YAML `models.yaml`, resolved from
+`.praxec/models.yaml` (project) first, then `~/.praxec/models.yaml`
+(user); a project file shadows the user one. The interpreter resolves
+`delegate: <name>` against that file at spawn time. See
+[agents-and-models.md](./agents-and-models.md) for the full schema and
+setup.
 
 ```bash
 px walk \
   --workflow swe_agent \
-  --agent planning=anthropic/claude-sonnet-4 \
-  --agent editing=openrouter/qwen-2.5-coder-7b \
-  --agent critique=anthropic/claude-opus-4 \
   --max-sub-agent-seconds 120 \
   --max-sub-agent-steps 20
 ```
 
-Format: `name=provider/model`. The interpreter resolves `delegate: <name>`
-against this map at spawn time. Missing name → an actionable
-`InterpreterError::UnknownAgent` naming both the state and the
-agent so the operator sees exactly which `--agent` flag they forgot.
+The repeated `--agent name=provider/model` CLI flags are **deprecated as
+of v0.3** in favor of `models.yaml`. They still parse (and `px migrate`
+translates a set of them into a `models.yaml` body), but new setups
+should author `models.yaml` directly.
 
-TOML agent config files (`~/.praxec/agents/*.toml`) are a planned
-v2 UX improvement.
+A `delegate` name that resolves to nothing surfaces an actionable
+`InterpreterError::AgentResolution { state, source: ResolutionError }`
+— it names both the workflow state and the underlying resolution error
+so the operator sees exactly which binding is missing.
 
 ## Timeout poka-yoke — no defaults by design
 
@@ -158,6 +162,11 @@ This is the same FMECA discipline you'll see throughout the codebase
 (see the no-shortcuts lint at `crates/praxec-core/tests/no_shortcuts.rs`):
 **don't write a default that hides what an operator must consciously
 decide.** Pick values you can defend.
+
+Caveat: `max_sub_agent_steps` is currently **advisory** — the headless
+sub-agent runner has no built-in step counter, so the value is surfaced
+as a logged hint, not enforced. `max_sub_agent_seconds` (the wall-clock
+timeout) is the hard bound today; per-step enforcement is deferred to v2.
 
 ## Why this beats single-frontier-model loops
 
@@ -200,8 +209,8 @@ drives it through `walk_workflow` to completion. The earlier
 Other v2 work: a thin LLM-based branch picker when guards can't resolve
 to a single path (v1 uses the deterministic first-non-escalate fallback,
 which works in practice because the critic cycle corrects wrong picks);
-TOML agent config files; a real benchmark spike of sub-agent ensemble
-vs single frontier model (scaffold + methodology lives at
+per-step enforcement of `max_sub_agent_steps`; a real benchmark spike of
+sub-agent ensemble vs single frontier model (scaffold + methodology lives at
 `docs/BENCHMARK-COGNITIVE-ARCHITECTURE.md`; running it requires API
 budget).
 

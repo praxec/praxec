@@ -29,7 +29,7 @@ version: "1.0.0"
 # This is a demo config: ephemeral in-memory store + stderr audit. `serve`
 # refuses non-durable storage by default (state/audit would be lost in
 # production), so this demo explicitly opts in. Do NOT copy this line into a
-# real deployment — configure store.kind: file|sqlite + audit.sink: file.
+# real deployment — configure store.kind: sqlite + audit.sink: file.
 gateway:
   allow_ephemeral: true
 
