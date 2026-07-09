@@ -17,6 +17,16 @@ covered by a stability commitment.
 > none were tagged at the time. Versions `0.0.1`–`0.0.5` are the earlier
 > development history, renumbered onto this line.
 
+### Added — default reasoning effort for agent turns
+
+- **`kind: agent` turns now default to `low` reasoning effort** via the new
+  `ReasoningTuning.default_effort` config field. A *reasoning* model leading a
+  chain would otherwise spend the whole turn budget on hidden reasoning, which
+  surfaces as empty content and an `AGENT_NO_RESULT` stall. A step's explicit
+  `reasoning_effort` still wins; setting `default_effort: ""` opts out (provider
+  default). `low` (not `medium`) because `medium` is a no-op (≡ provider
+  default in `reasoning_params`).
+
 ### Fixed — agent-execution setup: make it work and fail honestly
 
 - **Chooser failures surface honestly instead of masquerading as "gave up."**

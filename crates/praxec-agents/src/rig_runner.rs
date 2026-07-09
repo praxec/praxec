@@ -363,9 +363,19 @@ impl AgentSessionRunner for RigSessionRunner {
                 )));
             }
         }
-        // Per-provider reasoning effort (native `additional_params` shape), when
-        // the session requests it — otherwise the provider default.
-        let reasoning = session.reasoning_effort.as_deref().and_then(|level| {
+        // Per-provider reasoning effort (native `additional_params` shape). Use
+        // the step's explicit `reasoning_effort` when set, else the configured
+        // default (`ReasoningTuning.default_effort`, "low") so a *reasoning*
+        // model can lead a chain without spending the whole turn budget on hidden
+        // reasoning. An empty configured default opts out (provider default).
+        let effort = session.reasoning_effort.clone().or_else(|| {
+            let d = praxec_core::tuning::tuning()
+                .reasoning
+                .default_effort
+                .clone();
+            (!d.trim().is_empty()).then_some(d)
+        });
+        let reasoning = effort.as_deref().and_then(|level| {
             let vendor = session.model.split_once(':').map(|(v, _)| v).unwrap_or("");
             praxec_core::tuning::reasoning_params(vendor, level)
         });
