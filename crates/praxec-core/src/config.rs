@@ -619,12 +619,13 @@ fn inject_hop_slots(config: &mut Value) -> anyhow::Result<()> {
             continue;
         };
 
-        // The workflow's resolution stack (Spec A §5); absent → `generic`.
-        let stack = def_obj
-            .get("stack")
-            .and_then(Value::as_str)
-            .unwrap_or("generic")
-            .to_string();
+        // The workflow's resolution chain (Spec A §5.1). `stack:` is either a
+        // plain string (language-only, back-compat) or an object
+        // `{ language, frameworks, primary_framework, project }`. Parsed into an
+        // ordered, most-specific-first specificity chain
+        // `[project, primary_framework, language]` (absent levels skipped);
+        // `resolve_hop_cap` appends the `generic` floor.
+        let stack_chain = parse_stack_chain(def_obj.get("stack"))?;
 
         // First pass: walk states→transitions, inject each transition's
         // `inputSchema` + resolved executor, and collect the slot→Out ref for
@@ -685,7 +686,7 @@ fn inject_hop_slots(config: &mut Value) -> anyhow::Result<()> {
                     // ties). A load error if nothing resolves.
                     let resolved = resolve_hop_cap(
                         &slot,
-                        &stack,
+                        &stack_chain,
                         &loaded_ids,
                         &repo_priority,
                         wf_id,
@@ -772,35 +773,121 @@ fn read_repo_priority(config: &Value) -> HashMap<String, i64> {
         .unwrap_or_default()
 }
 
-/// Spec A §5 — resolve a `hop_slot: <slot>` marker to a concrete loaded cap id.
+/// Spec A §5.1 — parse a workflow's `stack:` field into an ordered,
+/// most-specific-first specificity chain `[project, primary_framework, language]`
+/// (absent levels skipped). `resolve_hop_cap` appends the `generic` floor.
 ///
-/// - Look for `cap.<slot>.<stack>` among loaded ids (host-local, or namespaced
-///   as `<ns>/cap.<slot>.<stack>`). If none and `stack != "generic"`, fall back
-///   to `cap.<slot>.generic`. Neither → `HOP_SLOT_UNRESOLVED`.
-/// - When several namespaces provide the matching cap, the highest `priority:`
-///   wins; a host-local (unprefixed) cap outranks any repo (the operator's own
-///   config is top authority). An equal-priority tie → `HOP_SLOT_AMBIGUOUS`.
+/// Two accepted forms:
+/// - a plain string (`stack: rust`) — language-only (back-compat);
+/// - an object `{ language, frameworks: [set], primary_framework, project }` —
+///   `project` and `primary_framework` layer above `language`. `frameworks:` is
+///   accepted (additive-knowledge composition is a separate later concern,
+///   Spec A §5.2) but does NOT participate in override-resolution; only
+///   `primary_framework` does.
+///
+/// Absent `stack:` → empty chain → resolves against `generic` alone.
+/// A non-string / non-object `stack:`, or non-string level values, are load
+/// errors (poka-yoke — a malformed descriptor never silently degrades).
+fn parse_stack_chain(stack: Option<&Value>) -> anyhow::Result<Vec<String>> {
+    match stack {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => {
+            // Language-only. `generic` is the floor `resolve_hop_cap` always
+            // appends, so an explicit `stack: generic` collapses to the floor.
+            if s == "generic" {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![s.clone()])
+            }
+        }
+        Some(Value::Object(obj)) => {
+            let level = |key: &str| -> anyhow::Result<Option<String>> {
+                match obj.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(s)) if s.is_empty() || s == "generic" => Ok(None),
+                    Some(Value::String(s)) => Ok(Some(s.clone())),
+                    Some(other) => bail!(
+                        "HOP_STACK_INVALID: `stack.{key}` must be a string, got {other}"
+                    ),
+                }
+            };
+            // Most-specific-first: project → primary_framework → language.
+            let mut chain = Vec::new();
+            if let Some(p) = level("project")? {
+                chain.push(p);
+            }
+            if let Some(f) = level("primary_framework")? {
+                chain.push(f);
+            }
+            if let Some(l) = level("language")? {
+                chain.push(l);
+            }
+            Ok(chain)
+        }
+        Some(other) => bail!(
+            "HOP_STACK_INVALID: `stack:` must be a string (language) or an object \
+             {{ language, frameworks, primary_framework, project }}, got {other}"
+        ),
+    }
+}
+
+/// A human-readable rendering of the resolution chain for diagnostics — the
+/// specificity levels joined most-specific-first with the `generic` floor,
+/// e.g. `myapp→axum→rust→generic`. An empty chain renders as `generic`.
+fn stack_display(chain: &[String]) -> String {
+    if chain.is_empty() {
+        "generic".to_string()
+    } else {
+        let mut parts: Vec<&str> = chain.iter().map(String::as_str).collect();
+        parts.push("generic");
+        parts.join("→")
+    }
+}
+
+/// Spec A §5.1 — resolve a `hop_slot: <slot>` marker to a concrete loaded cap id
+/// by walking the specificity chain most-specific-first.
+///
+/// - Walk `chain` (`[project, primary_framework, language]`, absent levels
+///   already skipped) then the `generic` floor. For each level, look for
+///   `cap.<slot>.<level>` among loaded ids (host-local, or namespaced as
+///   `<ns>/cap.<slot>.<level>`). The FIRST level with any provider wins — a more
+///   specific cap always beats a less specific one (override-resolution). No
+///   level matches → `HOP_SLOT_UNRESOLVED`.
+/// - When several namespaces provide the winning level's cap, the highest
+///   `priority:` breaks the tie; a host-local (unprefixed) cap outranks any repo
+///   (the operator's own config is top authority). An equal-priority tie →
+///   `HOP_SLOT_AMBIGUOUS`.
 fn resolve_hop_cap(
     slot: &str,
-    stack: &str,
+    chain: &[String],
     loaded_ids: &[String],
     repo_priority: &HashMap<String, i64>,
     wf_id: &str,
     state_name: &str,
     t_name: &str,
 ) -> anyhow::Result<String> {
-    // Stack-specific first, then the generic floor (only if distinct).
-    let mut candidates = matching_caps(slot, stack, loaded_ids);
-    if candidates.is_empty() && stack != "generic" {
-        candidates = matching_caps(slot, "generic", loaded_ids);
+    let stack_display = stack_display(chain);
+    // Levels to try, most-specific-first, with the `generic` floor last.
+    // (`generic` never duplicates: `parse_stack_chain` drops explicit `generic`
+    // levels.)
+    let mut levels: Vec<&str> = chain.iter().map(String::as_str).collect();
+    levels.push("generic");
+
+    let mut candidates: Vec<String> = Vec::new();
+    for level in &levels {
+        candidates = matching_caps(slot, level, loaded_ids);
+        if !candidates.is_empty() {
+            break; // most-specific level with a provider wins
+        }
     }
 
     if candidates.is_empty() {
         bail!(
             "HOP_SLOT_UNRESOLVED: workflow '{wf_id}' state '{state_name}' transition '{t_name}': \
-             `hop_slot: {slot}` (stack '{stack}') resolves to no loaded capability — neither \
-             `cap.{slot}.{stack}` nor `cap.{slot}.generic` is loaded. Register a slot cap or \
-             declare the repo that provides it."
+             `hop_slot: {slot}` (stack '{stack_display}') resolves to no loaded capability — no \
+             `cap.{slot}.<level>` along the chain [{}] nor `cap.{slot}.generic` is loaded. \
+             Register a slot cap or declare the repo that provides it.",
+            levels.join(", ")
         );
     }
 
@@ -808,8 +895,8 @@ fn resolve_hop_cap(
         return Ok(candidates.into_iter().next().expect("len checked == 1"));
     }
 
-    // Multiple providers — break the tie by repo priority. Host-local
-    // (unprefixed) caps are the operator's own config: top authority.
+    // Multiple providers at the winning level — break the tie by repo priority.
+    // Host-local (unprefixed) caps are the operator's own config: top authority.
     let ranked: Vec<(i64, String)> = candidates
         .into_iter()
         .map(|id| {
@@ -831,7 +918,7 @@ fn resolve_hop_cap(
         names.sort_unstable();
         bail!(
             "HOP_SLOT_AMBIGUOUS: workflow '{wf_id}' state '{state_name}' transition '{t_name}': \
-             `hop_slot: {slot}` (stack '{stack}') is provided by multiple repos at equal \
+             `hop_slot: {slot}` (stack '{stack_display}') is provided by multiple repos at equal \
              priority {top}: [{}]. Raise one repo's `priority:` to disambiguate.",
             names.join(", ")
         );
