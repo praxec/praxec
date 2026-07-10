@@ -9,13 +9,14 @@ pub(crate) use crate::gateway_config::{
 };
 pub use crate::gateway_config::{
     GatewayOverlays, OverlayCtx, build_evidence_store, build_guidance_ack_store,
-    build_script_ack_store, collect_diagnostics_with,
+    build_parked_session_store, build_script_ack_store, collect_diagnostics_with,
 };
 // `llm_overlay_registrar` is gated on the optional llm-executor feature; its
 // only caller (main.rs) is also gated, so the re-export must carry the same
 // cfg or the lean `--no-default-features` build fails to resolve it (E0432).
 #[cfg(feature = "llm-executor")]
 pub use crate::gateway_config::llm_overlay_registrar;
+pub use crate::provision::detect;
 use anyhow::Context;
 use clap::Parser;
 use praxec_core::SingleKindOverlay;
@@ -100,6 +101,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             args,
         } => run_query(config, human, args, overlays).await,
         Command::Check { config } => check(config, &overlays.diagnostics),
+        Command::Doctor { config } => doctor(config),
         Command::Health { config } => health(config),
         Command::Observe { config } => observe(config),
         Command::Migrate { config } => migrate(config),
@@ -116,6 +118,9 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 id,
                 outcome,
             } => approvals_resolve(&config, &id, &outcome).await,
+            ApprovalsCommand::Resume { config, id, reply } => {
+                approvals_resume_await(&config, &id, &reply, overlays).await
+            }
             ApprovalsCommand::Tail { config } => approvals_tail(&config),
         },
         Command::Fuzz {
@@ -283,6 +288,11 @@ async fn orchestrate(
     use praxec_core::model::{Principal, StartWorkflow};
 
     let config = load_config(&config_path)?;
+    // P15 — fail fast on a missing provider credential BEFORE doing any work:
+    // check the providers the config's model bindings reference plus the
+    // orchestrator's own `--model`, instead of failing deep in the first model
+    // call. Missing tools do NOT block (they fail loud at invocation).
+    crate::preflight::guard_provider_credentials(&config, &[model.as_str()])?;
     let runtime = build_runtime_for_orchestrate(&config, &overlays).await?;
 
     // Resolve the mission: drive an existing instance, or START a fresh one from a
@@ -830,6 +840,12 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         // command/query against an ephemeral store is fine; a long-running serve
         // is not. As a config fault, this now degrades rather than crashing.
         guard_durable_serve(&config)?;
+        // P15 — credential preflight: a provider key the config's model
+        // bindings need that is missing means every agent/llm step is doomed
+        // to fail at dispatch. Surface it here as a live DEGRADED state (the
+        // self-documenting HealthReport) instead of the first deep model-call
+        // error. Missing TOOLS never block — they fail loud at invocation.
+        crate::preflight::guard_provider_credentials(&config, &[])?;
         build_oneshot_server(&config, &overlays).await
     }
     .await;
@@ -851,6 +867,15 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         "starting praxec stdio server"
     );
 
+    // P6b — the staleness tracker behind the lazy recheck: the config file
+    // set's mtimes as captured at boot. Every reload path (in-band, SIGHUP,
+    // staleness-triggered) recaptures after the attempt so a picked-up (or
+    // rejected) edit is not re-triggered every TTL window.
+    let staleness_tracker = Arc::new(praxec_core::hot_reload::StalenessTracker::new(
+        praxec_core::config::local_config_file_set(&config_path),
+        praxec_core::hot_reload::STALENESS_TTL,
+    ));
+
     // P6 — build the in-band reload hook (the SAME gated path as SIGHUP) and
     // inject it so `praxec.command { reload }` fires a live config reload,
     // reachable by the in-workflow agent over stdio (no third MCP tool).
@@ -862,8 +887,9 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         let aud = audit.clone();
         let rt = runtime.clone();
         let regs = overlays.registrars.clone();
+        let tracker = staleness_tracker.clone();
         let hook: praxec_mcp_server::ReloadHook = Arc::new(move || {
-            let (defs, execs, disc, cfg, aud, rt, regs) = (
+            let (defs, execs, disc, cfg, aud, rt, regs, tracker) = (
                 defs.clone(),
                 execs.clone(),
                 disc.clone(),
@@ -871,12 +897,58 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                 aud.clone(),
                 rt.clone(),
                 regs.clone(),
+                tracker.clone(),
             );
-            Box::pin(
-                async move { reload_gated(&defs, &execs, &disc, &cfg, &aud, &rt, &regs).await },
-            ) as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
+            Box::pin(async move {
+                let outcome = reload_gated(&defs, &execs, &disc, &cfg, &aud, &rt, &regs).await;
+                tracker.recapture(praxec_core::config::local_config_file_set(&cfg));
+                outcome
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
         });
         server.with_reload_hook(hook)
+    };
+
+    // P6b — the lazy staleness recheck (polling backup to fs-event watchers,
+    // which don't fire reliably on WSL). Runs at the top of every call_tool;
+    // within the TTL window (STALENESS_TTL) it is a lock + Instant compare.
+    // At most once per TTL it stats the config file set, and an advanced
+    // mtime triggers the SAME gated reload as SIGHUP — validated, atomic
+    // swap, audited; a broken edit keeps the old config live.
+    let server = {
+        let defs = swappable_defs.clone();
+        let execs = swappable_executors.clone();
+        let disc = swappable_discovery.clone();
+        let cfg = config_path.clone();
+        let aud = audit.clone();
+        let rt = runtime.clone();
+        let regs = overlays.registrars.clone();
+        let tracker = staleness_tracker.clone();
+        let hook: praxec_mcp_server::StalenessHook = Arc::new(move || {
+            let (defs, execs, disc, cfg, aud, rt, regs, tracker) = (
+                defs.clone(),
+                execs.clone(),
+                disc.clone(),
+                cfg.clone(),
+                aud.clone(),
+                rt.clone(),
+                regs.clone(),
+                tracker.clone(),
+            );
+            Box::pin(async move {
+                if !tracker.stale_check_due() {
+                    return;
+                }
+                tracing::info!(
+                    "config changed on disk — triggering gated reload (staleness recheck)"
+                );
+                let _ = reload_gated(&defs, &execs, &disc, &cfg, &aud, &rt, &regs).await;
+                // Recapture regardless of outcome: a REJECTED edit is audited
+                // once (config.reload_rejected), not retried every TTL until
+                // the operator saves the file again.
+                tracker.recapture(praxec_core::config::local_config_file_set(&cfg));
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        });
+        server.with_staleness_hook(hook)
     };
 
     let service = server
@@ -894,6 +966,7 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         let reload_audit = audit.clone();
         let reload_runtime = runtime.clone();
         let reload_registrars = overlays.registrars.clone();
+        let reload_tracker = staleness_tracker.clone();
         tokio::spawn(async move {
             let mut sighup =
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -916,6 +989,11 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                     &reload_registrars,
                 )
                 .await;
+                // P6b — re-baseline the staleness tracker so this reload's
+                // pickup isn't double-fired by the next lazy recheck.
+                reload_tracker.recapture(praxec_core::config::local_config_file_set(
+                    &reload_config_path,
+                ));
             }
         });
     }
@@ -1269,6 +1347,23 @@ fn migrate(config_path: PathBuf) -> anyhow::Result<()> {
         count,
         config_path.display()
     );
+    Ok(())
+}
+
+/// P15 — the operator's "is my machine set up for this config" command: run
+/// the credential/tooling preflight and print the report. Exits non-zero iff
+/// a required provider credential is missing (a missing `kind: mcp` binary is
+/// reported as a warning — it fails loud at invocation, not at boot).
+fn doctor(config_path: PathBuf) -> anyhow::Result<()> {
+    let config = load_config(&config_path)?;
+    let report = crate::preflight::preflight(&config);
+    print!("{}", crate::preflight::format_report(&report));
+    if !report.ok {
+        anyhow::bail!(
+            "doctor: required provider credential(s) missing — a drive against this \
+             config would fail at the first model call"
+        );
+    }
     Ok(())
 }
 
@@ -1897,7 +1992,8 @@ async fn approvals_list(config_path: &PathBuf, all: bool) -> anyhow::Result<()> 
     // (propagated via `?`) from "sink doesn't store events" (`Ok(None)`) and
     // "stored but the queue is empty" (`Ok(Some(vec![]))`). A failed read can
     // no longer masquerade as an empty approval queue.
-    let events = match sink.try_list_events().await? {
+    let events_opt = sink.try_list_events().await?;
+    match &events_opt {
         None => {
             let sink_kind = config
                 .pointer("/audit/sink")
@@ -1912,66 +2008,203 @@ async fn approvals_list(config_path: &PathBuf, all: bool) -> anyhow::Result<()> 
                     println!("No approval requests found.");
                 }
             }
-            return Ok(());
         }
-        Some(events) => events,
-    };
-    if events.is_empty() {
-        println!("No approval requests found.");
-        return Ok(());
-    }
+        Some(events) if events.is_empty() => {
+            println!("No approval requests found.");
+        }
+        Some(events) => {
+            let mut pending = Vec::new();
+            let mut resolved_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
-    let mut pending = Vec::new();
-    let mut resolved_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for event in events {
+                if event.event_type == "human.approval.resolved" {
+                    if let Some(approval_id) =
+                        event.payload.get("approval_id").and_then(Value::as_str)
+                    {
+                        resolved_ids.insert(approval_id.to_string());
+                    }
+                }
 
-    for event in &events {
-        let _event_id = &event.id;
+                if event.event_type == "human.approval.requested" {
+                    pending.push(event);
+                }
+            }
 
-        if event.event_type == "human.approval.resolved" {
-            if let Some(approval_id) = event.payload.get("approval_id").and_then(Value::as_str) {
-                resolved_ids.insert(approval_id.to_string());
+            for event in &pending {
+                let id = &event.id;
+                let status = if resolved_ids.contains(id) {
+                    "resolved"
+                } else {
+                    "pending"
+                };
+                if !all && resolved_ids.contains(id) {
+                    continue;
+                }
+                println!("[{status}] {id}");
+                println!(
+                    "  queue:      {}",
+                    event
+                        .payload
+                        .get("queue")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                );
+                println!(
+                    "  transition: {}",
+                    event
+                        .payload
+                        .get("transition")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                );
+                println!(
+                    "  workflow:   {}",
+                    event.workflow_id.as_deref().unwrap_or("?")
+                );
+                println!();
             }
         }
+    }
 
-        if event.event_type == "human.approval.requested" {
-            pending.push(event);
+    // ── P12 R1.4 — parked agent awaits (`await_human`) ─────────────────────
+    // The durable parked-session store is the source of truth for pending
+    // agent awaits (a row exists exactly while the frame awaits its human);
+    // the audit trail contributes the workflow/transition context when the
+    // sink stores events.
+    if let Some(parked) = build_parked_session_store(&config)? {
+        let sessions = parked.list().await?;
+        if !sessions.is_empty() {
+            println!("Parked agent awaits (await_human):");
+            for s in &sessions {
+                // Join with the suspend audit event for workflow context.
+                let hit = events_opt.as_ref().and_then(|events| {
+                    events.iter().rev().find(|e| {
+                        e.event_type == "agent.await.suspended"
+                            && e.payload.get("correlation_id").and_then(Value::as_str)
+                                == Some(s.correlation_id.as_str())
+                    })
+                });
+                println!("[awaiting] {}", s.correlation_id);
+                println!("  prompt:     {}", s.prompt);
+                println!("  parked_at:  {}", s.parked_at.to_rfc3339());
+                if let Some(e) = hit {
+                    println!("  workflow:   {}", e.workflow_id.as_deref().unwrap_or("?"));
+                    println!(
+                        "  transition: {}",
+                        e.payload
+                            .get("transition")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                    );
+                }
+                println!(
+                    "  resume:     praxec approvals resume --config {} {} --reply \"<answer>\"",
+                    config_path.display(),
+                    s.correlation_id
+                );
+                println!();
+            }
         }
     }
 
-    for event in &pending {
-        let id = &event.id;
-        let status = if resolved_ids.contains(id) {
-            "resolved"
-        } else {
-            "pending"
-        };
-        if !all && resolved_ids.contains(id) {
-            continue;
-        }
-        println!("[{status}] {id}");
-        println!(
-            "  queue:      {}",
-            event
-                .payload
-                .get("queue")
-                .and_then(Value::as_str)
-                .unwrap_or("?")
-        );
-        println!(
-            "  transition: {}",
-            event
-                .payload
-                .get("transition")
-                .and_then(Value::as_str)
-                .unwrap_or("?")
-        );
-        println!(
-            "  workflow:   {}",
-            event.workflow_id.as_deref().unwrap_or("?")
-        );
-        println!();
-    }
+    Ok(())
+}
 
+/// P12 R1.4 — the operator resume driver for a parked agent `await_human`
+/// session. Locates the workflow + transition parked on `correlation_id`
+/// (via the `agent.await.suspended` audit event), then re-submits that
+/// transition — through the SAME governed one-shot submit pipeline every
+/// caller uses (guards, versioning, audit, the human-origin gate) — as a
+/// human principal with `arguments.reply`. The agent executor routes the
+/// reply to the runner's correlated `resume`, the session continues from the
+/// exact parked turn, and the workflow advances on its result.
+async fn approvals_resume_await(
+    config_path: &PathBuf,
+    id: &str,
+    reply: &str,
+    overlays: GatewayOverlays,
+) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let parked = build_parked_session_store(&config)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "approvals resume requires store.kind: sqlite (the durable parked-session store)"
+        )
+    })?;
+    let record = parked.load(id).await?.ok_or_else(|| {
+        anyhow::anyhow!("no parked agent session '{id}' (already resumed, or never parked)")
+    })?;
+
+    // Locate the parked workflow + transition via the suspend audit event.
+    let events = build_audit_sink(&config)?
+        .try_list_events()
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "audit.sink does not store events, so the parked workflow can't be located. \
+                 Resume manually: re-submit the parked transition with `arguments.reply` via \
+                 `praxec command` (as a human: --human)."
+            )
+        })?;
+    let hit = events
+        .iter()
+        .rev()
+        .find(|e| {
+            e.event_type == "agent.await.suspended"
+                && e.payload.get("correlation_id").and_then(Value::as_str) == Some(id)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no agent.await.suspended audit event names correlation '{id}'; resume \
+                 manually via `praxec command`."
+            )
+        })?;
+    let workflow_id = hit
+        .workflow_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("audit event for '{id}' carries no workflow id"))?;
+    let transition = hit
+        .payload
+        .get("transition")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("audit event for '{id}' carries no transition"))?
+        .to_string();
+
+    // Read the LIVE version + verify the workflow is still parked on THIS
+    // frame (protects against a stale audit hit after a later re-park).
+    let store = build_workflow_store(&config)?;
+    let inst = store.load(&workflow_id).await?;
+    let live = inst
+        .context
+        .pointer("/_agent_await/correlation_id")
+        .and_then(Value::as_str);
+    if live != Some(id) {
+        anyhow::bail!(
+            "workflow {workflow_id} is not currently parked on '{id}' \
+             (its live await marker is {live:?})"
+        );
+    }
+    let expected_version = inst.version;
+
+    println!("resuming parked agent session {id}");
+    println!("  workflow:   {workflow_id}");
+    println!("  transition: {transition}");
+    println!("  prompt:     {}", record.prompt);
+
+    let bundle = build_oneshot_server(&config, &overlays).await?;
+    let resp = bundle
+        .server
+        .dispatch_command(
+            json!({
+                "workflowId": workflow_id,
+                "expectedVersion": expected_version,
+                "transition": transition,
+                "arguments": { "reply": reply },
+            }),
+            cli_principal(true),
+        )
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }
 

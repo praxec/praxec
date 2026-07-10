@@ -70,6 +70,14 @@ pub struct AgentExecutorConfig {
     /// the whole run. Keys without a declared type are not type-checked.
     #[serde(default)]
     pub expected_output_types: std::collections::BTreeMap<String, String>,
+    /// P12 R1.4 — opt-in suspend capability: when `true` the runner offers the
+    /// reserved `await_human` tool, and calling it durably parks the session
+    /// (`AGENT_SUSPENDED` + a persisted conversation keyed by correlation_id)
+    /// until a human reply resumes it. Default `false`: a step that doesn't
+    /// opt in can never suspend. Requires a `ParkedSessionStore` wired on the
+    /// runner (fail-fast `AGENT_AWAIT_UNSUPPORTED` otherwise).
+    #[serde(default)]
+    pub await_enabled: bool,
 }
 
 /// An agent's `affinity:` value — a closed [`ModelRef`] OR an open `activity:`

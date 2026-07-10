@@ -133,6 +133,10 @@ pub enum StatusHint {
     /// Suspended waiting for a spawned sub-workflow to terminate — `Waiting`
     /// regardless of who owns the parent state.
     WaitingOnSubworkflow,
+    /// Suspended waiting for a human reply to a parked `kind: agent` session
+    /// (`await_human`, P12 R1.4) — `Waiting` regardless of who owns the state,
+    /// exactly like the other suspend sources.
+    WaitingOnAgentAwait,
 }
 
 /// Derive the mission status (ADR-0008) from the transient hint plus the
@@ -170,6 +174,7 @@ pub fn derive_mission_status(
         // Non-terminal: in process. Waiting iff stalled on a lock or a human.
         StatusHint::WaitingOnLock => MissionStatus::Waiting,
         StatusHint::WaitingOnSubworkflow => MissionStatus::Waiting,
+        StatusHint::WaitingOnAgentAwait => MissionStatus::Waiting,
         _ if awaiting_human => MissionStatus::Waiting,
         _ => MissionStatus::Running,
     }
@@ -203,6 +208,7 @@ mod tests {
     #[case(H::WaitingForAction, false, None, false, true, Waiting)] // human owns the next move
     #[case(H::WaitingOnLock, false, None, false, false, Waiting)] // blocked on a lock
     #[case(H::WaitingOnSubworkflow, false, None, false, false, Waiting)] // parked on a child, even from a non-human state
+    #[case(H::WaitingOnAgentAwait, false, None, false, false, Waiting)] // agent parked on await_human — waiting, never failed
     #[case(H::Executed, false, None, false, false, Running)]
     #[case(H::Rejected, false, None, false, false, Running)] // a rejected move stays in process
     fn status_derivation(

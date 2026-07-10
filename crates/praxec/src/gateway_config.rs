@@ -62,6 +62,16 @@ pub(crate) enum Command {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// P15 — preflight this machine for a config: is every provider key the
+    /// config's models reference resolvable (env / providers.env), and is every
+    /// `kind: mcp` connection binary on PATH? Missing credentials fail (exit
+    /// non-zero — nothing agentic could run); missing tools are warnings (they
+    /// fail loud at invocation and only affect the steps that use them).
+    Doctor {
+        /// Path to the gateway YAML config.
+        #[arg(short, long)]
+        config: PathBuf,
+    },
     /// Print a JSON health snapshot: connections, repos, definition_count, store.
     Health {
         #[arg(short, long)]
@@ -226,6 +236,21 @@ pub(crate) enum ApprovalsCommand {
         /// Resolution outcome (approved | rejected).
         #[arg(short, long, default_value = "approved")]
         outcome: String,
+    },
+    /// P12 R1.4 — resume a parked agent `await_human` session: deliver the
+    /// human's reply to the exact parked frame by re-submitting the parked
+    /// transition (as a human principal) with `arguments.reply`. The resumed
+    /// agent continues from the awaited turn and the workflow advances on its
+    /// result. Requires `store.kind: sqlite` and a stored audit sink.
+    Resume {
+        /// Path to the gateway YAML config.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The parked session's correlation id (see `approvals list`).
+        id: String,
+        /// The human's reply to the agent's `await_human` prompt.
+        #[arg(short, long)]
+        reply: String,
     },
     /// Tail the audit log for new approval requests.
     Tail {
@@ -743,6 +768,36 @@ pub fn build_script_ack_store(
     }
 }
 
+/// Build the parked-agent-session store from `config` (P12 R1.4 — the durable
+/// half of agent `await_human` suspend/resume). The only durable backend is
+/// `store.kind=sqlite` (a `parked_agent_sessions` table coexisting in the same
+/// DB file as the workflow store — a parked conversation must survive a power
+/// cycle). `memory`/`file` get `None`: the runner then fails fast on any
+/// `await_enabled` session (AGENT_AWAIT_UNSUPPORTED) rather than parking a
+/// frame that a restart would lose. An unknown kind fails fast, mirroring
+/// [`build_workflow_store`].
+pub fn build_parked_session_store(
+    config: &Value,
+) -> anyhow::Result<Option<Arc<dyn praxec_core::ports::ParkedSessionStore>>> {
+    let kind = config
+        .pointer("/store/kind")
+        .and_then(Value::as_str)
+        .unwrap_or("memory");
+    let path = config.pointer("/store/path").and_then(Value::as_str);
+
+    match kind {
+        "sqlite" => {
+            let path = path
+                .ok_or_else(|| anyhow::anyhow!("store.path is required when store.kind=sqlite"))?;
+            Ok(Some(Arc::new(
+                praxec_core::store::SqliteParkedSessionStore::open(path)?,
+            )))
+        }
+        "memory" | "file" => Ok(None),
+        other => anyhow::bail!("unknown store kind '{other}'"),
+    }
+}
+
 pub(crate) fn build_audit_sink(config: &Value) -> anyhow::Result<Arc<dyn AuditSink>> {
     let sink_kind = config
         .pointer("/audit/sink")
@@ -779,5 +834,60 @@ pub(crate) fn parse_rotation_interval(config: &Value) -> RotationInterval {
         "hourly" => RotationInterval::Hourly,
         "weekly" => RotationInterval::Weekly,
         _ => RotationInterval::Daily,
+    }
+}
+
+#[cfg(test)]
+mod parked_store_wiring_tests {
+    use super::build_parked_session_store;
+    use praxec_core::model::ParkedAgentSession;
+    use serde_json::json;
+
+    /// P12 R1.4 wiring — `store.kind: sqlite` yields a REAL durable parked
+    /// store on the same DB path the workflow store uses, and it round-trips
+    /// a parked session (the bin-path integration assert).
+    #[tokio::test]
+    async fn sqlite_store_kind_wires_a_working_parked_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("praxec.db");
+        let cfg = json!({ "store": { "kind": "sqlite", "path": db.to_str().unwrap() } });
+        let store = build_parked_session_store(&cfg)
+            .expect("sqlite parked store builds")
+            .expect("sqlite yields Some(store)");
+        store
+            .park(ParkedAgentSession {
+                correlation_id: "corr-wire".into(),
+                prompt: "ship it?".into(),
+                session: json!({}),
+                conversation: json!({}),
+                parked_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("park persists");
+        let listed = store.list().await.expect("list works");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].correlation_id, "corr-wire");
+        assert_eq!(listed[0].prompt, "ship it?");
+    }
+
+    /// `memory`/`file` stores are non-durable → no parked store (the runner
+    /// then fails fast on `await_enabled` instead of parking losable frames).
+    #[test]
+    fn non_durable_store_kinds_yield_no_parked_store() {
+        let mem = json!({ "store": { "kind": "memory" } });
+        assert!(build_parked_session_store(&mem).unwrap().is_none());
+        let file = json!({ "store": { "kind": "file", "path": "/tmp/x" } });
+        assert!(build_parked_session_store(&file).unwrap().is_none());
+    }
+
+    /// sqlite without a path fails fast (mirrors `build_workflow_store`).
+    #[test]
+    fn sqlite_without_a_path_fails_fast() {
+        let cfg = json!({ "store": { "kind": "sqlite" } });
+        let err = match build_parked_session_store(&cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("sqlite without a path must fail fast"),
+        };
+        assert!(err.to_string().contains("store.path is required"));
     }
 }

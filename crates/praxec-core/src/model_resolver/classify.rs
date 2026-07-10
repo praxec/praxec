@@ -196,6 +196,23 @@ mod tests {
         );
     }
 
+    /// P12 R1.4 — AGENT_SUSPENDED is NOT a model-health failure: the agent
+    /// parked on a human gate. It must classify as ContentOther (surface, not
+    /// route-around-able), or the chain-walk would escalate to the NEXT model
+    /// and run a second agent on the same task while the first one's parked
+    /// frame awaits its human reply — a duplicate-execution hazard.
+    #[test]
+    fn from_executor_error_agent_suspended_is_not_escalatable() {
+        let err =
+            ExecutorError::Permanent("AGENT_SUSPENDED: parked awaiting human (corr-1)".into());
+        let class = FailureClass::from_executor_error(&err);
+        assert_eq!(class, FailureClass::ContentOther);
+        assert!(
+            !class.is_infrastructure(),
+            "a suspension must never be chain-escalated to another model"
+        );
+    }
+
     /// (d) LlmErrorCode::NoToolCall maps to Capability.
     #[test]
     fn from_executor_error_no_tool_call_is_capability() {

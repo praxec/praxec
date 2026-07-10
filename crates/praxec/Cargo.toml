@@ -39,6 +39,8 @@ serde_yaml = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Resolve MCP-connection command binaries on PATH for self-provision detection.
+which = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 

@@ -133,6 +133,7 @@ fn session(tools: Vec<String>) -> AgentSession {
         stall_timeout: Duration::from_secs(5),
         expected_output_keys: Vec::new(),
         expected_output_types: Default::default(),
+        await_enabled: false,
     }
 }
 
@@ -1042,6 +1043,7 @@ async fn test_tool_setup_timeout() {
         stall_timeout: Duration::from_secs(5),
         expected_output_keys: Vec::new(),
         expected_output_types: Default::default(),
+        await_enabled: false,
     };
     let runner = RigSessionRunner::new(Arc::new(ScriptedFactory::new(vec![])))
         .with_tool_host(Arc::new(HangingToolHost));
@@ -1138,4 +1140,314 @@ fn is_transient_retries_only_transient_classes() {
     // NOT retried (chain-walk / surface instead):
     assert!(!super::is_transient(&ExecutorError::Permanent("x".into())));
     assert!(!super::is_transient(&ExecutorError::Auth("x".into())));
+}
+
+// ═══ P12 R1.4 — durable suspend / resume (docs/await-resume-architecture.md) ═══
+
+use praxec_core::store::SqliteParkedSessionStore;
+
+fn await_call(id: &str, prompt: &str) -> StreamEvent {
+    StreamEvent::ToolCall(ToolCallRequest {
+        id: id.into(),
+        name: AWAIT_HUMAN_TOOL.into(),
+        arguments: json!({ "prompt": prompt }).to_string(),
+    })
+}
+
+fn await_session(tools: Vec<String>) -> AgentSession {
+    AgentSession {
+        await_enabled: true,
+        ..session(tools)
+    }
+}
+
+fn parked_store() -> Arc<SqliteParkedSessionStore> {
+    Arc::new(SqliteParkedSessionStore::open_in_memory().unwrap())
+}
+
+/// (a) The suspend signal: an `await_human` call STOPS the loop with a
+/// first-class Suspended outcome (not an error, not NoResult) AND the parked
+/// conversation is persisted in the store, keyed by the correlation_id.
+#[tokio::test]
+async fn an_await_human_call_suspends_and_durably_parks_the_conversation() {
+    let store = parked_store();
+    let factory = ScriptedFactory::new(vec![vec![Ok(await_call("a1", "ship it?")), Ok(done())]]);
+    let runner = RigSessionRunner::new(Arc::new(factory)).with_parked_store(store.clone());
+    let report = runner.run(await_session(vec![])).await.unwrap();
+
+    let AgentRunOutcome::Suspended(s) = report.outcome else {
+        panic!("expected Suspended, got {:?}", report.outcome);
+    };
+    assert_eq!(s.prompt, "ship it?");
+    assert!(!s.correlation_id.is_empty());
+    let rec = store
+        .load(&s.correlation_id)
+        .await
+        .unwrap()
+        .expect("a parked row must exist for the reported correlation_id");
+    assert_eq!(rec.prompt, "ship it?");
+    let conv: ParkedConversation = serde_json::from_value(rec.conversation).unwrap();
+    // Exactly one awaited slot (the hole the reply fills), and the history
+    // carries the goal + the awaited turn.
+    assert_eq!(conv.pending.iter().filter(|p| p.text.is_none()).count(), 1);
+    let history_json = serde_json::to_string(&conv.history).unwrap();
+    assert!(history_json.contains("do the thing"), "goal in history");
+    assert!(
+        history_json.contains(AWAIT_HUMAN_TOOL),
+        "awaited turn in history"
+    );
+    assert_eq!(conv.turns_used, 1);
+}
+
+/// (b) Persist-then-reload round-trips: the reloaded conversation and session
+/// re-serialize to exactly the persisted JSON (the durable fixpoint).
+#[tokio::test]
+async fn a_parked_session_reloads_faithfully_from_the_store() {
+    let store = parked_store();
+    let factory = ScriptedFactory::new(vec![vec![Ok(await_call("a1", "approve?")), Ok(done())]]);
+    let runner = RigSessionRunner::new(Arc::new(factory)).with_parked_store(store.clone());
+    let report = runner.run(await_session(vec![])).await.unwrap();
+    let AgentRunOutcome::Suspended(s) = report.outcome else {
+        panic!("expected Suspended, got {:?}", report.outcome);
+    };
+
+    let rec = store.load(&s.correlation_id).await.unwrap().unwrap();
+    let conv: ParkedConversation = serde_json::from_value(rec.conversation.clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&conv).unwrap(),
+        rec.conversation,
+        "reloaded conversation must re-serialize to exactly what was persisted"
+    );
+    let sess: AgentSession = serde_json::from_value(rec.session.clone()).unwrap();
+    assert_eq!(sess.user_prompt, "do the thing");
+    assert_eq!(sess.model, "anthropic:claude-sonnet-4-6");
+    assert!(sess.await_enabled);
+    assert_eq!(
+        serde_json::to_value(&sess).unwrap(),
+        rec.session,
+        "reloaded session must re-serialize to exactly what was persisted"
+    );
+}
+
+/// (c) Resume: the human reply is injected as the awaited call's tool result,
+/// the loop continues from the parked turn to final_answer, the parked turn's
+/// OTHER tool is never re-executed, and the consumed frame is removed.
+#[tokio::test]
+async fn resume_injects_the_reply_and_continues_to_final_answer() {
+    let store = parked_store();
+    let factory = Arc::new(PromptCapturingFactory::new(vec![
+        // Turn 0: a real tool call AND the await, same turn.
+        vec![
+            Ok(StreamEvent::ToolCall(ToolCallRequest {
+                id: "t1".into(),
+                name: "lookup".into(),
+                arguments: r#"{"q":"x"}"#.into(),
+            })),
+            Ok(await_call("a1", "approve?")),
+            Ok(done()),
+        ],
+        // The resume turn: the model answers.
+        vec![
+            Ok(final_answer(r#"{"status":"success","output":{"ok":true}}"#)),
+            Ok(done()),
+        ],
+    ]));
+    let host = Arc::new(RecordingHost {
+        calls: Mutex::new(vec![]),
+    });
+    let runner = RigSessionRunner::new(factory.clone())
+        .with_tool_host(host.clone())
+        .with_parked_store(store.clone());
+
+    let report = runner
+        .run(await_session(vec!["conn".into()]))
+        .await
+        .unwrap();
+    let AgentRunOutcome::Suspended(susp) = report.outcome else {
+        panic!("expected Suspended, got {:?}", report.outcome);
+    };
+    assert_eq!(
+        host.calls.lock().unwrap().len(),
+        1,
+        "the parked turn's non-await tool executes ONCE, at park time"
+    );
+
+    let resumed = runner
+        .resume(&susp.correlation_id, "yes, approved")
+        .await
+        .unwrap();
+    match resumed.outcome {
+        AgentRunOutcome::Completed(r) => assert_eq!(r.output["ok"], true),
+        other => panic!("expected Completed after resume, got {other:?}"),
+    }
+    // The resume turn's input carried the human reply as the awaited tool's
+    // result AND the pre-park lookup's realized result (not re-run).
+    {
+        let prompts = factory.prompts.lock().unwrap();
+        let resume_prompt = prompts.last().unwrap();
+        assert!(
+            resume_prompt.contains("yes, approved"),
+            "the reply must arrive as the awaited tool result, got: {resume_prompt}"
+        );
+        assert!(
+            resume_prompt.contains("found"),
+            "the parked turn's realized tool result must ride along, got: {resume_prompt}"
+        );
+    } // prompts guard dropped here — before the .await below (clippy::await_holding_lock)
+    assert_eq!(
+        host.calls.lock().unwrap().len(),
+        1,
+        "resume must NOT re-execute the parked turn's tools"
+    );
+    // The consumed frame is gone.
+    assert!(
+        store.load(&susp.correlation_id).await.unwrap().is_none(),
+        "a completed resume must remove its parked frame"
+    );
+}
+
+/// (c′) Durability semantics: a DIFFERENT runner instance (fresh factory, no
+/// shared in-process state — the in-process stand-in for a restart) resumes
+/// from the store alone.
+#[tokio::test]
+async fn a_fresh_runner_resumes_from_the_store_alone() {
+    let store = parked_store();
+    let factory_a = ScriptedFactory::new(vec![vec![Ok(await_call("a1", "go?")), Ok(done())]]);
+    let runner_a = RigSessionRunner::new(Arc::new(factory_a)).with_parked_store(store.clone());
+    let report = runner_a.run(await_session(vec![])).await.unwrap();
+    let AgentRunOutcome::Suspended(susp) = report.outcome else {
+        panic!("expected Suspended, got {:?}", report.outcome);
+    };
+    drop(runner_a); // nothing of the suspending runner survives
+
+    let factory_b = ScriptedFactory::new(vec![vec![
+        Ok(final_answer(
+            r#"{"status":"success","output":{"done":true}}"#,
+        )),
+        Ok(done()),
+    ]]);
+    let runner_b = RigSessionRunner::new(Arc::new(factory_b)).with_parked_store(store.clone());
+    let resumed = runner_b.resume(&susp.correlation_id, "go").await.unwrap();
+    match resumed.outcome {
+        AgentRunOutcome::Completed(r) => assert_eq!(r.output["done"], true),
+        other => panic!("expected Completed via a fresh runner, got {other:?}"),
+    }
+}
+
+/// (d) A session that does NOT opt in never sees the suspend tool — the tool
+/// set the provider receives is exactly the pre-P12 one, so a normal run
+/// cannot suspend by accident.
+#[tokio::test]
+async fn await_human_is_not_offered_without_opt_in() {
+    let factory = Arc::new(CapturingFactory {
+        turns: Mutex::new(
+            vec![vec![
+                Ok(final_answer(r#"{"status":"success","output":{"ok":true}}"#)),
+                Ok(done()),
+            ]]
+            .into_iter()
+            .collect(),
+        ),
+        seen_tool_names: Mutex::new(Vec::new()),
+    });
+    // Even with a parked store wired, no opt-in ⇒ no await tool.
+    let runner = RigSessionRunner::new(factory.clone()).with_parked_store(parked_store());
+    let report = runner.run(session(vec![])).await.unwrap();
+    assert!(matches!(report.outcome, AgentRunOutcome::Completed(_)));
+    let seen = factory.seen_tool_names.lock().unwrap();
+    assert!(
+        !seen.iter().any(|n| n == AWAIT_HUMAN_TOOL),
+        "await_human must not be offered without await_enabled; saw {seen:?}"
+    );
+}
+
+/// (d′) An await-enabled run that never calls the tool is unaffected: it
+/// reaches final_answer normally and parks nothing.
+#[tokio::test]
+async fn an_await_enabled_run_that_never_awaits_completes_and_parks_nothing() {
+    let store = parked_store();
+    let factory = ScriptedFactory::new(vec![vec![
+        Ok(final_answer(r#"{"status":"success","output":{"ok":true}}"#)),
+        Ok(done()),
+    ]]);
+    let runner = RigSessionRunner::new(Arc::new(factory)).with_parked_store(store.clone());
+    let report = runner.run(await_session(vec![])).await.unwrap();
+    assert!(
+        matches!(report.outcome, AgentRunOutcome::Completed(_)),
+        "got {:?}",
+        report.outcome
+    );
+    assert!(
+        store.list().await.unwrap().is_empty(),
+        "no suspend signal ⇒ nothing parked"
+    );
+}
+
+/// (e) Resume with an unknown correlation_id is a TYPED error — no panic.
+#[tokio::test]
+async fn resume_with_an_unknown_correlation_id_is_a_typed_error() {
+    let runner = RigSessionRunner::new(Arc::new(ScriptedFactory::new(vec![])))
+        .with_parked_store(parked_store());
+    let err = runner.resume("no-such-id", "hello").await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("AGENT_UNKNOWN_CORRELATION"),
+        "got {err:?}"
+    );
+}
+
+/// A parked row whose payload can't be reconstituted is a TYPED corruption
+/// error — no panic, no silent resume of garbage.
+#[tokio::test]
+async fn resume_of_a_corrupt_parked_payload_is_a_typed_error() {
+    let store = parked_store();
+    store
+        .park(praxec_core::model::ParkedAgentSession {
+            correlation_id: "corr-x".into(),
+            prompt: "?".into(),
+            session: json!("this is not an AgentSession"),
+            conversation: json!({ "also": "not a conversation" }),
+            parked_at: chrono::Utc::now(),
+        })
+        .await
+        .unwrap();
+    let runner =
+        RigSessionRunner::new(Arc::new(ScriptedFactory::new(vec![]))).with_parked_store(store);
+    let err = runner.resume("corr-x", "hi").await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("AGENT_PARKED_SESSION_CORRUPT"),
+        "got {err:?}"
+    );
+}
+
+/// Poka-yoke: an await-capable session with no durable park fails FAST at run
+/// start — a suspend whose conversation couldn't persist must be impossible.
+#[tokio::test]
+async fn an_await_enabled_session_without_a_parked_store_fails_fast() {
+    let runner = RigSessionRunner::new(Arc::new(ScriptedFactory::new(vec![])));
+    let err = runner.run(await_session(vec![])).await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("AGENT_AWAIT_UNSUPPORTED"),
+        "got {err:?}"
+    );
+}
+
+/// resume() without a parked store is the same typed fail-fast.
+#[tokio::test]
+async fn resume_without_a_parked_store_is_a_typed_error() {
+    let runner = RigSessionRunner::new(Arc::new(ScriptedFactory::new(vec![])));
+    let err = runner.resume("any", "hi").await.unwrap_err();
+    assert!(
+        format!("{err:?}").contains("AGENT_AWAIT_UNSUPPORTED"),
+        "got {err:?}"
+    );
+}
+
+/// A host tool literally named `await_human` must not shadow the reserved
+/// suspend signal (its handler intercepts the name before host routing).
+#[test]
+fn sanitize_does_not_shadow_the_reserved_await_human() {
+    let taken = std::collections::HashMap::new();
+    let n = sanitize_tool_name(AWAIT_HUMAN_TOOL, &taken);
+    assert_ne!(n, AWAIT_HUMAN_TOOL);
+    assert!(valid_provider_tool_name(&n));
 }
