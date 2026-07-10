@@ -41,3 +41,8 @@ WIP/
 .fg-harness/
 .px-harness/
 .worktrees/
+
+# auxiliary tool/serve run-state (must not be committed)
+.write.lock
+.frontrails/
+.corpus/
