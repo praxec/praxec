@@ -31,6 +31,20 @@ pub struct AuditEvent {
     /// Opaque to the gateway. Default `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// L1 tree-linkage — the workflow id of the mission that SPAWNED the
+    /// mission this event belongs to (`workflow_id` is the tree node; this is
+    /// the edge up to its parent). `None` for a top-level mission. Stamped from
+    /// the already-persisted `WorkflowInstance` parent link at the single
+    /// mission-level emission site (`workflow.started`), not per-event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_workflow_id: Option<String>,
+    /// L1 tree-linkage — sub-workflow nesting depth of the emitting mission:
+    /// 0 at the top level, +1 per `kind: workflow` spawn. Mirrors the persisted
+    /// [`WorkflowInstance::depth`](crate::model::WorkflowInstance::depth).
+    /// `#[serde(default)]` keeps events from older trails/stores readable
+    /// (they load at depth 0).
+    #[serde(default)]
+    pub depth: u32,
 }
 
 impl AuditEvent {
@@ -45,6 +59,8 @@ impl AuditEvent {
             payload: json!({}),
             trace_id: None,
             run_id: None,
+            parent_workflow_id: None,
+            depth: 0,
         }
     }
 
@@ -79,6 +95,17 @@ impl AuditEvent {
     /// workflow instances.
     pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
         self.run_id = Some(run_id.into());
+        self
+    }
+
+    /// L1 tree-linkage — stamp the emitting mission's tree coordinates from the
+    /// already-persisted `WorkflowInstance`: its parent's workflow id (`None` at
+    /// the top level) and its nesting depth. Applied at the single mission-level
+    /// emission site (`workflow.started`), so an observer reconstructs the
+    /// execution tree from `workflow_id` + `parent_workflow_id` + `depth`.
+    pub fn with_topology(mut self, parent_workflow_id: Option<String>, depth: u32) -> Self {
+        self.parent_workflow_id = parent_workflow_id;
+        self.depth = depth;
         self
     }
 }
@@ -220,6 +247,17 @@ impl RotationInterval {
     }
 }
 
+/// True if `path` is a per-writer `agent.heartbeat` pulse log
+/// (`{stamp}-{pid}-heartbeat.log`). Governance readers exclude these so the
+/// high-frequency liveness stream never bloats an approvals / `observe` scan.
+/// Shared so the reader in this module and the binary's `observe`/tail agree
+/// on one naming convention.
+pub fn is_heartbeat_log(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with("-heartbeat.log"))
+}
+
 /// A clock function that returns the current time. Boxed so tests can inject
 /// a deterministic implementation without spawning real timers.
 type ClockFn = Box<dyn Fn() -> DateTime<Utc> + Send + Sync>;
@@ -231,8 +269,10 @@ type ClockFn = Box<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 ///   [`Utc::now`]).
 /// - The date stamp is derived from the clock and the configured
 ///   [`RotationInterval`].
-/// - Events whose `event_type == "workflow.transition"` are routed to
-///   `{stamp}-transitions.log`; all other events go to `{stamp}-audit.log`.
+/// - Events are routed by category to a per-writer file (see [`Self::log_path`]):
+///   `{stamp}-{pid}-transitions.log`, `{stamp}-{pid}-heartbeat.log`, or
+///   `{stamp}-{pid}-audit.log`. The `{pid}` component keeps concurrent
+///   appenders on distinct fds; the reader merges all `*.log` files.
 /// - The parent directory is created if it does not already exist.
 pub struct FileAuditSink {
     /// The directory into which rotated log files are written.
@@ -274,14 +314,28 @@ impl FileAuditSink {
     }
 
     /// Derive the log file path for the given event at the current clock time.
+    ///
+    /// Category split (each stream to its own file so a governance read never
+    /// scans the noise of another):
+    /// - `workflow.transition` → `{stamp}-{pid}-transitions.log`
+    /// - `agent.heartbeat`     → `{stamp}-{pid}-heartbeat.log` (high-frequency
+    ///   liveness pulses; governance readers exclude this file so pulses never
+    ///   bloat approvals / `observe` reads)
+    /// - everything else       → `{stamp}-{pid}-audit.log`
+    ///
+    /// The `{pid}` component makes each writer's filename unique, so concurrent
+    /// appenders (future cross-process children) never share an fd. The reader
+    /// already merges all `*.log` files in the dir, so this is conflict-free by
+    /// construction with zero reader change.
     fn log_path(&self, event: &AuditEvent) -> PathBuf {
         let stamp = self.rotation.stamp((self.clock)());
-        let category = if event.event_type == "workflow.transition" {
-            "transitions"
-        } else {
-            "audit"
+        let category = match event.event_type.as_str() {
+            "workflow.transition" => "transitions",
+            "agent.heartbeat" => "heartbeat",
+            _ => "audit",
         };
-        self.dir.join(format!("{stamp}-{category}.log"))
+        let pid = std::process::id();
+        self.dir.join(format!("{stamp}-{pid}-{category}.log"))
     }
 }
 
@@ -325,6 +379,10 @@ impl AuditSink for FileAuditSink {
         let mut paths: Vec<PathBuf> = all_paths
             .into_iter()
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("log"))
+            // Governance reads exclude the high-frequency `agent.heartbeat`
+            // pulse stream (its own `-heartbeat.log` category) so liveness
+            // noise never bloats approvals / `observe` reads.
+            .filter(|p| !is_heartbeat_log(p))
             .collect();
         paths.sort();
 

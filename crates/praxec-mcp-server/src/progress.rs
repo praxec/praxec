@@ -126,6 +126,8 @@ mod tests {
             payload: json!({"k": "v"}),
             trace_id: None,
             run_id: None,
+            parent_workflow_id: None,
+            depth: 0,
         }
     }
 

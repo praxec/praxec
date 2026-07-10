@@ -80,6 +80,19 @@ pub(crate) enum Command {
     Observe {
         #[arg(short, long)]
         config: PathBuf,
+        /// Stream events live: replay the audit dir (from the start, or
+        /// `--since`), then poll for newly-appended lines and per-writer files.
+        /// Emits each event as one structured JSON line so a client can
+        /// reconstruct the execution tree from
+        /// `workflow_id` + `parent_workflow_id` + `depth`. Requires
+        /// `audit.sink: file` (fails fast otherwise — a non-file sink would tail
+        /// nothing).
+        #[arg(long)]
+        follow: bool,
+        /// With `--follow`, only replay events at/after this instant
+        /// (RFC3339 or `YYYY-MM-DD`) before switching to live polling.
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Rewrite legacy guards in the config file in place: every
     /// `kind: jsonpath` becomes `kind: expr` (a string replace over the

@@ -102,8 +102,9 @@ async fn transition_and_audit_streams_split_by_name() {
         .await
         .expect("audit record");
 
-    let transitions_path = PathBuf::from(format!("/audit/{stamp}-transitions.log"));
-    let audit_path = PathBuf::from(format!("/audit/{stamp}-audit.log"));
+    let pid = std::process::id();
+    let transitions_path = PathBuf::from(format!("/audit/{stamp}-{pid}-transitions.log"));
+    let audit_path = PathBuf::from(format!("/audit/{stamp}-{pid}-audit.log"));
 
     let files = mem_fs.files();
     let paths: Vec<&PathBuf> = files.iter().map(|(p, _)| p).collect();
@@ -159,6 +160,59 @@ async fn transition_and_audit_streams_split_by_name() {
     assert_eq!(
         audit_parsed["event_type"], "workflow.started",
         "audit log should contain the non-transition event"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 2b — heartbeat category split: agent.heartbeat gets its OWN per-writer
+// file, and a governance read (try_list_events) EXCLUDES it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn heartbeat_lands_in_its_own_file_excluded_from_governance_reads() {
+    let dir = PathBuf::from("/audit");
+    let fixed: DateTime<Utc> = Utc.with_ymd_and_hms(2026, 4, 2, 9, 0, 0).unwrap();
+    let (sink, _clock, mem_fs) = make_sink(dir, RotationInterval::Daily, fixed);
+    let pid = std::process::id();
+
+    // A governance event + a high-frequency heartbeat pulse.
+    sink.record(AuditEvent::new("workflow.started"))
+        .await
+        .expect("audit record");
+    sink.record(AuditEvent::new("agent.heartbeat"))
+        .await
+        .expect("heartbeat record");
+
+    // (d) — the per-writer filenames carry the pid AND the heartbeat is a
+    // distinct category file.
+    let names: Vec<String> = mem_fs
+        .files()
+        .into_iter()
+        .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.contains(&format!("2026-04-02-{pid}-audit.log")),
+        "audit stream should be a per-writer pid file, got: {names:?}"
+    );
+    assert!(
+        names.contains(&format!("2026-04-02-{pid}-heartbeat.log")),
+        "heartbeat should route to its OWN per-writer pid file, got: {names:?}"
+    );
+
+    // (c) — a governance read merges the audit stream but NOT the heartbeat.
+    let events = sink
+        .try_list_events()
+        .await
+        .expect("read ok")
+        .expect("some events");
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert!(
+        types.contains(&"workflow.started"),
+        "governance read includes the audit stream, got: {types:?}"
+    );
+    assert!(
+        !types.contains(&"agent.heartbeat"),
+        "governance read must EXCLUDE the heartbeat pulse stream, got: {types:?}"
     );
 }
 
