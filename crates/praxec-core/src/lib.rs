@@ -81,8 +81,9 @@ pub use audit::{
 };
 pub use capability::{Capability, CapabilityRegistry, CapabilitySource};
 pub use discovery::{
-    DiscoveryIndex, DiscoveryItem, DiscoveryKind, DiscoveryLink, InMemoryDiscoveryIndex, SearchHit,
-    SearchRequest,
+    DiscoveryIndex, DiscoveryItem, DiscoveryKind, DiscoveryLink, EvidenceSignal,
+    InMemoryDiscoveryIndex, RankedCandidate, SearchHit, SearchRequest, TopologySignal,
+    rank_candidates,
 };
 pub use error::{ErrorClass, ExecutorError, RuntimeError};
 pub use fs::{Filesystem, InMemoryFilesystem, RealFilesystem};
