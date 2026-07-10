@@ -864,6 +864,15 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         "starting praxec stdio server"
     );
 
+    // P6b — the staleness tracker behind the lazy recheck: the config file
+    // set's mtimes as captured at boot. Every reload path (in-band, SIGHUP,
+    // staleness-triggered) recaptures after the attempt so a picked-up (or
+    // rejected) edit is not re-triggered every TTL window.
+    let staleness_tracker = Arc::new(praxec_core::hot_reload::StalenessTracker::new(
+        praxec_core::config::local_config_file_set(&config_path),
+        praxec_core::hot_reload::STALENESS_TTL,
+    ));
+
     // P6 — build the in-band reload hook (the SAME gated path as SIGHUP) and
     // inject it so `praxec.command { reload }` fires a live config reload,
     // reachable by the in-workflow agent over stdio (no third MCP tool).
@@ -875,8 +884,9 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         let aud = audit.clone();
         let rt = runtime.clone();
         let regs = overlays.registrars.clone();
+        let tracker = staleness_tracker.clone();
         let hook: praxec_mcp_server::ReloadHook = Arc::new(move || {
-            let (defs, execs, disc, cfg, aud, rt, regs) = (
+            let (defs, execs, disc, cfg, aud, rt, regs, tracker) = (
                 defs.clone(),
                 execs.clone(),
                 disc.clone(),
@@ -884,12 +894,58 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                 aud.clone(),
                 rt.clone(),
                 regs.clone(),
+                tracker.clone(),
             );
-            Box::pin(
-                async move { reload_gated(&defs, &execs, &disc, &cfg, &aud, &rt, &regs).await },
-            ) as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
+            Box::pin(async move {
+                let outcome = reload_gated(&defs, &execs, &disc, &cfg, &aud, &rt, &regs).await;
+                tracker.recapture(praxec_core::config::local_config_file_set(&cfg));
+                outcome
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
         });
         server.with_reload_hook(hook)
+    };
+
+    // P6b — the lazy staleness recheck (polling backup to fs-event watchers,
+    // which don't fire reliably on WSL). Runs at the top of every call_tool;
+    // within the TTL window (STALENESS_TTL) it is a lock + Instant compare.
+    // At most once per TTL it stats the config file set, and an advanced
+    // mtime triggers the SAME gated reload as SIGHUP — validated, atomic
+    // swap, audited; a broken edit keeps the old config live.
+    let server = {
+        let defs = swappable_defs.clone();
+        let execs = swappable_executors.clone();
+        let disc = swappable_discovery.clone();
+        let cfg = config_path.clone();
+        let aud = audit.clone();
+        let rt = runtime.clone();
+        let regs = overlays.registrars.clone();
+        let tracker = staleness_tracker.clone();
+        let hook: praxec_mcp_server::StalenessHook = Arc::new(move || {
+            let (defs, execs, disc, cfg, aud, rt, regs, tracker) = (
+                defs.clone(),
+                execs.clone(),
+                disc.clone(),
+                cfg.clone(),
+                aud.clone(),
+                rt.clone(),
+                regs.clone(),
+                tracker.clone(),
+            );
+            Box::pin(async move {
+                if !tracker.stale_check_due() {
+                    return;
+                }
+                tracing::info!(
+                    "config changed on disk — triggering gated reload (staleness recheck)"
+                );
+                let _ = reload_gated(&defs, &execs, &disc, &cfg, &aud, &rt, &regs).await;
+                // Recapture regardless of outcome: a REJECTED edit is audited
+                // once (config.reload_rejected), not retried every TTL until
+                // the operator saves the file again.
+                tracker.recapture(praxec_core::config::local_config_file_set(&cfg));
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        });
+        server.with_staleness_hook(hook)
     };
 
     let service = server
@@ -907,6 +963,7 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         let reload_audit = audit.clone();
         let reload_runtime = runtime.clone();
         let reload_registrars = overlays.registrars.clone();
+        let reload_tracker = staleness_tracker.clone();
         tokio::spawn(async move {
             let mut sighup =
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -929,6 +986,11 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                     &reload_registrars,
                 )
                 .await;
+                // P6b — re-baseline the staleness tracker so this reload's
+                // pickup isn't double-fired by the next lazy recheck.
+                reload_tracker.recapture(praxec_core::config::local_config_file_set(
+                    &reload_config_path,
+                ));
             }
         });
     }

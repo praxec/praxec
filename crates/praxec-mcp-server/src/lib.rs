@@ -69,6 +69,18 @@ pub type ReloadHook = std::sync::Arc<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> + Send + Sync,
 >;
 
+/// P6b — lazy config-staleness recheck hook. The serve path injects a closure
+/// that runs a TTL-throttled mtime probe (praxec-core's `StalenessTracker`)
+/// and, when the config file set changed on disk, fires the SAME gated reload
+/// as SIGHUP / `praxec.command { reload: true }`. Invoked at the top of every
+/// `call_tool` — within the TTL window it returns immediately without touching
+/// the filesystem, so per-request cost is a mutex lock + `Instant` compare.
+/// This is the WSL-safe polling backup to fs-event watchers (which don't fire
+/// reliably there); `None` (CLI / one-shot / tests) disables it.
+pub type StalenessHook = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
 #[derive(Clone)]
 pub struct PraxecServer {
     pub(crate) runtime: WorkflowRuntime,
@@ -153,6 +165,12 @@ pub struct PraxecServer {
     /// rebuild+swap. `None` on the CLI/one-shot/test paths (no live server to
     /// reload); the command then returns `RELOAD_UNAVAILABLE`.
     pub(crate) reload_hook: Option<ReloadHook>,
+    /// P6b — optional lazy staleness recheck (serve-mode only). When set,
+    /// `call_tool` awaits it before dispatching, so an operator's on-disk
+    /// config edit is picked up by the next request after the TTL elapses —
+    /// no manual reload, no fs-event watcher (unreliable on WSL). `None` on
+    /// the CLI/one-shot/test paths.
+    pub(crate) staleness_hook: Option<StalenessHook>,
 }
 
 /// CMP-001 — reverse-DNS `_meta` key under which the embedding host passes a
@@ -184,6 +202,7 @@ impl PraxecServer {
             trust_meta_principal: true,
             progress_peer: ProgressPeer::default(),
             reload_hook: None,
+            staleness_hook: None,
         }
     }
 
@@ -192,6 +211,15 @@ impl PraxecServer {
     /// SIGHUP. Omit it (CLI/one-shot/tests) and reload returns RELOAD_UNAVAILABLE.
     pub fn with_reload_hook(mut self, hook: ReloadHook) -> Self {
         self.reload_hook = Some(hook);
+        self
+    }
+
+    /// P6b — wire the lazy staleness recheck (serve path only). With it set,
+    /// every `call_tool` first runs a TTL-throttled mtime probe of the config
+    /// file set and fires the gated reload when the operator edited it on
+    /// disk. Omit it (CLI/one-shot/tests) and requests dispatch directly.
+    pub fn with_staleness_hook(mut self, hook: StalenessHook) -> Self {
+        self.staleness_hook = Some(hook);
         self
     }
 
@@ -853,6 +881,13 @@ impl ServerHandler for PraxecServer {
         // #18 — capture the connected peer so the bridged audit sink can push
         // events recorded DURING this (possibly long) call to the client.
         self.progress_peer.set(context.peer.clone());
+        // P6b — lazy staleness recheck BEFORE dispatch: if the operator edited
+        // the config on disk (and the TTL elapsed), the gated reload runs now,
+        // so THIS request already sees the new config. Within the TTL window
+        // this returns immediately (no filesystem access).
+        if let Some(check) = &self.staleness_hook {
+            check().await;
+        }
         // CMP-001 — resolve identity from the request `_meta` (host channel)
         // falling back to the configured default, then dispatch under it.
         let principal = self.resolve_principal(&context.meta);

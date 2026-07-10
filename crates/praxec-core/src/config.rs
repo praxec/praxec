@@ -188,6 +188,71 @@ fn load_include_entry(
     serde_yaml::from_str(&body).with_context(|| format!("parsing included YAML from {uri}"))
 }
 
+/// P6b — best-effort enumeration of the LOCAL files that make up a config:
+/// the top-level file plus every recursively-included local file (plain
+/// string `include:` entries and `file://` object entries, resolved relative
+/// to the file that lists them — the same base rule as `load_yaml_inner`).
+///
+/// Scope (v1, deliberate): remote includes (`https://` / `git+https://`) and
+/// `repos:` working trees are NOT enumerated — the staleness recheck watches
+/// the config file set only; a repo edit is picked up by the explicit
+/// `praxec.command {reload}` / SIGHUP paths. Unreadable or unparsable files
+/// are skipped rather than erroring: this feeds the lazy staleness probe on
+/// a LIVE server, which must degrade to "track less" — never fail a request.
+pub fn local_config_file_set(path: impl AsRef<Path>) -> Vec<PathBuf> {
+    let mut visited = HashSet::new();
+    let mut out = Vec::new();
+    collect_local_config_files(path.as_ref(), &mut visited, &mut out);
+    out
+}
+
+fn collect_local_config_files(path: &Path, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
+    let Ok(canonical) = path.canonicalize() else {
+        return;
+    };
+    if !visited.insert(canonical.clone()) {
+        return; // cycle / duplicate — already tracked
+    }
+    let Ok(text) = std::fs::read_to_string(&canonical) else {
+        return;
+    };
+    out.push(canonical.clone());
+    let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+        return; // unparsable mid-edit: still track the file itself
+    };
+    let Some(parent) = canonical.parent() else {
+        return;
+    };
+    let Some(includes) = value.get("include").and_then(Value::as_array) else {
+        return;
+    };
+    for inc in includes {
+        match inc {
+            Value::String(rel) => {
+                collect_local_config_files(&parent.join(rel), visited, out);
+            }
+            Value::Object(_) => {
+                // Mirror load_include_entry's file:// resolution; skip remote.
+                let Some(rel) = inc
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .and_then(|uri| uri.strip_prefix("file://"))
+                else {
+                    continue;
+                };
+                let p = Path::new(rel);
+                let full = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    parent.join(rel)
+                };
+                collect_local_config_files(&full, visited, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Deep-merge `b` into `a`. Maps merge recursively (b wins on key collisions).
 /// Arrays concatenate (`a` first, then `b`). Scalars: `b` wins.
 pub fn deep_merge(a: Value, b: Value) -> Value {
