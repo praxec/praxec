@@ -1,7 +1,7 @@
 //! Synthesize a type-appropriate dummy value from a JSON Schema fragment, for
 //! satisfying a capability's declared `snippet.outputs`.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// A minimal valid value for the given JSON Schema fragment.
 pub fn dummy_for_schema(schema: &Value) -> Value {

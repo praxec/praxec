@@ -6,8 +6,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use praxec_agents::orchestrator::{
-    drive_mission, run_headless_consumer, HeadlessPolicy, MissionGateway, RuntimeMissionGateway,
+    HeadlessPolicy, MissionGateway, RuntimeMissionGateway, drive_mission, run_headless_consumer,
 };
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::bus::Bus;
 use praxec_core::config;
@@ -15,7 +16,6 @@ use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::{Principal, StartWorkflow};
 use praxec_core::ports::{DefinitionStore, ExecutorRegistry};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
 use serde_json::Value;
 
 use crate::chooser::FuzzChooser;

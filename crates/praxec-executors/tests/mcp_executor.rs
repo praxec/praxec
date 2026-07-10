@@ -14,7 +14,7 @@ use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::Executor;
 use praxec_executors::mcp::{McpExecutor, McpToolCaller};
 use rmcp::model::{CallToolResult, Tool};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 /// One recorded `call_tool` invocation.
 #[derive(Clone)]

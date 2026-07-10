@@ -4,7 +4,7 @@
 //! flag on for itself.
 
 use praxec_core::config;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── Top-level praxec.* is fine ────────────────────────────────────────────
 

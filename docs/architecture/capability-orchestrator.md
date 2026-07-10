@@ -517,16 +517,26 @@ respectively; they are not separate rules.)
 
 | From | May invoke | May NOT invoke |
 |---|---|---|
-| Flow (`flow.*`) | capabilities, scripts, MCP tools, skills, HITL gates | other flows, itself |
+| Flow (`flow.*`) | other flows, capabilities, scripts, MCP tools, skills, HITL gates | itself |
 | Capability (`cap.*`) | scripts, MCP tools, skills, HITL gates | other capabilities, flows |
+
+**Flows may nest flows.** The original one-level rule (V11 — a flow may not
+invoke another flow) was **relaxed** so flows can compose multi-flow programs
+(e.g. the loom: `flow.loom → flow.derisk` / `flow.execute-cohorts →
+flow.implement.deliverable`). Unbounded or cyclic nesting no longer needs a
+static ban: recursion is bounded at runtime by the sub-workflow depth cap
+(`MAX_WORKFLOW_DEPTH = 10`), so an over-deep or cyclic chain — including a flow
+that reaches itself — fails fast at depth rather than hanging. A flow still
+should not invoke itself directly; cycle-safety is now a runtime guarantee (the
+depth cap) rather than a static prohibition.
 
 **Check:** walk every workflow's transitions. For each executor with
 `kind: workflow`, look at the host workflow's id and the target's id:
 
 - Host id `cap.*` + any `kind: workflow` target → error
   ("capability cannot invoke another workflow").
-- Host id `flow.*` + target id `flow.*` → error
-  ("flow cannot invoke another flow").
+- Host id `flow.*` + target id `flow.*` → OK (bounded at runtime by
+  `MAX_WORKFLOW_DEPTH`).
 - Host id `flow.*` + target id `cap.*` → OK.
 
 Indirect cycles via MCP tools that re-enter the gateway are out of

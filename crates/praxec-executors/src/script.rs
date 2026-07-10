@@ -42,7 +42,7 @@ use praxec_core::error::ExecutorError;
 use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
 use praxec_core::sandbox::{ConfinementProfile, SandboxProvider, SandboxSpec};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::process::Command;
 use uuid::Uuid;

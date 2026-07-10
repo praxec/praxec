@@ -8,8 +8,8 @@ use praxec_core::ports::Executor;
 use praxec_executors::rest::{RestConnections, RestExecutor};
 use serde_json::json;
 use wiremock::{
-    matchers::{body_json, header, method, path, query_param},
     Mock, MockServer, ResponseTemplate,
+    matchers::{body_json, header, method, path, query_param},
 };
 
 fn make_executor(server: &MockServer) -> RestExecutor {

@@ -21,11 +21,11 @@
 use std::sync::Arc;
 
 use rmcp::model::JsonObject;
-use schemars::gen::{SchemaGenerator, SchemaSettings};
-use schemars::schema::{InstanceType, Schema, SchemaObject};
 use schemars::JsonSchema;
+use schemars::r#gen::{SchemaGenerator, SchemaSettings};
+use schemars::schema::{InstanceType, Schema, SchemaObject};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -116,8 +116,8 @@ pub(crate) fn integer_schema(_: &mut SchemaGenerator) -> Schema {
     .into()
 }
 
-pub(crate) fn limit_schema(gen: &mut SchemaGenerator) -> Schema {
-    let mut schema = match integer_schema(gen) {
+pub(crate) fn limit_schema(r#gen: &mut SchemaGenerator) -> Schema {
+    let mut schema = match integer_schema(r#gen) {
         Schema::Object(o) => o,
         Schema::Bool(_) => unreachable!("integer_schema always returns Schema::Object"),
     };
@@ -220,7 +220,19 @@ pub struct QueryArgs {
     /// content hash (SPEC §8.4 — the basis for an edit). Distinct from
     /// `workflow_id` (a running instance) and `subject` (a guidance fragment).
     pub definition_id: Option<String>,
-    /// Search result cap. Modifier on `search`.
+    /// Observability read: present-and-true (alone) → bounded replay of the
+    /// structured audit event stream — the SAME events `praxec observe
+    /// --follow` emits (heartbeat pulses excluded), each carrying
+    /// `workflow_id` / `parent_workflow_id` / `depth` so the client can
+    /// rebuild the execution tree. An MCP call returns a response, not a
+    /// stream, so this is the PULL complement to the CLI tail: "give me
+    /// events since X" — re-query with the returned `next_since` cursor to
+    /// tail. Requires `audit.sink: file` (fails fast otherwise).
+    pub observe: Option<bool>,
+    /// RFC3339 floor for `observe` — only events with `timestamp >= since`
+    /// are returned. Modifier on `observe` only.
+    pub since: Option<String>,
+    /// Search result cap. Modifier on `search` and `observe`.
     #[schemars(schema_with = "integer_schema")]
     pub limit: Option<u64>,
 }
@@ -275,4 +287,9 @@ pub struct CommandArgs {
     /// emitted by SPEC §30.10.5.
     #[serde(rename = "unknown_subject")]
     pub unknown_subject: Option<String>,
+    /// P6 — in-band config reload. `reload: true` fires the same gated
+    /// rebuild+swap as SIGHUP (re-reads the config + `repos:` from disk so a
+    /// post-startup repo becomes visible), without adding a third MCP tool.
+    /// Present-and-true → reload; all other fields are ignored for that call.
+    pub reload: Option<bool>,
 }

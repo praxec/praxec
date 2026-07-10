@@ -23,12 +23,12 @@
 
 use std::collections::HashMap;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::TokioChildProcess;
-use rmcp::ServiceExt;
 use serde_json::Value;
 
 use crate::interpreter::McpToolCaller;

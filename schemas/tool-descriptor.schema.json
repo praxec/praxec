@@ -1,0 +1,258 @@
+{
+  "$id": "https://praxec.dev/schemas/tool-descriptor.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PraxecToolDescriptor",
+  "description": "v0.0.17 tool-source ecosystem contract (D1). A descriptor is a manifest over existing primitives: `reach.connection` is a LITERAL gateway `connections:` entry (copy, never transform), `reach.grant_as` names the bare token the operator must add to `grant_connections:` (the descriptor never grants), and `provision` mirrors the ADR-0013 packs/v2 provider chain. Auth is declared by NAME only — never secret values.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "name",
+    "version",
+    "kind",
+    "reach",
+    "operations"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "praxec.tool/v1"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Tool version (semver-ish, pinned)."
+    },
+    "source_repo": {
+      "type": "string",
+      "description": "Git URL / registry coordinate of origin."
+    },
+    "description": {
+      "type": "string",
+      "default": ""
+    },
+    "tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "aliases": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "kind": {
+      "enum": [
+        "cli",
+        "mcp",
+        "rest"
+      ],
+      "description": "Closed discriminator — exhaustive `match` in Rust (ToolKind). Adding a kind is a deliberate schema amendment. Must match reach.connection.kind (TOOL_KIND_MISMATCH otherwise)."
+    },
+    "reach": {
+      "$ref": "#/$defs/reach"
+    },
+    "provision": {
+      "$ref": "#/$defs/provision"
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/operation"
+      }
+    },
+    "suggested_workflows": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "description": "Workflow definitionIds (namespace-qualified) that compose this tool."
+    },
+    "embedding": {
+      "type": "array",
+      "items": {
+        "type": "number"
+      },
+      "description": "Reserved v0.0.18 forward-compat attachment point (tool-description embeddings). Never required."
+    },
+    "structural_fingerprint": {
+      "type": "string",
+      "description": "Reserved v0.0.18 forward-compat attachment point (structural dedup). Never required."
+    }
+  },
+  "$defs": {
+    "reach": {
+      "type": "object",
+      "required": [
+        "connection_name",
+        "grant_as",
+        "connection"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "connection_name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The `connections:` key this tool's operations reference."
+        },
+        "grant_as": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Bare pack-local name the operator writes in `grant_connections:`. Declaring it never grants — activation stays an operator act (SPEC §9.5 grant gate)."
+        },
+        "connection": {
+          "$ref": "gateway-config.schema.json#/$defs/connection",
+          "description": "The LITERAL connections entry, copied verbatim into /connections on install. Same $ref the gateway config already validates; kind here MUST match the top-level kind."
+        },
+        "auth": {
+          "$ref": "#/$defs/authRequirement"
+        }
+      }
+    },
+    "authRequirement": {
+      "type": "object",
+      "required": [
+        "scheme"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "scheme": {
+          "enum": [
+            "none",
+            "env",
+            "header",
+            "bearer"
+          ]
+        },
+        "env": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Env var NAMES the tool needs. Never secret values — those enter only via `px connections add` (D4a)."
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Header NAMES the tool needs. Never secret values."
+        }
+      }
+    },
+    "provision": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mcp_registry_id": {
+          "type": "string",
+          "description": "ADR-0013 registry id, e.g. dev.praxec/<tool>."
+        },
+        "version": {
+          "type": "string"
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "docker",
+              "release",
+              "cargo",
+              "npx",
+              "uvx"
+            ]
+          },
+          "description": "Ordered provider chain, first-available wins (mirrors packs/v2; doctor offers with consent, never auto-installs)."
+        }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "required": [
+        "id",
+        "input_schema",
+        "output_schema"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "verb": {
+          "enum": [
+            "build",
+            "test",
+            "deploy",
+            "format",
+            "lint",
+            "install",
+            "verify",
+            "run",
+            "inspect",
+            "search",
+            "fetch",
+            "audit"
+          ],
+          "description": "Closed ScriptVerb vocabulary (SPEC §22.3) — no parallel taxonomy."
+        },
+        "input_schema": {
+          "type": "object",
+          "description": "JSON Schema for the operation's arguments."
+        },
+        "output_schema": {
+          "type": "object",
+          "description": "JSON Schema for the operation's result."
+        },
+        "mcp_tool": {
+          "type": "string",
+          "description": "kind: mcp dispatch coordinate — the remote tool name."
+        },
+        "rest": {
+          "type": "object",
+          "required": [
+            "method",
+            "path"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "method": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "description": "kind: rest dispatch coordinate."
+        },
+        "cli": {
+          "type": "object",
+          "required": [
+            "args"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "kind: cli dispatch coordinate."
+        }
+      }
+    }
+  }
+}

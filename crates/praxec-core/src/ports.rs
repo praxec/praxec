@@ -154,6 +154,33 @@ pub trait EvidenceStore: Send + Sync {
     async fn list(&self, workflow_id: &str) -> anyhow::Result<Vec<Evidence>>;
 }
 
+/// P12 R1.4 (`docs/await-resume-architecture.md`) — durable storage for
+/// parked agent tool-loop sessions: the agent-loop half of the await/resume
+/// primitive. The agent runner `park`s a [`ParkedAgentSession`] when a session
+/// hits its suspend signal, and `load`s + `remove`s it on a correlated resume.
+/// The production backend is SQLite (the design mandates the sqlite
+/// governance store, not a file — a parked frame must survive a power cycle).
+#[async_trait]
+pub trait ParkedSessionStore: Send + Sync {
+    /// Persist a newly parked session. The `correlation_id` MUST be fresh —
+    /// parking twice under one id is an **error**, never a silent overwrite
+    /// (an overwrite would destroy a live parked frame).
+    async fn park(&self, record: ParkedAgentSession) -> anyhow::Result<()>;
+
+    /// Load a parked session. `Ok(None)` when the id is unknown (already
+    /// resumed / never parked) so the caller can answer with its own typed
+    /// error; `Err` only for storage failure or a corrupt row.
+    async fn load(&self, correlation_id: &str) -> anyhow::Result<Option<ParkedAgentSession>>;
+
+    /// Remove a parked session — after its frame terminally completes, or
+    /// when it is superseded by a new suspension of the resumed frame.
+    async fn remove(&self, correlation_id: &str) -> anyhow::Result<()>;
+
+    /// Every parked session, oldest first — the durable "pending awaits"
+    /// inbox a human drains later when running headless.
+    async fn list(&self) -> anyhow::Result<Vec<ParkedAgentSession>>;
+}
+
 /// SPEC §5.9 — tracks `gateway.describe` calls per workflow + subject so the
 /// `guidance_acknowledged` guard (§17.4) can verify that the body was
 /// fetched AND that the fetched body's hash still matches the current
@@ -165,7 +192,7 @@ pub trait GuidanceAcknowledgmentStore: Send + Sync {
     /// Record that `subject` was fetched for `workflow_id` while the body's
     /// normalized hash was `body_hash`.
     async fn record(&self, workflow_id: &str, subject: &str, body_hash: &str)
-        -> anyhow::Result<()>;
+    -> anyhow::Result<()>;
 
     /// Return the hash of the body last fetched for `(workflow_id, subject)`,
     /// or `None` if no fetch was recorded.
@@ -184,7 +211,7 @@ pub trait GuidanceAcknowledgmentStore: Send + Sync {
 #[async_trait]
 pub trait ScriptAcknowledgmentStore: Send + Sync {
     async fn record(&self, workflow_id: &str, subject: &str, body_hash: &str)
-        -> anyhow::Result<()>;
+    -> anyhow::Result<()>;
 
     async fn last_acknowledged_hash(
         &self,

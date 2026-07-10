@@ -11,10 +11,10 @@ use crate::chat_catalog;
 use crate::llm::has_key;
 use crate::theme;
 use praxec_core::providers::ProviderId;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
-use ratatui::Frame;
 
 pub fn render_chat_setup(f: &mut Frame, area: Rect, app: &App) {
     let title = match app.chat_phase {

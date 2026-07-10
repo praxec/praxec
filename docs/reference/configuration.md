@@ -60,7 +60,7 @@ state `onEnter.executor`, and reliability `fallback.executors[]`.
 | `human`  | Records a pending approval and emits `human.approval.requested`.              |
 | `script` | Runs a declared, verb-tagged script (SPEC §22) — a named command bundle resolved through a connection, distinct from raw `cli`. |
 | `llm`    | Governed in-runtime LLM call (SPEC §33); prompt + model binding resolved from config, output is a candidate subject to guards. |
-| `agent`  | Spawns a sub-agent (subprocess) bound to a model; added by the binary's overlay, not the default registry. |
+| `agent`  | Runs a governed **in-process** agent session (the rig runner) bound to a model — no subprocess; added by the binary's overlay, not the default registry. |
 | `parallel` | Fan-out / fan-in inside one transition (SPEC §24): runs `branches` concurrently and joins per the declared condition. |
 | `pipeline` | Sequential composition of N executor steps inside one transition (SPEC §25); each step's output threads as the next step's input. |
 | `workflow` | Starts a sub-workflow by `definitionId`, waits for completion, returns its final context. Supports `input` mapping and `timeoutMs`. |
@@ -432,6 +432,64 @@ see [../architecture/mcp-control-architecture.md](../architecture/mcp-control-ar
 
 ---
 
+## Models & agents
+
+Steps that put an LLM in the loop — `kind: agent`, affinity-resolved `kind: llm`,
+and the auto-driven coding agent — resolve their model through a **models file**.
+
+```yaml
+gateway:
+  models_yaml: .praxec/models.yaml       # path to the ModelsFile (see below)
+
+praxec:
+  agents:
+    auto_drive: true                      # run an agent at every `actor: agent` gate (default false)
+    auto_drive_affinity: reasoning        # binding the agent's model resolves through (default "reasoning")
+    auto_drive_max_seconds: 300           # per-step deadline (default 0 → executor default)
+    auto_drive_tools:                      # tools appended to every wired connection; {{ }}-templated per leaf
+      - "file:{{ $.workflow.input.repo_path }}"
+```
+
+| Key | Notes |
+|-----|-------|
+| `gateway.models_yaml` | Path to the models file that resolves agent / affinity model bindings. **This is the only key read** — a top-level `models_yaml:` is inert. Canonical location `.praxec/models.yaml`. A config declaring a `kind: agent` step or `auto_drive: true` **fails `praxec check`** without it (`AGENT_MODELS_YAML_REQUIRED`). |
+| `praxec.agents.auto_drive` | Master switch (bool, default `false`). |
+| `praxec.agents.auto_drive_affinity` | Model binding for the auto-driven agent (default `"reasoning"`). |
+| `praxec.agents.auto_drive_max_seconds` | Fail-fast bound per agent step (u64 seconds; `0` = executor default). |
+| `praxec.agents.auto_drive_tools` | Extra tools appended to every wired connection. Entries are `{{ … }}` templates rendered per leaf against `$.workflow.input.*` / `$.context.*`. |
+
+`kind: agent` is an **in-process** rig session (no subprocess) — it reads the
+gateway process's environment for provider keys. The full walkthrough — models
+file schema, `orchestrate` vs `auto_drive`, templating, and troubleshooting — is
+in [../guides/agents-and-models.md](../guides/agents-and-models.md).
+
+---
+
+## Provider keys
+
+Once a binding resolves to a `provider` + `model`, the runtime needs that
+provider's credential from the environment:
+
+| Provider | Credential |
+|----------|-----------|
+| Anthropic | `ANTHROPIC_API_KEY` |
+| OpenAI | `OPENAI_API_KEY` |
+| OpenRouter | `OPENROUTER_API_KEY` |
+| Gemini | `GEMINI_API_KEY` |
+| Ollama (local) | `OLLAMA_HOST` (keyless) |
+
+Two backends, with the **environment winning over the file**:
+
+- **Environment variables** — set directly (ideal for CI).
+- **File** — `~/.praxec/providers.env` (mode `0600`), written by
+  `px set-provider-keys`. Override the path with `PRAXEC_PROVIDER_KEYS_FILE`.
+
+Both `px` and the `praxec` gateway load the file at startup, so `serve` /
+`orchestrate` pick up your keys the same way `px walk` does. Details in
+[../guides/agents-and-models.md](../guides/agents-and-models.md#provider-keys).
+
+---
+
 ## Persistent stores
 
 Workflow instance state across restarts:
@@ -451,20 +509,34 @@ store:
 The `WorkflowStore` is a trait, so a custom backend (Redis, a SQL database)
 plugs in without changing the runtime.
 
+**`serve` refuses ephemeral storage.** Durable governance state — evidence and
+acknowledgments — lives only in the `sqlite` backend. A `memory` store keeps
+nothing across restarts; a `file` store persists workflows but leaves evidence
+and acknowledgments in memory (a silent durable/ephemeral split). To protect a
+production deployment, `serve` refuses to start on `store.kind: memory` or
+`store.kind: file` — and refuses a `file`/`sqlite` `path` on an ephemeral
+filesystem (`/tmp`, `/var/tmp`, `/dev/shm`), which the OS wipes on cleanup or
+reboot. Use `store.kind: sqlite` on a persistent path for production. To
+override for dev/testing, set `gateway.allow_ephemeral: true` (or the env var
+`PRAXEC_ALLOW_EPHEMERAL=1`).
+
 ---
 
 ## Discovery
 
 ```yaml
 discovery:
-  index: memory                         # only "memory" is implemented today
+  index: memory                         # lexical in-memory (default)
   include: [proxy, workflows, connections]
 ```
 
 `praxec.query` lexically scores items against the query (title 6× /
-id 5× / tags 3× / description 2× / freeform indexed text 1×). The trait
-is `DiscoveryIndex` so a Tantivy or vector backend can replace the
-in-memory default.
+id 5× / tags 3× / description 2× / freeform indexed text 1×) — this is
+the default `InMemoryDiscoveryIndex`. When an embedding model is configured, a
+semantic embedding-backed index (`SemanticDiscoveryIndex`) activates and ranks
+by a hybrid of the lexical score and cosine similarity; with no embedding model
+the runtime stays on the free lexical index. The trait is `DiscoveryIndex`, so
+either backend plugs in without changing the runtime.
 
 ---
 

@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -124,7 +124,7 @@ pub fn load_manifest(repo_root: &Path) -> anyhow::Result<RepoManifest> {
 /// Top-level config blocks whose entries are subject to namespace prefixing
 /// when loaded from a repo. Order matters only for stable error messages;
 /// the merged value is order-independent.
-const PREFIXABLE_BLOCKS: &[&str] = &["workflows", "skills", "scripts", "connections"];
+const PREFIXABLE_BLOCKS: &[&str] = &["workflows", "skills", "scripts", "connections", "schemas"];
 
 /// Load a repo: parse its `praxec.repo.yaml`, walk every layout directory,
 /// merge every `*.yaml` file's top-level `workflows:` / `skills:` / `scripts:` /

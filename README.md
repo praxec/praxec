@@ -3,7 +3,7 @@
 [![CI](https://github.com/praxec/praxec/actions/workflows/ci.yml/badge.svg)](https://github.com/praxec/praxec/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/praxec.svg)](https://crates.io/crates/praxec)
 [![docs.rs](https://docs.rs/praxec/badge.svg)](https://docs.rs/praxec)
-[![License: BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 **The AI execution kernel for deterministic, policy-gated workflows.**
 
@@ -182,8 +182,9 @@ audit log; operators choose per step:
 - The MCP server your external agent drives. Point any MCP client at the gateway
   and it governs your existing coding agent — fixed two-tool surface, everything
   behind it.
-- The agentic runtime (`praxec` TUI, default-on `agents` feature on the single
-  binary) that runs workflows end-to-end on the platform. Its graph-walking
+- The agentic runtime (`px` TUI, plus the gateway's default-on in-process
+  `kind: agent` / `orchestrate` on the single binary) that runs workflows
+  end-to-end on the platform. Its graph-walking
   interpreter spawns an isolated sub-agent per state, so each model sees only its
   scoped guidance and blackboard — a Qwen-7B editor directed by Sonnet-grade
   planning and reviewed by an Opus-grade critic, each doing only what it's best
@@ -245,6 +246,9 @@ and [docs/reference/configuration.md](docs/reference/configuration.md):
   cloud catches dangling targets, unreachable states, type mismatches, and verb
   misuse at load, exiting non-zero. → [Validation rules](https://praxec.dev/reference/validation-rules/)
 - Hot reload: `SIGHUP` reloads config without dropping in-flight workflows.
+- Running agents in the workflow: point `gateway.models_yaml` at a `models.yaml`
+  and set provider keys before you flip on `kind: agent` steps or `auto_drive` —
+  `praxec check` fails fast without them. → [Agents & models](docs/guides/agents-and-models.md)
 
 Scope: single-host is production-ready; multiple processes on one host share a
 `sqlite` file (WAL). Cross-host HA isn't supported — there's no networked store
@@ -284,6 +288,7 @@ docs:
 | Full config reference | [docs/reference/configuration.md](docs/reference/configuration.md) · [/reference/configuration](https://praxec.dev/reference/configuration/) |
 | Connections (MCP/CLI/REST) | [docs/guides/connections.md](docs/guides/connections.md) · [/guides/connections](https://praxec.dev/guides/connections/) |
 | LLM-authoring guidance | [docs/guides/llm-guidance.md](docs/guides/llm-guidance.md) |
+| Agents & models setup | [docs/guides/agents-and-models.md](docs/guides/agents-and-models.md) |
 | Composing at scale | [docs/architecture/mcp-control-architecture.md](docs/architecture/mcp-control-architecture.md) |
 | Embedding as a library | [docs/guides/embeddings.md](docs/guides/embeddings.md) · [/advanced/embedding](https://praxec.dev/advanced/embedding/) |
 | Runtime invariants | [docs/reference/invariants.md](docs/reference/invariants.md) |
@@ -310,4 +315,4 @@ for a tour of the codebase.
 
 ## License
 
-Licensed under [BSD-3-Clause](LICENSE).
+Licensed under [Apache-2.0](LICENSE).

@@ -13,8 +13,8 @@
 //! tracked as follow-up in the leak plan and builds on these primitives.
 #![cfg(target_os = "linux")]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Is `pid` a live process? (`/proc/<pid>` exists while the process is alive;

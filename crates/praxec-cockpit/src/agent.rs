@@ -110,7 +110,7 @@ pub async fn run_turn_streaming(
     // Each arm builds the provider's typed client + agent; `run_agent` is generic
     // over the resulting model so the streaming drive is written once.
     macro_rules! drive {
-        ($client:expr) => {
+        ($client:expr_2021) => {
             match $client {
                 Ok(client) => {
                     let agent = client.agent(name).preamble(SYSTEM).build();

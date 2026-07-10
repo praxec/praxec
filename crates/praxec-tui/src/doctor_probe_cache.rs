@@ -129,10 +129,11 @@ pub fn read_cache(path: &std::path::Path) -> std::io::Result<Option<ProbeCache>>
 /// Atomic write the cache to disk. Same tempfile + rename pattern as
 /// `migrate::write_atomic`.
 pub fn write_cache(cache: &ProbeCache, path: &std::path::Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_vec_pretty(cache)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

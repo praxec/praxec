@@ -16,9 +16,9 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use rmcp::Peer;
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::RoleServer;
-use rmcp::Peer;
 use serde_json::json;
 
 use praxec_core::audit::{AuditEvent, AuditSink};
@@ -70,6 +70,10 @@ impl AuditSink for PeerBridgeAuditSink {
                 "payload": event.payload,
             });
             // Best-effort push; ignore send errors (client gone / not subscribed).
+            // TODO(SEP-2577): rmcp deprecated logging notifications with no
+            // replacement yet — the durable audit record above is the source of
+            // truth. Migrate when rmcp ships an alternative transport.
+            #[allow(deprecated)]
             let _ = peer
                 .notify_logging_message(LoggingMessageNotificationParam {
                     level: LoggingLevel::Info,
@@ -88,6 +92,12 @@ impl AuditSink for PeerBridgeAuditSink {
 
     async fn try_list_events(&self) -> anyhow::Result<Option<Vec<AuditEvent>>> {
         self.inner.try_list_events().await
+    }
+
+    fn sink_kind(&self) -> &'static str {
+        // Decorator — the observability fail-fast must see the REAL sink kind,
+        // not the bridge.
+        self.inner.sink_kind()
     }
 }
 
@@ -122,6 +132,8 @@ mod tests {
             payload: json!({"k": "v"}),
             trace_id: None,
             run_id: None,
+            parent_workflow_id: None,
+            depth: 0,
         }
     }
 

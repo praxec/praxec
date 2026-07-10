@@ -21,11 +21,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context};
-use serde_json::{json, Map, Value};
+use anyhow::{Context, anyhow, bail};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::discovery::{Lifecycle, ScriptVerb, Verb, BLESSED_SCRIPT_ROOTS, BLESSED_SUBJECT_ROOTS};
+use crate::discovery::{BLESSED_SCRIPT_ROOTS, BLESSED_SUBJECT_ROOTS, Lifecycle, ScriptVerb, Verb};
 
 /// Recursively load `path` as YAML and merge any `include:` files into it.
 /// Includes resolve relative to the file that lists them.
@@ -188,6 +188,71 @@ fn load_include_entry(
     serde_yaml::from_str(&body).with_context(|| format!("parsing included YAML from {uri}"))
 }
 
+/// P6b — best-effort enumeration of the LOCAL files that make up a config:
+/// the top-level file plus every recursively-included local file (plain
+/// string `include:` entries and `file://` object entries, resolved relative
+/// to the file that lists them — the same base rule as `load_yaml_inner`).
+///
+/// Scope (v1, deliberate): remote includes (`https://` / `git+https://`) and
+/// `repos:` working trees are NOT enumerated — the staleness recheck watches
+/// the config file set only; a repo edit is picked up by the explicit
+/// `praxec.command {reload}` / SIGHUP paths. Unreadable or unparsable files
+/// are skipped rather than erroring: this feeds the lazy staleness probe on
+/// a LIVE server, which must degrade to "track less" — never fail a request.
+pub fn local_config_file_set(path: impl AsRef<Path>) -> Vec<PathBuf> {
+    let mut visited = HashSet::new();
+    let mut out = Vec::new();
+    collect_local_config_files(path.as_ref(), &mut visited, &mut out);
+    out
+}
+
+fn collect_local_config_files(path: &Path, visited: &mut HashSet<PathBuf>, out: &mut Vec<PathBuf>) {
+    let Ok(canonical) = path.canonicalize() else {
+        return;
+    };
+    if !visited.insert(canonical.clone()) {
+        return; // cycle / duplicate — already tracked
+    }
+    let Ok(text) = std::fs::read_to_string(&canonical) else {
+        return;
+    };
+    out.push(canonical.clone());
+    let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+        return; // unparsable mid-edit: still track the file itself
+    };
+    let Some(parent) = canonical.parent() else {
+        return;
+    };
+    let Some(includes) = value.get("include").and_then(Value::as_array) else {
+        return;
+    };
+    for inc in includes {
+        match inc {
+            Value::String(rel) => {
+                collect_local_config_files(&parent.join(rel), visited, out);
+            }
+            Value::Object(_) => {
+                // Mirror load_include_entry's file:// resolution; skip remote.
+                let Some(rel) = inc
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .and_then(|uri| uri.strip_prefix("file://"))
+                else {
+                    continue;
+                };
+                let p = Path::new(rel);
+                let full = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    parent.join(rel)
+                };
+                collect_local_config_files(&full, visited, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Deep-merge `b` into `a`. Maps merge recursively (b wins on key collisions).
 /// Arrays concatenate (`a` first, then `b`). Scalars: `b` wins.
 pub fn deep_merge(a: Value, b: Value) -> Value {
@@ -312,6 +377,16 @@ pub fn resolve_with_diagnostics(mut config: Value) -> anyhow::Result<(Value, Vec
         }
     }
 
+    // 5b. Spec A / A.1 §3 — the `hop_slot:` primitive. For every transition that
+    //     declares `hop_slot: <name>`, inject the canonical `In` contract as the
+    //     transition `inputSchema` and the canonical `Out` contract as the
+    //     `$.context.<name>` typed blackboard slot, both by `$ref` into the
+    //     shipped HOP vocabulary (praxec://hop). The existing seams then enforce
+    //     both with no new runtime code: input via `validate_schema`
+    //     (runtime_submit.rs), output via `validate_blackboard_writes`
+    //     (runtime_records.rs). An unknown slot name is a hard load error.
+    inject_hop_slots(&mut config)?;
+
     // 6. Poka-yoke on `skills:` (SPEC §5.4). `verb` and the `skills:` keys
     //    must match `^[a-z][a-z0-9-]*$` — lowercase kebab, no whitespace.
     //    Enforced at config load so malformed descriptors are unrepresentable
@@ -412,7 +487,222 @@ pub fn resolve_with_diagnostics(mut config: Value) -> anyhow::Result<(Value, Vec
     //           no schema lookup at run time.
     expand_use_bindings(&mut config)?;
 
+    // 7-septies. Spec A.1 §7 (FM-7) — slot-named context keys are engine-owned.
+    //            After `use:` expansion has normalized every projection into the
+    //            transition `output:` mapping, reject any *non*-`hop_slot`
+    //            transition that writes `$.context.<slot>` (an unvalidated write
+    //            to a typed, engine-owned slot). `hop_slot:` transitions are
+    //            exempt — the engine owns their slot write by construction.
+    validate_slot_key_ownership(&config)?;
+
+    // 7-octies. Spec A.1 §4.2/§4.4 — SchemaBound L2 registry (`finding.fix`).
+    //           (1) every top-level `schemas:` entry must compile; (2) every
+    //           statically-referenced `schema_ref` must resolve (closed-world,
+    //           mirrors `validate_workflow_refs_resolve`); (3) stamp the merged
+    //           registry onto every workflow snapshot as `_schemasRegistry` so
+    //           the blackboard-write seam can validate a `finding.fix` inner
+    //           `value` at runtime without a side channel. The closed-world walk
+    //           runs BEFORE the stamp so it never sees the registry's own
+    //           schema-property definitions.
+    validate_schemas_registry(&config)?;
+    validate_schema_refs_resolve(&config)?;
+    stamp_schemas_registry(&mut config);
+
     Ok((config, diagnostics))
+}
+
+/// Spec A.1 §4.1 step 2 — every top-level `schemas:` entry must be a compilable
+/// JSON Schema (registry-aware, so an inner `$ref praxec://hop#/…` resolves). A
+/// bad pack schema fails at load, not mid-run.
+fn validate_schemas_registry(config: &Value) -> anyhow::Result<()> {
+    let Some(schemas) = config.pointer("/schemas").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for (name, schema) in schemas {
+        if let Err(e) = crate::hop::compile_validator(schema) {
+            bail!(
+                "SCHEMA_INVALID: `schemas:` entry '{name}' is not a valid JSON Schema: {e}. \
+                 A registered SchemaBound inner schema must compile at load."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Spec A.1 §4.1 step 4 — closed-world `schema_ref` check (mirrors
+/// [`validate_workflow_refs_resolve`]). Every `schema_ref` literal statically
+/// present in a workflow body must name a registered top-level `schemas:` entry.
+/// Unresolved → `SCHEMA_REF_UNRESOLVED` (the V22 fix-it voice).
+fn validate_schema_refs_resolve(config: &Value) -> anyhow::Result<()> {
+    let registered: HashSet<String> = config
+        .pointer("/schemas")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut unresolved: Vec<(String, String)> = Vec::new();
+    if let Some(workflows) = config.pointer("/workflows").and_then(Value::as_object) {
+        for (wf_id, wf_def) in workflows {
+            collect_unresolved_schema_refs(wf_def, &registered, wf_id, &mut unresolved);
+        }
+    }
+    if let Some((wf_id, sref)) = unresolved.first() {
+        bail!(
+            "SCHEMA_REF_UNRESOLVED: workflow '{wf_id}' statically references schema_ref '{sref}', \
+             but no `schemas:` entry registers it. Register the inner schema or fully qualify the \
+             ref as `<namespace>/<name>` (Spec A.1 §4.2)."
+        );
+    }
+    Ok(())
+}
+
+/// Walk a workflow body for `{ schema_ref: "<string>", … }` SchemaBound literals
+/// and record any whose ref is not registered. Engine-internal stamps
+/// (`_`-prefixed keys — e.g. `_schemasRegistry`, `_snippetOutputs`) are skipped:
+/// a registered inner schema may itself declare a property *named* `schema_ref`
+/// (whose value is a schema object, not a ref string), and must not be mistaken
+/// for a reference.
+fn collect_unresolved_schema_refs(
+    value: &Value,
+    registered: &HashSet<String>,
+    wf_id: &str,
+    out: &mut Vec<(String, String)>,
+) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(sref)) = map.get("schema_ref") {
+                if !registered.contains(sref) {
+                    out.push((wf_id.to_string(), sref.clone()));
+                }
+            }
+            for (k, child) in map {
+                if k.starts_with('_') {
+                    continue;
+                }
+                collect_unresolved_schema_refs(child, registered, wf_id, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                collect_unresolved_schema_refs(v, registered, wf_id, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Spec A.1 §4.1 step 6 — stamp the merged `schemas:` registry onto every
+/// workflow snapshot as `_schemasRegistry` (internal metadata; mirrors
+/// `_lexiconLibrary` / `_snippetOutputs`). The runtime blackboard-write seam
+/// reads it to validate `finding.fix` inner values without a side channel.
+/// No-op when no schemas are registered.
+fn stamp_schemas_registry(config: &mut Value) {
+    let Some(schemas) = config
+        .pointer("/schemas")
+        .and_then(Value::as_object)
+        .filter(|m| !m.is_empty())
+        .cloned()
+    else {
+        return;
+    };
+    let registry = Value::Object(schemas);
+    if let Some(workflows) = config
+        .pointer_mut("/workflows")
+        .and_then(Value::as_object_mut)
+    {
+        for def in workflows.values_mut() {
+            if let Some(obj) = def.as_object_mut() {
+                obj.insert("_schemasRegistry".into(), registry.clone());
+            }
+        }
+    }
+}
+
+/// Spec A.1 §7 (FM-7) — the poka-yoke that keeps slot-named context keys
+/// engine-owned.
+///
+/// The five [`HOP_SLOT_NAMES`] name typed blackboard slots whose `Out` contract
+/// only a `hop_slot:`-declared transition may produce (the engine injects the
+/// contract + wires the resolved cap). A non-`hop_slot` transition that writes
+/// `$.context.<slot>` — through an `output:` mapping key (which, post
+/// [`expand_use_bindings`], is the context-key tail) or a `kind: workflow`
+/// `use.outputs` LHS — is the FM-7/FM-13 hole: config surfaces an *unvalidated*
+/// write to a slot-named key. This is a hard load error.
+///
+/// A transition carrying a `hop_slot:` marker is exempt: its `$.context.<slot>`
+/// write is exactly the engine-owned production this lint protects.
+fn validate_slot_key_ownership(config: &Value) -> anyhow::Result<()> {
+    let Some(workflows) = config.pointer("/workflows").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for (wf_id, def) in workflows {
+        let Some(states) = def.pointer("/states").and_then(Value::as_object) else {
+            continue;
+        };
+        for (state_name, state) in states {
+            let Some(transitions) = state.pointer("/transitions").and_then(Value::as_object) else {
+                continue;
+            };
+            for (t_name, t) in transitions {
+                let Some(t_obj) = t.as_object() else {
+                    continue;
+                };
+                // Exempt: a hop_slot transition legitimately owns its slot write.
+                if t_obj.contains_key("hop_slot") {
+                    continue;
+                }
+                // (a) `output:` mapping keys are context-key tails after expansion.
+                if let Some(output) = t_obj.get("output").and_then(Value::as_object) {
+                    for key in output.keys() {
+                        if HOP_SLOT_NAMES.contains(&key.as_str()) {
+                            // Exempt: the resolved slot cap is the sanctioned typed
+                            // producer. A workflow that declares `snippet.outputs.<slot>`
+                            // as the canonical `<slot>Out` contract IS the cap a
+                            // `hop_slot: <slot>` flow resolves to; its `output.<slot>`
+                            // write is runtime-validated against that same contract by
+                            // `validate_outputs_against_snippet`, so it is not the
+                            // unvalidated forge this lint guards against.
+                            if declares_hop_typed_slot_output(def, key) {
+                                continue;
+                            }
+                            bail!(
+                                "SLOT_KEY_ENGINE_OWNED: workflow '{wf_id}' state '{state_name}' \
+                                 transition '{t_name}': `output:` writes the engine-owned slot key \
+                                 '$.context.{key}', but the transition is not `hop_slot:`-declared. \
+                                 Slot keys [{}] carry an engine-injected typed contract — only a \
+                                 `hop_slot: {key}` transition (in a flow), or the resolved slot cap \
+                                 declaring `snippet.outputs.{key}: {{ $ref: praxec://hop#/$defs/…Out }}`, \
+                                 may produce one. Declare `hop_slot: {key}`, add that typed \
+                                 `snippet.outputs.{key}`, or write a non-slot context key.",
+                                HOP_SLOT_NAMES.join(", ")
+                            );
+                        }
+                    }
+                }
+                // (b) A `kind: workflow` `use.outputs` LHS (`$.context.<slot>`).
+                if let Some(use_outputs) = t
+                    .pointer("/executor/use/outputs")
+                    .and_then(Value::as_object)
+                {
+                    for host_path in use_outputs.keys() {
+                        if let Some(tail) = host_path_tail(host_path) {
+                            if HOP_SLOT_NAMES.contains(&tail.as_str()) {
+                                bail!(
+                                    "SLOT_KEY_ENGINE_OWNED: workflow '{wf_id}' state \
+                                     '{state_name}' transition '{t_name}': `use.outputs` projects \
+                                     into the engine-owned slot key '$.context.{tail}', but the \
+                                     transition is not `hop_slot:`-declared. Slot keys [{}] carry \
+                                     an engine-injected typed contract — only a `hop_slot: {tail}` \
+                                     transition may produce one.",
+                                    HOP_SLOT_NAMES.join(", ")
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// SPEC: compile a workflow's `inputs:` block into a synthesized `/inputSchema`
@@ -452,6 +742,413 @@ fn synthesize_input_schema(def: &mut Map<String, Value>) {
         schema.insert("required".into(), Value::Array(required));
     }
     def.insert("inputSchema".into(), Value::Object(schema));
+}
+
+/// The five canonical specialization-slot names (Spec A §3). A `hop_slot:`
+/// marker MUST name one of these. Kept as the single closed set for the
+/// load-time poka-yoke (the doctor rule) and the `$defs` base mapping.
+pub const HOP_SLOT_NAMES: [&str; 5] = ["verify", "detect", "scaffold", "implement", "lint_format"];
+
+/// Map a `hop_slot:` name to its camelCase `$defs` base in `hop.schema.json`
+/// (`lint_format` → `lintFormat`); `<base>In` / `<base>Out` are the injected
+/// contracts. `None` marks an unknown slot name — the doctor rule (§3).
+///
+/// Exhaustive match (poka-yoke): the closed set lives here, not as a
+/// hand-maintained parallel string list.
+fn hop_def_base(slot: &str) -> Option<&'static str> {
+    match slot {
+        "verify" => Some("verify"),
+        "detect" => Some("detect"),
+        "scaffold" => Some("scaffold"),
+        "implement" => Some("implement"),
+        "lint_format" => Some("lintFormat"),
+        _ => None,
+    }
+}
+
+/// A canonical `$ref` into the shipped HOP vocabulary for one slot def.
+fn hop_ref(base: &str, dir: &str) -> Value {
+    json!({ "$ref": format!("praxec://hop#/$defs/{base}{dir}") })
+}
+
+/// True when `def` declares `snippet.outputs.<slot>` as the canonical
+/// `praxec://hop#/$defs/<base>Out` contract — i.e. this workflow IS the resolved
+/// slot cap, the sanctioned typed producer of the slot value (Spec A §3.1). Such
+/// a cap's `output.<slot>` write is runtime-validated against that same contract
+/// by `validate_outputs_against_snippet`, so it is exempt from FM-7: it is a typed
+/// production, not the unvalidated forge the lint guards against. The `$ref` must
+/// match exactly — an untyped `snippet.outputs.<slot>` does NOT earn the exemption.
+fn declares_hop_typed_slot_output(def: &Value, slot: &str) -> bool {
+    let Some(base) = hop_def_base(slot) else {
+        return false;
+    };
+    let expected = format!("praxec://hop#/$defs/{base}Out");
+    def.pointer(&format!("/snippet/outputs/{slot}/$ref"))
+        .and_then(Value::as_str)
+        == Some(expected.as_str())
+}
+
+/// Spec A / A.1 §3 — the `hop_slot:` load-time injector.
+///
+/// For each transition declaring `hop_slot: <name>`:
+///   (a) set the transition `inputSchema` to `{ "$ref": "…/<name>In" }` — only
+///       if the transition does not already declare an explicit `inputSchema`
+///       (the author may narrow, the engine supplies the default);
+///   (b) declare `$.context.<name>` as a typed blackboard slot with schema
+///       `{ "$ref": "…/<name>Out" }` on the workflow's `blackboard:` map — the
+///       engine OWNS the output contract, so this overwrites any authored
+///       schema for that key.
+///
+/// Enforcement is then entirely reuse: `runtime_submit`'s `validate_schema`
+/// checks the input, `runtime_records`'s `validate_blackboard_writes` checks
+/// the output (both now registry-aware so the `praxec://hop` refs resolve).
+///
+/// Precedents for this load-time move: [`synthesize_input_schema`] and
+/// `expand_use_bindings` (both synthesize schema/mappings onto a transition at
+/// load), and the V13 slot table (the typed blackboard the output check reads).
+///
+/// An unknown slot name, a non-string marker, or an array-form `blackboard:`
+/// that collides with a slot is a hard load error (`bail!`).
+fn inject_hop_slots(config: &mut Value) -> anyhow::Result<()> {
+    // Snapshot the resolution inputs BEFORE taking the mutable `workflows`
+    // borrow: the full set of loaded (namespace-prefixed) definition ids and
+    // the repo `namespace → priority` map stamped by `merge_declared_repos`.
+    let loaded_ids: Vec<String> = config
+        .pointer("/workflows")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let repo_priority = read_repo_priority(config);
+
+    let Some(workflows) = config
+        .pointer_mut("/workflows")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(());
+    };
+
+    for (wf_id, def) in workflows.iter_mut() {
+        let Some(def_obj) = def.as_object_mut() else {
+            continue;
+        };
+
+        // The workflow's resolution chain (Spec A §5.1). `stack:` is either a
+        // plain string (language-only, back-compat) or an object
+        // `{ language, frameworks, primary_framework, project }`. Parsed into an
+        // ordered, most-specific-first specificity chain
+        // `[project, primary_framework, language]` (absent levels skipped);
+        // `resolve_hop_cap` appends the `generic` floor.
+        let stack_chain = parse_stack_chain(def_obj.get("stack"))?;
+
+        // First pass: walk states→transitions, inject each transition's
+        // `inputSchema` + resolved executor, and collect the slot→Out ref for
+        // the blackboard. (Borrow split: mutate transitions here, mutate
+        // `blackboard` after.)
+        let mut out_slots: std::collections::BTreeMap<String, Value> =
+            std::collections::BTreeMap::new();
+
+        if let Some(states) = def_obj.get_mut("states").and_then(Value::as_object_mut) {
+            for (state_name, state) in states.iter_mut() {
+                let Some(transitions) = state.get_mut("transitions").and_then(Value::as_object_mut)
+                else {
+                    continue;
+                };
+                for (t_name, t) in transitions.iter_mut() {
+                    let Some(t_obj) = t.as_object_mut() else {
+                        continue;
+                    };
+                    let Some(marker) = t_obj.get("hop_slot") else {
+                        continue;
+                    };
+                    // Own the slot name and end the immutable borrow of `t_obj`
+                    // before mutating it below.
+                    let slot = marker
+                        .as_str()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "HOP_SLOT_INVALID: workflow '{wf_id}' state '{state_name}' \
+                                 transition '{t_name}': `hop_slot` must be a string naming a \
+                                 slot; valid names: [{}]",
+                                HOP_SLOT_NAMES.join(", ")
+                            )
+                        })?
+                        .to_string();
+                    // Doctor rule (§3): the marker must name a known slot.
+                    let base = hop_def_base(&slot).ok_or_else(|| {
+                        anyhow!(
+                            "HOP_SLOT_UNKNOWN: workflow '{wf_id}' state '{state_name}' \
+                             transition '{t_name}': `hop_slot: {slot}` is not a known \
+                             specialization slot; valid names: [{}]",
+                            HOP_SLOT_NAMES.join(", ")
+                        )
+                    })?;
+
+                    // STRICT: a hop_slot transition never declares its own
+                    // executor — the engine owns wiring the resolved cap.
+                    if t_obj.contains_key("executor") {
+                        bail!(
+                            "HOP_SLOT_EXECUTOR_CONFLICT: workflow '{wf_id}' state \
+                             '{state_name}' transition '{t_name}': hop_slot transitions must \
+                             not declare an executor; the engine wires the resolved \
+                             `cap.{slot}.<stack>`. Remove the `executor:` block."
+                        );
+                    }
+
+                    // Resolve the marker to a concrete cap (stack-specific, then
+                    // `generic` fallback; repo-priority breaks multi-namespace
+                    // ties). A load error if nothing resolves.
+                    let resolved = resolve_hop_cap(
+                        &slot,
+                        &stack_chain,
+                        &loaded_ids,
+                        &repo_priority,
+                        wf_id,
+                        state_name,
+                        t_name,
+                    )?;
+
+                    // (a) Inject the input contract, honoring an explicit author schema.
+                    if !t_obj.contains_key("inputSchema") {
+                        t_obj.insert("inputSchema".into(), hop_ref(base, "In"));
+                    }
+
+                    // Wire the resolved cap as a `kind: workflow` executor. The
+                    // `use:` block expands normally in `expand_use_bindings`
+                    // (which runs after this pass): `outputs` synthesizes the
+                    // `output:` mapping that lands the cap's `<slot>` output at
+                    // `$.context.<slot>`; `inputs` forwards the required
+                    // In-contract fields the actor supplied as arguments.
+                    let mut use_inputs = Map::new();
+                    for field in crate::hop::slot_in_required(base) {
+                        use_inputs
+                            .insert(field.clone(), Value::String(format!("$.arguments.{field}")));
+                    }
+                    let mut use_outputs = Map::new();
+                    use_outputs.insert(
+                        format!("$.context.{slot}"),
+                        // Convention (Spec A.1 §4.2): a `cap.<slot>.<stack>`
+                        // names its HOP output after the slot.
+                        Value::String(slot.clone()),
+                    );
+                    t_obj.insert(
+                        "executor".into(),
+                        json!({
+                            "kind": "workflow",
+                            "definitionId": resolved,
+                            "use": {
+                                "inputs": Value::Object(use_inputs),
+                                "outputs": Value::Object(use_outputs),
+                            }
+                        }),
+                    );
+
+                    // Record the Out ref; the engine owns this contract.
+                    out_slots.insert(slot, hop_ref(base, "Out"));
+                }
+            }
+        }
+
+        // (b) Declare the typed blackboard slots for the collected Outs.
+        if !out_slots.is_empty() {
+            let bb = def_obj
+                .entry("blackboard")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let Some(bb_obj) = bb.as_object_mut() else {
+                bail!(
+                    "HOP_SLOT_BLACKBOARD_SHAPE: workflow '{wf_id}' declares `blackboard:` in \
+                     array (bare-name) form, but a `hop_slot:` transition needs an object-form \
+                     `blackboard:` to carry the typed slot contract. Convert `blackboard:` to \
+                     the object form (`{{ <name>: <schema> }}`)."
+                );
+            };
+            for (slot, out_ref) in out_slots {
+                // Engine owns the slot Out contract — overwrite any authored schema.
+                bb_obj.insert(slot, out_ref);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Read the stamped `namespace → priority` map (`/praxec/_repoPriority`,
+/// [`stamp_repo_priority`]) into a lookup. Absent → empty (all namespaces
+/// default to priority `0`).
+fn read_repo_priority(config: &Value) -> HashMap<String, i64> {
+    config
+        .pointer("/praxec/_repoPriority")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(ns, v)| v.as_i64().map(|p| (ns.clone(), p)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Spec A §5.1 — parse a workflow's `stack:` field into an ordered,
+/// most-specific-first specificity chain `[project, primary_framework, language]`
+/// (absent levels skipped). `resolve_hop_cap` appends the `generic` floor.
+///
+/// Two accepted forms:
+/// - a plain string (`stack: rust`) — language-only (back-compat);
+/// - an object `{ language, frameworks: [set], primary_framework, project }` —
+///   `project` and `primary_framework` layer above `language`. `frameworks:` is
+///   accepted (additive-knowledge composition is a separate later concern,
+///   Spec A §5.2) but does NOT participate in override-resolution; only
+///   `primary_framework` does.
+///
+/// Absent `stack:` → empty chain → resolves against `generic` alone.
+/// A non-string / non-object `stack:`, or non-string level values, are load
+/// errors (poka-yoke — a malformed descriptor never silently degrades).
+fn parse_stack_chain(stack: Option<&Value>) -> anyhow::Result<Vec<String>> {
+    match stack {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => {
+            // Language-only. `generic` is the floor `resolve_hop_cap` always
+            // appends, so an explicit `stack: generic` collapses to the floor.
+            if s == "generic" {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![s.clone()])
+            }
+        }
+        Some(Value::Object(obj)) => {
+            let level = |key: &str| -> anyhow::Result<Option<String>> {
+                match obj.get(key) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(s)) if s.is_empty() || s == "generic" => Ok(None),
+                    Some(Value::String(s)) => Ok(Some(s.clone())),
+                    Some(other) => {
+                        bail!("HOP_STACK_INVALID: `stack.{key}` must be a string, got {other}")
+                    }
+                }
+            };
+            // Most-specific-first: project → primary_framework → language.
+            let mut chain = Vec::new();
+            if let Some(p) = level("project")? {
+                chain.push(p);
+            }
+            if let Some(f) = level("primary_framework")? {
+                chain.push(f);
+            }
+            if let Some(l) = level("language")? {
+                chain.push(l);
+            }
+            Ok(chain)
+        }
+        Some(other) => bail!(
+            "HOP_STACK_INVALID: `stack:` must be a string (language) or an object \
+             {{ language, frameworks, primary_framework, project }}, got {other}"
+        ),
+    }
+}
+
+/// A human-readable rendering of the resolution chain for diagnostics — the
+/// specificity levels joined most-specific-first with the `generic` floor,
+/// e.g. `myapp→axum→rust→generic`. An empty chain renders as `generic`.
+fn stack_display(chain: &[String]) -> String {
+    if chain.is_empty() {
+        "generic".to_string()
+    } else {
+        let mut parts: Vec<&str> = chain.iter().map(String::as_str).collect();
+        parts.push("generic");
+        parts.join("→")
+    }
+}
+
+/// Spec A §5.1 — resolve a `hop_slot: <slot>` marker to a concrete loaded cap id
+/// by walking the specificity chain most-specific-first.
+///
+/// - Walk `chain` (`[project, primary_framework, language]`, absent levels
+///   already skipped) then the `generic` floor. For each level, look for
+///   `cap.<slot>.<level>` among loaded ids (host-local, or namespaced as
+///   `<ns>/cap.<slot>.<level>`). The FIRST level with any provider wins — a more
+///   specific cap always beats a less specific one (override-resolution). No
+///   level matches → `HOP_SLOT_UNRESOLVED`.
+/// - When several namespaces provide the winning level's cap, the highest
+///   `priority:` breaks the tie; a host-local (unprefixed) cap outranks any repo
+///   (the operator's own config is top authority). An equal-priority tie →
+///   `HOP_SLOT_AMBIGUOUS`.
+fn resolve_hop_cap(
+    slot: &str,
+    chain: &[String],
+    loaded_ids: &[String],
+    repo_priority: &HashMap<String, i64>,
+    wf_id: &str,
+    state_name: &str,
+    t_name: &str,
+) -> anyhow::Result<String> {
+    let stack_display = stack_display(chain);
+    // Levels to try, most-specific-first, with the `generic` floor last.
+    // (`generic` never duplicates: `parse_stack_chain` drops explicit `generic`
+    // levels.)
+    let mut levels: Vec<&str> = chain.iter().map(String::as_str).collect();
+    levels.push("generic");
+
+    let mut candidates: Vec<String> = Vec::new();
+    for level in &levels {
+        candidates = matching_caps(slot, level, loaded_ids);
+        if !candidates.is_empty() {
+            break; // most-specific level with a provider wins
+        }
+    }
+
+    if candidates.is_empty() {
+        bail!(
+            "HOP_SLOT_UNRESOLVED: workflow '{wf_id}' state '{state_name}' transition '{t_name}': \
+             `hop_slot: {slot}` (stack '{stack_display}') resolves to no loaded capability — no \
+             `cap.{slot}.<level>` along the chain [{}] nor `cap.{slot}.generic` is loaded. \
+             Register a slot cap or declare the repo that provides it.",
+            levels.join(", ")
+        );
+    }
+
+    if candidates.len() == 1 {
+        return Ok(candidates.into_iter().next().expect("len checked == 1"));
+    }
+
+    // Multiple providers at the winning level — break the tie by repo priority.
+    // Host-local (unprefixed) caps are the operator's own config: top authority.
+    let ranked: Vec<(i64, String)> = candidates
+        .into_iter()
+        .map(|id| {
+            let prio = match id.split_once('/') {
+                Some((ns, _)) => repo_priority.get(ns).copied().unwrap_or(0),
+                None => i64::MAX, // host-local wins outright
+            };
+            (prio, id)
+        })
+        .collect();
+    let top = ranked.iter().map(|(p, _)| *p).max().expect("non-empty");
+    let winners: Vec<&String> = ranked
+        .iter()
+        .filter(|(p, _)| *p == top)
+        .map(|(_, id)| id)
+        .collect();
+    if winners.len() > 1 {
+        let mut names: Vec<&str> = winners.iter().map(|s| s.as_str()).collect();
+        names.sort_unstable();
+        bail!(
+            "HOP_SLOT_AMBIGUOUS: workflow '{wf_id}' state '{state_name}' transition '{t_name}': \
+             `hop_slot: {slot}` (stack '{stack_display}') is provided by multiple repos at equal \
+             priority {top}: [{}]. Raise one repo's `priority:` to disambiguate.",
+            names.join(", ")
+        );
+    }
+    Ok(winners[0].clone())
+}
+
+/// Collect every loaded id that is `cap.<slot>.<stack>` — either host-local
+/// (exact match) or namespaced (`<ns>/cap.<slot>.<stack>`).
+fn matching_caps(slot: &str, stack: &str, loaded_ids: &[String]) -> Vec<String> {
+    let target = format!("cap.{slot}.{stack}");
+    let suffix = format!("/{target}");
+    loaded_ids
+        .iter()
+        .filter(|id| **id == target || id.ends_with(&suffix))
+        .cloned()
+        .collect()
 }
 
 /// SPEC §6 — Walk every workflow's transitions; for any `kind: workflow`
@@ -2162,7 +2859,10 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     let (repos, overrides) = take_repos_and_overrides(&mut host)?;
     if repos.is_empty() {
         // No repos declared — strip an empty `overrides:` (it's meaningless
-        // without any repo-provided ids to shadow) and return unchanged.
+        // without any repo-provided ids to shadow). Host-level staged
+        // connections (`px connections add` / `grant`) still get the grant gate.
+        let staged_ungranted = apply_staged_connection_grants(&mut host)?;
+        stamp_ungranted_connections(&mut host, staged_ungranted);
         return Ok(host);
     }
 
@@ -2173,11 +2873,20 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     // targets, carried forward to the gateway via the resolved config (see
     // `stamp_writable_repos`).
     let mut writable_repo_roots: Vec<(String, bool)> = Vec::new();
+    // Spec A §5 — namespace → priority, carried into the merged config for
+    // `hop_slot:` cap-resolution tie-breaking (see `stamp_repo_priority`).
+    let mut repo_priorities: Vec<(String, i64)> = Vec::new();
+    // SPEC §9.5 — pack-declared connections the operator has NOT granted,
+    // diverted out of the live registry and stamped as self-documenting
+    // diagnostic state (see `stamp_ungranted_connections`).
+    let mut ungranted_connections: Vec<UngrantedConnection> = Vec::new();
 
     for RepoDecl {
         source,
         writable,
         push,
+        priority,
+        grant_connections,
     } in repos
     {
         // Resolve to a local path: a local dir relative to the host config (same
@@ -2201,7 +2910,7 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
                     .with_context(|| format!("importing repo {uri}"))?
             }
         };
-        let (manifest, repo_value) = crate::repo::load_repo(&repo_path)
+        let (manifest, mut repo_value) = crate::repo::load_repo(&repo_path)
             .with_context(|| format!("loading repo at {}", repo_path.display()))?;
         if writable {
             writable_repo_roots.push((repo_path.display().to_string(), push));
@@ -2218,9 +2927,24 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
                 manifest.name
             );
         }
+        repo_priorities.push((manifest.namespace.clone(), priority));
+        // Collect ids BEFORE the grant gate strips ungranted connections, so
+        // a host definition colliding with an ungranted pack connection still
+        // trips V23 (the operator must acknowledge the shadowing either way).
         for id in crate::repo::aggregate_ids(&repo_value) {
             repo_provided_ids.insert(id);
         }
+        // SPEC §9.5 — connection GRANT GATE. A pack DECLARES connections; only
+        // the OPERATOR activates them (the `human:intent` trust factor). Any
+        // connection this repo contributed that is not listed in the host's
+        // `grant_connections:` is diverted out of the live `/connections`
+        // registry here, before the merge — so it can never be spawned and
+        // never seeds the authoring provenance gate.
+        ungranted_connections.extend(gate_repo_connections(
+            &mut repo_value,
+            &manifest,
+            &grant_connections,
+        )?);
         repo_aggregate = deep_merge(repo_aggregate, repo_value);
     }
 
@@ -2266,7 +2990,269 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     // `praxec.authoring.write_enabled` is set. Reads still flow through the
     // merged registry above; this records only the authoring write target(s).
     stamp_writable_repos(&mut merged, writable_repo_roots);
+
+    // Spec A §5 — carry namespace priorities forward for `hop_slot:` resolution.
+    stamp_repo_priority(&mut merged, repo_priorities);
+
+    // SPEC §9.5 — surface ungranted pack connections as live, self-documenting
+    // DEGRADED state (the #23 pattern): each entry carries the exact YAML
+    // remedy. Keys the host itself (re)declares are skipped — the operator's
+    // own definition is live under that key (implicit grant by authorship),
+    // gated by the explicit `overrides:` acknowledgment above.
+    ungranted_connections.retain(|u| !host_ids.contains(&u.key));
+    // SPEC §9.5 — host-level staged connections (`px connections add` / `grant`):
+    // promote granted staged bodies into the live `/connections` registry and
+    // divert ungranted ones to `_ungrantedConnections` — the same mechanism as
+    // repo-declared connections. Applied after the repo merge so a staged name
+    // colliding with a repo-provided live connection is caught.
+    let staged_ungranted = apply_staged_connection_grants(&mut merged)?;
+    ungranted_connections.extend(staged_ungranted);
+    stamp_ungranted_connections(&mut merged, ungranted_connections);
     Ok(merged)
+}
+
+/// SPEC §9.5 — apply the host-level staged-connection grant gate (`px connections
+/// add` / `grant`). This is the operator-authored analog of
+/// [`gate_repo_connections`]: `add` writes a body under top-level
+/// `stagedConnections:` (never live), and `grant` lists its name under top-level
+/// `grant_connections:`. Here, for each staged entry:
+///   - GRANTED (name in `grant_connections:`) → the body is promoted into the
+///     live `/connections` registry (fail-fast on a collision with an existing
+///     live connection — never a silent overwrite);
+///   - UNGRANTED → returned as an [`UngrantedConnection`] for stamping into
+///     `/praxec/_ungrantedConnections`, so a spawn attempt fails typed with the
+///     grant remedy exactly like a pack-declared ungranted connection.
+///
+/// Both `stagedConnections:` and top-level `grant_connections:` are stripped from
+/// the resolved config (internal authoring state, not live registry keys). A
+/// grant naming no staged connection is a hard error (`STALE_CONNECTION_GRANT`,
+/// mirroring the repo path). A config with neither key round-trips unchanged.
+fn apply_staged_connection_grants(config: &mut Value) -> anyhow::Result<Vec<UngrantedConnection>> {
+    let Some(obj) = config.as_object_mut() else {
+        return Ok(Vec::new());
+    };
+    let staged = match obj.remove("stagedConnections") {
+        Some(Value::Object(m)) => m,
+        None | Some(Value::Null) => {
+            // No staged connections — a lone `grant_connections:` grants nothing.
+            if let Some(g) = obj.remove("grant_connections") {
+                if g.as_array().is_some_and(|a| !a.is_empty()) {
+                    bail!(
+                        "STALE_CONNECTION_GRANT: top-level `grant_connections:` lists names, but \
+                         there is no `stagedConnections:` block. Add a connection with \
+                         `px connections add <name> --kind <kind> ...` first (SPEC §9.5)."
+                    );
+                }
+            }
+            return Ok(Vec::new());
+        }
+        Some(_) => bail!(
+            "INVALID_STAGED_CONNECTIONS: top-level `stagedConnections:` must be a mapping of \
+             name → connection body (SPEC §9.5)."
+        ),
+    };
+    let grants: HashSet<String> = match obj.remove("grant_connections") {
+        Some(Value::Array(a)) => a
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        None | Some(Value::Null) => HashSet::new(),
+        Some(_) => bail!(
+            "INVALID_GRANT_CONNECTIONS: top-level `grant_connections:` must be an array of \
+             staged connection names (SPEC §9.5)."
+        ),
+    };
+    // A grant naming a connection that is not staged is stale (mirrors the repo
+    // `STALE_CONNECTION_GRANT`): the operator's mental model has drifted.
+    for g in &grants {
+        if !staged.contains_key(g) {
+            bail!(
+                "STALE_CONNECTION_GRANT: top-level `grant_connections:` lists '{g}', but no \
+                 `stagedConnections:` entry declares it. Add it with \
+                 `px connections add {g} --kind <kind> ...` or remove the grant (SPEC §9.5)."
+            );
+        }
+    }
+    let mut ungranted = Vec::new();
+    for (name, body) in staged {
+        if grants.contains(&name) {
+            let connections = obj
+                .entry("connections")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let cm = connections.as_object_mut().ok_or_else(|| {
+                anyhow::anyhow!("INVALID_CONNECTIONS: `connections:` must be a mapping")
+            })?;
+            if cm.contains_key(&name) {
+                bail!(
+                    "DUPLICATE_CONNECTION: granting staged connection '{name}' collides with an \
+                     existing live `connections:` entry of the same name. Rename or remove one \
+                     (SPEC §9.5)."
+                );
+            }
+            cm.insert(name, body);
+        } else {
+            ungranted.push(UngrantedConnection {
+                key: name.clone(),
+                bare: name,
+                repo: "host config (px connections add)".to_string(),
+                namespace: String::new(),
+            });
+        }
+    }
+    Ok(ungranted)
+}
+
+/// SPEC §9.5 — one pack-declared connection the operator has not granted.
+/// Carried from the grant gate to [`stamp_ungranted_connections`].
+struct UngrantedConnection {
+    /// Fully-qualified live-registry key the connection would occupy
+    /// (`<namespace>/<name>`).
+    key: String,
+    /// Bare pack-local name — what the operator writes in `grant_connections:`.
+    bare: String,
+    /// Manifest `name` of the declaring repo.
+    repo: String,
+    /// Manifest `namespace` of the declaring repo.
+    namespace: String,
+}
+
+/// SPEC §9.5 — apply the connection grant gate to one loaded repo aggregate.
+///
+/// Every connection key this repo contributed is admitted into the live
+/// `/connections` ONLY when the host's `grant_connections:` for this repo
+/// lists it (bare pack-local name or fully-qualified `<namespace>/<name>`).
+/// Ungranted keys are REMOVED from the aggregate (never merged live) and
+/// returned for diagnostic stamping — not silently dropped.
+///
+/// A grant naming a connection this repo does not declare is a hard error
+/// (`STALE_CONNECTION_GRANT`, mirroring `STALE_OVERRIDE`): a grant that grants
+/// nothing means the operator's mental model and the pack have drifted.
+fn gate_repo_connections(
+    repo_value: &mut Value,
+    manifest: &crate::repo::RepoManifest,
+    grants: &[String],
+) -> anyhow::Result<Vec<UngrantedConnection>> {
+    let conn_keys: Vec<String> = repo_value
+        .pointer("/connections")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let ns_prefix = format!("{}/", manifest.namespace);
+    for grant in grants {
+        let matches = conn_keys
+            .iter()
+            .any(|k| k == grant || k.strip_prefix(&ns_prefix) == Some(grant.as_str()));
+        if !matches {
+            bail!(
+                "STALE_CONNECTION_GRANT: the `repos:` entry for '{}' lists '{}' in \
+                 `grant_connections`, but that repo declares no such connection \
+                 (declared: {:?}). Remove the grant or correct the name (SPEC §9.5).",
+                manifest.name,
+                grant,
+                conn_keys
+            );
+        }
+    }
+    if conn_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ungranted = Vec::new();
+    let block = repo_value
+        .pointer_mut("/connections")
+        .and_then(Value::as_object_mut)
+        .expect("conn_keys non-empty implies /connections object");
+    for key in conn_keys {
+        let bare = key
+            .strip_prefix(&ns_prefix)
+            .unwrap_or(key.as_str())
+            .to_string();
+        let granted = grants.iter().any(|g| *g == key || *g == bare);
+        if !granted {
+            block.remove(&key);
+            ungranted.push(UngrantedConnection {
+                key,
+                bare,
+                repo: manifest.name.clone(),
+                namespace: manifest.namespace.clone(),
+            });
+        }
+    }
+    if block.is_empty() {
+        if let Some(obj) = repo_value.as_object_mut() {
+            obj.remove("connections");
+        }
+    }
+    Ok(ungranted)
+}
+
+/// SPEC §9.5 — record pack-declared-but-ungranted connections under
+/// `/praxec/_ungrantedConnections` (internal resolved-config metadata, not an
+/// operator-authored key — mirrors [`stamp_writable_repos`]/`_writableRepos`).
+/// Keyed by the fully-qualified connection key the pack's workflows reference;
+/// each entry names the declaring repo and carries the exact YAML remedy. The
+/// executors read this to turn a spawn attempt into a typed
+/// `UNGRANTED_PACK_CONNECTION` failure instead of a bare not-found. No-op when
+/// empty.
+fn stamp_ungranted_connections(config: &mut Value, entries: Vec<UngrantedConnection>) {
+    if entries.is_empty() {
+        return;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let praxec = obj
+        .entry("praxec")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(fg) = praxec.as_object_mut() {
+        let mut map = Map::new();
+        for u in entries {
+            // Host-staged connections (empty namespace) carry the `px connections
+            // grant` remedy; pack-declared ones carry the per-repo grant remedy.
+            let remedy = if u.namespace.is_empty() {
+                format!(
+                    "run `px connections grant {0}` (or add `{0}` to the top-level \
+                     `grant_connections:`) to activate this operator-staged connection",
+                    u.bare
+                )
+            } else {
+                format!(
+                    "add `grant_connections: [{}]` to the `repos:` entry for {} to activate \
+                     this connection",
+                    u.bare, u.repo
+                )
+            };
+            map.insert(
+                u.key,
+                json!({ "repo": u.repo, "namespace": u.namespace, "remedy": remedy }),
+            );
+        }
+        fg.insert("_ungrantedConnections".into(), Value::Object(map));
+    }
+}
+
+/// Spec A §5 — record declared repos' `namespace → priority` under
+/// `/praxec/_repoPriority` (internal resolved-config metadata, not an
+/// operator-authored key — mirrors [`stamp_writable_repos`]/`_writableRepos`).
+/// [`inject_hop_slots`] reads it to break `hop_slot:` cap-resolution ties.
+/// No-op when empty. Priority `0` entries are stamped too, so an explicit
+/// `priority: 0` reads back identically to the default.
+fn stamp_repo_priority(config: &mut Value, priorities: Vec<(String, i64)>) {
+    if priorities.is_empty() {
+        return;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let praxec = obj
+        .entry("praxec")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(fg) = praxec.as_object_mut() {
+        let mut map = Map::new();
+        for (ns, prio) in priorities {
+            map.insert(ns, Value::from(prio));
+        }
+        fg.insert("_repoPriority".into(), Value::Object(map));
+    }
 }
 
 /// SPEC §8.4 — record repos declared `writable: true` under
@@ -2301,6 +3287,21 @@ struct RepoDecl {
     source: RepoSource,
     writable: bool,
     push: bool,
+    /// Spec A §5 — repo-priority for `hop_slot:` cap resolution. When multiple
+    /// declared repos provide the same `cap.<slot>.<stack>`, the highest
+    /// `priority` wins; an equal-priority tie is a hard load error
+    /// (`HOP_SLOT_AMBIGUOUS`). Default `0`. Carried into the merged config as a
+    /// `namespace → priority` map (see [`stamp_repo_priority`]).
+    priority: i64,
+    /// SPEC §9.5 — operator grant for pack-contributed connections. A layered
+    /// repo may DECLARE `connections:`, but a declared connection only goes
+    /// live when the OPERATOR lists its name here (bare pack-local name or the
+    /// fully-qualified `<namespace>/<name>` form). The grant lives ONLY in the
+    /// host config — a pack can never grant itself. Ungranted declarations are
+    /// diverted to `/praxec/_ungrantedConnections` (see
+    /// [`gate_repo_connections`] / [`stamp_ungranted_connections`]). Default
+    /// empty: no pack connection is ever live without an explicit grant.
+    grant_connections: Vec<String>,
 }
 
 /// Where a declared repo comes from.
@@ -2382,6 +3383,42 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
              only a writable repo has authored commits to push."
         );
     }
+    // Spec A §5 — optional numeric `priority:` (default 0) breaks `hop_slot:`
+    // cap-resolution ties between repos providing the same `cap.<slot>.<stack>`.
+    let priority = match entry.get("priority") {
+        None | Some(Value::Null) => 0,
+        Some(v) => v.as_i64().ok_or_else(|| {
+            anyhow!(
+                "INVALID_REPO_ENTRY: `repos[{index}].priority` must be an integer ({})",
+                short_value_kind(v)
+            )
+        })?,
+    };
+    // SPEC §9.5 — optional `grant_connections:` (default empty), the operator's
+    // explicit activation of this repo's declared connections.
+    let grant_connections: Vec<String> = match entry.get("grant_connections") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .map(|v| match v {
+                Value::String(s) if !s.is_empty() => Ok(s.clone()),
+                Value::String(_) => bail!(
+                    "INVALID_REPO_ENTRY: `repos[{index}].grant_connections` entries MUST be \
+                     non-empty connection names"
+                ),
+                other => bail!(
+                    "INVALID_REPO_ENTRY: `repos[{index}].grant_connections` entries MUST be \
+                     strings ({})",
+                    short_value_kind(other)
+                ),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        Some(other) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}].grant_connections` must be an array of \
+             connection names ({})",
+            short_value_kind(other)
+        ),
+    };
     // SPEC §9 — a repo is either local (`path`) or remote (`uri`, imported via
     // git). Exactly one; a remote repo may pin a `ref` (default `main`).
     let path = entry.get("path").and_then(Value::as_str);
@@ -2413,6 +3450,8 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
         source,
         writable,
         push,
+        priority,
+        grant_connections,
     })
 }
 

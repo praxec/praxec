@@ -9,7 +9,7 @@ use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::{DefinitionStoreWritable, Executor};
 use praxec_core::store::InMemoryWritableDefinitionStore;
 use praxec_executors::RegistryExecutor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn instance_stub() -> WorkflowInstance {
     WorkflowInstance {

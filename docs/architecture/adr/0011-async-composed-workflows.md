@@ -55,5 +55,5 @@ runtime and the agent overlay.
 ## References
 
 - `crates/praxec-executors/src/workflow.rs` (`WorkflowExecutor`)
-- `crates/praxec-core/src/runtime_submit.rs` (redrive, file locks)
+- `crates/praxec-core/src/runtime/runtime_submit.rs` (redrive, file locks)
 - Builds on the validity-first engine roadmap (P2).

@@ -8,7 +8,7 @@
 //! - MISSING_API_KEY when provider env var is absent
 //! - lexicon coverage: LEXICON_PENDING_DEFINITIONS when unresolved subjects exist
 
-use praxec_tui::doctor::{count_failures, run_doctor, CheckStatus, DoctorArgs};
+use praxec_tui::doctor::{CheckStatus, DoctorArgs, count_failures, run_doctor};
 
 fn find_status<'a>(
     results: &'a [praxec_tui::doctor::CheckResult],
@@ -35,7 +35,8 @@ async fn doctor_passes_against_smoke_ete_with_anthropic_key_set() {
     // present so the agent check passes. We use a placeholder value —
     // doctor only checks presence, not validity.
     let prior = std::env::var("ANTHROPIC_API_KEY").ok();
-    std::env::set_var("ANTHROPIC_API_KEY", "test-placeholder");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("ANTHROPIC_API_KEY", "test-placeholder") };
 
     let args = DoctorArgs {
         config: Some(smoke_ete_config()),
@@ -48,8 +49,10 @@ async fn doctor_passes_against_smoke_ete_with_anthropic_key_set() {
 
     // Restore env state.
     match prior {
-        Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
-        None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        Some(v) => unsafe { std::env::set_var("ANTHROPIC_API_KEY", v) },
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        None => unsafe { std::env::remove_var("ANTHROPIC_API_KEY") },
     }
 
     assert_eq!(
@@ -97,7 +100,8 @@ async fn doctor_reports_workflow_not_declared() {
 async fn doctor_reports_missing_api_key_when_env_var_absent() {
     // Remove the env var (if present) for the duration of this test.
     let prior = std::env::var("OPENAI_API_KEY").ok();
-    std::env::remove_var("OPENAI_API_KEY");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("OPENAI_API_KEY") };
 
     let args = DoctorArgs {
         config: None,
@@ -109,7 +113,8 @@ async fn doctor_reports_missing_api_key_when_env_var_absent() {
     let fail = find_status(&results, "MISSING_API_KEY");
 
     if let Some(v) = prior {
-        std::env::set_var("OPENAI_API_KEY", v);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("OPENAI_API_KEY", v) };
     }
 
     let fail = fail.expect("MISSING_API_KEY must surface when env var absent");

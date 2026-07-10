@@ -9,7 +9,7 @@
 
 use praxec_core::audit::AuditEvent;
 use praxec_core::model::Evidence;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ── Evidence (§20.1) ────────────────────────────────────────────────────────
 

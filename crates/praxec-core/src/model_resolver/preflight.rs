@@ -346,7 +346,8 @@ mod u2_auth_probe_tests {
     /// itself also short-circuits on absent keys.)
     #[tokio::test]
     async fn missing_credential_is_returned_without_a_network_call() {
-        std::env::remove_var("OPENAI_API_KEY");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
         let client = probe_client();
         let outcome = probe_binding(&client, &binding(Provider::Known(ProviderId::Openai))).await;
         assert!(

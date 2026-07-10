@@ -1,0 +1,182 @@
+{
+  "$id": "https://praxec.dev/schemas/hop.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PraxecHopVocabulary",
+  "description": "Canonical hand-off-point contracts for the specialization slots. Registered at runtime under alias praxec://hop; referenced by slot caps and injected by the hop_slot: primitive. Runtime-validated, not typify-generated.",
+  "$defs": {
+    "severity": {
+      "type": "string",
+      "enum": ["info", "warning", "error", "critical"],
+      "description": "The ONE shared severity vocabulary (parent §6). Order is semantic (info < warning < error < critical) for config-side gate thresholds, but the SPINE never compares severities — producers compute gate status; severity appears core-side only on findings."
+    },
+    "gateStatus": {
+      "type": "string",
+      "enum": ["pass", "fail", "not_evaluated"],
+      "description": "Parent §6 — typed tri-state. `not_evaluated` = 'I had nothing to check with', never a disguised pass. The spine branches on this and only this."
+    },
+    "schemaBound": {
+      "type": "object",
+      "required": ["schema_ref", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_ref": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)?$",
+          "description": "Names a pack-registered inner schema (top-level `schemas:` block), namespaced per repo like definitionIds (V20). Must resolve at CONFIG LOAD (V24, §4.2); unresolved at runtime = fail-fast defense-in-depth."
+        },
+        "value": true
+      },
+      "description": "Parent §4 — the runtime-validated extension point. `value` is opaque JSON, validated at the HOP boundary against the pack schema named by schema_ref. v1 scope: exactly ONE designated use — finding.fix."
+    },
+    "stackProvenance": {
+      "type": "object",
+      "required": ["stack", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "stack": { "type": "string", "description": "The chain link that won resolution, e.g. 'framework:react' / 'language:rust' / 'generic'." },
+        "source": {
+          "type": "string",
+          "enum": ["pack", "user-declared", "generic"],
+          "description": "Typed provenance, not prose (parent §3.1): `user-declared` marks the unaudited user-command fallback; `generic` marks the honest floor."
+        },
+        "chain": { "type": "array", "items": { "type": "string" }, "default": [], "description": "The walked resolution chain, most-specific-first — mirrors MODEL_RESOLVER_WALK's walked_levels (walk.rs:169)." }
+      },
+      "description": "Parent §5.4 — every slot HOP carries stack provenance."
+    },
+    "finding": {
+      "type": "object",
+      "required": ["file", "line", "rule_id", "severity", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1, "description": "Optional span end (tree-sitter producers, Spec B). Absent = single line." },
+        "column": { "type": "integer", "minimum": 1 },
+        "rule_id": { "type": "string" },
+        "severity": { "$ref": "#/$defs/severity" },
+        "message": { "type": "string" },
+        "fix": {
+          "$ref": "#/$defs/schemaBound",
+          "description": "THE v1 SchemaBound extension point. Optional: verify/lint findings may carry no remediation payload; detect producers SHOULD populate it (Spec B contract). All Spec-B variance confines here."
+        }
+      }
+    },
+    "criterion": {
+      "type": "object",
+      "required": ["id", "met", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "met": { "type": "boolean" },
+        "evidence": { "type": "string", "description": "Free-text in v1 (§9). met:true with empty evidence is a doctor WARNING (parent §3.1), deliberately not a schema failure." }
+      }
+    },
+
+    "verifyIn": {
+      "type": "object", "required": ["cwd"], "additionalProperties": false,
+      "properties": {
+        "cwd": { "type": "string" },
+        "file_set": { "type": "array", "items": { "type": "string" } },
+        "changed_only": { "type": "boolean", "default": false }
+      }
+    },
+    "verifyOut": {
+      "type": "object",
+      "required": ["status", "summary", "criteria", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "$ref": "#/$defs/gateStatus", "description": "pass iff criteria.all(met). Producer-computed; spine branches here." },
+        "summary": { "type": "string" },
+        "criteria": { "type": "array", "items": { "$ref": "#/$defs/criterion" } },
+        "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" }, "default": [] },
+        "provenance": { "$ref": "#/$defs/stackProvenance" }
+      }
+    },
+    "detectIn": {
+      "type": "object", "required": ["cwd", "ruleset"], "additionalProperties": false,
+      "properties": {
+        "cwd": { "type": "string" },
+        "file_set": { "type": "array", "items": { "type": "string" } },
+        "changed_only": { "type": "boolean", "default": false },
+        "ruleset": { "type": "string" }
+      }
+    },
+    "detectOut": {
+      "type": "object",
+      "required": ["status", "findings", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "$ref": "#/$defs/gateStatus", "description": "not_evaluated when no ruleset exists for the stack — never pass (parent §3.3)." },
+        "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+        "ruleset": { "type": "string", "description": "Which ruleset ran (observability; optional)." },
+        "provenance": { "$ref": "#/$defs/stackProvenance" }
+      }
+    },
+    "scaffoldIn": {
+      "type": "object", "required": ["cwd", "layer", "artifact_kind", "name"], "additionalProperties": false,
+      "properties": {
+        "cwd": { "type": "string" },
+        "layer": { "type": "string", "enum": ["contract", "solution", "implementation"] },
+        "artifact_kind": { "type": "string" },
+        "name": { "type": "string" },
+        "target_path": { "type": "string" },
+        "options": { "type": "object" }
+      }
+    },
+    "scaffoldOut": {
+      "type": "object",
+      "required": ["created", "wired", "layer", "summary", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "created": { "type": "array", "items": { "type": "string" } },
+        "wired": { "type": "array", "items": { "type": "string" } },
+        "layer": { "type": "string", "enum": ["contract", "solution", "implementation"], "description": "Closed set per parent §3.4." },
+        "generated_from": { "type": "string", "description": "Contract artifact this stub was generated from — marks a surface downstream steps must not hand-edit." },
+        "summary": { "type": "string" },
+        "provenance": { "$ref": "#/$defs/stackProvenance" }
+      }
+    },
+    "implementIn": {
+      "type": "object", "required": ["cwd", "deliverable", "acceptance_criteria"], "additionalProperties": false,
+      "properties": {
+        "cwd": { "type": "string" },
+        "deliverable": { "type": "object" },
+        "acceptance_criteria": { "type": "array", "items": { "$ref": "#/$defs/criterion" } },
+        "skeleton_files": { "type": "array", "items": { "type": "string" } },
+        "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+        "idiom_lens": { "type": "string" }
+      }
+    },
+    "implementOut": {
+      "type": "object",
+      "required": ["changed", "summary", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "changed": { "type": "array", "items": { "type": "string" } },
+        "summary": { "type": "string" },
+        "notes": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "provenance": { "$ref": "#/$defs/stackProvenance" }
+      }
+    },
+    "lintFormatIn": {
+      "type": "object", "required": ["cwd"], "additionalProperties": false,
+      "properties": {
+        "cwd": { "type": "string" },
+        "file_set": { "type": "array", "items": { "type": "string" } },
+        "changed_only": { "type": "boolean", "default": false },
+        "fix": { "type": "boolean", "default": true }
+      }
+    },
+    "lintFormatOut": {
+      "type": "object",
+      "required": ["status", "findings", "fixed", "provenance"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "$ref": "#/$defs/gateStatus" },
+        "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" }, "description": "REMAINING findings after this pass — findings.length drives the loop's progress-monotonicity breaker (parent §3.2)." },
+        "fixed": { "type": "array", "items": { "type": "string" }, "description": "Files touched by auto-fix this pass (aligns with created/wired/changed convention)." },
+        "provenance": { "$ref": "#/$defs/stackProvenance" }
+      }
+    }
+  }
+}

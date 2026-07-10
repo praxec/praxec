@@ -31,7 +31,7 @@
 //! with `SLOT_CONSTRAINT_VIOLATED` naming the slot, constraint kind, and
 //! offending value.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde_json::{Map, Value};
 

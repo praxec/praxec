@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::NullAuditSink;
 use praxec_core::error::ExecutorError;
 use praxec_core::guards::DefaultGuardEvaluator;
@@ -12,7 +13,6 @@ use praxec_core::model::{
 };
 use praxec_core::ports::{Executor, ExecutorRegistry};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryEvidenceStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
 use serde_json::json;
 
 struct EmitsEvidence(&'static str);

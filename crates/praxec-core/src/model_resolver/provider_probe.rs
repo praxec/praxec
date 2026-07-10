@@ -295,7 +295,8 @@ mod tests {
     /// before any network call.
     #[tokio::test]
     async fn cloud_provider_without_credential_is_no_credential() {
-        std::env::remove_var("ANTHROPIC_API_KEY");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
         let client = probe_client();
         let b = binding(Provider::Known(ProviderId::Anthropic), "claude-sonnet-4-6");
         let (status, detail) = probe_binding(&client, &b).await;

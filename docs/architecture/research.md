@@ -133,14 +133,14 @@ version: "1.0.0"
 
 connections:
   codebase_graph:
-    type: mcp
-    transport: { kind: streamable_http, url: "http://localhost:7100/mcp" }
+    kind: mcp
+    url: "http://localhost:7100/mcp"
   verifier_harness:
-    type: mcp
-    transport: { kind: streamable_http, url: "http://localhost:7200/mcp" }
+    kind: mcp
+    url: "http://localhost:7200/mcp"
   constrained_edit:
-    type: cli
-    command: ["constrained-edit"]
+    kind: cli
+    command: constrained-edit
 
 skills:
   plan.specify.change-request:

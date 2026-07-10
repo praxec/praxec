@@ -17,11 +17,127 @@ covered by a stability commitment.
 > none were tagged at the time. Versions `0.0.1`–`0.0.5` are the earlier
 > development history, renumbered onto this line.
 
-### Changed — relicensed Apache-2.0 → BSD-3-Clause
+## [0.0.17] — 2026-07-10 — tool-source ecosystem & governed connections
 
-- **The project is now under the BSD 3-Clause license.** `LICENSE`, the
-  `[workspace.package]` `license` field (inherited by every crate), and all
-  doc/README/badge references were switched from Apache-2.0 to BSD-3-Clause.
+> **This release bundles every 0.0.16 improvement.** There is no separate 0.0.16
+> cut: the 0.0.16 self-improvement program (observability, self-healing, durable
+> planning, telemetry) ships here alongside the 0.0.17 tool-source ecosystem.
+
+### Added — the tool-source ecosystem (headline)
+
+- **Tool descriptor schema (`praxec.tool/v1`)** — a schema-first descriptor
+  (`schemas/tool-descriptor.schema.json`) that describes a **cli, mcp, or rest**
+  tool uniformly: identity, `kind`, its connection requirement (`reach`, which
+  embeds the existing gateway connection shape verbatim — install = copy, never
+  transform), invocation `operations[]`, and `suggested_workflows[]`. Typed
+  loader with fail-fast `validate()` in `praxec-core::tool_descriptor`.
+- **Tool-source executor** — ingests a descriptor and surfaces its operations as
+  a callable tool through the gateway, dispatching per kind by reusing the
+  existing mcp/cli/rest transports. Fail-fasts (never auto-grants) when the
+  required connection is absent or ungranted.
+- **Registry v3 (`praxec.packs/v3`)** — a compatible superset of the v2 pack
+  registry: each tool may carry a descriptor (so the registry finally spans
+  cli + rest, not just mcp), plus per-tool `suggested_workflows` and a top-level
+  `crossmatrix` (tool × workflow) topology. Typed loader in
+  `praxec-core::registry_v3` with `workflows_for_tool` / `tools_for_workflow`.
+- **Evidence + topology-aware selector** — deterministic candidate ranking
+  (`rank_candidates`) combining lexical relevance, item1 intent-evidence, and
+  registry topology, with an explainable `why` line carrying the exact
+  arithmetic. The compiled-tool-determinism middle of
+  human-intent × tool-determinism × model-generation.
+- **`px connections add` / `px connections grant`** — a governed connection
+  write path. `add` writes a connection **staged/ungranted**; `grant` is the
+  separate, explicit, auditable trust act (emits `connections.granted`).
+
+### Security
+
+- **Operator grant gate for repo-contributed connections.** Repo/pack-declared
+  connections are no longer auto-trusted — a supply-chain hole. They are stamped
+  `_ungrantedConnections` at load and every consumer (cli/mcp/rest) fail-fasts
+  with `UNGRANTED_PACK_CONNECTION` until the operator grants them. A
+  CLI-staged connection (`px connections add`) is treated identically until
+  granted, so no code path can silently obtain a trusted connection.
+
+### Added — observability (0.0.16)
+
+- **Structured harness-event stream** (not LLM tokens) exposing execution
+  topology, cross-platform: `agent.heartbeat` liveness pulses, execution-tree
+  linkage (`parent_workflow_id` + `depth`), audit-granule rotation + retention,
+  a published `AuditEvent` JSON Schema (`praxec schema audit-event`),
+  `praxec observe --follow`, and the MCP `praxec.query { observe }` read.
+- **Intent-evidence on discovery** — `praxec.query` workflow hits carry
+  `evidence:{runs, success_rate, mean_cost}` from recorded outcomes (gated at a
+  minimum run count), so discovery is no longer blind to what actually worked.
+
+### Added / Changed / Fixed — 0.0.16 self-improvement program
+
+- Durable CPM control plane (sqlite + retry circuit-breaker), INCOSE/SEBoK Vee
+  flow, per-model cooldown breaker over the chain-walk, bounded reasoning-stall,
+  credential preflight + `praxec doctor`, cost/affinity telemetry, staged
+  `cargo_scope` build-loop throughput, and pack-wide guard-failure→`outcome:
+  failure` correctness. See `docs/v0.0.16-dogfooding-report.md` for the full
+  program + honest A/B findings.
+
+## [0.0.15] — 2026-07-09 — resilient serve & self-healing misconfiguration
+
+### Fixed — HOP: FM-7 exempts the resolved slot cap (typed `snippet.outputs`)
+
+- **`SLOT_KEY_ENGINE_OWNED` no longer rejects the resolved slot cap.** FM-7
+  exempted only `hop_slot:`-declared transitions, but the cap a `hop_slot: <slot>`
+  flow resolves to (`cap.verify.<stack>`) declares
+  `snippet.outputs.<slot>: { $ref: praxec://hop#/$defs/<slot>Out }` and writes
+  `output.<slot>` — the sanctioned typed production, runtime-validated against the
+  same contract by `validate_outputs_against_snippet`. Both shipped packs use this
+  shape, so a live gateway failed config load (surfacing as an opaque MCP
+  `-32000`). The lint now exempts a slot-key write whose enclosing workflow
+  declares the canonical `<slot>Out` `snippet.outputs`; an untyped declaration does
+  **not** earn the exemption (the forge hole stays closed).
+
+### Added — misconfiguration is a live, self-documenting state (degraded serve)
+
+- **`serve` no longer hard-crashes on a bad config.** A config fault (parse
+  error, the durability guard, or a validation lint like `SLOT_KEY_ENGINE_OWNED`)
+  used to abort **before** the MCP transport came up, so the client saw an opaque
+  transport `-32000` with no diagnosis. Now `serve` captures the fault and comes
+  up **DEGRADED**: a live server that completes the handshake and answers **every**
+  call with a precise, self-documenting `HealthReport` — code, location, detail,
+  ordered remedies, and the reload path — as both a rich message and structured
+  `data`, so an LLM operator can self-heal and reconnect. It does zero governed
+  work; it refuses everything, loudly and precisely (not a fallback). Recovery is
+  a reconnect — a fresh process loads the corrected config. The declarative repair
+  loop lives in praxec-meta (`meta/flow.repair-workflow-health`).
+
+### Added — default reasoning effort for agent turns
+
+- **`kind: agent` turns now default to `low` reasoning effort** via the new
+  `ReasoningTuning.default_effort` config field. A *reasoning* model leading a
+  chain would otherwise spend the whole turn budget on hidden reasoning, which
+  surfaces as empty content and an `AGENT_NO_RESULT` stall. A step's explicit
+  `reasoning_effort` still wins; setting `default_effort: ""` opts out (provider
+  default). `low` (not `medium`) because `medium` is a no-op (≡ provider
+  default in `reasoning_params`).
+
+### Fixed — agent-execution setup: make it work and fail honestly
+
+- **Chooser failures surface honestly instead of masquerading as "gave up."**
+  `TransitionChooser::choose` now returns `Result`, and `drive_mission` maps a
+  runner failure (missing API key, 401, model-resolution, network) to a new
+  `DriveOutcome::ChooserFailed { source }` that renders the real error — instead
+  of the misleading "no actionable move… legal actions: […]" (the old `.ok()?`
+  swallowed every error into a false give-up). A legitimate no-move still reads
+  as give-up.
+- **`praxec check` flags agent steps with no `gateway.models_yaml`** at load
+  (`AGENT_MODELS_YAML_REQUIRED`), rather than only failing at first dispatch with
+  `AGENT_NO_AGENTS_YAML`.
+- **The `praxec` gateway binary loads `~/.praxec/providers.env` at startup**
+  (previously only `px` did), so provider keys set via `px set-provider-keys`
+  reach `serve`/`orchestrate`/`command`. Environment still wins over the file.
+- **One canonical models path.** `meta/flow.configure-models` now writes
+  `.praxec/models.yaml` (was `.praxec/agents.yaml`), matching `px doctor`
+  discovery and the `gateway.models_yaml` runtime key — one name for one
+  `ModelsFile` schema.
+- Corrected `docs/reference/configuration.md`: `kind: agent` runs a governed
+  in-process rig session, not a subprocess.
 
 ### Added — value-based model selection
 
@@ -82,6 +198,26 @@ covered by a stability commitment.
 - The `spikes/0006-sandbox-exec` coordination/mechanism proof is removed from
   source control; the ADR-0006 + source provenance notes that referenced it were
   updated to drop the dead path.
+
+## [0.0.14] — 2026-07-08 — HOP typed-core & the `hop_slot` primitive
+
+### Added — stack-aware specialization: the HOP typed-core (Spec A.1)
+
+- **Canonical HOP vocabulary (`schemas/hop.schema.json`), shipped and runtime-
+  registered.** A standalone JSON Schema (draft 2020-12) defining the shared
+  building blocks (`severity`, `gateStatus`, `schemaBound`, `stackProvenance`,
+  `finding`, `criterion`) and the ten per-slot `In`/`Out` contracts
+  (`verify`/`detect`/`scaffold`/`implement`/`lint_format`). It is embedded in
+  `praxec-core` and prepared once into a process-wide `jsonschema` registry under
+  the alias `praxec://hop`, forced at serve startup so a malformed shipped schema
+  fails at boot rather than mid-run.
+- **The `hop_slot:` primitive — the unbypassable contract.** A transition marked
+  `hop_slot: <name>` has, at config load, its canonical `In` contract injected as
+  the transition `inputSchema` and its `Out` contract injected as the
+  `$.context.<name>` typed blackboard slot; the existing per-transition input and
+  blackboard-write seams (now registry-aware, resolving `praxec://hop` `$ref`s)
+  then enforce both with no new runtime code. An unknown slot name is a hard
+  load-time error listing the valid names.
 
 ## [0.0.13] — 2026-06-16 — release hygiene
 

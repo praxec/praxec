@@ -22,7 +22,7 @@ use praxec_core::discovery::BLESSED_SUBJECT_ROOTS;
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Names of every required rule, in spec order. Exposed publicly so the
 /// rules-self-check test can iterate the closed set without depending on

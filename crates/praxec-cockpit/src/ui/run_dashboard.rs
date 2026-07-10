@@ -14,11 +14,11 @@ use crate::theme;
 use crate::view::{
     ExecutorKind, Hitl, MissionView, NodeRole, NodeState, Speaker, TaskNode, Verdict,
 };
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
-use ratatui::Frame;
 
 const STATUS_COL: usize = 26;
 
@@ -479,8 +479,8 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::view::MissionView;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn render_to_string(app: &App) -> String {
         let backend = TestBackend::new(120, 28);

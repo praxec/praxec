@@ -34,6 +34,22 @@
       },
       "default": {}
     },
+    "stagedConnections": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/connection"
+      },
+      "default": {},
+      "description": "SPEC §9.5 — operator-staged, not-yet-granted connections (written by `px connections add`). Same entry shape as `connections:`, but a staged connection is INERT: it is never in the live `/connections` registry until its name is listed in the top-level `grant_connections:`. Ungranted staged entries are diverted to `/praxec/_ungrantedConnections` at load, so a spawn attempt fails typed with the grant remedy — treated identically to a pack-declared, ungranted connection."
+    },
+    "grant_connections": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "SPEC §9.5 — the names of `stagedConnections:` entries the operator has GRANTED (via `px connections grant <name>`). On load, each granted staged body is promoted into the live `/connections` registry. Granting a name with no staged entry fails at load (STALE_CONNECTION_GRANT). This is the host-level analog of a `repos:` entry's `grant_connections:`."
+    },
     "proxy": {
       "$ref": "#/$defs/proxyConfig"
     },
@@ -63,6 +79,12 @@
     },
     "embeddings": {
       "$ref": "#/$defs/embeddingsConfig"
+    },
+    "schemas": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {},
+      "description": "Spec A.1 §4.2 — SchemaBound inner-schema registry. Each key is a (repo-namespaced) name; each value is a JSON Schema that a `finding.fix` SchemaBound `value` is validated against (the one v1 extension point). Every statically-referenced `schema_ref` must resolve at config load (closed-world, V24); every entry must compile. Stamped onto each workflow snapshot as `_schemasRegistry` for the runtime blackboard-write seam."
     },
     "skills": {
       "type": "object",
@@ -96,6 +118,14 @@
           "path": {
             "type": "string",
             "description": "Directory containing a `praxec.repo.yaml` manifest. Accepts absolute, relative (resolved against the host config's directory), or `~/`-prefixed paths."
+          },
+          "grant_connections": {
+            "type": "array",
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "description": "SPEC §9.5 — operator grant for this repo's declared connections. A pack may DECLARE `connections:`, but a declared connection only goes live when its name (bare pack-local, or fully-qualified `<namespace>/<name>`) is listed here. Ungranted declarations are diverted to `/praxec/_ungrantedConnections` and are never spawnable. Granting a connection the repo does not declare fails at load (STALE_CONNECTION_GRANT)."
           }
         }
       },
@@ -611,6 +641,40 @@
           "default": "experimental",
           "description": "SPEC \u00a76.2 \u2014 workflow lifecycle. Capabilities default to `experimental`; declaring `stable` is what makes `expects_contract_hash` mandatory on callers (V16, PR3)."
         },
+        "stack": {
+          "description": "Spec A \u00a75.1 \u2014 the resolution descriptor this workflow's `hop_slot:` transitions resolve against. Either a plain string (language-only, e.g. `rust`) or an object `{ language, frameworks, primary_framework, project }`. At config load each `hop_slot: <slot>` walks the specificity chain most-specific-first \u2014 `cap.<slot>.<project>` \u2192 `cap.<slot>.<primary_framework>` \u2192 `cap.<slot>.<language>` \u2192 `cap.<slot>.generic` \u2014 first match wins. `frameworks:` is accepted (additive-knowledge composition, Spec A \u00a75.2) but only `primary_framework` participates in override-resolution. Absent \u2192 `generic`.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "language": {
+                  "type": "string",
+                  "description": "The language link (the least-specific non-generic level)."
+                },
+                "frameworks": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "default": [],
+                  "description": "The set of frameworks in play. Additive-knowledge composition (detect rulesets, lenses) is a later concern; these do NOT drive override-resolution."
+                },
+                "primary_framework": {
+                  "type": "string",
+                  "description": "The one framework that governs the override slots (scaffold template, verify/lint command). Layers above `language` in resolution."
+                },
+                "project": {
+                  "type": "string",
+                  "description": "The project name \u2014 the most-specific resolution level, above `primary_framework`."
+                }
+              }
+            }
+          ]
+        },
         "initialState": {
           "type": "string"
         },
@@ -768,6 +832,17 @@
         "inputSchema": {
           "$ref": "#/$defs/jsonSchema"
         },
+        "hop_slot": {
+          "type": "string",
+          "enum": [
+            "verify",
+            "detect",
+            "scaffold",
+            "implement",
+            "lint_format"
+          ],
+          "description": "Specialization-slot marker (Spec A §3). At config load the engine injects this slot's canonical `In` contract as the transition `inputSchema` and its `Out` contract as the `$.context.<name>` typed blackboard slot, both by `$ref` into the shipped HOP vocabulary (praxec://hop). The concrete `cap.<name>.<stack>` resolution is layered separately."
+        },
         "guards": {
           "type": "array",
           "items": {
@@ -880,7 +955,8 @@
             "dry_run",
             "structural_analysis",
             "ingest",
-            "diff"
+            "diff",
+            "tool_source"
           ]
         },
         "connection": {

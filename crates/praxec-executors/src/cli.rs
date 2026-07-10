@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::process::Command;
 use uuid::Uuid;
 
@@ -14,6 +14,11 @@ use uuid::Uuid;
 #[derive(Default, Clone)]
 pub struct CliConnections {
     inner: HashMap<String, CliConnection>,
+    /// SPEC §9.5 — pack-declared connections the operator has not granted
+    /// (from `/praxec/_ungrantedConnections`). Never spawnable; a reference
+    /// fails typed with the grant remedy, even when an inline `command` would
+    /// otherwise let execution proceed (no silent fallback).
+    ungranted: HashMap<String, crate::conn_util::UngrantedConnection>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,7 +55,10 @@ impl CliConnections {
                 }
             }
         }
-        Self { inner }
+        Self {
+            inner,
+            ungranted: crate::conn_util::ungranted_from_config(config),
+        }
     }
 }
 
@@ -72,6 +80,19 @@ impl Executor for CliExecutor {
         // Resolve command + working dir + env from either the connection or inline overrides.
         let connection_name = cfg.get("connection").and_then(Value::as_str);
         let connection = connection_name.and_then(|n| self.connections.inner.get(n));
+        // SPEC §9.5 — an UNGRANTED pack connection fails typed here, BEFORE the
+        // inline-command fallback below could silently proceed without the
+        // connection's env/working-directory: no fallback across the trust
+        // boundary.
+        if let (Some(name), None) = (connection_name, connection) {
+            if self.connections.ungranted.contains_key(name) {
+                return Err(crate::conn_util::connection_not_found_error(
+                    "cli",
+                    name,
+                    &self.connections.ungranted,
+                ));
+            }
+        }
 
         let command = cfg
             .get("command")

@@ -10,7 +10,7 @@ use praxec_core::audit::{AuditEvent, AuditSink};
 use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::Executor;
 use praxec_executors::HumanExecutor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// An audit sink whose `record` always fails — exercises the swallow path.
 struct FailingAuditSink;
@@ -58,10 +58,12 @@ async fn audit_failure_is_swallowed_and_request_still_queued() {
         .expect("a failing audit sink must NOT fail the human step");
     assert_eq!(result.output["status"], json!("queued"));
     assert_eq!(result.output["queue"], json!("approvals"));
-    assert!(result.output["requestId"]
-        .as_str()
-        .unwrap()
-        .starts_with("hr_"));
+    assert!(
+        result.output["requestId"]
+            .as_str()
+            .unwrap()
+            .starts_with("hr_")
+    );
 }
 
 #[tokio::test]

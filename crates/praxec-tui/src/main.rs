@@ -23,8 +23,8 @@ mod theme;
 // praxec_mcp) lives in src/lib.rs so integration tests + the
 // sub-agent spawner can reach them.
 use praxec_core::model_resolver::{
-    validate_model_source_exclusivity, verify_all_primary_bindings, ConfigSource, ModelsFile,
-    Resolver,
+    ConfigSource, ModelsFile, Resolver, validate_model_source_exclusivity,
+    verify_all_primary_bindings,
 };
 use praxec_tui::interpreter::{
     AgentRegistry, LegacyAgentRegistry, McpToolCaller, YamlAgentRegistry,
@@ -570,7 +570,7 @@ async fn run_tui() -> Result<ExitCode> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("praxec"));
     let acp_command = format!("{} acp", exe.display());
 
-    let mut state: RuntimeState = RuntimeState::new(&acp_command)
+    let mut state: RuntimeState = RuntimeState::new(&acp_command, Default::default())
         .await
         .map_err(|e| anyhow::anyhow!("TUI initialization failed: {e}"))?;
 
@@ -595,10 +595,10 @@ async fn run_tui() -> Result<ExitCode> {
 ///
 /// Exposed as a free function so tests can exercise it directly.
 pub fn resolve_log_dir() -> PathBuf {
-    if let Ok(override_path) = std::env::var("PRAXEC_LOG_DIR") {
-        if !override_path.trim().is_empty() {
-            return PathBuf::from(override_path);
-        }
+    if let Ok(override_path) = std::env::var("PRAXEC_LOG_DIR")
+        && !override_path.trim().is_empty()
+    {
+        return PathBuf::from(override_path);
     }
     match dirs::home_dir() {
         Some(home) => home.join(".praxec").join("logs"),

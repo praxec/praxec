@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::doctor_probe_cache::{
-    self, default_cache_path, read_cache, refresh_cache, write_cache, ProbeCache, ProbeStatus,
+    self, ProbeCache, ProbeStatus, default_cache_path, read_cache, refresh_cache, write_cache,
 };
 use crate::praxec_mcp::find_praxec_binary;
 use praxec_core::model_resolver::{ConfigSource, ModelRef, ModelsFile, Resolver};
@@ -245,31 +245,31 @@ pub async fn run_doctor(args: &DoctorArgs) -> Vec<CheckResult> {
     }
 
     // 6. Script URIs (file:// only — https / git+https are load-time fetched)
-    if let Some(cfg) = &resolved_config {
-        if let Some(scripts) = cfg.pointer("/scripts").and_then(Value::as_object) {
-            let mut missing: Vec<String> = Vec::new();
-            for (subject, decl) in scripts {
-                let Some(uri) = decl.get("uri").and_then(Value::as_str) else {
-                    continue; // inline body, nothing to check
-                };
-                if let Some(path) = uri.strip_prefix("file://") {
-                    if !Path::new(path).exists() {
-                        missing.push(format!("{subject}: {uri}"));
-                    }
-                }
+    if let Some(cfg) = &resolved_config
+        && let Some(scripts) = cfg.pointer("/scripts").and_then(Value::as_object)
+    {
+        let mut missing: Vec<String> = Vec::new();
+        for (subject, decl) in scripts {
+            let Some(uri) = decl.get("uri").and_then(Value::as_str) else {
+                continue; // inline body, nothing to check
+            };
+            if let Some(path) = uri.strip_prefix("file://")
+                && !Path::new(path).exists()
+            {
+                missing.push(format!("{subject}: {uri}"));
             }
-            if missing.is_empty() {
-                results.push(CheckResult::pass(
-                    "script file:// URIs",
-                    format!("{} script(s) verified", scripts.len()),
-                ));
-            } else {
-                results.push(CheckResult::fail(
-                    "script file:// URIs",
-                    "SCRIPT_URI_MISSING",
-                    format!("missing files: {}", missing.join(", ")),
-                ));
-            }
+        }
+        if missing.is_empty() {
+            results.push(CheckResult::pass(
+                "script file:// URIs",
+                format!("{} script(s) verified", scripts.len()),
+            ));
+        } else {
+            results.push(CheckResult::fail(
+                "script file:// URIs",
+                "SCRIPT_URI_MISSING",
+                format!("missing files: {}", missing.join(", ")),
+            ));
         }
     }
 
@@ -758,7 +758,7 @@ fn atty_stdout() -> bool {
 }
 
 // Tiny FFI shim to avoid pulling in the `libc` crate just for this.
-extern "C" {
+unsafe extern "C" {
     fn isatty(fd: i32) -> i32;
 }
 fn libc_isatty(fd: i32) -> bool {

@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Apply an output-mapping object to the workflow's context.
 ///

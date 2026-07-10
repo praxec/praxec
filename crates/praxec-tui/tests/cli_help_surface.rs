@@ -16,7 +16,7 @@ fn completions_bash_emits_nonempty_script_with_command_name() {
     assert!(
         stdout.contains("px"),
         "expected completion script to reference the 'px' binary; got first 200 chars:\n{}",
-        &stdout.chars().take(200).collect::<String>()
+        stdout.chars().take(200).collect::<String>()
     );
 }
 
@@ -77,7 +77,7 @@ fn man_emits_roff_document() {
     assert!(
         stdout.starts_with(".TH") || stdout.contains("\n.TH"),
         "expected roff `.TH` header; got first 200 chars:\n{}",
-        &stdout.chars().take(200).collect::<String>()
+        stdout.chars().take(200).collect::<String>()
     );
 }
 

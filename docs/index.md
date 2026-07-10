@@ -14,6 +14,7 @@ far as you need.
 | Reach a tool / CLI / API | [Connections](guides/connections.md) |
 | Add guards, approvals, the trust model | [Governance](reference/governance.md) |
 | Steer an LLM that authors transitions | [LLM authoring guidance](guides/llm-guidance.md) |
+| Run agents in a workflow (models + keys) | [Agents & models](guides/agents-and-models.md) |
 | Check a workflow is sound | [Checking workflows](guides/checking-workflows.md) |
 | Compose many configs at scale | [MCP control architecture](architecture/mcp-control-architecture.md) |
 | Embed the crates as a library | [Embedding](guides/embeddings.md) |
@@ -27,6 +28,7 @@ Task-oriented how-tos. Concrete, shallow, safe to skim.
 - [Connections](guides/connections.md) — wire MCP / CLI / REST downstream services
 - [Embeddings](guides/embeddings.md) — embed the gateway crates in your own binary
 - [LLM authoring guidance](guides/llm-guidance.md) — prefill, phase guidance, authoring patterns
+- [Agents & models](guides/agents-and-models.md) — `models.yaml`, provider keys, `orchestrate` vs `auto_drive`
 - [Checking workflows](guides/checking-workflows.md) — `praxec fuzz` / `praxec test`
 - [TUI agent](guides/tui-agent.md) — the interactive agentic runtime
 

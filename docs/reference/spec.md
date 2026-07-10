@@ -156,7 +156,7 @@ small object with bounded fields; no body content appears in the listing.
 
 - **`subject`** — the fragment's `skills:` map key; also the `praxec.query({subject})`
   lookup handle (see §32). Required.
-- **`verb`** — one of eight closed cognitive operations (see below). Required.
+- **`verb`** — one of ten closed cognitive operations (see below). Required.
 - **`hash`** — `sha256:` prefix + hex digest of the **normalized** body (see
   §5.7). Required. Enables cache invalidation: when the body is edited, the
   hash flips; previously-cached refs are stale.
@@ -594,7 +594,7 @@ The request schemas (tool argument shapes) remain Rust-first in
 | Check | Level |
 |---|---|
 | `skills:` ref resolves to a declared fragment | error |
-| `verb` is one of the eight closed cognitive verbs (§5.4.1) | error (load-time) |
+| `verb` is one of the ten closed cognitive verbs (§5.4.1) | error (load-time) |
 | `subject` matches `^[a-z][a-z0-9-]+(\.[a-z][a-z0-9-]+)+$` | error (load-time) |
 | `subject` first segment is a blessed root (§5.4.2) | error if `strict_namespacing: true` (default); warn otherwise |
 | `lifecycle` is one of `experimental`/`stable`/`deprecated` | error (load-time) |
@@ -653,7 +653,7 @@ unless the ref's `hash` differs (cache invalidation, §5.7).
 |---|---|
 | `RECORD_WRITE_FAILED` | transition record not durably written — transition aborts |
 | `BLACKBOARD_TYPE_ERROR` | typed-slot write violates schema |
-| `INVALID_VERB` | `verb` field not in the closed eight (§5.4.1); payload includes `allowed` list |
+| `INVALID_VERB` | `verb` field not in the closed ten (§5.4.1); payload includes `allowed` list |
 | `MISSING_VERB` | `verb` field absent from a fragment declaration |
 | `INVALID_SUBJECT_ROOT` | first segment of `subject` not blessed; raised under `strict_namespacing: true` |
 | `EMPTY_SUBJECT` | `subject` string is empty after trim |
@@ -864,7 +864,7 @@ same pattern.
 ### 19.3 Verb synonym mapping
 
 A small built-in synonym table maps common external verbs to the closed
-eight (§5.4.1). Mappings emit a `VERB_MAPPED` info diagnostic so the
+ten (§5.4.1). Mappings emit a `VERB_MAPPED` info diagnostic so the
 author can audit the rename:
 
 | External verb | Mapped to |
@@ -878,7 +878,7 @@ author can audit the rename:
 | `prioritize`, `classify`, `route` | `triage` |
 | `design`, `spec`, `plan` | `plan` |
 
-A source-side verb that's already in the closed eight passes through with
+A source-side verb that's already in the closed ten passes through with
 no `VERB_MAPPED` diagnostic. A source-side verb absent from both the closed
 set and the synonym table fails with `INGEST_INVALID_VERB`.
 
@@ -887,7 +887,7 @@ set and the synonym table fails with `INGEST_INVALID_VERB`.
 | Code | When |
 |---|---|
 | `INGEST_CANNOT_INFER_SUBJECT` | no `subject` argument and source path doesn't yield one |
-| `INGEST_INVALID_VERB` | source verb is neither in closed eight nor in synonym table |
+| `INGEST_INVALID_VERB` | source verb is neither in closed ten nor in synonym table |
 | `INGEST_SUBJECT_COLLISION` | proposed subject already exists in the live skill library |
 | `INGEST_EMPTY_BODY` | source has no body content after frontmatter strip |
 
@@ -1228,7 +1228,7 @@ subject, and vice versa.
 
 | Code | When |
 |---|---|
-| `INVALID_SCRIPT_VERB` | `verb` field not in the closed eight |
+| `INVALID_SCRIPT_VERB` | `verb` field not in the closed twelve |
 | `MISSING_SCRIPT_VERB` | `verb` field absent |
 | `INVALID_SCRIPT_SUBJECT_ROOT` | First segment not blessed; raised under `strict_namespacing: true` |
 | `EMPTY_SCRIPT_SUBJECT` | `subject` empty after trim |
@@ -2029,7 +2029,7 @@ A self-loop `actor: human` transition gives the same effect as a
 "human.ask" tool would, AND:
 
 - reuses existing transition machinery (validation, audit, reliability)
-- reuses existing seven-tool MCP surface (no STABILITY commitment to an 8th tool)
+- reuses existing two-tool MCP surface (no STABILITY commitment to a third tool)
 - inherits existing `actor: human` gating (only humans can submit)
 - inherits existing `inputSchema`/`outputSchema` (questions arrive typed)
 - inherits existing timeout machinery (`definition.timeoutMs` + `onTimeout`)

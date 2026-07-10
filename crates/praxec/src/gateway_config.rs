@@ -4,14 +4,16 @@
 //! `gateway.rs` via StructureOS `propose_decomposition` + `move` (#25).
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde_json::Value;
 
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{
-    AuditSink, FileAuditSink, MemoryAuditSink, NullAuditSink, RotationInterval, StderrAuditSink,
+    AuditRetention, AuditSink, FileAuditSink, MemoryAuditSink, NullAuditSink, RotationInterval,
+    StderrAuditSink,
 };
 use praxec_core::ports::{
     EvidenceStore, ExecutorRegistry, GuidanceAcknowledgmentStore, ScriptAcknowledgmentStore,
@@ -23,15 +25,14 @@ use praxec_core::store::{
 };
 use praxec_core::store_file::FileWorkflowStore;
 use praxec_core::store_sqlite::SqliteWorkflowStore;
-use praxec_core::WorkflowRuntime;
 
 use crate::gateway::{DiagnosticProvider, OverlayRegistrar};
 
 // llm_overlay_registrar (gated on the optional llm-executor dep/feature).
 #[cfg(feature = "llm-executor")]
-use praxec_core::ports::Executor;
-#[cfg(feature = "llm-executor")]
 use praxec_core::SingleKindOverlay;
+#[cfg(feature = "llm-executor")]
+use praxec_core::ports::Executor;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -62,6 +63,16 @@ pub(crate) enum Command {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// P15 — preflight this machine for a config: is every provider key the
+    /// config's models reference resolvable (env / providers.env), and is every
+    /// `kind: mcp` connection binary on PATH? Missing credentials fail (exit
+    /// non-zero — nothing agentic could run); missing tools are warnings (they
+    /// fail loud at invocation and only affect the steps that use them).
+    Doctor {
+        /// Path to the gateway YAML config.
+        #[arg(short, long)]
+        config: PathBuf,
+    },
     /// Print a JSON health snapshot: connections, repos, definition_count, store.
     Health {
         #[arg(short, long)]
@@ -70,6 +81,19 @@ pub(crate) enum Command {
     Observe {
         #[arg(short, long)]
         config: PathBuf,
+        /// Stream events live: replay the audit dir (from the start, or
+        /// `--since`), then poll for newly-appended lines and per-writer files.
+        /// Emits each event as one structured JSON line so a client can
+        /// reconstruct the execution tree from
+        /// `workflow_id` + `parent_workflow_id` + `depth`. Requires
+        /// `audit.sink: file` (fails fast otherwise — a non-file sink would tail
+        /// nothing).
+        #[arg(long)]
+        follow: bool,
+        /// With `--follow`, only replay events at/after this instant
+        /// (RFC3339 or `YYYY-MM-DD`) before switching to live polling.
+        #[arg(long)]
+        since: Option<String>,
     },
     /// Rewrite legacy guards in the config file in place: every
     /// `kind: jsonpath` becomes `kind: expr` (a string replace over the
@@ -191,6 +215,93 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: IntentCommand,
     },
+    /// Print the generated JSON Schema for a public wire type (code-first:
+    /// the Rust struct is canonical; the schema is derived from it).
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+    /// Manage the config's top-level `connections:` block.
+    Connections {
+        #[command(subcommand)]
+        command: ConnectionsCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum SchemaCommand {
+    /// The structured audit event — the element type of the on-disk audit
+    /// trail, `praxec observe --follow`, and the MCP `praxec.query
+    /// { observe: true }` read. Includes the execution-tree linkage fields
+    /// (`workflow_id`, `parent_workflow_id`, `depth`).
+    AuditEvent,
+}
+
+/// D4a — the connection kind the operator names on `connections add --kind`.
+/// A CLI-local mirror of [`praxec_executors::conn_write::ConnectionKind`] so the
+/// clap surface stays typed (exhaustive `--kind` validation) without pulling
+/// clap into the executors crate.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "lowercase")]
+pub(crate) enum CliConnectionKind {
+    Mcp,
+    Cli,
+    Rest,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ConnectionsCommand {
+    /// D4a — STAGE a new connection (ungranted) under `stagedConnections:`. This
+    /// writes ONLY the connection body; it does NOT grant. A staged connection is
+    /// inert — never in the live `/connections` registry — and is treated exactly
+    /// like a pack-declared, not-yet-granted connection: any spawn attempt fails
+    /// typed with the grant remedy. Granting is the separate, explicit
+    /// `connections grant` act, so a non-human running `add` cannot silently
+    /// obtain a trusted connection. Fail-fast on a duplicate name, an invalid
+    /// kind/field combination, or an unwritable config — never a silent overwrite.
+    Add {
+        /// Path to the gateway YAML config to edit in place.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The connection name, referenced by `executor.connection:`. Must be
+        /// unique in the config and must not contain '/'.
+        name: String,
+        /// The connection kind.
+        #[arg(long, value_enum)]
+        kind: CliConnectionKind,
+        /// Command to spawn — an mcp stdio server, or the cli command. (mcp/cli)
+        #[arg(long)]
+        command: Option<String>,
+        /// A single command argument; repeat for each. (mcp) MCP server args
+        /// often begin with '-' (e.g. `-y`), so hyphen-leading values are
+        /// accepted here.
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Endpoint URL — an mcp streamable-http server, or the rest base URL. (mcp/rest)
+        #[arg(long)]
+        url: Option<String>,
+        /// Working directory for the command. (cli)
+        #[arg(long)]
+        working_directory: Option<String>,
+        /// An environment entry `KEY=VALUE`; repeat for each. (mcp/cli)
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// A request header `Name: value` (or `Name=value`); repeat for each. (rest)
+        #[arg(long = "header")]
+        headers: Vec<String>,
+    },
+    /// D4a — GRANT a previously-staged connection: the separate, explicit,
+    /// auditable operator trust act. Adds the name to the top-level
+    /// `grant_connections:` list so the config-load gate promotes the staged body
+    /// into the live `/connections` registry, and records a `connections.granted`
+    /// audit event. Fail-fast if the name is not staged or is already granted.
+    Grant {
+        /// Path to the gateway YAML config to edit in place.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The staged connection to grant.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -226,6 +337,21 @@ pub(crate) enum ApprovalsCommand {
         /// Resolution outcome (approved | rejected).
         #[arg(short, long, default_value = "approved")]
         outcome: String,
+    },
+    /// P12 R1.4 — resume a parked agent `await_human` session: deliver the
+    /// human's reply to the exact parked frame by re-submitting the parked
+    /// transition (as a human principal) with `arguments.reply`. The resumed
+    /// agent continues from the awaited turn and the workflow advances on its
+    /// result. Requires `store.kind: sqlite` and a stored audit sink.
+    Resume {
+        /// Path to the gateway YAML config.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The parked session's correlation id (see `approvals list`).
+        id: String,
+        /// The human's reply to the agent's `await_human` prompt.
+        #[arg(short, long)]
+        reply: String,
     },
     /// Tail the audit log for new approval requests.
     Tail {
@@ -389,7 +515,7 @@ pub fn collect_diagnostics_with(
     diagnostics.extend(praxec_executors::kind_doctor::doctor_check(config));
     #[cfg(feature = "llm-executor")]
     {
-        use crate::affinity_resolver::{resolve_affinity_to_model, AgentsYamlAffinityResolver};
+        use crate::affinity_resolver::{AgentsYamlAffinityResolver, resolve_affinity_to_model};
 
         let today = chrono::Utc::now().date_naive();
 
@@ -743,11 +869,51 @@ pub fn build_script_ack_store(
     }
 }
 
+/// Build the parked-agent-session store from `config` (P12 R1.4 — the durable
+/// half of agent `await_human` suspend/resume). The only durable backend is
+/// `store.kind=sqlite` (a `parked_agent_sessions` table coexisting in the same
+/// DB file as the workflow store — a parked conversation must survive a power
+/// cycle). `memory`/`file` get `None`: the runner then fails fast on any
+/// `await_enabled` session (AGENT_AWAIT_UNSUPPORTED) rather than parking a
+/// frame that a restart would lose. An unknown kind fails fast, mirroring
+/// [`build_workflow_store`].
+pub fn build_parked_session_store(
+    config: &Value,
+) -> anyhow::Result<Option<Arc<dyn praxec_core::ports::ParkedSessionStore>>> {
+    let kind = config
+        .pointer("/store/kind")
+        .and_then(Value::as_str)
+        .unwrap_or("memory");
+    let path = config.pointer("/store/path").and_then(Value::as_str);
+
+    match kind {
+        "sqlite" => {
+            let path = path
+                .ok_or_else(|| anyhow::anyhow!("store.path is required when store.kind=sqlite"))?;
+            Ok(Some(Arc::new(
+                praxec_core::store::SqliteParkedSessionStore::open(path)?,
+            )))
+        }
+        "memory" | "file" => Ok(None),
+        other => anyhow::bail!("unknown store kind '{other}'"),
+    }
+}
+
 pub(crate) fn build_audit_sink(config: &Value) -> anyhow::Result<Arc<dyn AuditSink>> {
     let sink_kind = config
         .pointer("/audit/sink")
         .and_then(Value::as_str)
         .unwrap_or("stderr");
+
+    // Poka-yoke: `audit.retention` prunes rotated files in `audit.path`, which
+    // only the file sink writes. On any other sink it would be a silent no-op
+    // knob — reject the config instead.
+    if sink_kind != "file" && config.pointer("/audit/retention").is_some() {
+        anyhow::bail!(
+            "audit.retention requires `audit.sink: file` (current: `{sink_kind}`) — \
+             retention prunes rotated files in audit.path, which only the file sink writes"
+        );
+    }
 
     let sink: Arc<dyn AuditSink> = match sink_kind {
         "stderr" => Arc::new(StderrAuditSink),
@@ -758,8 +924,12 @@ pub(crate) fn build_audit_sink(config: &Value) -> anyhow::Result<Arc<dyn AuditSi
                 .pointer("/audit/path")
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow::anyhow!("audit.path is required when audit.sink=file"))?;
-            let rotation = parse_rotation_interval(config);
-            Arc::new(FileAuditSink::new(path, rotation))
+            let rotation = parse_rotation_interval(config)?;
+            let mut sink = FileAuditSink::new(path, rotation);
+            if let Some(retention) = parse_audit_retention(config)? {
+                sink = sink.with_retention(retention);
+            }
+            Arc::new(sink)
         }
         other => anyhow::bail!(
             "unknown audit sink '{other}' — valid values are: stderr, memory, file, none"
@@ -768,16 +938,197 @@ pub(crate) fn build_audit_sink(config: &Value) -> anyhow::Result<Arc<dyn AuditSi
     Ok(sink)
 }
 
-/// Parse `audit.rotation` from config; defaults to `Daily` when absent or
-/// unrecognized.
-pub(crate) fn parse_rotation_interval(config: &Value) -> RotationInterval {
-    match config
-        .pointer("/audit/rotation")
-        .and_then(Value::as_str)
-        .unwrap_or("daily")
-    {
-        "hourly" => RotationInterval::Hourly,
-        "weekly" => RotationInterval::Weekly,
-        _ => RotationInterval::Daily,
+/// Parse `audit.rotation` from config; defaults to `Daily` when absent.
+/// Accepts `"daily"` / `"hourly"` / `"weekly"` or the sub-daily granule
+/// object `{ minutes: <1..=1440> }`. An unrecognized value is a config
+/// ERROR (fail-fast) — it must not silently degrade to daily.
+pub(crate) fn parse_rotation_interval(config: &Value) -> anyhow::Result<RotationInterval> {
+    let Some(raw) = config.pointer("/audit/rotation") else {
+        return Ok(RotationInterval::Daily);
+    };
+    let interval: RotationInterval = serde_json::from_value(raw.clone()).map_err(|e| {
+        anyhow::anyhow!(
+            "invalid audit.rotation {raw}: {e} — valid values: \"daily\", \"hourly\", \
+             \"weekly\", or {{ minutes: <1..=1440> }}"
+        )
+    })?;
+    if let RotationInterval::Minutes(m) = interval {
+        anyhow::ensure!(
+            m.get() <= 1440,
+            "audit.rotation minutes must be 1..=1440 (got {m}); use daily/weekly for \
+             coarser granules"
+        );
+    }
+    Ok(interval)
+}
+
+/// Parse the opt-in `audit.retention` block (`{ keep_for_hours: <hours ≥ 1> }`).
+/// Absent → `None` (nothing is ever deleted). Unknown keys or a zero window
+/// are config ERRORS — a typo'd retention block must not silently keep
+/// everything forever.
+pub(crate) fn parse_audit_retention(config: &Value) -> anyhow::Result<Option<AuditRetention>> {
+    let Some(raw) = config.pointer("/audit/retention") else {
+        return Ok(None);
+    };
+    let retention: AuditRetention = serde_json::from_value(raw.clone()).map_err(|e| {
+        anyhow::anyhow!(
+            "invalid audit.retention {raw}: {e} — expected {{ keep_for_hours: <hours ≥ 1> }}"
+        )
+    })?;
+    Ok(Some(retention))
+}
+
+#[cfg(test)]
+mod audit_config_tests {
+    use super::{build_audit_sink, parse_audit_retention, parse_rotation_interval};
+    use praxec_core::audit::RotationInterval;
+    use serde_json::json;
+
+    #[test]
+    fn rotation_defaults_to_daily_and_parses_named_granules() {
+        assert_eq!(
+            parse_rotation_interval(&json!({})).unwrap(),
+            RotationInterval::Daily
+        );
+        assert_eq!(
+            parse_rotation_interval(&json!({ "audit": { "rotation": "hourly" } })).unwrap(),
+            RotationInterval::Hourly
+        );
+        assert_eq!(
+            parse_rotation_interval(&json!({ "audit": { "rotation": "weekly" } })).unwrap(),
+            RotationInterval::Weekly
+        );
+    }
+
+    #[test]
+    fn rotation_parses_sub_daily_minutes_granule() {
+        let interval =
+            parse_rotation_interval(&json!({ "audit": { "rotation": { "minutes": 5 } } }))
+                .expect("minutes granule parses");
+        assert_eq!(
+            interval,
+            RotationInterval::Minutes(std::num::NonZeroU32::new(5).unwrap())
+        );
+    }
+
+    /// Fail-fast: an unrecognized/invalid rotation is a config ERROR, not a
+    /// silent fall-through to daily (a typo'd granule must be visible).
+    #[test]
+    fn rotation_rejects_invalid_values_loudly() {
+        for bad in [
+            json!({ "audit": { "rotation": "fortnightly" } }),
+            json!({ "audit": { "rotation": { "minutes": 0 } } }),
+            json!({ "audit": { "rotation": { "minutes": 2000 } } }),
+        ] {
+            let err = parse_rotation_interval(&bad).expect_err("invalid rotation must error");
+            assert!(
+                err.to_string().contains("audit.rotation"),
+                "message names the config key: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_is_opt_in_and_rejects_typos() {
+        assert_eq!(parse_audit_retention(&json!({})).unwrap(), None);
+        let retention =
+            parse_audit_retention(&json!({ "audit": { "retention": { "keep_for_hours": 72 } } }))
+                .expect("valid retention parses")
+                .expect("present");
+        assert_eq!(retention.keep_for_hours.get(), 72);
+
+        // Unknown keys and a zero window are errors — a typo'd block must not
+        // silently keep everything forever.
+        for bad in [
+            json!({ "audit": { "retention": { "keep_files": 5 } } }),
+            json!({ "audit": { "retention": { "keep_for_hours": 0 } } }),
+        ] {
+            assert!(parse_audit_retention(&bad).is_err(), "must reject: {bad}");
+        }
+    }
+
+    /// Poka-yoke: `audit.retention` on a non-file sink is a dead knob — the
+    /// config is rejected instead of the retention silently never running.
+    #[test]
+    fn retention_on_non_file_sink_is_rejected() {
+        let cfg = json!({ "audit": { "sink": "stderr", "retention": { "keep_for_hours": 24 } } });
+        let err = match build_audit_sink(&cfg) {
+            Ok(_) => panic!("retention on a non-file sink must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("audit.retention"),
+            "message names the offending key: {err}"
+        );
+    }
+
+    /// The file sink builds with rotation granule + retention wired through.
+    #[test]
+    fn file_sink_builds_with_minutes_granule_and_retention() {
+        let cfg = json!({
+            "audit": {
+                "sink": "file",
+                "path": "/tmp/praxec-audit-test",
+                "rotation": { "minutes": 15 },
+                "retention": { "keep_for_hours": 48 }
+            }
+        });
+        let sink = build_audit_sink(&cfg).expect("file sink builds");
+        assert_eq!(sink.sink_kind(), "file");
+    }
+}
+
+#[cfg(test)]
+mod parked_store_wiring_tests {
+    use super::build_parked_session_store;
+    use praxec_core::model::ParkedAgentSession;
+    use serde_json::json;
+
+    /// P12 R1.4 wiring — `store.kind: sqlite` yields a REAL durable parked
+    /// store on the same DB path the workflow store uses, and it round-trips
+    /// a parked session (the bin-path integration assert).
+    #[tokio::test]
+    async fn sqlite_store_kind_wires_a_working_parked_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("praxec.db");
+        let cfg = json!({ "store": { "kind": "sqlite", "path": db.to_str().unwrap() } });
+        let store = build_parked_session_store(&cfg)
+            .expect("sqlite parked store builds")
+            .expect("sqlite yields Some(store)");
+        store
+            .park(ParkedAgentSession {
+                correlation_id: "corr-wire".into(),
+                prompt: "ship it?".into(),
+                session: json!({}),
+                conversation: json!({}),
+                parked_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("park persists");
+        let listed = store.list().await.expect("list works");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].correlation_id, "corr-wire");
+        assert_eq!(listed[0].prompt, "ship it?");
+    }
+
+    /// `memory`/`file` stores are non-durable → no parked store (the runner
+    /// then fails fast on `await_enabled` instead of parking losable frames).
+    #[test]
+    fn non_durable_store_kinds_yield_no_parked_store() {
+        let mem = json!({ "store": { "kind": "memory" } });
+        assert!(build_parked_session_store(&mem).unwrap().is_none());
+        let file = json!({ "store": { "kind": "file", "path": "/tmp/x" } });
+        assert!(build_parked_session_store(&file).unwrap().is_none());
+    }
+
+    /// sqlite without a path fails fast (mirrors `build_workflow_store`).
+    #[test]
+    fn sqlite_without_a_path_fails_fast() {
+        let cfg = json!({ "store": { "kind": "sqlite" } });
+        let err = match build_parked_session_store(&cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("sqlite without a path must fail fast"),
+        };
+        assert!(err.to_string().contains("store.path is required"));
     }
 }

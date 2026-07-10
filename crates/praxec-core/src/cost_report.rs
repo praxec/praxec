@@ -1,7 +1,8 @@
 //! The **value-prop savings report** — aggregates the realized cost telemetry
 //! that the agent auto-drive path now records on each `agent.completed` audit
-//! event ({model, prompt_tokens, completion_tokens, cost_usd}) into a per-run /
-//! cross-run cost picture, and computes the **counterfactual**: what the same
+//! event ({affinity, duration_ms, model, prompt_tokens, completion_tokens,
+//! cost_usd}) into a per-run / cross-run cost picture, and computes the
+//! **counterfactual**: what the same
 //! realized tokens *would* have cost at the most-capable ("ceiling") catalog
 //! model. The headline is "saved Z% vs ceiling" — the evidence that justifies
 //! the chosen base model and that the de-escalation loop consumes.
@@ -16,7 +17,7 @@
 //! never a panic), in line with the runtime leaving `cost_usd: null`.
 
 use crate::audit::AuditEvent;
-use crate::model_catalog::{cost_usd_in, ModelEntry};
+use crate::model_catalog::{ModelEntry, cost_usd_in};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -26,6 +27,12 @@ use std::fmt::Write as _;
 
 /// The audit event type that carries per-agent-step cost telemetry.
 pub const AGENT_COMPLETED: &str = "agent.completed";
+
+/// The start-of-step event; carries the affinity the agent was resolved under.
+/// Older `agent.completed` events don't self-carry `affinity`, so the report
+/// joins it from here via the shared `correlation_id` (same join the
+/// de-escalation loop uses).
+pub const AGENT_INVOKED: &str = "agent.invoked";
 
 /// Scoping for the report: restrict to one workflow run and/or a time window.
 #[derive(Debug, Clone, Default)]
@@ -43,6 +50,8 @@ pub struct GroupCost {
     pub runs: usize,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Summed wall-clock duration across the runs in this group.
+    pub duration_ms: u64,
     /// Summed realized USD across the priced runs in this group.
     pub cost_usd: f64,
     /// Runs in this group whose model wasn't catalogued (cost unknown).
@@ -75,12 +84,18 @@ pub struct CostReport {
     pub uncatalogued_runs: usize,
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
+    /// Summed wall-clock duration over all in-scope agent steps.
+    pub total_duration_ms: u64,
     /// Sum of realized USD over the priced runs.
     pub total_cost_usd: f64,
     /// Cost rolled up per model, most expensive first.
     pub by_model: Vec<GroupCost>,
     /// Cost rolled up per step/transition, most expensive first.
     pub by_step: Vec<GroupCost>,
+    /// Cost rolled up per affinity (the intent of the work: `reasoning`,
+    /// `coding`, `review`, …), most expensive first — attributes spend to
+    /// *what kind of work* it was.
+    pub by_affinity: Vec<GroupCost>,
     /// `None` when no ceiling model can be determined or no comparable runs.
     pub counterfactual: Option<Counterfactual>,
 }
@@ -104,9 +119,14 @@ pub fn ceiling_model(models: &[ModelEntry]) -> Option<&ModelEntry> {
 /// One agent step distilled from an `agent.completed` event.
 struct Run {
     transition: String,
+    /// The affinity tier the agent was resolved under (`reasoning`, `coding`,
+    /// …): read from the event's own payload, else joined from the paired
+    /// `agent.invoked` via `correlation_id`.
+    affinity: Option<String>,
     model: Option<String>,
     prompt_tokens: u64,
     completion_tokens: u64,
+    duration_ms: u64,
     /// Realized USD: the recorded `cost_usd`, else recomputed from the catalog,
     /// else `None` (model uncatalogued ⇒ cost unknown).
     cost_usd: Option<f64>,
@@ -118,6 +138,7 @@ struct GroupAcc {
     runs: usize,
     prompt_tokens: u64,
     completion_tokens: u64,
+    duration_ms: u64,
     cost_usd: f64,
     uncatalogued_runs: usize,
 }
@@ -127,6 +148,7 @@ impl GroupAcc {
         self.runs += 1;
         self.prompt_tokens += r.prompt_tokens;
         self.completion_tokens += r.completion_tokens;
+        self.duration_ms += r.duration_ms;
         match r.cost_usd {
             Some(c) => self.cost_usd += c,
             None => self.uncatalogued_runs += 1,
@@ -139,6 +161,7 @@ impl GroupAcc {
             runs: self.runs,
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
+            duration_ms: self.duration_ms,
             cost_usd: self.cost_usd,
             uncatalogued_runs: self.uncatalogued_runs,
         }
@@ -163,6 +186,18 @@ pub fn build_cost_report(
     models: &[ModelEntry],
     opts: &ReportOptions,
 ) -> CostReport {
+    // 0. Affinity join table: `agent.invoked` carries the affinity the agent
+    // was resolved under; older `agent.completed` events don't self-carry it,
+    // so join by the shared `correlation_id`.
+    let invoked_affinity: BTreeMap<&str, &str> = events
+        .iter()
+        .filter(|e| e.event_type == AGENT_INVOKED)
+        .filter_map(|e| {
+            let a = e.payload.get("affinity").and_then(Value::as_str)?;
+            Some((e.correlation_id.as_str(), a))
+        })
+        .collect();
+
     // 1. Distill the in-scope agent steps.
     let mut runs: Vec<Run> = Vec::new();
     for e in events {
@@ -185,12 +220,20 @@ pub fn build_cost_report(
             .and_then(Value::as_str)
             .unwrap_or("(unknown)")
             .to_string();
+        // The event's own affinity wins (current emission shape); older logs
+        // fall back to the paired `agent.invoked` join.
+        let affinity = p
+            .get("affinity")
+            .and_then(Value::as_str)
+            .or_else(|| invoked_affinity.get(e.correlation_id.as_str()).copied())
+            .map(str::to_string);
         let model = p.get("model").and_then(Value::as_str).map(str::to_string);
         let prompt_tokens = p.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
         let completion_tokens = p
             .get("completion_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let duration_ms = p.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
         // Prefer the realized cost the runtime recorded; if absent, reprice from
         // the catalog; if the model is uncatalogued, the cost stays unknown.
         let cost_usd = p.get("cost_usd").and_then(Value::as_f64).or_else(|| {
@@ -200,23 +243,27 @@ pub fn build_cost_report(
         });
         runs.push(Run {
             transition,
+            affinity,
             model,
             prompt_tokens,
             completion_tokens,
+            duration_ms,
             cost_usd,
         });
     }
 
-    // 2. Aggregate totals + per-model + per-step.
+    // 2. Aggregate totals + per-model + per-step + per-affinity.
     let mut report = CostReport {
         runs: runs.len(),
         ..Default::default()
     };
     let mut by_model: BTreeMap<String, GroupAcc> = BTreeMap::new();
     let mut by_step: BTreeMap<String, GroupAcc> = BTreeMap::new();
+    let mut by_affinity: BTreeMap<String, GroupAcc> = BTreeMap::new();
     for r in &runs {
         report.total_prompt_tokens += r.prompt_tokens;
         report.total_completion_tokens += r.completion_tokens;
+        report.total_duration_ms += r.duration_ms;
         match r.cost_usd {
             Some(c) => {
                 report.priced_runs += 1;
@@ -227,9 +274,12 @@ pub fn build_cost_report(
         let model_key = r.model.clone().unwrap_or_else(|| "(unknown)".into());
         by_model.entry(model_key).or_default().add(r);
         by_step.entry(r.transition.clone()).or_default().add(r);
+        let affinity_key = r.affinity.clone().unwrap_or_else(|| "(unknown)".into());
+        by_affinity.entry(affinity_key).or_default().add(r);
     }
     report.by_model = finalize(by_model);
     report.by_step = finalize(by_step);
+    report.by_affinity = finalize(by_affinity);
 
     // 3. Counterfactual: reprice each comparable run (known realized cost) at the
     // ceiling model, apples-to-apples over the same set.
@@ -283,6 +333,11 @@ pub fn render_human(r: &CostReport) -> String {
         "  tokens: {} prompt / {} completion",
         r.total_prompt_tokens, r.total_completion_tokens
     );
+    let _ = writeln!(
+        s,
+        "  wall time: {:.1}s",
+        r.total_duration_ms as f64 / 1000.0
+    );
     if r.uncatalogued_runs > 0 {
         let _ = writeln!(
             s,
@@ -313,6 +368,17 @@ pub fn render_human(r: &CostReport) -> String {
             g.key, g.runs, g.cost_usd
         );
     }
+    let _ = writeln!(s, "By affinity:");
+    for g in &r.by_affinity {
+        let _ = writeln!(
+            s,
+            "  {:<28} {:>3} run(s)  ${:.4}  {:.1}s",
+            g.key,
+            g.runs,
+            g.cost_usd,
+            g.duration_ms as f64 / 1000.0
+        );
+    }
     s
 }
 
@@ -320,7 +386,7 @@ pub fn render_human(r: &CostReport) -> String {
 mod tests {
     use super::*;
     use crate::model_resolver::AffinityScores;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     /// A catalogued model with explicit prices so the arithmetic is checkable.
     fn model(name: &str, intelligence: f64, input: f64, output: f64) -> ModelEntry {
@@ -340,7 +406,9 @@ mod tests {
     }
 
     /// An `agent.completed` event with telemetry. `cost` of `None` ⇒ the runtime
-    /// left `cost_usd: null` (uncatalogued at run time).
+    /// left `cost_usd: null` (uncatalogued at run time). Every step takes a
+    /// fixed 1000ms so duration totals are checkable. No `affinity` in the
+    /// payload — mirrors pre-affinity logs (joined from `agent.invoked`).
     fn completed(
         wf: &str,
         transition: &str,
@@ -357,10 +425,24 @@ mod tests {
             .with_workflow(wf)
             .with_payload(json!({
                 "transition": transition,
+                "duration_ms": 1_000,
                 "model": model_str,
                 "prompt_tokens": prompt,
                 "completion_tokens": completion,
                 "cost_usd": cost_val,
+            }))
+    }
+
+    /// The paired `agent.invoked` for a step — the pre-affinity source of the
+    /// affinity tier, joined to its `agent.completed` via `correlation_id`.
+    fn invoked(wf: &str, correlation: &str, transition: &str, affinity: &str) -> AuditEvent {
+        AuditEvent::new(AGENT_INVOKED)
+            .with_workflow(wf)
+            .with_correlation(correlation)
+            .with_payload(json!({
+                "transition": transition,
+                "state": "working",
+                "affinity": affinity,
             }))
     }
 
@@ -416,6 +498,58 @@ mod tests {
         assert_eq!(r.by_step[0].runs, 2);
         assert_eq!(r.by_step[1].key, "review");
         assert!((r.by_step[1].cost_usd - 1.10).abs() < 1e-9);
+    }
+
+    /// The P14 telemetry fixture: intent/affinity attribution + wall-duration.
+    /// Covers both affinity sources — the event's own payload (current emission
+    /// shape) and the `agent.invoked` join via `correlation_id` (older logs) —
+    /// plus the `(unknown)` bucket when neither exists.
+    #[test]
+    fn attributes_cost_to_affinity_and_duration() {
+        let models = vec![
+            model("base", 56.0, 1.0, 3.0),
+            model("ceiling", 80.0, 10.0, 30.0),
+        ];
+        // Step A: self-carried affinity "coding" (current emission shape).
+        let mut a = completed("wf1", "draft", "v:base", 1_000_000, 1_000_000, Some(4.00));
+        a.payload["affinity"] = json!("coding");
+        // Step B: no payload affinity — joined from `agent.invoked` ("reasoning").
+        let b = completed("wf1", "review", "v:ceiling", 500_000, 100_000, Some(8.00))
+            .with_correlation("cor_b");
+        let b_invoked = invoked("wf1", "cor_b", "review", "reasoning");
+        // Step C: neither ⇒ the honest "(unknown)" bucket, never a fabrication.
+        let c = completed("wf1", "draft", "v:base", 1_000_000, 1_000_000, Some(4.00));
+
+        let events = vec![b_invoked, a, b, c];
+        let r = build_cost_report(&events, &models, &ReportOptions::default());
+
+        // Totals: 3 steps of 1000ms each.
+        assert_eq!(r.runs, 3);
+        assert_eq!(r.total_duration_ms, 3_000);
+        assert!((r.total_cost_usd - 16.00).abs() < 1e-9);
+
+        // By affinity, most expensive first: reasoning (8) > coding (4) =
+        // (unknown) (4), ties broken by key.
+        let keys: Vec<&str> = r.by_affinity.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(keys, ["reasoning", "(unknown)", "coding"]);
+        let reasoning = &r.by_affinity[0];
+        assert_eq!(reasoning.runs, 1);
+        assert!((reasoning.cost_usd - 8.00).abs() < 1e-9);
+        assert_eq!(reasoning.prompt_tokens, 500_000);
+        assert_eq!(reasoning.duration_ms, 1_000);
+        let coding = r.by_affinity.iter().find(|g| g.key == "coding").unwrap();
+        assert_eq!(coding.runs, 1);
+        assert!((coding.cost_usd - 4.00).abs() < 1e-9);
+
+        // Duration also rolls up per model: v:base ran 2 steps (2000ms).
+        let base = r.by_model.iter().find(|g| g.key == "v:base").unwrap();
+        assert_eq!(base.duration_ms, 2_000);
+
+        // And the human rendering surfaces the affinity attribution.
+        let text = render_human(&r);
+        assert!(text.contains("By affinity:"), "missing section:\n{text}");
+        assert!(text.contains("reasoning"));
+        assert!(text.contains("wall time: 3.0s"));
     }
 
     #[test]

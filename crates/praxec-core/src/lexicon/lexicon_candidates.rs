@@ -16,9 +16,9 @@
 //! Results are sorted: exact → alias → semantic → fuzzy_close → fuzzy_loose,
 //! then by distance ascending within each tier. The top 5 are returned.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
-use crate::embeddings::{cosine_similarity, EmbeddingProvider, EMBEDDING_COSINE_THRESHOLD};
+use crate::embeddings::{EMBEDDING_COSINE_THRESHOLD, EmbeddingProvider, cosine_similarity};
 
 /// Sort priority for each match kind (lower = higher priority in the ranking).
 const PRIORITY_EXACT: u8 = 0;

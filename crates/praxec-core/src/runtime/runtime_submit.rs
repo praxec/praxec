@@ -4,14 +4,14 @@
 //! share the same `impl WorkflowRuntime` block split across sibling files.
 
 use anyhow::bail;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::error::{ExecutorError, LlmErrorCode};
 use crate::mapping::merge_output;
 use crate::mission::StatusHint;
 use crate::model::{Evidence, NextTransition, Principal, SubmitTransition, WorkflowInstance};
-use crate::reliability::{execute_with_reliability, ReliabilityPolicy};
+use crate::reliability::{ReliabilityPolicy, execute_with_reliability};
 use crate::runtime::runtime_links::{
     is_terminal, push_failed_chain_recovery_link, push_state_recovery_links, transition_definition,
 };
@@ -68,6 +68,47 @@ pub(crate) fn clear_subworkflow_wait_on_advance(
     } else {
         false
     }
+}
+
+/// P12 R1.4 — the `_agent_await` twin of [`clear_subworkflow_wait_on_advance`]:
+/// when a transition that was parked on an agent `await_human` finally
+/// advances (the resumed session completed and merged its output), drop the
+/// durable wait marker so a later fire of the same transition starts a FRESH
+/// agent run instead of trying to resume a consumed frame. Guarded by
+/// transition identity, exactly like the sub-workflow twin.
+pub(crate) fn clear_agent_await_on_advance(context: &mut Value, resolved_transition: &str) -> bool {
+    let Some(obj) = context.as_object_mut() else {
+        return false;
+    };
+    let matches = obj
+        .get("_agent_await")
+        .and_then(|w| w.get("transition"))
+        .and_then(Value::as_str)
+        .map(|t| t == resolved_transition)
+        .unwrap_or(false);
+    if matches {
+        obj.remove("_agent_await");
+        true
+    } else {
+        false
+    }
+}
+
+/// P12 R1.4 — read the durable `_agent_await` marker when it belongs to
+/// `transition` (transition-identity guarded, like the sub-workflow wait).
+/// Returns `(correlation_id, prompt)` so callers can enforce the human-origin
+/// gate and surface the pending question.
+pub(crate) fn agent_await_for<'a>(
+    context: &'a Value,
+    transition: &str,
+) -> Option<(&'a str, &'a str)> {
+    let wait = context.get("_agent_await")?;
+    if wait.get("transition").and_then(Value::as_str) != Some(transition) {
+        return None;
+    }
+    let correlation_id = wait.get("correlation_id").and_then(Value::as_str)?;
+    let prompt = wait.get("prompt").and_then(Value::as_str).unwrap_or("");
+    Some((correlation_id, prompt))
 }
 
 struct DispatchOutcome {
@@ -334,6 +375,77 @@ impl WorkflowRuntime {
                 principal,
             )
             .await;
+        Ok(resp)
+    }
+
+    /// P12 R1.4 — durably suspend the transition on a parked agent session
+    /// (`await_human`). Mirrors [`Self::suspend_on_subworkflow`] EXACTLY —
+    /// the same waiting representation, a different resume signal: writes an
+    /// `_agent_await` record `{correlation_id, prompt, transition}` into the
+    /// persisted context (survives restart; the agent's conversation itself
+    /// is already parked in the `ParkedSessionStore` under `correlation_id`),
+    /// bumps the version, saves, and returns a `waiting` response. The
+    /// transition does NOT advance — a human resumes it by re-submitting the
+    /// same transition with `arguments.reply`.
+    pub(crate) async fn suspend_on_agent_await(
+        &self,
+        definition: &Value,
+        instance: &WorkflowInstance,
+        transition: &str,
+        expected_version: u64,
+        principal: &Principal,
+        suspend: crate::model::AgentAwaitSuspend,
+    ) -> anyhow::Result<Value> {
+        let mut next = instance.clone();
+        let wait = json!({
+            "correlation_id": suspend.correlation_id,
+            "prompt": suspend.prompt,
+            "transition": transition,
+        });
+        match next.context.as_object_mut() {
+            Some(obj) => {
+                obj.insert("_agent_await".to_string(), wait);
+            }
+            None => {
+                next.context = json!({ "_agent_await": wait });
+            }
+        }
+        next.version = instance.version + 1;
+        // The durable `_agent_await` record MUST commit, or the parked frame is
+        // orphaned (no marker routes the human's reply back to the transition).
+        // A STALE_WORKFLOW_VERSION here is a genuine rejection — surface it via
+        // `?`, exactly like the sub-workflow twin. NEVER a fake `waiting`.
+        let saved = self.store.save_if_version(next, expected_version).await?;
+        let _ = self
+            .audit
+            .record(
+                instance
+                    .audit_event("agent.await.suspended")
+                    .with_payload(json!({
+                        "correlation_id": suspend.correlation_id,
+                        "prompt": suspend.prompt,
+                        "transition": transition,
+                    })),
+            )
+            .await;
+        let mut resp = self
+            .response(
+                definition,
+                &saved,
+                StatusHint::WaitingOnAgentAwait,
+                None,
+                principal,
+            )
+            .await;
+        // Surface the pending question + resume handle on the waiting
+        // response itself, so an interactive caller can relay it to the human
+        // without digging through the audit trail.
+        resp["await"] = json!({
+            "source": "agent_await",
+            "correlationId": suspend.correlation_id,
+            "prompt": suspend.prompt,
+            "transition": transition,
+        });
         Ok(resp)
     }
 
@@ -708,6 +820,37 @@ impl WorkflowRuntime {
             ));
         }
 
+        // P12 R1.4 origin gate (mirrors P16, `docs/await-resume-architecture.md`):
+        // when this transition is parked on an `_agent_await` (a `kind: agent`
+        // session suspended on `await_human`), re-submitting it is *resolving a
+        // human gate* — only a proven-human principal may do that. No LLM in
+        // the chain (including an auto-drive re-fire) may supply or trigger
+        // the reply; a non-human submit is rejected typed, never executed.
+        if agent_await_for(&instance.context, &request.transition).is_some()
+            && !request.principal.is_human()
+        {
+            return Ok(DispatchOutcome::terminal(
+                self.record_rejected(
+                    &definition,
+                    &instance,
+                    "AWAIT_RESUME_NOT_HUMAN",
+                    format!(
+                        "Transition '{}' is parked on an agent `await_human` gate; only a \
+                         human principal may resume it (submitter '{}' has no '{}' role). \
+                         Resume via `praxec approvals` / a human-authenticated submit \
+                         carrying `arguments.reply`.",
+                        request.transition,
+                        request.principal.subject,
+                        Principal::HUMAN_ROLE
+                    ),
+                    &request.transition,
+                    &correlation_id,
+                    &request.principal,
+                )
+                .await,
+            ));
+        }
+
         // SPEC §29 — generic per-state fire cap. A transition may declare
         // `max_fires_per_visit: N` to bound how many times it can fire
         // before the workflow advances to a different state. Counter
@@ -917,22 +1060,38 @@ impl WorkflowRuntime {
 
             match exec_result {
                 Ok(result) => {
-                    // P2 — a `kind: workflow` executor whose child is non-terminal
-                    // returns `suspend` instead of advancing: durably park the
-                    // parent on the child and return a `waiting` response. The
-                    // executor declares no `owned_files`, so no lock is held for
-                    // THIS transition to release on this early return.
+                    // The one step-suspend channel: an executor that parked
+                    // instead of advancing returns `suspend`; the runtime
+                    // durably records the wait and returns a `waiting`
+                    // response — NEVER a failure. Both sources park the
+                    // mission identically (a context wait-marker + a
+                    // `Waiting`-mapping StatusHint); they differ only in what
+                    // resumes them (child termination vs a human reply).
                     if let Some(suspend) = result.suspend.clone() {
-                        let resp = self
-                            .suspend_on_subworkflow(
-                                &definition,
-                                &instance,
-                                &request.transition,
-                                request.expected_version,
-                                &request.principal,
-                                suspend,
-                            )
-                            .await?;
+                        let resp = match suspend {
+                            crate::model::StepSuspend::Subworkflow(s) => {
+                                self.suspend_on_subworkflow(
+                                    &definition,
+                                    &instance,
+                                    &request.transition,
+                                    request.expected_version,
+                                    &request.principal,
+                                    s,
+                                )
+                                .await?
+                            }
+                            crate::model::StepSuspend::AgentAwait(a) => {
+                                self.suspend_on_agent_await(
+                                    &definition,
+                                    &instance,
+                                    &request.transition,
+                                    request.expected_version,
+                                    &request.principal,
+                                    a,
+                                )
+                                .await?
+                            }
+                        };
                         return Ok(DispatchOutcome::terminal(resp));
                     }
                     executor_outcome = Some((true, exec_started.elapsed().as_millis() as u64));
@@ -951,6 +1110,11 @@ impl WorkflowRuntime {
                     // identity so a wait for a different, still-pending leaf is
                     // untouched.
                     clear_subworkflow_wait_on_advance(&mut next.context, &request.transition);
+                    // P12 R1.4 — likewise for an `_agent_await`: the executor
+                    // returned a real result (a resumed session completed), so
+                    // the consumed wait marker must not leak into a later fire
+                    // of the same transition.
+                    clear_agent_await_on_advance(&mut next.context, &request.transition);
                     // SPEC §6.2: typed blackboard slots are validated *before*
                     // the transition advances. A mismatch aborts here so the
                     // caller sees BLACKBOARD_TYPE_ERROR and the snapshot stays
@@ -1467,25 +1631,39 @@ impl WorkflowRuntime {
                 suspend,
                 transition,
             } => {
-                // P2 (chain path) — a `kind: workflow` chain leaf signalled a
-                // sub-workflow suspend. Durably park the parent on the child
+                // Chain path — a chain leaf signalled a step suspend (P2
+                // sub-workflow or P12 agent await). Durably park the parent
                 // and respond `waiting`, mirroring the direct-submit suspend
                 // path. `partial.instance` already carries any context the
                 // PRIOR chain steps committed, at its current version; the
                 // suspend save bumps that version by exactly 1 and writes the
-                // `_subworkflow_wait` marker. A STALE_WORKFLOW_VERSION here is
-                // a genuine rejection — propagate it via `?`, never fake a
-                // `waiting` response.
-                let resp = self
-                    .suspend_on_subworkflow(
-                        &definition,
-                        &partial.instance,
-                        &transition,
-                        partial.instance.version,
-                        &request.principal,
-                        suspend,
-                    )
-                    .await?;
+                // wait marker. A STALE_WORKFLOW_VERSION here is a genuine
+                // rejection — propagate it via `?`, never fake a `waiting`
+                // response.
+                let resp = match suspend {
+                    crate::model::StepSuspend::Subworkflow(s) => {
+                        self.suspend_on_subworkflow(
+                            &definition,
+                            &partial.instance,
+                            &transition,
+                            partial.instance.version,
+                            &request.principal,
+                            s,
+                        )
+                        .await?
+                    }
+                    crate::model::StepSuspend::AgentAwait(a) => {
+                        self.suspend_on_agent_await(
+                            &definition,
+                            &partial.instance,
+                            &transition,
+                            partial.instance.version,
+                            &request.principal,
+                            a,
+                        )
+                        .await?
+                    }
+                };
                 Ok(DispatchOutcome::terminal(resp))
             }
         }
@@ -1670,9 +1848,11 @@ mod tests {
             _request: crate::model::ExecuteRequest,
         ) -> Result<crate::model::ExecuteResult, crate::error::ExecutorError> {
             Ok(crate::model::ExecuteResult {
-                suspend: Some(crate::model::SubworkflowSuspend {
-                    child_workflow_id: "child_x".into(),
-                }),
+                suspend: Some(crate::model::StepSuspend::Subworkflow(
+                    crate::model::SubworkflowSuspend {
+                        child_workflow_id: "child_x".into(),
+                    },
+                )),
                 ..Default::default()
             })
         }
@@ -1801,6 +1981,229 @@ mod tests {
         assert_eq!(
             reloaded.version, 1,
             "the suspend commit must bump the version by exactly 1"
+        );
+    }
+
+    // ── P12 R1.4 — agent-await suspend: the SAME waiting representation ──
+
+    /// A `kind: agent` stand-in that parks on `await_human` on its first
+    /// dispatch (returns `StepSuspend::AgentAwait`) and completes with a real
+    /// output when re-dispatched with `arguments.reply` (the resumed frame).
+    struct AwaitingAgentExecutor;
+    #[async_trait]
+    impl Executor for AwaitingAgentExecutor {
+        async fn execute(
+            &self,
+            request: crate::model::ExecuteRequest,
+        ) -> Result<crate::model::ExecuteResult, crate::error::ExecutorError> {
+            if request.arguments.get("reply").is_some() {
+                return Ok(crate::model::ExecuteResult {
+                    output: json!({ "verdict": "approved-and-done" }),
+                    ..Default::default()
+                });
+            }
+            Ok(crate::model::ExecuteResult {
+                suspend: Some(crate::model::StepSuspend::AgentAwait(
+                    crate::model::AgentAwaitSuspend {
+                        correlation_id: "corr-7".into(),
+                        prompt: "ship it?".into(),
+                    },
+                )),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn agent_await_config() -> serde_json::Value {
+        json!({
+            "version": "1.0.0",
+            "workflows": {
+                "p": {
+                    "version": "1.0.0",
+                    "initialState": "a",
+                    "states": {
+                        "a": {
+                            "actor": "agent",
+                            "transitions": {
+                                "do_work": {
+                                    "target": "b",
+                                    "executor": { "kind": "agent" }
+                                }
+                            }
+                        },
+                        "b": { "terminal": true }
+                    }
+                }
+            }
+        })
+    }
+
+    fn agent_await_runtime(store: Arc<InMemoryWorkflowStore>) -> WorkflowRuntime {
+        WorkflowRuntime::new(
+            Arc::new(ConfigDefinitionStore::from_config(&agent_await_config())),
+            store,
+            Arc::new(SingleExecutorRegistry {
+                kind: "agent",
+                executor: Arc::new(AwaitingAgentExecutor),
+            }),
+            Arc::new(DefaultGuardEvaluator::new()),
+            Arc::new(MemoryAuditSink::new()) as Arc<dyn AuditSink>,
+        )
+    }
+
+    async fn start_and_park(runtime: &WorkflowRuntime) -> (String, Value) {
+        let start = runtime
+            .start(StartWorkflow {
+                definition_id: "p".into(),
+                input: json!({}),
+                principal: Principal::anonymous(),
+                trace_id: None,
+                run_id: None,
+                depth: 0,
+                parent: None,
+            })
+            .await
+            .expect("start should succeed");
+        let workflow_id = start["workflow"]["id"].as_str().unwrap().to_string();
+        let parked = runtime
+            .submit(SubmitTransition {
+                workflow_id: workflow_id.clone(),
+                expected_version: 0,
+                transition: "do_work".into(),
+                arguments: json!({}),
+                principal: Principal::anonymous(),
+                summary: None,
+                trace_id: None,
+                run_id: None,
+            })
+            .await
+            .expect("submit should succeed (parked, not errored)");
+        (workflow_id, parked)
+    }
+
+    /// P12 R1.4 — an agent `Suspended` outcome parks the mission exactly like
+    /// a workflow-level gate: the response is `waiting` (NOT failed), the
+    /// state does not advance, the durable `_agent_await` marker carries the
+    /// correlation_id, and the version bumps by exactly 1. Mirrors
+    /// `suspend_on_subworkflow_parks_parent_without_advancing` — same waiting
+    /// representation, different resume signal.
+    #[tokio::test]
+    async fn agent_await_suspend_parks_mission_waiting_without_advancing() {
+        let store = Arc::new(InMemoryWorkflowStore::new());
+        let runtime = agent_await_runtime(store.clone());
+        let (workflow_id, response) = start_and_park(&runtime).await;
+
+        assert_eq!(
+            response["result"]["status"].as_str(),
+            Some("waiting"),
+            "a suspended agent must park the mission waiting, got: {response:#}"
+        );
+        assert_eq!(
+            response["workflow"]["state"].as_str(),
+            Some("a"),
+            "the workflow must stay in its pre-transition state"
+        );
+        // The pending question + resume handle are surfaced on the response.
+        assert_eq!(
+            response["await"]["correlationId"].as_str(),
+            Some("corr-7"),
+            "the waiting response must carry the resume correlation_id"
+        );
+        assert_eq!(response["await"]["prompt"].as_str(), Some("ship it?"));
+
+        // The durable `_agent_await` marker is persisted for the resume.
+        let reloaded = store.load(&workflow_id).await.unwrap();
+        assert_eq!(
+            reloaded.context["_agent_await"]["correlation_id"].as_str(),
+            Some("corr-7")
+        );
+        assert_eq!(
+            reloaded.context["_agent_await"]["transition"].as_str(),
+            Some("do_work")
+        );
+        assert_eq!(
+            reloaded.version, 1,
+            "the suspend commit must bump the version by exactly 1"
+        );
+    }
+
+    /// P12 R1.4 origin gate (mirrors P16): once a transition is parked on an
+    /// `_agent_await`, a NON-human principal may not re-submit it — an LLM /
+    /// auto-drive re-fire is rejected typed instead of resolving (or even
+    /// touching) the human gate.
+    #[tokio::test]
+    async fn a_non_human_cannot_resume_a_parked_agent_await() {
+        let store = Arc::new(InMemoryWorkflowStore::new());
+        let runtime = agent_await_runtime(store.clone());
+        let (workflow_id, _) = start_and_park(&runtime).await;
+
+        let rejected = runtime
+            .submit(SubmitTransition {
+                workflow_id: workflow_id.clone(),
+                expected_version: 1,
+                transition: "do_work".into(),
+                arguments: json!({ "reply": "sneaky LLM approval" }),
+                principal: Principal::anonymous(),
+                summary: None,
+                trace_id: None,
+                run_id: None,
+            })
+            .await
+            .expect("the rejection is a typed response, not an Err");
+        assert_eq!(
+            rejected["error"]["code"].as_str(),
+            Some("AWAIT_RESUME_NOT_HUMAN"),
+            "got: {rejected:#}"
+        );
+        // The gate is intact: still parked, still waiting on the same frame.
+        let reloaded = store.load(&workflow_id).await.unwrap();
+        assert_eq!(
+            reloaded.context["_agent_await"]["correlation_id"].as_str(),
+            Some("corr-7"),
+            "a rejected non-human resume must not consume the parked frame"
+        );
+        assert_eq!(reloaded.state, "a");
+    }
+
+    /// P12 R1.4 — the resume round-trip: a HUMAN principal re-submits the
+    /// parked transition with `arguments.reply`; the executor's resumed result
+    /// merges, the transition advances, and the consumed `_agent_await`
+    /// marker is cleared so a later fire starts fresh.
+    #[tokio::test]
+    async fn a_human_reply_resumes_advances_and_clears_the_await_marker() {
+        let store = Arc::new(InMemoryWorkflowStore::new());
+        let runtime = agent_await_runtime(store.clone());
+        let (workflow_id, _) = start_and_park(&runtime).await;
+
+        let human = Principal {
+            subject: "matt".into(),
+            roles: vec![Principal::HUMAN_ROLE.into()],
+            permissions: vec![],
+        };
+        let resumed = runtime
+            .submit(SubmitTransition {
+                workflow_id: workflow_id.clone(),
+                expected_version: 1,
+                transition: "do_work".into(),
+                arguments: json!({ "reply": "yes — ship it" }),
+                principal: human,
+                summary: None,
+                trace_id: None,
+                run_id: None,
+            })
+            .await
+            .expect("a human resume submit succeeds");
+        assert_eq!(
+            resumed["workflow"]["state"].as_str(),
+            Some("b"),
+            "the resumed step must advance to its target, got: {resumed:#}"
+        );
+
+        let reloaded = store.load(&workflow_id).await.unwrap();
+        assert!(
+            reloaded.context.get("_agent_await").is_none(),
+            "the consumed await marker must be cleared on advance: {:#}",
+            reloaded.context
         );
     }
 

@@ -26,6 +26,12 @@ async fn main() -> anyhow::Result<()> {
     overlays
         .diagnostics
         .push(agent::models_yaml_load_diagnostic());
+    // Fail-fast at load when a `kind: agent` step (or auto_drive) needs
+    // `gateway.models_yaml` but it is unset/missing — otherwise the only signal
+    // is AGENT_NO_AGENTS_YAML at first dispatch.
+    overlays
+        .diagnostics
+        .push(agent::agent_steps_need_models_yaml_diagnostic());
 
     gateway::run_cli(overlays).await
 }
@@ -38,8 +44,8 @@ mod agent {
     use std::sync::Arc;
 
     use praxec::gateway::{DiagnosticProvider, OverlayCtx, OverlayRegistrar};
-    use praxec_core::ports::Executor;
     use praxec_core::SingleKindOverlay;
+    use praxec_core::ports::Executor;
     use serde_json::Value;
 
     struct RejectingAgentModelResolver;
@@ -223,8 +229,36 @@ mod agent {
             )));
             let mcp_host: Arc<dyn ToolHost> = Arc::new(McpToolHost { caller });
             let host: Arc<dyn ToolHost> = Arc::new(CompositeToolHost::new(mcp_host));
-            let runner: Arc<dyn AgentSessionRunner> =
-                Arc::new(RigSessionRunner::with_default_provider().with_tool_host(host));
+            // Observability — heartbeat: hand the runner the gateway audit
+            // sink so a governed agent run pulses `agent.heartbeat` events
+            // (per tool-loop turn + within a long silent model call) into the
+            // SAME audit log `agent.invoked`/`agent.completed` land in. An
+            // operator tailing that log can now tell "slow model" from "hung".
+            let mut rig_runner = RigSessionRunner::with_default_provider()
+                .with_tool_host(host)
+                .with_audit_sink(ctx.audit.clone());
+            // P12 R1.4 — wire the durable park for agent `await_human`
+            // suspend/resume when the gateway has a durable (sqlite) store:
+            // the same DB file the workflow store uses. Without it the runner
+            // fails fast on any `await_enabled` session (never a suspend whose
+            // conversation can't survive a restart). An open failure is
+            // defense-in-depth only — building the sqlite workflow store from
+            // the same path would already have failed the boot.
+            match praxec::gateway::build_parked_session_store(&ctx.config) {
+                Ok(Some(parked)) => {
+                    tracing::info!("wired sqlite ParkedSessionStore for agent await/resume");
+                    rig_runner = rig_runner.with_parked_store(parked);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "PARKED_STORE_UNAVAILABLE: agent await/resume park store failed to \
+                         open; `await_enabled` agent sessions will fail fast"
+                    );
+                }
+            }
+            let runner: Arc<dyn AgentSessionRunner> = Arc::new(rig_runner);
             let resolver = build_agent_model_resolver(&ctx.config);
             let mut agent_executor = AgentExecutor::new(runner, resolver);
 
@@ -237,12 +271,16 @@ mod agent {
             // untrusted is disabled rather than run against a divergent authority.
             let bwrap = praxec_core::sandbox::BwrapProvider::new();
             if praxec_core::sandbox::SandboxProvider::preflight(&bwrap).usable {
-                if let Some(locks) = ctx.runtime.repo_locks() {
-                    agent_executor = agent_executor.with_untrusted_support(Arc::new(bwrap), locks);
-                } else {
-                    tracing::warn!(
-                        "untrusted kind: agent disabled: runtime has no repo_locks to share"
-                    );
+                match ctx.runtime.repo_locks() {
+                    Some(locks) => {
+                        agent_executor =
+                            agent_executor.with_untrusted_support(Arc::new(bwrap), locks);
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "untrusted kind: agent disabled: runtime has no repo_locks to share"
+                        );
+                    }
                 }
             }
 
@@ -294,6 +332,65 @@ mod agent {
             }
         })
     }
+
+    /// Load-time fail-fast for a config that NEEDS `gateway.models_yaml` but has
+    /// none. A `kind: agent` step (or `praxec.agents.auto_drive: true`) resolves
+    /// its model binding through models.yaml; with the key unset (or pointing at
+    /// a missing file) every such step fails only at first dispatch with
+    /// `AGENT_NO_AGENTS_YAML`. This turns that late runtime failure into a
+    /// `praxec check` / serve-blocking error naming the key.
+    ///
+    /// Complements [`models_yaml_load_diagnostic`], which covers the *present but
+    /// unloadable* case; this rule covers *unset or missing*. A config with no
+    /// agent step and no auto-drive is clean regardless of the key.
+    pub fn agent_steps_need_models_yaml_diagnostic() -> DiagnosticProvider {
+        use praxec_core::validate::{Diagnostic, for_each_executor_site};
+        Arc::new(|config: &Value| {
+            // Does this config actually depend on models.yaml resolution?
+            let auto_drive = config
+                .pointer("/praxec/agents/auto_drive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut has_agent_step = false;
+            if let Some(workflows) = config.pointer("/workflows").and_then(Value::as_object) {
+                for (_wf_id, wf_def) in workflows {
+                    for_each_executor_site(wf_def, |site| {
+                        if site.executor.get("kind").and_then(Value::as_str) == Some("agent") {
+                            has_agent_step = true;
+                        }
+                    });
+                }
+            }
+            if !has_agent_step && !auto_drive {
+                return Vec::new(); // nothing here needs models.yaml
+            }
+
+            // Usable = the key is set, non-empty, AND the file exists. Present-
+            // but-unloadable is left to `models_yaml_load_diagnostic` (no dup).
+            let usable = config
+                .pointer("/gateway/models_yaml")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| std::path::Path::new(p).exists())
+                .unwrap_or(false);
+            if usable {
+                return Vec::new();
+            }
+
+            let trigger = if has_agent_step {
+                "a `kind: agent` step"
+            } else {
+                "`praxec.agents.auto_drive: true`"
+            };
+            vec![Diagnostic::Error(format!(
+                "AGENT_MODELS_YAML_REQUIRED: this config declares {trigger} but `gateway.models_yaml` \
+                 is unset or points to a missing file. Agent and auto-drive model bindings resolve \
+                 through models.yaml, so every such step would fail at first dispatch \
+                 (AGENT_NO_AGENTS_YAML). Set `gateway.models_yaml` to your models.yaml path."
+            ))]
+        })
+    }
 }
 
 #[cfg(test)]
@@ -335,6 +432,93 @@ mod models_yaml_doctor_tests {
         assert!(
             matches!(&diags[0], Diagnostic::Error(m) if m.contains("MODELS_YAML_LOAD_FAILED")),
             "expected MODELS_YAML_LOAD_FAILED error, got: {:?}",
+            diags[0]
+        );
+    }
+}
+
+#[cfg(test)]
+mod agent_models_yaml_required_tests {
+    use praxec_core::validate::Diagnostic;
+    use serde_json::json;
+
+    fn run(config: &serde_json::Value) -> Vec<Diagnostic> {
+        crate::agent::agent_steps_need_models_yaml_diagnostic()(config)
+    }
+
+    fn agent_wf() -> serde_json::Value {
+        json!({
+            "workflows": {
+                "wf": { "states": { "s": { "transitions": {
+                    "go": { "target": "done", "executor": {
+                        "kind": "agent", "affinity": "coding", "goal": "do it"
+                    } }
+                } } } }
+            }
+        })
+    }
+
+    #[test]
+    fn agent_step_without_models_yaml_is_an_error() {
+        let diags = run(&agent_wf());
+        assert_eq!(diags.len(), 1, "expected exactly one error, got: {diags:?}");
+        assert!(
+            matches!(&diags[0], Diagnostic::Error(m) if m.contains("AGENT_MODELS_YAML_REQUIRED")),
+            "expected AGENT_MODELS_YAML_REQUIRED, got: {:?}",
+            diags[0]
+        );
+    }
+
+    #[test]
+    fn agent_step_with_present_models_yaml_is_clean() {
+        // "with it" = the key is set and the file exists. (Loadability is the
+        // separate `models_yaml_load_diagnostic`'s concern.)
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("praxec_models_present_{}.yaml", std::process::id()));
+        std::fs::write(&path, "delegates: {}\n").unwrap();
+        let mut cfg = agent_wf();
+        cfg["gateway"] = json!({ "models_yaml": path.to_str().unwrap() });
+        let diags = run(&cfg);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            diags.is_empty(),
+            "present models.yaml must be clean: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn non_agent_config_without_models_yaml_is_clean() {
+        let cfg = json!({
+            "workflows": {
+                "wf": { "states": { "s": { "transitions": {
+                    "go": { "target": "done", "executor": { "kind": "cli", "command": "ls" } }
+                } } } }
+            }
+        });
+        assert!(run(&cfg).is_empty(), "non-agent config must be clean");
+    }
+
+    #[test]
+    fn auto_drive_without_models_yaml_is_an_error() {
+        let cfg = json!({ "praxec": { "agents": { "auto_drive": true } } });
+        let diags = run(&cfg);
+        assert_eq!(diags.len(), 1, "auto_drive needs models.yaml: {diags:?}");
+        assert!(
+            matches!(&diags[0], Diagnostic::Error(m) if m.contains("AGENT_MODELS_YAML_REQUIRED")),
+            "got: {:?}",
+            diags[0]
+        );
+    }
+
+    #[test]
+    fn agent_step_with_missing_models_yaml_file_is_an_error() {
+        let mut cfg = agent_wf();
+        cfg["gateway"] = json!({ "models_yaml": "/no/such/models.yaml" });
+        let diags = run(&cfg);
+        assert_eq!(diags.len(), 1, "a missing file must error: {diags:?}");
+        assert!(
+            matches!(&diags[0], Diagnostic::Error(m) if m.contains("AGENT_MODELS_YAML_REQUIRED")),
+            "got: {:?}",
             diags[0]
         );
     }

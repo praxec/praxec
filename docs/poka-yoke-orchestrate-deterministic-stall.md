@@ -13,9 +13,25 @@ praxec orchestrate --definition cognitive/flow.greenfield-mcp --input <...> \
 # →
 orchestrate: started cognitive/flow.greenfield-mcp → wf_261ab4b0...
 [mission wf_261ab4b0...] status: running
-Error: the agentic driver found no actionable move and gave up
-       (stalled at status `running`; legal actions: []).
+Error: orchestrate wf_261ab4b0...: the agentic driver found no actionable move
+       and gave up (stalled at status `running`; legal actions: [vet_spec]).
+       orchestrate steers a *mission* toward its declared `outcomes` via
+       agent-actionable transitions; a deterministic or human-gated flow offers
+       the driver no such move. Drive it instead with `praxec command '<json>'` /
+       `query '<json>'` (step-by-step) or `px walk` (end-to-end).
 ```
+
+Since the fail-loud backstop landed (PREVENT-#3, below), the give-up path is
+**split into two typed outcomes** so the diagnostic points at the right fix
+(`gateway.rs:377-384` and the `ChooserFailed` arm just after):
+
+- **`GaveUp`** — the driver ran its decision model and there genuinely is no
+  agent-actionable move (a deterministic / human-gated flow). Fix: drive it with
+  `praxec command` / `query` step-by-step, or `px walk` end-to-end.
+- **`ChooserFailed`** — the driver could not even *run* its decision model (no
+  provider API key, a 401/auth error, an unresolvable model binding, or a network
+  failure). This is not a dead-end flow. Fix: check `gateway.models_yaml`, your
+  provider keys (`~/.praxec/providers.env`), and connectivity.
 
 The instance is left **`running`** at state `spec_vetting`. But the engine disagrees that there is
 no move:
@@ -71,7 +87,7 @@ approvals queue is empty. The failure is upstream, in driver/definition-class ma
 
 ## Poka-yoke (layered: prevent → fail-loud → surface)
 
-1. **PREVENT — core fix: `orchestrate` fires deterministic transitions.**
+1. **PREVENT — core fix: `orchestrate` fires deterministic transitions.** *(open)*
    Driver loop: when no `actor: agent` move is available but `legalTransitionsNow` holds a
    transition whose actor is `deterministic` and `allowedFromCurrentState`, **fire it** (run its
    executor, capture outputs, advance), then re-evaluate. Loop until reaching (a) an `actor: agent`
@@ -85,16 +101,23 @@ approvals queue is empty. The failure is upstream, in driver/definition-class ma
    diagnostic ("engine-driven / human-gated pipeline — drive via serve `auto_drive` or `command`
    stepping"). Never half-run and strand.
 
-3. **FAIL-LOUD — backstop.** A driver may never exit "gave up" while `legalTransitionsNow` is
-   non-empty. If it would, that is an engine invariant violation: fire the legal move, or hard-error
-   explicitly (non-zero), but never silently leave the instance `running`.
+3. **FAIL-LOUD — backstop.** *(implemented — `gateway.rs:377-384` + the `ChooserFailed` arm)*
+   A give-up no longer masquerades as success: every non-success `DriveOutcome`
+   (`GaveUp`, `ChooserFailed`, `Resolved` non-`succeeded`, `MaxSteps`, `Declined`, `Error`)
+   returns a non-zero error with a diagnostic, and `GaveUp` re-queries for the stall snapshot
+   (`stalled at status … legal actions: […]`) and points at the deterministic alternatives.
+   Firing the legal move itself is still #1's job (open); this backstop guarantees the give-up
+   is loud, typed, and actionable rather than a silent `running` orphan.
 
 4. **SURFACE — HATEOAS.** `get.links` should include deterministic legal-now transitions (flagged
    as auto/advance), so a human polling a parked or stranded instance always sees an actionable link
    instead of `[]`. Closes the "invisible move" gap for human rescue and is adjacent to the original
    misread ("the gate isn't reaching the human").
 
-**Minimum viable fix = #1 + #3.** #2 and #4 harden it.
+**Minimum viable fix = #1 + #3.** #3 (fail-loud) has landed; **#1 (deterministic
+firing) remains open** — until it lands, `orchestrate` still exits loudly on a
+deterministic flow rather than driving it (use the workarounds below). #2 and #4
+harden it.
 
 ## Acceptance / regression
 

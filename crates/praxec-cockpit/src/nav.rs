@@ -35,9 +35,5 @@ pub const TREE: usize = 0;
 
 /// Facet count for a mode (Run and Build differ).
 pub fn count(is_build: bool) -> usize {
-    if is_build {
-        BUILD.len()
-    } else {
-        RUN.len()
-    }
+    if is_build { BUILD.len() } else { RUN.len() }
 }

@@ -13,7 +13,7 @@
 //! `guidance_acknowledged` depends on stays stable.
 
 use praxec_core::error::{ExecutorError, LlmErrorCode};
-use praxec_core::skills::{assemble_system_message, SkillAssemblyError};
+use praxec_core::skills::{SkillAssemblyError, assemble_system_message};
 use serde_json::Value;
 
 /// Build the system message from the skills in scope for this step.

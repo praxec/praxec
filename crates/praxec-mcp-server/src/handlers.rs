@@ -4,16 +4,16 @@
 
 use praxec_core::audit::AuditEvent;
 use praxec_core::discovery::{DiscoveryKind, SearchRequest};
-use praxec_core::embeddings::{entry_embed_text, EmbeddingProvider};
+use praxec_core::embeddings::{EmbeddingProvider, entry_embed_text};
 use praxec_core::model::{GetWorkflow, Principal, StartWorkflow, SubmitTransition};
 use serde::de::DeserializeOwned;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::PraxecServer;
 use crate::args::{
     CommandArgs, DescribeArgs, ExplainArgs, GetArgs, QueryArgs, SearchArgs, StartArgs, SubmitArgs,
 };
 use crate::tools::parse_kind;
-use crate::PraxecServer;
 
 /// Caller-supplied argument errors that must surface at the MCP boundary as
 /// `invalid_params (-32602)` rather than `internal_error (-32603)`. The
@@ -44,6 +44,12 @@ pub(crate) fn parse_args<T: DeserializeOwned>(args: Value) -> anyhow::Result<T> 
     serde_json::from_value(args).map_err(|e| bad_request(format!("invalid arguments: {e}")))
 }
 
+/// Default event cap for one `observe` query window. Callers override with
+/// `limit`; a truncated window carries `truncated: true` plus a `next_since`
+/// cursor link so the client pages forward instead of receiving an unbounded
+/// response.
+const DEFAULT_OBSERVE_LIMIT: u64 = 200;
+
 impl PraxecServer {
     pub(crate) async fn handle_home(&self) -> anyhow::Result<Value> {
         self.discovery.home().await
@@ -66,7 +72,7 @@ impl PraxecServer {
         };
         let limit = parsed.limit as usize;
 
-        let hits = self
+        let mut hits = self
             .discovery
             .search(SearchRequest {
                 query: query.clone(),
@@ -74,6 +80,12 @@ impl PraxecServer {
                 limit,
             })
             .await?;
+
+        // Evidence loop, last hop — annotate workflow hits with the intent
+        // index's historical track record so the caller chooses by evidence,
+        // not blind. Never fails the search: missing/thin evidence is the
+        // normal state (fresh system, non-file sink), silently omitted.
+        self.attach_intent_evidence(&mut hits).await;
 
         Ok(json!({
             "query": query,
@@ -83,6 +95,51 @@ impl PraxecServer {
                 { "rel": "home", "method": "praxec.query", "args": {} }
             ]
         }))
+    }
+
+    /// Attach per-`(task_class, template)` intent evidence to workflow search
+    /// hits. Reuses the exact read + aggregate path of `praxec intent report`:
+    /// [`AuditSink::try_list_events`] over the runtime's sink →
+    /// [`observations_from_audit`] → [`aggregate`], gated by the tuning
+    /// `intent.min_runs` threshold (the same "trust the rate" bar the report
+    /// flags thin samples with).
+    ///
+    /// Graceful degrade by design — evidence is an annotation, never a
+    /// precondition: a non-file sink (no stored events), an empty audit dir,
+    /// or even a genuine read error all leave the hits unannotated and the
+    /// search successful. A read error is logged (it IS a defect signal) but
+    /// must not turn a working search into a failure.
+    ///
+    /// [`AuditSink::try_list_events`]: praxec_core::audit::AuditSink::try_list_events
+    /// [`observations_from_audit`]: praxec_core::intent_index::observations_from_audit
+    /// [`aggregate`]: praxec_core::intent_index::aggregate
+    async fn attach_intent_evidence(&self, hits: &mut [praxec_core::discovery::SearchHit]) {
+        use praxec_core::intent_index::{
+            IntentParams, aggregate, annotate_hits_with_evidence, observations_from_audit,
+        };
+        // Only pay the audit read when a hit could carry evidence at all.
+        if !hits
+            .iter()
+            .any(|h| h.item.kind == DiscoveryKind::Workflow && h.item.task_class().is_some())
+        {
+            return;
+        }
+        let events = match self.runtime.audit().try_list_events().await {
+            Ok(Some(events)) if !events.is_empty() => events,
+            // Non-file sink (events not stored) or no history yet — the
+            // normal fresh-system state; evidence is simply absent.
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "intent-evidence audit read failed — returning search hits without evidence"
+                );
+                return;
+            }
+        };
+        let models = praxec_core::model_catalog::model_catalog().models;
+        let stats = aggregate(&observations_from_audit(&events, &models));
+        annotate_hits_with_evidence(hits, &stats, IntentParams::from_tuning().min_runs);
     }
 
     pub(crate) async fn handle_describe(
@@ -808,6 +865,7 @@ impl PraxecServer {
     ///
     /// Dispatch table (first match wins):
     /// - `(none)`               → home
+    /// - `observe: true` alone  → observe (bounded audit-stream replay)
     /// - `query` present        → search
     /// - `subject` only         → describe (browse-time, no audit)
     /// - `subject + workflowId` → describe-in-workflow (audit fires)
@@ -821,6 +879,24 @@ impl PraxecServer {
         let wid = parsed.workflow_id.is_some();
         let tr = parsed.transition.is_some();
         let d = parsed.definition_id.is_some();
+
+        // Observe: `observe: true` is an exclusive shape (its only modifiers
+        // are `since` and `limit`); mixed with any other intent field it's
+        // ambiguous. `since` without `observe: true` is likewise rejected
+        // rather than silently ignored (a no-op arg would read as a filter
+        // that "worked").
+        let ob = parsed.observe.unwrap_or(false);
+        if ob && (q || s || wid || tr || d) {
+            return Ok(ambiguous_intent_query());
+        }
+        if parsed.since.is_some() && !ob {
+            return Ok(ambiguous_intent_query());
+        }
+        if ob {
+            return self
+                .handle_observe(parsed.since.as_deref(), parsed.limit)
+                .await;
+        }
 
         // Detect ambiguity: `query` (search intent) alongside subject/workflow
         // fields (describe/get/explain intent) is unresolvable.
@@ -917,6 +993,91 @@ impl PraxecServer {
                     "args": { "definitionId": "authoring-edit", "input": {} }
                 }
             ]
+        }))
+    }
+
+    /// L1 observability — the `praxec.query { observe: true }` read: a bounded
+    /// replay of the structured audit event stream (the pull complement to the
+    /// CLI `observe --follow` tail — an MCP call returns a response, not an
+    /// infinite stream). Reuses the file sink's dir-glob + newline-parse
+    /// reader ([`AuditSink::try_list_events`]): rotated / per-writer files
+    /// merged, heartbeat pulses excluded, timestamp-ordered. Fails fast with
+    /// the same rich error as the CLI when the sink is not `file`
+    /// (`praxec_core::audit::require_file_sink`).
+    ///
+    /// [`AuditSink::try_list_events`]: praxec_core::audit::AuditSink::try_list_events
+    pub(crate) async fn handle_observe(
+        &self,
+        since: Option<&str>,
+        limit: Option<u64>,
+    ) -> anyhow::Result<Value> {
+        let sink = self.runtime.audit();
+        if let Err(e) = praxec_core::audit::require_file_sink(sink.sink_kind(), "the observe query")
+        {
+            // Structured 4xx-class response (per the AMBIGUOUS_INTENT /
+            // LEXICON_WRITES_DISABLED pattern) so HATEOAS links stay
+            // machine-parseable.
+            return Ok(json!({
+                "error": {
+                    "code": "OBSERVE_REQUIRES_FILE_SINK",
+                    "message": e.to_string(),
+                    "hint": "Set `audit.sink: file` and `audit.path: <dir>` in the gateway config, then reload."
+                },
+                "links": [
+                    { "rel": "home", "method": "praxec.query", "args": {} }
+                ]
+            }));
+        }
+
+        let floor = since
+            .map(|s| {
+                s.parse::<chrono::DateTime<chrono::Utc>>().map_err(|e| {
+                    bad_request(format!(
+                        "invalid `since` (want RFC3339, e.g. 2026-07-10T12:00:00Z): {e}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        // A genuine directory-read failure PROPAGATES (internal error); a
+        // missing/empty audit dir is an empty window, not an error.
+        let mut events = sink.try_list_events().await?.unwrap_or_default();
+        if let Some(floor) = floor {
+            // Same `timestamp >= since` floor as the CLI `--since`: the cursor
+            // event itself is re-included — consumers dedupe by event `id`.
+            events.retain(|e| e.timestamp >= floor);
+        }
+
+        let total = events.len();
+        let limit = limit.unwrap_or(DEFAULT_OBSERVE_LIMIT) as usize;
+        let truncated = total > limit;
+        // Oldest-first page: the client walks FORWARD through the stream via
+        // the `next_since` cursor (matches the replay order of the CLI tail).
+        events.truncate(limit);
+        let next_since = events.last().map(|e| e.timestamp.to_rfc3339());
+
+        let mut links = vec![json!({ "rel": "home", "method": "praxec.query", "args": {} })];
+        if let Some(cursor) = &next_since {
+            links.push(json!({
+                "rel": "observe_next",
+                "title": "Poll the next window (pull-tail): events at/after this cursor",
+                "method": "praxec.query",
+                "args": { "observe": true, "since": cursor }
+            }));
+        }
+
+        Ok(json!({
+            "resource": { "type": "observe", "id": "audit-events" },
+            "result": { "status": "ok" },
+            "count": events.len(),
+            "truncated": truncated,
+            "next_since": next_since,
+            "events": events,
+            "note": "Bounded replay window — an MCP call returns a response, not a stream. \
+                     This is the pull complement to `praxec observe --follow`: re-query with \
+                     since=next_since to tail. Rebuild the execution tree from workflow_id + \
+                     parent_workflow_id + depth. Event schema: `praxec schema audit-event`.",
+            "links": links
         }))
     }
 
@@ -1362,7 +1523,7 @@ fn ambiguous_intent_query() -> Value {
         "error": {
             "code": "AMBIGUOUS_INTENT",
             "message": "praxec.query args do not match a known dispatch shape",
-            "hint": "see §32 dispatch table: home (no args), search (query), describe (subject), get (workflowId), explain (workflowId+transition), describe-in-workflow (subject+workflowId), read-definition (definitionId)"
+            "hint": "see §32 dispatch table: home (no args), search (query), describe (subject), get (workflowId), explain (workflowId+transition), describe-in-workflow (subject+workflowId), read-definition (definitionId), observe (observe:true, optional since/limit)"
         },
         "links": [
             { "rel": "home",   "method": "praxec.query", "args": {} },

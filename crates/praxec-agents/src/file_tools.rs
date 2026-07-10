@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use praxec_core::error::ExecutorError;
 use rig::completion::ToolDefinition;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::rig_runner::ToolHost;
 
@@ -177,8 +177,7 @@ impl ToolHost for FileEditToolHost {
                 // context-limited agent calling write_file on a big file
                 // truncates it.  Above the threshold, direct to edit_file.
                 if target.exists() {
-                    let existing = std::fs::read_to_string(&target)
-                        .unwrap_or_default();
+                    let existing = std::fs::read_to_string(&target).unwrap_or_default();
                     let n_lines = existing.lines().count();
                     if n_lines > WRITE_FILE_MAX_OVERWRITE_LINES {
                         return Err(format!(
@@ -250,11 +249,9 @@ impl ToolHost for FileEditToolHost {
             "read_range" => {
                 // Read lines [start,end] (1-based, inclusive) — a bounded window
                 // into a large file.
-                let start = args
-                    .get("start")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| "FILE_TOOL_BAD_ARGS: missing integer 'start' (1-based)".to_string())?
-                    as usize;
+                let start = args.get("start").and_then(Value::as_u64).ok_or_else(|| {
+                    "FILE_TOOL_BAD_ARGS: missing integer 'start' (1-based)".to_string()
+                })? as usize;
                 let end = args
                     .get("end")
                     .and_then(Value::as_u64)

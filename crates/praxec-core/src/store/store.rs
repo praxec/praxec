@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::model::{Evidence, WorkflowInstance};
 use crate::ports::{DefinitionStore, EvidenceStore, WorkflowStore};
-use crate::proxy_workflow::{compile_proxy_workflow, DEFAULT_PROXY_WORKFLOW_ID};
+use crate::proxy_workflow::{DEFAULT_PROXY_WORKFLOW_ID, compile_proxy_workflow};
 
 /// In-memory workflow store with optimistic concurrency on `version`.
 ///

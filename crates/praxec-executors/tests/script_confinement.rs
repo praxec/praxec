@@ -18,7 +18,7 @@ use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::Executor;
 use praxec_core::sandbox::{Egress, Preflight, SandboxOutput, SandboxProvider, SandboxSpec};
 use praxec_executors::ScriptExecutor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn instance(lib: Value) -> WorkflowInstance {
@@ -105,10 +105,12 @@ async fn unprofiled_script_runs_unconfined_exactly_as_before() {
         .await
         .expect("unprofiled script still runs");
     assert_eq!(out.output["success"], true);
-    assert!(out.output["stdout"]
-        .as_str()
-        .unwrap()
-        .contains("hello from script"));
+    assert!(
+        out.output["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("hello from script")
+    );
 }
 
 // ── Case 2: profiled + provider → routes through the sandbox ─────────────────
@@ -126,10 +128,12 @@ async fn confined_script_routes_through_the_provider() {
 
     // The executor adapted the provider's output, not bash's.
     assert_eq!(out.output["success"], true);
-    assert!(out.output["stdout"]
-        .as_str()
-        .unwrap()
-        .contains("confined-ok"));
+    assert!(
+        out.output["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("confined-ok")
+    );
 
     // The spec carried the real command, praxec env, and deny-all egress.
     let (command, env, egress) = provider

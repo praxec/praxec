@@ -2,7 +2,7 @@
 //! mutually exclusive at startup. Exercises the pure validator that
 //! agent-source resolution delegates to.
 
-use praxec_core::model_resolver::{validate_model_source_exclusivity, AmbiguousModelSourceError};
+use praxec_core::model_resolver::{AmbiguousModelSourceError, validate_model_source_exclusivity};
 
 #[test]
 fn cli_flag_and_yaml_both_present_fails_startup() {

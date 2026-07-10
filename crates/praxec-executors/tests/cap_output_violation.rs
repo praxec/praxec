@@ -21,7 +21,7 @@ use praxec_core::ports::{Executor, ExecutorRegistry, WorkflowStore};
 use praxec_core::runtime::WorkflowRuntime;
 use praxec_core::store::{ConfigDefinitionStore, InMemoryEvidenceStore, InMemoryWorkflowStore};
 use praxec_executors::workflow::WorkflowExecutor;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct CapTestRegistry {
     workflow_executor: OnceLock<Arc<WorkflowExecutor>>,

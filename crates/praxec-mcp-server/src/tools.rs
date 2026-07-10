@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use praxec_core::discovery::DiscoveryKind;
 use rmcp::model::Tool;
 
-use crate::args::{schema_for_args, CommandArgs, QueryArgs};
+use crate::args::{CommandArgs, QueryArgs, schema_for_args};
 use crate::{TOOL_COMMAND, TOOL_QUERY};
 
 pub(crate) fn parse_kind(s: &str) -> Option<DiscoveryKind> {
@@ -31,7 +31,8 @@ pub fn tool_definitions() -> Vec<Tool> {
             Cow::Borrowed(
                 "SPEC §32 read tool. Dispatches by present-field shape: \
                  {} → home; query → search; subject → describe; \
-                 workflowId → get; workflowId+transition → explain. \
+                 workflowId → get; workflowId+transition → explain; \
+                 observe:true → bounded audit-event replay (since/limit). \
                  Add kind='skill'|'script'|'lexicon' to scope search results.",
             ),
             schema_for_args::<QueryArgs>(&[]),
@@ -52,7 +53,7 @@ pub(crate) fn instructions() -> &'static str {
     r#"This is the praxec gateway. SPEC §32 two-tool surface.
 
 The tool surface is exactly two tools, stable across configs:
-  praxec.query   — read: home, search, describe, get, explain
+  praxec.query   — read: home, search, describe, get, explain, observe
   praxec.command — write: start, submit, define
 
 Dispatch by present-field shape:
@@ -61,6 +62,10 @@ Dispatch by present-field shape:
   praxec.query { subject }                 → describe
   praxec.query { workflowId }              → get
   praxec.query { workflowId, transition }  → explain
+  praxec.query { observe: true }           → bounded audit-event replay
+                                             (since=<RFC3339>, limit=<n>; poll
+                                             next_since to tail; requires
+                                             audit.sink: file)
 
   praxec.command { definitionId }                                    → start
   praxec.command { workflowId, expectedVersion, transition }         → submit

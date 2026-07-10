@@ -4,7 +4,7 @@
 //! set, the `check` oracle, and the runtime registry in lockstep: if a kind is
 //! in the constant but not wired, `check` would pass and runtime would fail.
 
-use praxec_executors::{default_registry, REGISTERED_EXECUTOR_KINDS};
+use praxec_executors::{REGISTERED_EXECUTOR_KINDS, default_registry};
 use serde_json::json;
 
 /// Kinds advertised in `REGISTERED_EXECUTOR_KINDS` but wired OUTSIDE the

@@ -11,7 +11,7 @@ use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::Executor;
 use praxec_executors::{CliConnections, CliExecutor};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn executor() -> CliExecutor {
     CliExecutor::new(Arc::new(CliConnections::from_config(&json!({}))))
@@ -128,4 +128,55 @@ async fn idempotency_key_is_exported_as_env() {
         .await
         .expect("sh succeeds");
     assert_eq!(out.output["stdout"], json!("idem-xyz"));
+}
+
+/// SPEC §9.5 — a cli executor naming a pack connection the operator never
+/// granted must fail typed with the grant remedy, EVEN when an inline
+/// `command` would otherwise let execution proceed. Silently running without
+/// the connection's env/working-directory would be a fallback across the
+/// trust boundary.
+#[tokio::test]
+async fn ungranted_pack_connection_fails_typed_even_with_inline_command() {
+    let config = json!({
+        "connections": {},
+        "praxec": {
+            "_ungrantedConnections": {
+                "packns/gh-cli": {
+                    "repo": "conn-pack",
+                    "namespace": "packns",
+                    "remedy": "add `grant_connections: [gh-cli]` to the `repos:` entry \
+                               for conn-pack to activate this connection"
+                }
+            }
+        }
+    });
+    let executor = CliExecutor::new(Arc::new(CliConnections::from_config(&config)));
+    let err = executor
+        .execute(req(
+            json!({ "connection": "packns/gh-cli", "command": "printf", "args": ["hi"] }),
+            None,
+        ))
+        .await
+        .expect_err("ungranted connection must fail, not silently fall back to inline command");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("UNGRANTED_PACK_CONNECTION"), "msg: {msg}");
+    assert!(msg.contains("conn-pack"), "msg names the pack: {msg}");
+    assert!(
+        msg.contains("grant_connections"),
+        "msg carries the remedy: {msg}"
+    );
+}
+
+/// Back-compat: an unknown (not ungranted) connection name with an inline
+/// command keeps today's behavior — the inline command runs.
+#[tokio::test]
+async fn unknown_connection_with_inline_command_still_runs_inline() {
+    let out = executor()
+        .execute(req(
+            json!({ "connection": "not-declared", "command": "printf", "args": ["ok"] }),
+            None,
+        ))
+        .await
+        .expect("inline command still runs for a merely-unknown connection");
+    assert_eq!(out.output["stdout"], json!("ok"));
 }

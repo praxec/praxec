@@ -93,7 +93,9 @@ pub enum CostCatalogError {
 
     /// Model is present but its `verified_at` is more than
     /// `STALENESS_THRESHOLD_DAYS` days before `today`.
-    #[error("model '{model}' has stale catalog entry (verified {verified_at}, threshold {threshold_days} days)")]
+    #[error(
+        "model '{model}' has stale catalog entry (verified {verified_at}, threshold {threshold_days} days)"
+    )]
     Stale {
         model: String,
         verified_at: String,

@@ -7,8 +7,8 @@
 
 mod common;
 
-use common::{anon, AnyKind, FixedExecutor, Scenario};
-use serde_json::{json, Value};
+use common::{AnyKind, FixedExecutor, Scenario, anon};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn delegated_workflow_yaml() -> &'static str {

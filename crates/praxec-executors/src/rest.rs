@@ -36,15 +36,19 @@ use praxec_core::error::ExecutorError;
 use praxec_core::mapping::read_in_scopes;
 use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
 use reqwest::Method;
-use serde_json::{json, Value};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RETRY_AFTER};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 /// `restConnection` entries from the gateway config, keyed by name.
 #[derive(Default, Clone)]
 pub struct RestConnections {
     inner: HashMap<String, RestConnection>,
+    /// SPEC §9.5 — pack-declared connections the operator has not granted
+    /// (from `/praxec/_ungrantedConnections`). Never spawnable; lookups fail
+    /// typed with the grant remedy instead of a bare not-found.
+    ungranted: HashMap<String, crate::conn_util::UngrantedConnection>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +75,10 @@ impl RestConnections {
                 inner.insert(name.clone(), RestConnection { base_url, headers });
             }
         }
-        Self { inner }
+        Self {
+            inner,
+            ungranted: crate::conn_util::ungranted_from_config(config),
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&RestConnection> {
@@ -109,7 +116,11 @@ impl Executor for RestExecutor {
             .ok_or_else(|| ExecutorError::Permanent("rest executor needs `connection`".into()))?;
 
         let connection = self.connections.get(connection_name).ok_or_else(|| {
-            ExecutorError::Permanent(format!("rest connection '{connection_name}' not found"))
+            crate::conn_util::connection_not_found_error(
+                "rest",
+                connection_name,
+                &self.connections.ungranted,
+            )
         })?;
 
         let method_str = cfg
@@ -390,11 +401,96 @@ fn render_template(template: &Value, request: &ExecuteRequest) -> Value {
 }
 
 #[cfg(test)]
+mod grant_gate_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use praxec_core::model::WorkflowInstance;
+
+    fn req(cfg: Value) -> ExecuteRequest {
+        ExecuteRequest {
+            workflow: WorkflowInstance {
+                id: "wf".into(),
+                definition_id: "stub".into(),
+                definition_version: "0".into(),
+                definition: Value::Null,
+                state: "s".into(),
+                version: 0,
+                input: json!({}),
+                context: json!({}),
+                started_at: chrono::Utc::now(),
+                trace_id: None,
+                run_id: None,
+                cancelled_at: None,
+                cancelled_reason: None,
+                depth: 0,
+                parent: None,
+            },
+            transition: None,
+            arguments: json!({}),
+            executor_config: cfg,
+            idempotency_key: None,
+            correlation_id: None,
+        }
+    }
+
+    /// SPEC §9.5 — a rest executor call naming a pack connection the operator
+    /// never granted must fail typed with the grant remedy before any request
+    /// is attempted.
+    #[tokio::test]
+    async fn ungranted_pack_connection_fails_typed_with_grant_remedy() {
+        let config = json!({
+            "connections": {},
+            "praxec": {
+                "_ungrantedConnections": {
+                    "packns/audit-api": {
+                        "repo": "conn-pack",
+                        "namespace": "packns",
+                        "remedy": "add `grant_connections: [audit-api]` to the `repos:` \
+                                   entry for conn-pack to activate this connection"
+                    }
+                }
+            }
+        });
+        let executor = RestExecutor::new(Arc::new(RestConnections::from_config(&config)));
+        let err = executor
+            .execute(req(
+                json!({ "connection": "packns/audit-api", "path": "/x" }),
+            ))
+            .await
+            .expect_err("ungranted connection must not be reachable");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("UNGRANTED_PACK_CONNECTION"), "msg: {msg}");
+        assert!(msg.contains("conn-pack"), "msg names the pack: {msg}");
+        assert!(
+            msg.contains("grant_connections"),
+            "msg carries the remedy: {msg}"
+        );
+    }
+
+    /// A genuinely unknown connection keeps the existing message unchanged.
+    #[tokio::test]
+    async fn unknown_connection_keeps_the_existing_not_found_message() {
+        let executor = RestExecutor::new(Arc::new(RestConnections::from_config(&json!({}))));
+        let err = executor
+            .execute(req(json!({ "connection": "nope", "path": "/x" })))
+            .await
+            .expect_err("unknown connection errors");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("rest connection 'nope' not found"),
+            "msg: {msg}"
+        );
+        assert!(!msg.contains("UNGRANTED_PACK_CONNECTION"), "msg: {msg}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    use super::{classify_status, render_path, StatusClass};
+    use super::{StatusClass, classify_status, render_path};
     use praxec_core::error::ExecutorError;
     use praxec_core::model::{ExecuteRequest, WorkflowInstance};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn req(args: Value, context: Value) -> ExecuteRequest {
         ExecuteRequest {

@@ -9,15 +9,15 @@ use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::RunningService;
-use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::{RoleClient, ServiceExt};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::idle::{with_idle_timeout, ActivityClock, ActivityTracked};
+use crate::idle::{ActivityClock, ActivityTracked, with_idle_timeout};
 
 /// Per-connection idle (no-activity) ceiling on connect/`initialize` and each
 /// tool call when the connection does not set `idleTimeoutMs`. This is an
@@ -31,6 +31,10 @@ pub const DEFAULT_IDLE_TIMEOUT_MS: u64 = 30_000;
 #[derive(Default, Clone)]
 pub struct McpConnections {
     inner: Arc<HashMap<String, McpConnection>>,
+    /// SPEC §9.5 — pack-declared connections the operator has not granted
+    /// (from `/praxec/_ungrantedConnections`). Never spawnable; lookups fail
+    /// typed with the grant remedy instead of a bare not-found.
+    ungranted: Arc<HashMap<String, crate::conn_util::UngrantedConnection>>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +92,7 @@ impl McpConnections {
         }
         Self {
             inner: Arc::new(map),
+            ungranted: Arc::new(crate::conn_util::ungranted_from_config(config)),
         }
     }
 
@@ -163,7 +168,7 @@ impl RmcpToolCaller {
         }
 
         let conn = self.connections.get(name).ok_or_else(|| {
-            ExecutorError::Permanent(format!("mcp connection '{name}' not found"))
+            crate::conn_util::connection_not_found_error("mcp", name, &self.connections.ungranted)
         })?;
         let idle = conn.idle();
         let clock = ActivityClock::new();
@@ -564,6 +569,59 @@ fn classify(message: String) -> ExecutorError {
 }
 
 #[cfg(test)]
+mod grant_gate_tests {
+    use super::*;
+
+    /// SPEC §9.5 — an mcp executor call naming a pack connection the operator
+    /// never granted must fail typed with the grant remedy: no spawn attempt,
+    /// no bare not-found, no fallback.
+    #[tokio::test]
+    async fn ungranted_pack_connection_fails_typed_with_grant_remedy() {
+        let config = json!({
+            "connections": {},
+            "praxec": {
+                "_ungrantedConnections": {
+                    "packns/gh-mcp": {
+                        "repo": "conn-pack",
+                        "namespace": "packns",
+                        "remedy": "add `grant_connections: [gh-mcp]` to the `repos:` entry \
+                                   for conn-pack to activate this connection"
+                    }
+                }
+            }
+        });
+        let caller = RmcpToolCaller::new(McpConnections::from_config(&config));
+        let err = caller
+            .list_remote_tools("packns/gh-mcp")
+            .await
+            .expect_err("ungranted connection must not be reachable");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("UNGRANTED_PACK_CONNECTION"), "msg: {msg}");
+        assert!(msg.contains("conn-pack"), "msg names the pack: {msg}");
+        assert!(
+            msg.contains("grant_connections"),
+            "msg carries the remedy: {msg}"
+        );
+    }
+
+    /// A genuinely unknown connection keeps the existing message unchanged.
+    #[tokio::test]
+    async fn unknown_connection_keeps_the_existing_not_found_message() {
+        let caller = RmcpToolCaller::new(McpConnections::from_config(&json!({})));
+        let err = caller
+            .list_remote_tools("nope")
+            .await
+            .expect_err("unknown connection errors");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("mcp connection 'nope' not found"),
+            "msg: {msg}"
+        );
+        assert!(!msg.contains("UNGRANTED_PACK_CONNECTION"), "msg: {msg}");
+    }
+}
+
+#[cfg(test)]
 mod idle_wiring_tests {
     use super::*;
     use std::time::{Duration, Instant};
@@ -701,7 +759,7 @@ mod transport_happy_path_tests {
         ServerCapabilities, ServerInfo, Tool,
     };
     use rmcp::service::{RequestContext, RoleServer};
-    use rmcp::{serve_server, ErrorData as McpError, ServerHandler};
+    use rmcp::{ErrorData as McpError, ServerHandler, serve_server};
     use std::time::Duration;
 
     #[derive(Clone)]

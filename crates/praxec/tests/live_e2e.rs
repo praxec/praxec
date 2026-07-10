@@ -7,10 +7,10 @@
 //! the real binary, config loading, the MCP serialization boundary, and a full
 //! launch→drive→resolve loop. The drive needs no LLM (noop + human steps only).
 
+use rmcp::ServiceExt;
 use rmcp::model::CallToolRequestParams;
 use rmcp::transport::TokioChildProcess;
-use rmcp::ServiceExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const CONFIG: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),

@@ -41,6 +41,9 @@ pub fn classify_run(outcome: &DriveOutcome, final_state: &MissionState) -> RunVe
         DriveOutcome::Declined => RunVerdict::Pass,
         DriveOutcome::MaxSteps => RunVerdict::Livelock,
         DriveOutcome::Error(e) => RunVerdict::EngineError(e.clone()),
+        // A chooser/runner fault (missing key, 401, model-resolution, network)
+        // is an engine-level error, not a livelock/wedge — surface it as one.
+        DriveOutcome::ChooserFailed { source } => RunVerdict::EngineError(source.clone()),
         DriveOutcome::GaveUp => {
             if final_state.resolved() || final_state.human_turn() {
                 RunVerdict::Pass

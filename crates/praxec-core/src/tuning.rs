@@ -139,6 +139,15 @@ pub struct ReasoningTuning {
     /// Gemini `thinking_level` value per level.
     #[serde(default = "default_gemini_level")]
     pub gemini_level: BTreeMap<String, String>,
+    /// Reasoning effort applied to a `kind: agent` turn when the step declares
+    /// no explicit `reasoning_effort`. `low` caps per-turn reasoning so a
+    /// *reasoning* model can lead a chain without spending the whole turn budget
+    /// on hidden reasoning (which surfaces as empty content → an AGENT_NO_RESULT
+    /// stall). Empty string opts out (send nothing → provider default). Note
+    /// `medium` is itself a no-op here (≡ provider default — see
+    /// `reasoning_params`), so it is NOT a useful cap.
+    #[serde(default = "default_reasoning_default_effort")]
+    pub default_effort: String,
 }
 
 impl ReasoningTuning {
@@ -247,7 +256,13 @@ fn default_reasoning_tuning() -> ReasoningTuning {
         anthropic_budget_tokens: default_anthropic_budgets(),
         openai_effort: default_openai_effort(),
         gemini_level: default_gemini_level(),
+        default_effort: default_reasoning_default_effort(),
     }
+}
+/// Cap per-turn reasoning by default so reasoning models can lead a chain
+/// without burning the whole turn budget. Override-aware via the tuning file.
+fn default_reasoning_default_effort() -> String {
+    "low".to_string()
 }
 fn map_str(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
@@ -392,5 +407,30 @@ mod tests {
         assert_eq!(r.openai_effort("max"), "xhigh");
         assert_eq!(r.gemini_level("low"), "low");
         assert_eq!(r.gemini_level("mystery"), "high"); // fallback
+    }
+
+    #[test]
+    fn default_reasoning_effort_is_low_and_caps_the_turn() {
+        // The shipped default caps per-turn reasoning so a reasoning model can
+        // lead a chain; "low" (not "medium") because medium is a no-op.
+        let r = default_reasoning_tuning();
+        assert_eq!(r.default_effort, "low");
+        // And "low" actually emits a capping param for openrouter/openai
+        // (whereas "medium" would send nothing).
+        assert!(reasoning_params("openrouter", &r.default_effort).is_some());
+        assert!(reasoning_params("openrouter", "medium").is_none());
+    }
+
+    #[test]
+    fn default_effort_is_override_aware() {
+        // Setting only default_effort keeps the other reasoning maps at defaults.
+        let t: RecommendationTuning =
+            serde_json::from_str(r#"{ "reasoning": { "default_effort": "minimal" } }"#).unwrap();
+        assert_eq!(t.reasoning.default_effort, "minimal");
+        assert_eq!(t.reasoning.openai_effort("high"), "high"); // untouched
+        // Empty opts out (provider default).
+        let t2: RecommendationTuning =
+            serde_json::from_str(r#"{ "reasoning": { "default_effort": "" } }"#).unwrap();
+        assert_eq!(t2.reasoning.default_effort, "");
     }
 }

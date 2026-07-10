@@ -7,13 +7,13 @@
 //! so it appears to grow out of (zoom-in) or shrink toward (zoom-out) the tile.
 
 use crate::app::App;
-use crate::map::transition::ZoomDir;
 use crate::map::Level;
+use crate::map::transition::ZoomDir;
 use crate::theme;
 use crate::ui::{fleet_view, map_chrome::render_chrome, run_dashboard};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::widgets::{Block, Clear};
-use ratatui::Frame;
 
 pub fn render_map(f: &mut Frame, area: Rect, app: &App) {
     let rows = Layout::default()
@@ -83,8 +83,8 @@ fn clamp_to(r: Rect, bounds: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn render_map_to_string(app: &App, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);

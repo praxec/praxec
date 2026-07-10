@@ -6,8 +6,8 @@
 //! subject named — so failures point straight at the missing rule.
 
 use praxec_core::config::{
-    compute_script_hash, normalize_for_script_hash, resolve_str, resolve_with_diagnostics,
-    Diagnostic,
+    Diagnostic, compute_script_hash, normalize_for_script_hash, resolve_str,
+    resolve_with_diagnostics,
 };
 
 fn resolve_yaml_with_diagnostics(

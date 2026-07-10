@@ -217,6 +217,9 @@ async fn agent_completed_carries_cost_telemetry() {
     assert_eq!(p["cost_usd"], 0.123);
     // duration_ms is preserved alongside the new fields.
     assert!(p["duration_ms"].is_u64());
+    // The affinity the agent was resolved under rides along, so the cost
+    // report can attribute spend to the kind of work without a join.
+    assert_eq!(p["affinity"], "reasoning");
 }
 
 /// Degrade gracefully: an uncatalogued model leaves `cost_usd: null` on the

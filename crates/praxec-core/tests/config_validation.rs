@@ -2,7 +2,7 @@
 
 use praxec_core::config;
 use praxec_core::validate::validate_workflows;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[test]
 fn valid_config_with_version_field() {
@@ -831,10 +831,14 @@ fn explicit_input_schema_is_not_overwritten() {
     });
     let resolved = config::resolve(cfg).expect("resolves");
     // explicit inputSchema preserved (has `y`, not synthesized from inputs `x`)
-    assert!(resolved
-        .pointer("/workflows/f/inputSchema/properties/y")
-        .is_some());
-    assert!(resolved
-        .pointer("/workflows/f/inputSchema/properties/x")
-        .is_none());
+    assert!(
+        resolved
+            .pointer("/workflows/f/inputSchema/properties/y")
+            .is_some()
+    );
+    assert!(
+        resolved
+            .pointer("/workflows/f/inputSchema/properties/x")
+            .is_none()
+    );
 }

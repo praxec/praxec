@@ -36,7 +36,7 @@ use praxec_core::audit::AuditSink;
 use praxec_core::error::{ExecutorError, LlmErrorCode};
 use praxec_core::model::{ExecuteRequest, ExecuteResult, NextTransition, Principal};
 use praxec_core::ports::{Executor, TransitionResolver};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub use affinity::{AffinityResolver, RejectingAffinityResolver};
 pub use audit::InvocationContext;

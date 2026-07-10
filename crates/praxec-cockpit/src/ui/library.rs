@@ -9,10 +9,10 @@
 use crate::app::App;
 use crate::model::LibraryEntry;
 use crate::theme;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph, Wrap};
-use ratatui::Frame;
 
 /// The kind filter for a Build facet label. `None` means "all" (the `Sources`
 /// overview). Unknown facets fall through to all.
@@ -215,8 +215,8 @@ mod tests {
     use super::*;
     use crate::app::{App, Mode};
     use crate::gateway::{FakeGateway, Gateway};
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn app_with_library() -> App {
         let mut app = App::new();

@@ -19,8 +19,8 @@ use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::ExecutorRegistry;
-use praxec_executors::{default_registry_with_mcp, CliConnections, McpConnections, McpExecutor};
-use serde_json::{json, Value};
+use praxec_executors::{CliConnections, McpConnections, McpExecutor, default_registry_with_mcp};
+use serde_json::{Value, json};
 
 fn instance_stub() -> WorkflowInstance {
     WorkflowInstance {
@@ -390,7 +390,8 @@ async fn join_any_emits_cancelled_event_for_dropped_siblings() {
         .collect();
     let total_concluded = cancelled.len() + completed.len();
     assert_eq!(
-        total_concluded, 4,
+        total_concluded,
+        4,
         "every branch must conclude as either completed or cancelled; got: {} completed + {} cancelled",
         completed.len(),
         cancelled.len()
@@ -949,6 +950,193 @@ async fn unknown_join_value_is_permanent_config_error() {
     )
     .await
     .expect_err("an unknown join value must be a config error");
+    match err {
+        ExecutorError::Permanent(msg) => {
+            assert!(msg.contains("INVALID_PARALLEL_CONFIG"), "got: {msg}")
+        }
+        other => panic!("expected Permanent, got {other:?}"),
+    }
+}
+
+// ── Spec A §7.1 — MAP BOUNDARY: per-item input validation ────────────────
+
+#[tokio::test]
+async fn map_boundary_conforming_items_pass() {
+    // Every item conforms to the worker's declared inputSchema → fan-out runs.
+    let mut inst = instance_stub();
+    inst.context = json!({ "items": [
+        { "symbol": "alpha" },
+        { "symbol": "beta" },
+    ]});
+    let audit = Arc::new(MemoryAuditSink::new());
+    let result = run_parallel(
+        json!({
+            "kind": "parallel",
+            "branches": {
+                "for_each": "$.context.items",
+                "do": {
+                    "kind": "noop",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "symbol": { "type": "string" } },
+                        "required": ["symbol"]
+                    }
+                }
+            },
+            "join": "all",
+        }),
+        inst,
+        audit.clone(),
+    )
+    .await
+    .expect("conforming items pass the map boundary");
+    assert_eq!(result.output["summary"]["n"], 2);
+    assert_eq!(result.output["summary"]["ok_count"], 2);
+}
+
+#[tokio::test]
+async fn map_boundary_off_shape_item_rejected_before_fanout() {
+    // The second item is missing the required `symbol` field → fail-fast at the
+    // map boundary, naming the offending source-array index, BEFORE any branch
+    // spawns (no branch.started events).
+    let mut inst = instance_stub();
+    inst.context = json!({ "items": [
+        { "symbol": "alpha" },
+        { "nope": true },
+    ]});
+    let audit = Arc::new(MemoryAuditSink::new());
+    let err = run_parallel(
+        json!({
+            "kind": "parallel",
+            "branches": {
+                "for_each": "$.context.items",
+                "do": {
+                    "kind": "noop",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "symbol": { "type": "string" } },
+                        "required": ["symbol"]
+                    }
+                }
+            },
+            "join": "all",
+        }),
+        inst,
+        audit.clone(),
+    )
+    .await
+    .expect_err("an off-shape item must be rejected at the map boundary");
+    match err {
+        ExecutorError::Permanent(msg) => {
+            assert!(msg.contains("PARALLEL_MAP_INPUT_VIOLATION"), "got: {msg}");
+            assert!(
+                msg.contains("index 1"),
+                "must name the offending index: {msg}"
+            );
+        }
+        other => panic!("expected Permanent, got {other:?}"),
+    }
+    // Boundary is enforced before fan-out: no branch ever started.
+    let started = audit
+        .snapshot()
+        .into_iter()
+        .filter(|e| e.event_type == "parallel.branch.started")
+        .count();
+    assert_eq!(
+        started, 0,
+        "no branch may spawn once the map boundary rejects"
+    );
+}
+
+#[tokio::test]
+async fn map_boundary_only_validates_items_surviving_the_where_filter() {
+    // The off-shape element is filtered out by `where:` before the boundary,
+    // so the remaining (conforming) item passes and fan-out proceeds. This
+    // proves the map boundary validates exactly the items handed to workers.
+    let mut inst = instance_stub();
+    inst.context = json!({ "items": [
+        { "symbol": "alpha", "keep": true },
+        { "keep": false },
+    ]});
+    let audit = Arc::new(MemoryAuditSink::new());
+    let result = run_parallel(
+        json!({
+            "kind": "parallel",
+            "branches": {
+                "for_each": "$.context.items",
+                "where":    "$.value.keep == true",
+                "do": {
+                    "kind": "noop",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "symbol": { "type": "string" } },
+                        "required": ["symbol"]
+                    }
+                }
+            },
+            "join": "all",
+        }),
+        inst,
+        audit.clone(),
+    )
+    .await
+    .expect("filtered-out off-shape item must not trip the map boundary");
+    assert_eq!(result.output["summary"]["n"], 1);
+    assert_eq!(result.output["summary"]["ok_count"], 1);
+}
+
+#[tokio::test]
+async fn map_boundary_resolves_hop_input_ref() {
+    // A `praxec://hop#/$defs/verifyIn` contract must resolve against the shipped
+    // HOP vocabulary (registry-aware): `verifyIn` requires `cwd`, so an item
+    // without it is rejected — proving the boundary uses the same registry the
+    // runtime seams do, not a bare validator that would fail to resolve the ref.
+    let mut inst = instance_stub();
+    inst.context = json!({ "items": [ { "not_cwd": "x" } ] });
+    let audit = Arc::new(MemoryAuditSink::new());
+    let err = run_parallel(
+        json!({
+            "kind": "parallel",
+            "branches": {
+                "for_each": "$.context.items",
+                "do": {
+                    "kind": "noop",
+                    "inputSchema": { "$ref": "praxec://hop#/$defs/verifyIn" }
+                }
+            },
+            "join": "all",
+        }),
+        inst,
+        audit.clone(),
+    )
+    .await
+    .expect_err("an item missing `cwd` must fail the verifyIn contract");
+    match err {
+        ExecutorError::Permanent(msg) => {
+            assert!(msg.contains("PARALLEL_MAP_INPUT_VIOLATION"), "got: {msg}")
+        }
+        other => panic!("expected Permanent, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn map_boundary_non_object_input_schema_rejects_at_parse() {
+    let audit = Arc::new(MemoryAuditSink::new());
+    let mut inst = instance_stub();
+    inst.context = json!({ "items": [1, 2] });
+    let err = run_parallel(
+        json!({
+            "kind": "parallel",
+            "branches": {
+                "for_each": "$.context.items",
+                "do": { "kind": "noop", "inputSchema": "not-a-schema" }
+            },
+        }),
+        inst,
+        audit,
+    )
+    .await
+    .expect_err("a non-object inputSchema must reject at parse");
     match err {
         ExecutorError::Permanent(msg) => {
             assert!(msg.contains("INVALID_PARALLEL_CONFIG"), "got: {msg}")

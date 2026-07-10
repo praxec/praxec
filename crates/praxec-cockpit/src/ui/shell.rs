@@ -6,10 +6,10 @@ use crate::app::{App, Focus, Mode};
 use crate::nav;
 use crate::theme;
 use crate::view::MissionView;
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 pub fn render_shell(f: &mut Frame, app: &App) {
     let rows = Layout::default()
@@ -74,24 +74,24 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         ));
         chips.push(Span::raw("  "));
     }
-    if app.mode == Mode::Run {
-        if let Some(m) = app.mission.as_ref() {
-            let c = m.counts();
-            chips.push(Span::styled(
-                format!("● {} running", c.running),
-                theme::good(),
-            ));
-            chips.push(Span::raw("  "));
-            chips.push(Span::styled(
-                format!("◷ {} blocked", c.blocked),
-                theme::warn(),
-            ));
-            chips.push(Span::raw("  "));
-            chips.push(Span::styled(
-                format!("◆ {} needs you", c.needs_you),
-                theme::accent(),
-            ));
-        }
+    if app.mode == Mode::Run
+        && let Some(m) = app.mission.as_ref()
+    {
+        let c = m.counts();
+        chips.push(Span::styled(
+            format!("● {} running", c.running),
+            theme::good(),
+        ));
+        chips.push(Span::raw("  "));
+        chips.push(Span::styled(
+            format!("◷ {} blocked", c.blocked),
+            theme::warn(),
+        ));
+        chips.push(Span::raw("  "));
+        chips.push(Span::styled(
+            format!("◆ {} needs you", c.needs_you),
+            theme::accent(),
+        ));
     }
     f.render_widget(
         Paragraph::new(Line::from(chips)).alignment(Alignment::Right),
@@ -253,8 +253,8 @@ mod tests {
     use super::*;
     use crate::app::App;
     use crate::view::MissionView;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn render_to_string(app: &App) -> String {
         let backend = TestBackend::new(100, 26);

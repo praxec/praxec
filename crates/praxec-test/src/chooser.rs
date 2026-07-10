@@ -29,7 +29,7 @@ impl FuzzChooser {
 
 #[async_trait]
 impl TransitionChooser for FuzzChooser {
-    async fn choose(&self, state: &MissionState) -> Option<String> {
+    async fn choose(&self, state: &MissionState) -> Result<Option<String>, String> {
         // Detect stalls: if version hasn't changed across MAX_STALL calls, give up.
         {
             let mut p = self.progress.lock().expect("progress lock");
@@ -40,13 +40,13 @@ impl TransitionChooser for FuzzChooser {
                 p.1 = 0;
             }
             if p.1 >= MAX_STALL {
-                return None; // no progress for MAX_STALL choices → give up (livelock)
+                return Ok(None); // no progress for MAX_STALL choices → give up (livelock)
             }
         }
 
         let actions = state.agent_actions();
         if actions.is_empty() {
-            return None;
+            return Ok(None);
         }
         let idx = self.rng.lock().expect("rng lock").below(actions.len());
         let chosen = actions[idx].transition.clone();
@@ -54,7 +54,7 @@ impl TransitionChooser for FuzzChooser {
             .lock()
             .expect("coverage lock")
             .insert(chosen.clone());
-        Some(chosen)
+        Ok(Some(chosen))
     }
 }
 
@@ -86,7 +86,7 @@ mod tests {
         let cov = Arc::new(Mutex::new(HashSet::new()));
         let chooser = FuzzChooser::new(1, cov);
         let st = state_with(vec![("approve", "human"), ("request_changes", "human")]);
-        assert_eq!(chooser.choose(&st).await, None);
+        assert_eq!(chooser.choose(&st).await, Ok(None));
     }
 
     #[tokio::test]
@@ -94,7 +94,11 @@ mod tests {
         let cov = Arc::new(Mutex::new(HashSet::new()));
         let chooser = FuzzChooser::new(1, cov.clone());
         let st = state_with(vec![("a", "agent"), ("b", "agent")]);
-        let chosen = chooser.choose(&st).await.expect("an agent action");
+        let chosen = chooser
+            .choose(&st)
+            .await
+            .expect("no chooser error")
+            .expect("an agent action");
         assert!(chosen == "a" || chosen == "b");
         assert!(cov.lock().unwrap().contains(&chosen));
     }
@@ -116,7 +120,7 @@ mod tests {
         // First MAX_STALL calls return Some; then it gives up with None.
         let mut results = Vec::new();
         for _ in 0..8 {
-            results.push(chooser.choose(&st).await);
+            results.push(chooser.choose(&st).await.expect("no chooser error"));
         }
         assert!(
             results.iter().take(6).all(|r| r.is_some()),

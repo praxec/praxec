@@ -3,16 +3,16 @@
 //! sibling files — see `runtime.rs` for the type definition and lifecycle
 //! entry points (`start`, `submit`, `get`).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::ExecutorError;
-use crate::mission::{derive_mission_status, StatusHint, TerminalOutcome};
+use crate::mission::{StatusHint, TerminalOutcome, derive_mission_status};
 use crate::model::{Principal, WorkflowInstance};
+use crate::runtime::WorkflowRuntime;
 use crate::runtime::runtime_links::{
     collect_guidance_refs, is_terminal, link_filter_byguards, links, pointer_escape,
     transition_definition,
 };
-use crate::runtime::WorkflowRuntime;
 use crate::templating::render_template;
 
 /// SPEC §9 + §20.4 — outcome of evaluating a transition's full `guards:`

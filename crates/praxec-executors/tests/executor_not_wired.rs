@@ -12,7 +12,7 @@ use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::Executor;
 use praxec_executors::{ParallelExecutor, PipelineExecutor};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn req(executor_config: Value) -> ExecuteRequest {
     ExecuteRequest {

@@ -10,8 +10,8 @@ use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, WorkflowInstance};
 use praxec_core::ports::ExecutorRegistry;
-use praxec_executors::{default_registry_with_mcp, CliConnections, McpConnections, McpExecutor};
-use serde_json::{json, Value};
+use praxec_executors::{CliConnections, McpConnections, McpExecutor, default_registry_with_mcp};
+use serde_json::{Value, json};
 
 fn instance_stub() -> WorkflowInstance {
     WorkflowInstance {

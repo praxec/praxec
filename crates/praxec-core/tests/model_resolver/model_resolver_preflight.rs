@@ -3,12 +3,12 @@
 //! but is exercised via the public preflight surface).
 
 use praxec_core::model_resolver::preflight::{
-    api_key_env_for, classify_outcome, probe_binding, PreflightOutcome,
+    PreflightOutcome, api_key_env_for, classify_outcome, probe_binding,
 };
 use praxec_core::model_resolver::provider_probe::probe_client;
 use praxec_core::model_resolver::{
-    verify_primary_bindings, Binding, ConfigSource, FailureClass, ModelRef, ModelsFile,
-    PreflightError, Provider, ProviderFeatures, Resolver,
+    Binding, ConfigSource, FailureClass, ModelRef, ModelsFile, PreflightError, Provider,
+    ProviderFeatures, Resolver, verify_primary_bindings,
 };
 use praxec_core::providers::ProviderId;
 use std::path::PathBuf;
@@ -35,7 +35,8 @@ fn clear_env() {
         "ANTHROPIC_BASE_URL",
         "OPENAI_BASE_URL",
     ] {
-        std::env::remove_var(var);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(var) };
     }
 }
 
@@ -89,9 +90,11 @@ async fn probe_present_key_but_unreachable_endpoint_warns_not_fails() {
     // credential block startup", which is the whole point of the auth probe.
     let _g = env_lock().lock().await;
     clear_env();
-    std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test") };
     // 192.0.2.0/24 is reserved for documentation/tests and is not routed.
-    std::env::set_var("ANTHROPIC_BASE_URL", "http://192.0.2.1:1");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("ANTHROPIC_BASE_URL", "http://192.0.2.1:1") };
     let b = Binding {
         provider: Provider::Known(ProviderId::Anthropic),
         model: "claude-sonnet-4-6".into(),
@@ -181,8 +184,10 @@ async fn primary_with_credential_passes_startup_when_probe_is_transient() {
     // test is hermetic (no live provider call, no real key needed).
     let _g = env_lock().lock().await;
     clear_env();
-    std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test");
-    std::env::set_var("ANTHROPIC_BASE_URL", "http://192.0.2.1:1");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("ANTHROPIC_BASE_URL", "http://192.0.2.1:1") };
     let yaml = r#"
 version: 1
 default:
@@ -201,7 +206,8 @@ async fn skip_env_bypasses_preflight() {
     let _g = env_lock().lock().await;
     clear_env();
     // No credentials set, but SKIP env is on → preflight must pass.
-    std::env::set_var("PRAXEC_SKIP_PREFLIGHT", "1");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("PRAXEC_SKIP_PREFLIGHT", "1") };
     let yaml = r#"
 version: 1
 default:

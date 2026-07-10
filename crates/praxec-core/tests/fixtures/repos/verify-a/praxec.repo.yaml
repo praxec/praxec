@@ -1,0 +1,8 @@
+schema: praxec.repo/v1
+name: verify-a
+namespace: va
+version: 0.6.0
+description: |
+  Test fixture — ships cap.verify.generic under namespace `va`. Paired with
+  verify-b (same id, namespace `vb`) to exercise hop_slot repo-priority
+  tie-breaking (Spec A §5).

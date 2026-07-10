@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
-use crate::cap_verb::{CapVerb, CapVerbCategory, BLESSED_CAP_VERBS};
+use crate::cap_verb::{BLESSED_CAP_VERBS, CapVerb, CapVerbCategory};
 use crate::contract_hash::compute_contract_hash;
 use crate::tier::Tier;
 
@@ -263,6 +263,11 @@ fn validate_one_workflow(
     // writes that Null to the blackboard. Reject those shapes at load so a
     // typo'd operator can't masquerade as a real (null) value at runtime.
     validate_output_operator_shapes(id, def, out);
+    // Spec A §7.1 — the fan-in composition check for `kind: parallel` steps.
+    // Proves at LOAD that the reduce (aggregator) consumes only what the map
+    // produces: every field the reduce requires must be satisfiable from the
+    // fan-in envelope of worker outputs, so a mis-wired map-reduce cannot load.
+    validate_parallel_edges(id, def, out);
 
     let Some(initial_state) = def.get("initialState").and_then(Value::as_str) else {
         out.push(Diagnostic::Error(format!(
@@ -1922,6 +1927,146 @@ fn validate_output_operator_shapes(id: &str, def: &Value, out: &mut Vec<Diagnost
     }
 }
 
+/// The fixed fan-in envelope a `parallel` executor hands its aggregator
+/// (`compute_verdict`, `aggregator_input`): the branch results plus the four
+/// aggregate counts. The reduce (aggregator) can only consume these top-level
+/// fields — every worker output lives nested under `branches[].output`.
+const PARALLEL_FANIN_FIELDS: [&str; 5] = [
+    "branches",
+    "ok_count",
+    "failed_count",
+    "cancelled_count",
+    "n",
+];
+
+/// Spec A §7.1 — the fan-in composition check (the load-time half of the typed
+/// parallel edges). For every `kind: parallel` transition whose reduce is a
+/// declared aggregator with an `inputSchema`, prove that the reduce **consumes
+/// only what the map produces**:
+///
+/// 1. **Envelope coverage** — every top-level field the aggregator `inputSchema`
+///    marks `required` must be one of the fixed fan-in envelope fields
+///    (`branches`, `ok_count`, `failed_count`, `cancelled_count`, `n`). A
+///    required field outside that set can never be produced by the fan-out, so
+///    the map-reduce is mis-wired and must not load.
+/// 2. **Per-branch `<slot>Out` coverage** — when the aggregator further
+///    constrains the per-branch output (`properties.branches.items.properties.
+///    output.required`) AND the map worker declares its produced shape
+///    (`branches.do.outputSchema`, inline or a `praxec://hop` `$ref`), every
+///    output field the reduce requires must be a declared property of the
+///    worker's output. A reduce that reads a field the worker never emits is a
+///    load error.
+///
+/// Honest boundary (§4.5): this proves the reduce's *required* inputs are
+/// producible. It cannot prove a shape-valid *wrong-field* mapping — that stays
+/// a runtime/review concern. When a contract is absent (no aggregator
+/// `inputSchema`, or no worker `outputSchema` for the deeper check) there is
+/// nothing to prove and the check is skipped.
+fn validate_parallel_edges(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
+    let Some(states) = def.get("states").and_then(Value::as_object) else {
+        return;
+    };
+    for (state_name, state_def) in states {
+        let Some(ts) = state_def.get("transitions").and_then(Value::as_object) else {
+            continue;
+        };
+        for (t_name, t_def) in ts {
+            let Some(exec) = t_def.get("executor") else {
+                continue;
+            };
+            if exec.get("kind").and_then(Value::as_str) != Some("parallel") {
+                continue;
+            }
+            // The reduce contract lives on the aggregator's `inputSchema`.
+            // `join: "all" | "any" | { at_least } | { percent } | { expression }`
+            // carry no typed reduce contract — nothing to check.
+            let Some(reduce_in) = exec.pointer("/join/aggregator/inputSchema") else {
+                continue;
+            };
+
+            // 1. Envelope coverage — required top-level reduce fields must be
+            //    fan-in envelope fields.
+            if let Some(required) = schema_required_fields(reduce_in) {
+                for field in required {
+                    if !PARALLEL_FANIN_FIELDS.contains(&field.as_str()) {
+                        out.push(Diagnostic::Error(format!(
+                            "PARALLEL_REDUCE_UNSATISFIED_FIELD: workflow '{id}' state \
+                             '{state_name}' transition '{t_name}': the parallel reduce \
+                             (`join.aggregator`) requires field '{field}', which the fan-in \
+                             envelope never produces (available: [{}]). The reduce must consume \
+                             only what the map produces (Spec A §7.1).",
+                            PARALLEL_FANIN_FIELDS.join(", ")
+                        )));
+                    }
+                }
+            }
+
+            // 2. Per-branch `<slot>Out` coverage — reduce's required per-branch
+            //    output fields ⊆ worker's declared output properties.
+            let reduce_output_required = reduce_in
+                .pointer("/properties/branches/items/properties/output")
+                .and_then(schema_required_fields);
+            let Some(reduce_output_required) = reduce_output_required else {
+                continue;
+            };
+            let worker_out_props = exec
+                .pointer("/branches/do/outputSchema")
+                .and_then(schema_property_names);
+            let Some(worker_out_props) = worker_out_props else {
+                // Worker output shape not declared/resolvable — cannot prove the
+                // deeper coverage; honest boundary, skip.
+                continue;
+            };
+            for field in reduce_output_required {
+                if !worker_out_props.contains(&field) {
+                    out.push(Diagnostic::Error(format!(
+                        "PARALLEL_REDUCE_OUTPUT_FIELD_UNPRODUCED: workflow '{id}' state \
+                         '{state_name}' transition '{t_name}': the parallel reduce requires \
+                         per-branch output field '{field}', but the map worker's `outputSchema` \
+                         never produces it. The reduce must consume only what the map produces \
+                         (Spec A §7.1)."
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// The `required` field names of a schema, resolving a `praxec://hop` `$ref`
+/// against the shipped vocabulary. `None` when neither an inline `required`
+/// array nor a resolvable HOP `$ref` is present (an opaque/unprovable schema).
+fn schema_required_fields(schema: &Value) -> Option<Vec<String>> {
+    if let Some(def) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(crate::hop::hop_ref_def)
+    {
+        return crate::hop::hop_def_required(def);
+    }
+    schema.get("required").and_then(Value::as_array).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect()
+    })
+}
+
+/// The declared `properties` field names of a schema, resolving a `praxec://hop`
+/// `$ref` against the shipped vocabulary. `None` when the shape is not
+/// declared/resolvable (an opaque schema whose fields cannot be proven).
+fn schema_property_names(schema: &Value) -> Option<HashSet<String>> {
+    if let Some(def) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(crate::hop::hop_ref_def)
+    {
+        return crate::hop::hop_def_properties(def).map(|v| v.into_iter().collect());
+    }
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|o| o.keys().cloned().collect())
+}
+
 /// Check each spec in a mapping object. `where_` is a human label for the
 /// diagnostic (e.g. `"transition 'go' output"`).
 fn check_mapping_object(
@@ -2344,9 +2489,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("nonexistent")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("nonexistent"))
+        );
     }
 
     #[test]
@@ -2366,9 +2512,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("nowhere")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("nowhere"))
+        );
     }
 
     #[test]
@@ -2394,9 +2541,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("ghost")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("ghost"))
+        );
     }
 
     #[test]
@@ -2422,9 +2570,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| !d.is_error() && d.message().contains("orphan")));
+        assert!(
+            d.iter()
+                .any(|d| !d.is_error() && d.message().contains("orphan"))
+        );
     }
 
     #[test]
@@ -2445,9 +2594,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| !d.is_error() && d.message().contains("stuck")));
+        assert!(
+            d.iter()
+                .any(|d| !d.is_error() && d.message().contains("stuck"))
+        );
     }
 
     #[test]
@@ -2563,9 +2713,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("missing_timeout")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("missing_timeout"))
+        );
     }
 
     #[test]
@@ -2585,9 +2736,10 @@ mod tests {
             }
         });
         let d = validate_workflows(&config);
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("missing 'target'")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("missing 'target'"))
+        );
     }
 
     #[test]
@@ -2635,25 +2787,28 @@ mod tests {
         let d = validate_workflows(&guarded_workflow(
             json!({ "kind": "permission", "permission": "" }),
         ));
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND"))
+        );
     }
 
     #[test]
     fn role_guard_missing_operand_rejected() {
         let d = validate_workflows(&guarded_workflow(json!({ "kind": "role" })));
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND"))
+        );
     }
 
     #[test]
     fn expr_guard_missing_expr_rejected() {
         let d = validate_workflows(&guarded_workflow(json!({ "kind": "expr" })));
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND"))
+        );
     }
 
     #[test]
@@ -2685,9 +2840,10 @@ mod tests {
             "kind": "all_of",
             "guards": [{ "kind": "role" }]
         })));
-        assert!(d
-            .iter()
-            .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND")));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND"))
+        );
     }
 
     // ---- CMP-037: capability lifecycle enum -------------------------------
@@ -3295,6 +3451,171 @@ mod tests {
         assert!(
             !d.iter().any(|x| x.message().contains("switches on")),
             "a boolean equality switch must NOT be treated as an open-domain string switch, got: {d:?}"
+        );
+    }
+
+    // ── Spec A §7.1 — fan-in composition check for `kind: parallel` ──────────
+
+    /// Wrap a single `kind: parallel` transition executor in a loadable workflow.
+    fn wf_parallel(executor: Value) -> Value {
+        json!({
+            "workflows": { "demo": {
+                "initialState": "fan",
+                "states": {
+                    "fan": { "transitions": { "go": { "target": "done", "executor": executor } } },
+                    "done": { "terminal": true }
+                }
+            }}
+        })
+    }
+
+    #[test]
+    fn parallel_reduce_requiring_envelope_fields_is_clean() {
+        // The aggregator consumes only fan-in envelope fields → no diagnostics.
+        let d = validate_workflows(&wf_parallel(json!({
+            "kind": "parallel",
+            "branches": { "for_each": "$.context.items", "do": { "kind": "noop" } },
+            "join": { "aggregator": {
+                "kind": "expression",
+                "expr": "$.ok_count >= 1",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "branches": { "type": "array" }, "ok_count": { "type": "integer" } },
+                    "required": ["branches", "ok_count"]
+                }
+            }}
+        })));
+        assert!(
+            !d.iter().any(|x| x.message().contains("PARALLEL_REDUCE")),
+            "a reduce consuming only envelope fields must load clean, got: {d:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_reduce_requiring_unproducible_top_level_field_is_rejected() {
+        let d = validate_workflows(&wf_parallel(json!({
+            "kind": "parallel",
+            "branches": { "for_each": "$.context.items", "do": { "kind": "noop" } },
+            "join": { "aggregator": {
+                "kind": "script",
+                "subject": "reduce.sh",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "totals": { "type": "object" } },
+                    "required": ["totals"]
+                }
+            }}
+        })));
+        assert!(
+            errors_containing(&d, "PARALLEL_REDUCE_UNSATISFIED_FIELD"),
+            "a reduce requiring a field the fan-in never produces must be a load error, got: {d:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_reduce_requiring_unproduced_branch_output_field_is_rejected() {
+        // Worker declares it produces `{score}`; the reduce requires each
+        // branch output carry `weight` — never produced → load error.
+        let d = validate_workflows(&wf_parallel(json!({
+            "kind": "parallel",
+            "branches": {
+                "for_each": "$.context.items",
+                "do": {
+                    "kind": "noop",
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": { "score": { "type": "number" } },
+                        "required": ["score"]
+                    }
+                }
+            },
+            "join": { "aggregator": {
+                "kind": "script",
+                "subject": "reduce.sh",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "branches": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "output": {
+                                        "type": "object",
+                                        "properties": { "weight": { "type": "number" } },
+                                        "required": ["weight"]
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "required": ["branches"]
+                }
+            }}
+        })));
+        assert!(
+            errors_containing(&d, "PARALLEL_REDUCE_OUTPUT_FIELD_UNPRODUCED"),
+            "a reduce reading a per-branch field the map never produces must be a load error, got: {d:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_reduce_consuming_produced_branch_output_field_is_clean() {
+        // Worker produces `{score}`; reduce requires `{score}` per branch → clean.
+        let d = validate_workflows(&wf_parallel(json!({
+            "kind": "parallel",
+            "branches": {
+                "for_each": "$.context.items",
+                "do": {
+                    "kind": "noop",
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": { "score": { "type": "number" } },
+                        "required": ["score"]
+                    }
+                }
+            },
+            "join": { "aggregator": {
+                "kind": "script",
+                "subject": "reduce.sh",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "branches": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "output": {
+                                        "type": "object",
+                                        "properties": { "score": { "type": "number" } },
+                                        "required": ["score"]
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "required": ["branches"]
+                }
+            }}
+        })));
+        assert!(
+            !d.iter().any(|x| x.message().contains("PARALLEL_REDUCE")),
+            "a reduce consuming exactly what the map produces must load clean, got: {d:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_without_aggregator_input_contract_is_not_checked() {
+        // No aggregator inputSchema → nothing to prove, skip (honest boundary).
+        let d = validate_workflows(&wf_parallel(json!({
+            "kind": "parallel",
+            "branches": { "for_each": "$.context.items", "do": { "kind": "noop" } },
+            "join": "all"
+        })));
+        assert!(
+            !d.iter().any(|x| x.message().contains("PARALLEL_REDUCE")),
+            "a parallel step with no declared reduce contract must not be flagged, got: {d:?}"
         );
     }
 }

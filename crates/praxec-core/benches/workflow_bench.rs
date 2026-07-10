@@ -10,8 +10,9 @@ use std::sync::Arc;
 
 use std::hint::black_box;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
+use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::error::ExecutorError;
 use praxec_core::guards::DefaultGuardEvaluator;
@@ -20,7 +21,6 @@ use praxec_core::model::{
 };
 use praxec_core::ports::{Executor, ExecutorRegistry};
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
-use praxec_core::WorkflowRuntime;
 use serde_json::json;
 
 // ---- Test harness -----------------------------------------------------------

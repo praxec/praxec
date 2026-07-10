@@ -13,7 +13,9 @@ pub enum RuntimeError {
     /// the transition must fail fast and the snapshot must NOT be committed.
     /// The message names the workflow id and the `seq` (resulting version) so
     /// operators can pinpoint exactly which transition was aborted.
-    #[error("RECORD_WRITE_FAILED: failed to write transition record for workflow '{workflow_id}' at seq {seq}: {source}")]
+    #[error(
+        "RECORD_WRITE_FAILED: failed to write transition record for workflow '{workflow_id}' at seq {seq}: {source}"
+    )]
     RecordWriteFailed {
         workflow_id: String,
         seq: u64,

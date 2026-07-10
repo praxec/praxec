@@ -7,9 +7,9 @@ use praxec_core::audit::NullAuditSink;
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, Principal, WorkflowInstance};
 use praxec_core::ports::{Executor, TransitionResolver};
-use praxec_llm_executor::affinity::AffinityResolver;
 use praxec_llm_executor::LlmExecutor;
-use serde_json::{json, Value};
+use praxec_llm_executor::affinity::AffinityResolver;
+use serde_json::{Value, json};
 
 // A resolver whose error is a unique marker — proves the executor CALLED it
 // (instead of the old hardcoded "not wired in v0.6 D5" reject).

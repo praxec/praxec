@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::bail;
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use serde::Serialize;
@@ -54,14 +54,15 @@ pub enum ChainOutcome {
         error_class: String,
         failed_transition: String,
     },
-    /// Chain stopped because a `kind: workflow` executor signalled a
-    /// sub-workflow suspend (its child is non-terminal). The parent must be
-    /// durably parked on the child WITHOUT merging the child's (null) output
-    /// or advancing the transition. `partial.instance` carries the context
-    /// accumulated by PRIOR chain steps, committed at its current version.
+    /// Chain stopped because an executor signalled a step suspend — a
+    /// `kind: workflow` child is non-terminal (P2) or a `kind: agent` session
+    /// parked on `await_human` (P12 R1.4). The parent must be durably parked
+    /// WITHOUT merging the step's (absent) output or advancing the
+    /// transition. `partial.instance` carries the context accumulated by
+    /// PRIOR chain steps, committed at its current version.
     Suspended {
         partial: ChainResult,
-        suspend: crate::model::SubworkflowSuspend,
+        suspend: crate::model::StepSuspend,
         transition: String,
     },
 }
@@ -597,6 +598,16 @@ impl WorkflowRuntime {
                     .audit_event("workflow.started")
                     .with_correlation(&correlation_id)
                     .with_actor(&request.principal.subject)
+                    // L1 tree-linkage — stamp the tree edge from the persisted
+                    // instance (its `parent` ParentLink + `depth`), NOT a
+                    // task-local. `workflow.started` is the natural carrier of
+                    // the parent→child edge; an observer reconstructs the
+                    // execution tree from workflow_id + parent_workflow_id +
+                    // depth without every executor emit site stamping.
+                    .with_topology(
+                        instance.parent.as_ref().map(|p| p.workflow_id.clone()),
+                        instance.depth,
+                    )
                     .with_payload(json!({
                         "definitionId": instance.definition_id,
                         "state": instance.state,
@@ -719,24 +730,39 @@ impl WorkflowRuntime {
                 suspend,
                 transition,
             } => {
-                // P2 (chain path) — a `kind: workflow` chain leaf fired during
-                // `start` and its child is non-terminal. Durably park the
-                // parent on the child and respond `waiting`, mirroring the
+                // Chain path during `start` — a chain leaf signalled a step
+                // suspend (P2 sub-workflow or P12 agent await). Durably park
+                // the parent and respond `waiting`, mirroring the
                 // direct-submit suspend path. `partial.instance` carries the
                 // context the PRIOR chain steps committed, at its current
-                // version; the suspend save writes `_subworkflow_wait` and
-                // bumps that version by exactly 1. A STALE_WORKFLOW_VERSION
-                // here is a genuine rejection — propagate via `?`, never fake a
+                // version; the suspend save writes the wait marker and bumps
+                // that version by exactly 1. A STALE_WORKFLOW_VERSION here is
+                // a genuine rejection — propagate via `?`, never fake a
                 // `waiting` response.
-                self.suspend_on_subworkflow(
-                    &definition,
-                    &partial.instance,
-                    &transition,
-                    partial.instance.version,
-                    &request.principal,
-                    suspend,
-                )
-                .await
+                match suspend {
+                    crate::model::StepSuspend::Subworkflow(s) => {
+                        self.suspend_on_subworkflow(
+                            &definition,
+                            &partial.instance,
+                            &transition,
+                            partial.instance.version,
+                            &request.principal,
+                            s,
+                        )
+                        .await
+                    }
+                    crate::model::StepSuspend::AgentAwait(a) => {
+                        self.suspend_on_agent_await(
+                            &definition,
+                            &partial.instance,
+                            &transition,
+                            partial.instance.version,
+                            &request.principal,
+                            a,
+                        )
+                        .await
+                    }
+                }
             }
         }
     }
