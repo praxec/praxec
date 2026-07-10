@@ -40,3 +40,4 @@ WIP/
 # with machine-absolute paths; never part of the repo contract.
 .fg-harness/
 .px-harness/
+.worktrees/

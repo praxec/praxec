@@ -851,6 +851,34 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         "starting praxec stdio server"
     );
 
+    // P6 — build the in-band reload hook (the SAME gated path as SIGHUP) and
+    // inject it so `praxec.command { reload }` fires a live config reload,
+    // reachable by the in-workflow agent over stdio (no third MCP tool).
+    let server = {
+        let defs = swappable_defs.clone();
+        let execs = swappable_executors.clone();
+        let disc = swappable_discovery.clone();
+        let cfg = config_path.clone();
+        let aud = audit.clone();
+        let rt = runtime.clone();
+        let regs = overlays.registrars.clone();
+        let hook: praxec_mcp_server::ReloadHook = Arc::new(move || {
+            let (defs, execs, disc, cfg, aud, rt, regs) = (
+                defs.clone(),
+                execs.clone(),
+                disc.clone(),
+                cfg.clone(),
+                aud.clone(),
+                rt.clone(),
+                regs.clone(),
+            );
+            Box::pin(
+                async move { reload_gated(&defs, &execs, &disc, &cfg, &aud, &rt, &regs).await },
+            ) as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
+        });
+        server.with_reload_hook(hook)
+    };
+
     let service = server
         .serve(stdio())
         .await
@@ -878,82 +906,16 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
             loop {
                 sighup.recv().await;
                 tracing::info!("received SIGHUP — reloading config");
-                match load_config(&reload_config_path) {
-                    Ok(new_config) => {
-                        // Mint/reload gate (ADR-0012 harness) — refuse to swap in a
-                        // config carrying structural Error diagnostics (e.g. a V23
-                        // dead-stall-prone switch with no default). A broken edit
-                        // must never replace a working config: keep the previous one
-                        // and surface the FULL Error list, so "no execution until the
-                        // issue is resolved" holds for the live hot-reload path too.
-                        let errors: Vec<String> =
-                            praxec_core::validate::validate_workflows(&new_config)
-                                .into_iter()
-                                .filter(praxec_core::validate::Diagnostic::is_error)
-                                .map(|d| d.message().to_string())
-                                .collect();
-                        if !errors.is_empty() {
-                            tracing::error!(
-                                error_count = errors.len(),
-                                errors = ?errors,
-                                "config reload REJECTED — validation errors; keeping previous configuration"
-                            );
-                            let _ = reload_audit
-                                .record(
-                                    praxec_core::audit::AuditEvent::new("config.reload_rejected")
-                                        .with_payload(json!({
-                                            "config": reload_config_path.display().to_string(),
-                                            "errors": errors,
-                                        })),
-                                )
-                                .await;
-                            continue;
-                        }
-                        // CMP-031 — a config whose discovery.include is invalid
-                        // must NOT swap a partial index into the live runtime.
-                        // Keep the existing components and log the failure.
-                        match build_hot_components(&new_config, &reload_audit).await {
-                            Ok((new_defs, new_executors, new_discovery, new_workflow_handle)) => {
-                                // C1 — the fresh registry has a fresh runtime-less
-                                // `workflow` executor; re-wire it against the SAME
-                                // long-lived runtime so reloaded configs keep
-                                // dispatching `kind: workflow`.
-                                new_workflow_handle.set_runtime(reload_runtime.clone());
-                                // Re-apply the overlays so the reloaded registry
-                                // keeps hosting `kind: llm` / `kind: agent`.
-                                let new_executors = apply_overlays(
-                                    new_executors,
-                                    &new_config,
-                                    &reload_audit,
-                                    &reload_runtime,
-                                    &reload_registrars,
-                                );
-                                reload_defs.swap(new_defs);
-                                reload_executors.swap(new_executors);
-                                reload_discovery.swap(new_discovery);
-                                let _ = reload_audit
-                                    .record(
-                                        praxec_core::audit::AuditEvent::new("config.reloaded")
-                                            .with_payload(json!({
-                                                "config": reload_config_path.display().to_string(),
-                                            })),
-                                    )
-                                    .await;
-                                tracing::info!("config reloaded successfully");
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "config reload failed to build components; \
-                                     keeping previous configuration"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "config reload failed — keeping current config");
-                    }
-                }
+                let _ = reload_gated(
+                    &reload_defs,
+                    &reload_executors,
+                    &reload_discovery,
+                    &reload_config_path,
+                    &reload_audit,
+                    &reload_runtime,
+                    &reload_registrars,
+                )
+                .await;
             }
         });
     }
@@ -1006,6 +968,103 @@ async fn serve_degraded(config_path: PathBuf, err: anyhow::Error) -> anyhow::Res
         .context("starting degraded MCP service over stdio")?;
     service.waiting().await?;
     Ok(())
+}
+
+/// P6 — the single gated config-reload path, shared by SIGHUP and the in-band
+/// `praxec.command { reload }` trigger (and, as a fast-follow, the lazy
+/// staleness recheck). Re-reads the config + declared `repos:` from disk;
+/// refuses to swap in a config carrying structural Error diagnostics (keeps the
+/// previous one and audits `config.reload_rejected`); otherwise hot-swaps the
+/// definition store / executor registry / discovery index against the SAME
+/// long-lived runtime and audits `config.reloaded`. Returns the outcome as JSON
+/// so the in-band caller learns what happened (incl. the reloaded `repos:`).
+async fn reload_gated(
+    swappable_defs: &Arc<praxec_core::hot_reload::SwappableDefinitionStore>,
+    swappable_executors: &Arc<praxec_core::hot_reload::SwappableExecutorRegistry>,
+    swappable_discovery: &Arc<praxec_core::hot_reload::SwappableDiscoveryIndex>,
+    config_path: &PathBuf,
+    audit: &Arc<dyn praxec_core::audit::AuditSink>,
+    runtime: &WorkflowRuntime,
+    registrars: &[OverlayRegistrar],
+) -> Value {
+    let new_config = match load_config(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "config reload failed — keeping current config");
+            return json!({
+                "status": "failed",
+                "reason": "load_error",
+                "error": e.to_string(),
+                "config": config_path.display().to_string(),
+            });
+        }
+    };
+    // Mint/reload gate (ADR-0012) — a broken edit must never replace a working
+    // config: keep the previous one and surface the full Error list.
+    let errors: Vec<String> = praxec_core::validate::validate_workflows(&new_config)
+        .into_iter()
+        .filter(praxec_core::validate::Diagnostic::is_error)
+        .map(|d| d.message().to_string())
+        .collect();
+    if !errors.is_empty() {
+        tracing::error!(
+            error_count = errors.len(),
+            errors = ?errors,
+            "config reload REJECTED — validation errors; keeping previous configuration"
+        );
+        let _ = audit
+            .record(
+                praxec_core::audit::AuditEvent::new("config.reload_rejected").with_payload(json!({
+                    "config": config_path.display().to_string(),
+                    "errors": errors,
+                })),
+            )
+            .await;
+        return json!({
+            "status": "rejected",
+            "reason": "validation_errors",
+            "errors": errors,
+            "config": config_path.display().to_string(),
+        });
+    }
+    match build_hot_components(&new_config, audit).await {
+        Ok((new_defs, new_executors, new_discovery, new_workflow_handle)) => {
+            // Re-wire the fresh runtime-less `kind: workflow` handle against the
+            // SAME long-lived runtime, and re-apply the overlays so the reloaded
+            // registry keeps hosting `kind: llm` / `kind: agent`.
+            new_workflow_handle.set_runtime(runtime.clone());
+            let new_executors =
+                apply_overlays(new_executors, &new_config, audit, runtime, registrars);
+            swappable_defs.swap(new_defs);
+            swappable_executors.swap(new_executors);
+            swappable_discovery.swap(new_discovery);
+            let _ = audit
+                .record(
+                    praxec_core::audit::AuditEvent::new("config.reloaded").with_payload(json!({
+                        "config": config_path.display().to_string(),
+                    })),
+                )
+                .await;
+            tracing::info!("config reloaded successfully");
+            json!({
+                "status": "reloaded",
+                "config": config_path.display().to_string(),
+                "repos": new_config.pointer("/repos").cloned().unwrap_or_else(|| json!([])),
+            })
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "config reload failed to build components; keeping previous configuration"
+            );
+            json!({
+                "status": "failed",
+                "reason": "build_error",
+                "error": e.to_string(),
+                "config": config_path.display().to_string(),
+            })
+        }
+    }
 }
 
 async fn build_hot_components(

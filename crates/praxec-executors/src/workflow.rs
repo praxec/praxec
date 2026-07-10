@@ -61,7 +61,8 @@ use praxec_core::model::{
 use praxec_core::ports::Executor;
 use praxec_core::runtime::WorkflowRuntime;
 use praxec_core::use_binding::{
-    project_use_outputs, resolve_use_inputs, validate_outputs_against_snippet,
+    project_use_outputs, repair_outputs_against_snippet, resolve_use_inputs,
+    validate_outputs_against_snippet,
 };
 
 /// Maximum nesting depth for sub-workflows. A `workflow`-kind transition
@@ -441,7 +442,23 @@ impl Executor for WorkflowExecutor {
                 // instance.
                 if let Some(use_val) = use_block.as_ref() {
                     let use_outputs = use_val.get("outputs").cloned().unwrap_or(json!({}));
-                    let projected_by_host = project_use_outputs(&use_outputs, &child_context);
+                    let mut projected_by_host = project_use_outputs(&use_outputs, &child_context);
+                    // Deterministic-repair rung (P12 R3.1): coerce a trivially-
+                    // repairable Null output (e.g. an array field a commodity
+                    // model emitted as `null`) to its empty/default value BEFORE
+                    // validation — zero model calls. The repaired map is what
+                    // propagates forward via `rekey_by_cap_output_name` below.
+                    let repaired_slots = repair_outputs_against_snippet(
+                        &snippet_outputs,
+                        &use_outputs,
+                        &mut projected_by_host,
+                    );
+                    if !repaired_slots.is_empty() {
+                        tracing::debug!(
+                            slots = ?repaired_slots,
+                            "cap output deterministic-repair applied (P12 R3.1)"
+                        );
+                    }
                     if let Err(violations) = validate_outputs_against_snippet(
                         &snippet_outputs,
                         &use_outputs,

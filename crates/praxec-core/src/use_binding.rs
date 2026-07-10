@@ -216,6 +216,78 @@ pub fn validate_outputs_against_snippet(
     }
 }
 
+/// Deterministic-repair rung (P12 R3.1). Coerce a projected output that is
+/// `Null` into the schema's unambiguous empty/default value BEFORE validation,
+/// so a commodity model that emits an explicit `null` for an array/object
+/// field (or omits a field carrying a declared `default`) does not hard-fail
+/// the hop over a mechanically-repairable gap — zero model calls.
+///
+/// Only the unambiguously-repairable cases are touched: an explicit schema
+/// `default`, or `type: array` (→ `[]`) / `type: object` (→ `{}`), including a
+/// nullable union like `["array","null"]`. A `Null` under a scalar schema
+/// (string/number/boolean) or a `$ref`/untyped schema is LEFT AS-IS so genuine
+/// contract violations still surface at [`validate_outputs_against_snippet`].
+///
+/// Mutates `projected` in place — the repaired value is what propagates
+/// forward — and returns the cap-output names that were repaired, for
+/// observability (which rung resolved the miss).
+pub fn repair_outputs_against_snippet(
+    snippet_outputs: &Value,
+    output_paths: &Value,
+    projected: &mut Map<String, Value>,
+) -> Vec<String> {
+    let (Some(schemas), Some(bindings)) = (snippet_outputs.as_object(), output_paths.as_object())
+    else {
+        return Vec::new();
+    };
+    let mut by_name: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for (host_path, cap_name_value) in bindings {
+        if let Some(cap_name) = cap_name_value.as_str() {
+            by_name.insert(cap_name, host_path.as_str());
+        }
+    }
+    let mut repaired: Vec<String> = Vec::new();
+    for (cap_name, schema) in schemas {
+        let Some(host_path) = by_name.get(cap_name.as_str()) else {
+            continue;
+        };
+        // Repair only a present-but-Null value (or a bound-but-absent one).
+        if !matches!(projected.get(*host_path), Some(Value::Null) | None) {
+            continue;
+        }
+        if let Some(empty) = deterministic_empty_for(schema) {
+            projected.insert((*host_path).to_string(), empty);
+            repaired.push(cap_name.clone());
+        }
+    }
+    repaired
+}
+
+/// The unambiguous empty/default value for a snippet output schema, or `None`
+/// when there is no safe deterministic repair (scalars, `$ref`, untyped).
+fn deterministic_empty_for(schema: &Value) -> Option<Value> {
+    // An explicit `default` always wins — it is the author's declared intent.
+    if let Some(default) = schema.get("default") {
+        return Some(default.clone());
+    }
+    match schema.get("type") {
+        Some(Value::String(t)) if t == "array" => Some(Value::Array(vec![])),
+        Some(Value::String(t)) if t == "object" => Some(Value::Object(Map::new())),
+        // Nullable unions, e.g. ["array","null"] → []; ["object","null"] → {}.
+        Some(Value::Array(types)) => {
+            let has = |name: &str| types.iter().any(|v| v.as_str() == Some(name));
+            if has("array") {
+                Some(Value::Array(vec![]))
+            } else if has("object") {
+                Some(Value::Object(Map::new()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +409,102 @@ mod tests {
 
         validate_outputs_against_snippet(&snippet_outputs, &output_paths, &projected)
             .expect("only bound outputs validated");
+    }
+
+    // ── Deterministic-repair rung (P12 R3.1) ──────────────────────────────
+
+    #[test]
+    fn repair_coerces_explicit_null_to_empty_array_via_type() {
+        // The exact dogfood bug: a commodity model emitted `artifacts: null`
+        // for a `type: array` output. Repair must coerce it to `[]`.
+        let snippet_outputs = json!({ "artifacts": { "type": "array" } });
+        let output_paths = json!({ "$.context.artifacts": "artifacts" });
+        let mut projected = Map::new();
+        projected.insert("$.context.artifacts".into(), Value::Null);
+
+        let repaired =
+            repair_outputs_against_snippet(&snippet_outputs, &output_paths, &mut projected);
+        assert_eq!(projected.get("$.context.artifacts"), Some(&json!([])));
+        assert_eq!(repaired, vec!["artifacts".to_string()]);
+    }
+
+    #[test]
+    fn repair_uses_explicit_default_over_type() {
+        let snippet_outputs = json!({ "tags": { "type": "array", "default": ["seed"] } });
+        let output_paths = json!({ "$.context.tags": "tags" });
+        let mut projected = Map::new();
+        projected.insert("$.context.tags".into(), Value::Null);
+
+        repair_outputs_against_snippet(&snippet_outputs, &output_paths, &mut projected);
+        assert_eq!(projected.get("$.context.tags"), Some(&json!(["seed"])));
+    }
+
+    #[test]
+    fn repair_coerces_null_to_empty_object() {
+        let snippet_outputs = json!({ "meta": { "type": "object" } });
+        let output_paths = json!({ "$.context.meta": "meta" });
+        let mut projected = Map::new();
+        projected.insert("$.context.meta".into(), Value::Null);
+
+        repair_outputs_against_snippet(&snippet_outputs, &output_paths, &mut projected);
+        assert_eq!(projected.get("$.context.meta"), Some(&json!({})));
+    }
+
+    #[test]
+    fn repair_handles_nullable_union_type() {
+        let snippet_outputs = json!({ "items": { "type": ["array", "null"] } });
+        let output_paths = json!({ "$.context.items": "items" });
+        let mut projected = Map::new();
+        projected.insert("$.context.items".into(), Value::Null);
+
+        repair_outputs_against_snippet(&snippet_outputs, &output_paths, &mut projected);
+        assert_eq!(projected.get("$.context.items"), Some(&json!([])));
+    }
+
+    #[test]
+    fn repair_leaves_null_scalar_alone() {
+        // A null string has no unambiguous empty repair (empty string is a
+        // distinct, meaningful value) — leave it so the genuine violation
+        // still surfaces at validation.
+        let snippet_outputs = json!({ "verdict": { "type": "string" } });
+        let output_paths = json!({ "$.context.verdict": "verdict" });
+        let mut projected = Map::new();
+        projected.insert("$.context.verdict".into(), Value::Null);
+
+        let repaired =
+            repair_outputs_against_snippet(&snippet_outputs, &output_paths, &mut projected);
+        assert_eq!(projected.get("$.context.verdict"), Some(&Value::Null));
+        assert!(repaired.is_empty());
+    }
+
+    #[test]
+    fn repair_leaves_valid_non_null_value_untouched() {
+        let snippet_outputs = json!({ "artifacts": { "type": "array" } });
+        let output_paths = json!({ "$.context.artifacts": "artifacts" });
+        let mut projected = Map::new();
+        projected.insert("$.context.artifacts".into(), json!(["real"]));
+
+        repair_outputs_against_snippet(&snippet_outputs, &output_paths, &mut projected);
+        assert_eq!(projected.get("$.context.artifacts"), Some(&json!(["real"])));
+    }
+
+    #[test]
+    fn repair_then_validate_passes_for_the_bug_class() {
+        // End to end: null array output → repair → validation now passes.
+        let snippet_outputs = json!({
+            "plan":      { "type": "object" },
+            "artifacts": { "type": "array" }
+        });
+        let output_paths = json!({
+            "$.context.plan":      "plan",
+            "$.context.artifacts": "artifacts",
+        });
+        let mut projected = Map::new();
+        projected.insert("$.context.plan".into(), json!({ "deliverables": [] }));
+        projected.insert("$.context.artifacts".into(), Value::Null);
+
+        repair_outputs_against_snippet(&snippet_outputs, &output_paths, &mut projected);
+        validate_outputs_against_snippet(&snippet_outputs, &output_paths, &projected)
+            .expect("after repair, the null-array output validates");
     }
 }

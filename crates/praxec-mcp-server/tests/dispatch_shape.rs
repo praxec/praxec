@@ -590,3 +590,44 @@ async fn lexicon_define_via_dispatch_call_succeeds_when_writes_enabled() {
         "LEXICON_WRITES_DISABLED must NOT fire when writes are enabled; got: {resp}"
     );
 }
+
+// ── P6: in-band config reload (`praxec.command { reload }`) ────────────────────
+
+#[test]
+fn command_args_admits_reload() {
+    let a: CommandArgs = serde_json::from_value(json!({ "reload": true })).unwrap();
+    assert_eq!(a.reload, Some(true));
+}
+
+#[tokio::test]
+async fn command_reload_without_hook_returns_unavailable() {
+    // No serve-mode hook wired (CLI/one-shot/test path) → structured
+    // RELOAD_UNAVAILABLE, not a crash and not a workflow dispatch.
+    let server = test_server().await;
+    let resp = server
+        .dispatch_call(call("praxec.command", json!({ "reload": true })))
+        .await
+        .expect("reload dispatch returns Ok (structured response)");
+    assert_eq!(
+        resp.pointer("/error/code"),
+        Some(&json!("RELOAD_UNAVAILABLE")),
+        "no hook wired → RELOAD_UNAVAILABLE; got: {resp}"
+    );
+}
+
+#[tokio::test]
+async fn command_reload_with_hook_invokes_it() {
+    // With a hook wired, `reload: true` invokes it and returns its JSON verbatim,
+    // never touching the workflow-command shape router.
+    let hook: praxec_mcp_server::ReloadHook = Arc::new(|| {
+        Box::pin(async { json!({ "status": "reloaded", "test": true }) })
+            as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
+    });
+    let server = test_server().await.with_reload_hook(hook);
+    let resp = server
+        .dispatch_call(call("praxec.command", json!({ "reload": true })))
+        .await
+        .expect("reload dispatch ok");
+    assert_eq!(resp.pointer("/status"), Some(&json!("reloaded")));
+    assert_eq!(resp.pointer("/test"), Some(&json!(true)));
+}

@@ -60,6 +60,15 @@ pub const TOOL_COMMAND: &str = "praxec.command";
 /// name.
 pub const STABLE_TOOL_NAMES: &[&str] = &[TOOL_QUERY, TOOL_COMMAND];
 
+/// P6 — in-band config reload hook. The serve path injects this (built in the
+/// gateway binary, which owns `build_hot_components`/`apply_overlays`) so a
+/// `praxec.command { reload: true }` fires the SAME gated rebuild+swap as
+/// SIGHUP — no third MCP tool, the two-tool surface is preserved. Returns the
+/// reload outcome as JSON (`{status: reloaded|rejected|failed, ...}`).
+pub type ReloadHook = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>> + Send + Sync,
+>;
+
 #[derive(Clone)]
 pub struct PraxecServer {
     pub(crate) runtime: WorkflowRuntime,
@@ -139,6 +148,11 @@ pub struct PraxecServer {
     /// client as a logging notification, so a long auto-drive streams progress
     /// live. Default-empty: no peer, no push (CLI / tests).
     pub(crate) progress_peer: ProgressPeer,
+    /// P6 — optional in-band config reload hook (serve-mode only). When set,
+    /// `praxec.command { reload: true }` invokes it to run the gated
+    /// rebuild+swap. `None` on the CLI/one-shot/test paths (no live server to
+    /// reload); the command then returns `RELOAD_UNAVAILABLE`.
+    pub(crate) reload_hook: Option<ReloadHook>,
 }
 
 /// CMP-001 — reverse-DNS `_meta` key under which the embedding host passes a
@@ -169,7 +183,16 @@ impl PraxecServer {
             default_principal: Principal::anonymous(),
             trust_meta_principal: true,
             progress_peer: ProgressPeer::default(),
+            reload_hook: None,
         }
+    }
+
+    /// P6 — wire the in-band config reload hook (serve path only). With it set,
+    /// `praxec.command { reload: true }` fires the same gated rebuild+swap as
+    /// SIGHUP. Omit it (CLI/one-shot/tests) and reload returns RELOAD_UNAVAILABLE.
+    pub fn with_reload_hook(mut self, hook: ReloadHook) -> Self {
+        self.reload_hook = Some(hook);
+        self
     }
 
     /// #18 — wire the shared peer slot the bridged audit sink reads, so events
@@ -665,6 +688,20 @@ impl PraxecServer {
                     .map_err(|e| {
                         McpError::invalid_params(format!("invalid arguments: {e}"), None)
                     })?;
+                // P6 — in-band config reload. `reload: true` on the two-tool
+                // surface fires the same gated rebuild+swap as SIGHUP; no third
+                // tool is added. Returns the reload outcome as JSON.
+                if parsed.reload.unwrap_or(false) {
+                    return match &self.reload_hook {
+                        Some(hook) => Ok(hook().await),
+                        None => Ok(json!({
+                            "error": {
+                                "code": "RELOAD_UNAVAILABLE",
+                                "message": "Config reload is a serve-mode capability; this runtime was started without a reload hook."
+                            }
+                        })),
+                    };
+                }
                 let is_lexicon_define = parsed
                     .subject
                     .as_deref()
