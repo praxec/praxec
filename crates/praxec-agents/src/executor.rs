@@ -9,7 +9,7 @@
 //! lives behind the runner seam.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -27,6 +27,7 @@ use praxec_core::skills::{SkillAssemblyError, assemble_system_message};
 use praxec_core::templating::render_template;
 use serde_json::{Value, json};
 
+use crate::breaker::BreakerRegistry;
 use crate::config::AgentExecutorConfig;
 use crate::error::{AgentErrorCode, permanent};
 use crate::session::{
@@ -48,6 +49,11 @@ pub const DEFAULT_STALL_SECONDS: u64 = 120;
 pub struct AgentExecutor {
     runner: Arc<dyn AgentSessionRunner>,
     resolver: Arc<dyn AgentModelResolver>,
+    /// P12 — per-model cooldown circuit-breaker. Cross-call memory of which
+    /// models have failed repeatedly, so the per-invocation chain-walk skips a
+    /// known-bad model for a cooldown window instead of re-probing (and
+    /// re-timing-out on) it on every agent call.
+    breaker: BreakerRegistry,
     /// ADR-0007 untrusted branch — `None` until `with_untrusted_support`.
     sandbox: Option<Arc<dyn SandboxProvider>>,
     locks: Option<Arc<dyn RepoLocks>>,
@@ -58,6 +64,7 @@ impl AgentExecutor {
         Self {
             runner,
             resolver,
+            breaker: BreakerRegistry::default(),
             sandbox: None,
             locks: None,
         }
@@ -307,14 +314,22 @@ impl Executor for AgentExecutor {
         // Resolve the full ordered model chain (cheapest-effective first).
         let chain = self.resolver.resolve_chain(&cfg.model_binding()).await?;
 
+        // P12 — consult the per-model breaker: skip models whose breaker is
+        // open (they failed ≥ threshold times recently), keeping chain order.
+        // The walk starts below a known-bad primary instead of re-probing it
+        // every call. If EVERYTHING is open, `plan` degrades to the
+        // least-recently-failed model — never an empty walk.
+        let planned = self.breaker.plan(&chain, Instant::now());
+
         let mut escalations: Vec<Evidence> = Vec::new();
 
-        for (idx, model) in chain.iter().enumerate() {
+        for (idx, model) in planned.iter().enumerate() {
             match self
                 .run_one(model, &cfg, &request, &system_prompt, &user_prompt)
                 .await
             {
                 Ok(result) => {
+                    self.breaker.on_success(model);
                     let mut result = result;
                     for e in escalations.drain(..).rev() {
                         result.evidence.insert(0, e);
@@ -323,11 +338,17 @@ impl Executor for AgentExecutor {
                 }
                 Err(e) => {
                     let class = FailureClass::from_executor_error(&e);
-                    let is_last = idx + 1 == chain.len();
+                    // Escalatable classes (incl. Timeout / AGENT_NO_RESULT)
+                    // are model-health signals — feed the breaker. Content /
+                    // author errors are not the model's fault and don't count.
+                    if class.is_infrastructure() {
+                        self.breaker.on_failure(model, Instant::now());
+                    }
+                    let is_last = idx + 1 == planned.len();
                     if class.is_infrastructure() && !is_last {
                         tracing::warn!(
                             failed_model = %model,
-                            next_model = %chain[idx + 1],
+                            next_model = %planned[idx + 1],
                             error = %e,
                             "agent model failed with escalatable class; escalating to next model in chain"
                         );
@@ -338,7 +359,7 @@ impl Executor for AgentExecutor {
                             summary: Some(format!(
                                 "escalated from {} to {} ({:?})",
                                 model,
-                                chain[idx + 1],
+                                planned[idx + 1],
                                 class
                             )),
                             digest: None,
@@ -790,6 +811,120 @@ mod tests {
         assert!(
             format!("{err:?}").contains("some author bug"),
             "original error should be surfaced: {err:?}"
+        );
+    }
+
+    // ── P12 — per-model cooldown breaker (cross-call) ────────────────────
+
+    /// A runner where the weak model always times out (escalatable) and the
+    /// strong model succeeds — stands in for a persistently-down primary.
+    struct StallingWeakRunner {
+        seen: std::sync::Mutex<Vec<AgentSession>>,
+    }
+    impl StallingWeakRunner {
+        fn new() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn models_tried(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.model.clone())
+                .collect()
+        }
+    }
+    #[async_trait]
+    impl AgentSessionRunner for StallingWeakRunner {
+        async fn run(&self, session: AgentSession) -> Result<AgentRunReport, ExecutorError> {
+            self.seen.lock().unwrap().push(session.clone());
+            let outcome = if session.model == "openrouter:weak" {
+                AgentRunOutcome::TimedOut
+            } else {
+                AgentRunOutcome::Completed(AgentResult {
+                    status: AgentStatus::Success,
+                    output: json!({ "result": "done" }),
+                    internal_monologue: None,
+                })
+            };
+            Ok(AgentRunReport {
+                outcome,
+                transcript: String::new(),
+                model: session.model.clone(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn breaker_skips_a_repeatedly_timing_out_model_across_calls() {
+        // Calls 1 and 2: weak times out (escalatable) → escalate to strong,
+        // succeed. That is BREAKER_FAILURE_THRESHOLD (2) consecutive failures,
+        // so on call 3 the breaker is open and the walk must start at strong —
+        // no re-probe, no re-timeout of the known-bad primary.
+        let runner = Arc::new(StallingWeakRunner::new());
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(TwoModelResolver));
+        let req = || {
+            request(
+                json!({ "affinity": "coding", "goal": "do something" }),
+                bare_def(),
+            )
+        };
+
+        for _ in 0..3 {
+            let result = exec.execute(req()).await.expect("strong model succeeds");
+            assert_eq!(result.output, json!({ "result": "done" }));
+        }
+
+        assert_eq!(
+            runner.models_tried(),
+            vec![
+                "openrouter:weak",   // call 1: probe weak → timeout
+                "openrouter:strong", //         escalate → success
+                "openrouter:weak",   // call 2: probe weak → timeout (opens breaker)
+                "openrouter:strong", //         escalate → success
+                "openrouter:strong", // call 3: weak skipped by the open breaker
+            ],
+            "the third call must skip the weak model entirely"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_model_chain_with_open_breaker_still_attempts_it() {
+        // Degrade path end-to-end: fail the ONLY model past the threshold,
+        // then call again — the walk must still attempt it (degrade, don't
+        // leave the drive with zero models), and surface its error.
+        let runner = Arc::new(StallingWeakRunner::new());
+        struct WeakOnlyResolver;
+        #[async_trait]
+        impl AgentModelResolver for WeakOnlyResolver {
+            async fn resolve(&self, _binding: &ModelBinding) -> Result<String, ExecutorError> {
+                Ok("openrouter:weak".into())
+            }
+        }
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(WeakOnlyResolver));
+        let req = || {
+            request(
+                json!({ "affinity": "coding", "goal": "do something" }),
+                bare_def(),
+            )
+        };
+
+        for _ in 0..3 {
+            let err = exec
+                .execute(req())
+                .await
+                .expect_err("weak always times out");
+            assert!(matches!(err, ExecutorError::Timeout(_)), "got {err:?}");
+        }
+
+        assert_eq!(
+            runner.models_tried().len(),
+            3,
+            "an all-open chain must still yield one attempt per call"
         );
     }
 
