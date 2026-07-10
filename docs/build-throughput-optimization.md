@@ -274,3 +274,79 @@ One small PR to `cognitive-architectures` plus one operational change:
 
 Everything else (sccache wiring, nextest, N = 3) waits for the timings that
 step 4 starts collecting.
+
+## 7. Polyglot generalization
+
+Everything above is expressed in cargo, but praxec governs any codebase. This
+section splits the design into stack-independent principles and its Rust-pack
+implementation, and states how the machinery branches. (Vetted against a
+Rust/.NET/JVM/TS/interpreted polyglot monorepo.)
+
+### 7.1 Principles vs implementation
+
+Stack-independent (spine/spec level): (P1) parallel drives are safe iff build
+state is per-output-tree and shared caches are concurrency-safe; (P2) the staged
+verdict — scope-narrow per slice, full-scope gate before `mark_status complete`,
+never mark on scoped evidence alone; (P3) a shared compilation cache must share
+*content-addressed compiler outputs*, never the *locked output tree* (the
+sccache-vs-shared-target-dir law); (P4) verdict semantics (RED runs-and-fails)
+are inviolable; (P5) one build per output tree; (P6) cap parallelism at N and
+measure. Rust-pack implementation (§§2–6): `cargo_scope`/`-p`, the `.cargo-lock`
+analysis, sccache wiring, the libtest-parsing verdict script, and the "cost is
+linking 173 binaries" diagnosis.
+
+P2 applies to interpreted stacks too: scoped *test selection* misses cross-module
+breakage exactly as `-p` misses reverse-dependency breakage, so the full-suite
+pre-mark gate is universal, not a compile-stack artifact.
+
+### 7.2 Collision model per build system
+
+| Stack | Output isolation | Shared-state risk | Scope | Gate |
+|---|---|---|---|---|
+| cargo | `target/` per worktree; **flock-enforced** | `$CARGO_HOME` brief download locks | `-p <crate>` | `--workspace` |
+| dotnet | `obj/`/`bin/` per project, in-worktree; no lock | NuGet cache brief locks; Roslyn server + MSBuild nodes concurrent-safe | `dotnet test <proj>` | `dotnet test <sln>` |
+| gradle | `build/` + `.gradle/` per worktree | busy daemon ⇒ a **second daemon spawns** (RAM cost, not serialization); `~/.gradle/caches` file-locked, coarse contention at high N; local build cache is the built-in sccache | `:module:test` | root `build`/`test` |
+| maven | `target/` per module, in-worktree | **`~/.m2` is not cross-process-safe by default** — parallel drives REQUIRE the file-lock sync factory (`-Daether.syncContext.named.factory=file-lock`) or per-worktree `-Dmaven.repo.local` | `-pl <mod> -am` | `mvn verify` |
+| tsc | `outDir`+`.tsbuildinfo` per worktree; **no lock at all** | none shared (npm cacache safe); no shared compile cache in vanilla tsc | `tsc -b <proj>` (project refs only; else test-path scope) | root `tsc -b` + full tests |
+| interpreted (pytest/rspec/jest-no-build) | n/a — no build outputs | package caches only; per-worktree venv/node_modules | test-path selection | full test suite |
+
+Two generalizations of §Q1: (a) cargo is the only toolchain that *enforces*
+one-build-per-output-tree with a lock — elsewhere P5 holds by construction (one
+drive per worktree, serial loop per drive), which praxec already guarantees;
+(b) the rejected shared-target-dir failure mode does not reappear via
+daemons/compiler servers (they multiply or multiplex, not serialize) — the one
+real reintroduction is Maven's local repo, a declared per-stack precondition.
+
+### 7.3 Branch decision: build system, via `stack:`
+
+The machinery branches on **build system**, using the existing stack-aware
+specialization seam: `hop_slot: verify` → `cap.verify.<stack>` →
+`cap.verify.generic` floor (`status: not_evaluated`, never a fake green).
+Compiled-vs-interpreted is **not an engine taxonomy** — it is the degenerate
+per-stack contract where the build/lock/cache declarations are simply absent.
+(It is also not a stable language property: pyo3 Python compiles;
+vitest-transformed TS emits nothing.) Field presence, not a type enum, is the
+gate — the poka-yoke form.
+
+1. **`scope` replaces `cargo_scope`** — an optional, opaque, stack-interpreted
+   narrowing token on the verdict contract (alongside verifyIn's `cwd`/
+   `file_set`/`changed_only`). Rust: `-p <crate>`; dotnet: project path; gradle:
+   `:module:`; ts: project-ref or test path; interpreted: test path; `""` ⇒ full
+   scope. Deliverable metadata carries `scope` (plan-ingestion validated, `""`
+   allowed) — §6 step 3 should emit this name from day one, no migration.
+2. **Staged verdict = the slot, twice**: per-slice verify with `scope` set;
+   pre-mark gate = same slot, `scope: ""`. Identical shape for interpreted stacks
+   (scoped tests / full suite), build line items absent.
+3. **The TDD verdict script is the Rust member of a per-stack verdict family**
+   sharing the tri-state contract; RED's "compiles and fails" degrades honestly
+   on no-compile stacks to "collects and fails" (pytest collection errors play
+   the compile-error role).
+4. **Cache + parallel-safety are per-stack pack declarations** (runbook + doctor
+   rules), not contract inputs: rust = per-worktree target + optional operator
+   sccache; gradle = build cache on, N capped by daemon RAM; maven = the §7.2
+   locking precondition; dotnet/ts/interpreted = none. The only engine-visible
+   measurement is `duration_s` (§5 item 4).
+
+Known engine gap to close when wiring: the hop_slot resolver forwards only `cwd`
+today (the `ui_path`→`cwd` note in `cap.verify.ts`), so `scope` needs the same
+forwarding — one resolver change, not a new subsystem.
