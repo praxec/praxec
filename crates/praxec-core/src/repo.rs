@@ -175,7 +175,66 @@ pub fn load_repo(repo_path: &Path) -> anyhow::Result<(RepoManifest, Value)> {
             merge_repo_file(&mut aggregate, value, ns, &file_path)?;
         }
     }
+    // Surface the silent-drop footgun: definition files placed in a DEFAULT tier
+    // directory that this manifest has REMAPPED elsewhere are never scanned. Warn
+    // (loudly, at every load — `serve` and `check` both route through here) rather
+    // than let authored YAML vanish with no feedback.
+    for w in unscanned_definition_warnings(repo_path, &manifest.layout) {
+        tracing::warn!(repo = %manifest.name, "{w}");
+    }
     Ok((manifest, aggregate))
+}
+
+/// Detect definition files that sit in a DEFAULT tier directory (e.g. `flows/`)
+/// which the manifest has remapped to a different directory (e.g. `orchestrators/`).
+/// Those files are silently unscanned by [`load_repo`] — a footgun that lets
+/// authored (or hand-written) definitions vanish with no error. Returns one
+/// human-readable warning per remapped tier whose default dir still holds YAML.
+///
+/// Only the *remapped* case is flagged: if a tier uses its default directory,
+/// nothing is remapped and there is nothing to warn about; a malformed file
+/// *inside* the configured directory is a hard error in [`merge_repo_file`].
+pub fn unscanned_definition_warnings(repo_path: &Path, layout: &RepoLayout) -> Vec<String> {
+    let tiers: [(&str, String, &String); 5] = [
+        (
+            "capabilities",
+            default_capabilities_dir(),
+            &layout.capabilities,
+        ),
+        ("flows", default_flows_dir(), &layout.flows),
+        ("skills", default_skills_dir(), &layout.skills),
+        ("scripts", default_scripts_dir(), &layout.scripts),
+        (
+            "connections",
+            default_connections_dir(),
+            &layout.connections,
+        ),
+    ];
+    let mut warnings = Vec::new();
+    for (tier, default_dir, configured) in tiers {
+        if configured == &default_dir {
+            continue; // tier uses its default dir — nothing remapped.
+        }
+        let default_path = repo_path.join(&default_dir);
+        if !default_path.is_dir() {
+            continue;
+        }
+        let yaml_count = std::fs::read_dir(&default_path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("yaml"))
+            .count();
+        if yaml_count > 0 {
+            warnings.push(format!(
+                "UNSCANNED_DEFINITION_DIR: `{default_dir}/` holds {yaml_count} YAML file(s) but \
+                 this repo's manifest maps the `{tier}` tier to `{configured}/` — files under \
+                 `{default_dir}/` are NOT loaded. Move them to `{configured}/` (or fix the \
+                 manifest `layout`)."
+            ));
+        }
+    }
+    warnings
 }
 
 /// Merge one repo YAML file's contents into the aggregate Value. Prefix
@@ -661,6 +720,62 @@ workflows:
         assert!(
             agg.pointer("/workflows").is_none(),
             "no workflows block expected"
+        );
+    }
+
+    #[test]
+    fn unscanned_warning_flags_yaml_in_a_remapped_default_dir() {
+        // Manifest maps flows -> orchestrators/, but a file lands in the DEFAULT
+        // flows/ dir (the exact onboard-tool footgun). It must be flagged, not
+        // silently dropped.
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: cog\nnamespace: cog\nversion: 0.1.0\nlayout:\n  flows: orchestrators\n",
+        );
+        write_file(
+            td.path(),
+            "flows/flow.onboard-tool.yaml",
+            "workflows:\n  flow.onboard-tool:\n    title: x\n",
+        );
+        let m = load_manifest(td.path()).unwrap();
+        let warns = unscanned_definition_warnings(td.path(), &m.layout);
+        assert_eq!(
+            warns.len(),
+            1,
+            "one remapped-dir warning expected: {warns:?}"
+        );
+        assert!(
+            warns[0].contains("UNSCANNED_DEFINITION_DIR"),
+            "{}",
+            warns[0]
+        );
+        assert!(
+            warns[0].contains("flows/"),
+            "names default dir: {}",
+            warns[0]
+        );
+        assert!(
+            warns[0].contains("orchestrators/"),
+            "names configured dir: {}",
+            warns[0]
+        );
+    }
+
+    #[test]
+    fn unscanned_warning_silent_when_tier_uses_its_default_dir() {
+        // flows/ IS the configured dir (no remap) → no warning even with files.
+        let td = TempDir::new().unwrap();
+        write_manifest(td.path(), &minimal_manifest("swe"));
+        write_file(
+            td.path(),
+            "flows/flow.add-feature.yaml",
+            "workflows:\n  flow.add-feature:\n    title: x\n",
+        );
+        let m = load_manifest(td.path()).unwrap();
+        assert!(
+            unscanned_definition_warnings(td.path(), &m.layout).is_empty(),
+            "default-dir tier must not warn"
         );
     }
 
