@@ -58,6 +58,7 @@ pub mod promotion;
 pub mod provider_keys;
 pub mod providers;
 pub mod proxy_workflow;
+pub mod registry_v3;
 pub mod reliability;
 pub mod repo;
 pub mod repo_git;
@@ -91,6 +92,10 @@ pub use model::*;
 pub use overlay::SingleKindOverlay;
 pub use ports::*;
 pub use proxy_workflow::{DEFAULT_PROXY_STATE, DEFAULT_PROXY_WORKFLOW_ID, compile_proxy_workflow};
+pub use registry_v3::{
+    CrossmatrixRole, CrossmatrixRow, Pack, PackTier, Registry, RegistryError, RegistrySchema,
+    RegistryTool,
+};
 pub use reliability::{Backoff, FallbackPolicy, ReliabilityPolicy, RetryPolicy};
 pub use repo::{REPO_MANIFEST_SCHEMA_V1, RepoLayout, RepoManifest, load_manifest, load_repo};
 pub use runtime::WorkflowRuntime;

@@ -1,0 +1,198 @@
+{
+  "$id": "https://praxec.dev/schemas/registry.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PraxecPacksRegistry",
+  "description": "v0.0.17 tool-source ecosystem contract (D4b). The `praxec.packs/v3` registry — a compatible superset of ADR-0013 `praxec.packs/v2`: the same `packs` + `tools` catalog, where each tool MAY additionally carry a D1 tool descriptor (`descriptor`, $ref tool-descriptor.schema.json) and `suggested_workflows`, plus an optional top-level `crossmatrix` (tool x workflow topology index). The registry describes what a pack offers; it never grants — activation stays an operator `grant_connections:` act (D3).",
+  "type": "object",
+  "required": [
+    "schema"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "praxec.packs/v3"
+    },
+    "packs": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/pack"
+      }
+    },
+    "tools": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/registryTool"
+      }
+    },
+    "crossmatrix": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/crossmatrixRow"
+      },
+      "description": "Registry-level topology index: which workflows compose which tools. DERIVED from descriptors + workflow step refs, never hand-maintained (FM7); every row must reference a tool id and a suggested workflow definitionId present in this registry."
+    }
+  },
+  "$defs": {
+    "pack": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "namespace"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "namespace": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The `repos:` namespace the pack layers under (V20 uniqueness)."
+        },
+        "description": {
+          "type": "string",
+          "default": ""
+        },
+        "repo": {
+          "type": "string",
+          "description": "Git URL of the pack repo."
+        },
+        "tier": {
+          "enum": [
+            "open",
+            "premium"
+          ]
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "requires": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Tool ids (from this registry's `tools`) the pack's workflows depend on."
+        },
+        "external": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Tool ids provisioned outside this registry (not resolvable here by design)."
+        },
+        "extends": {
+          "type": "string",
+          "description": "Optional parent pack id this pack layers on top of."
+        }
+      }
+    },
+    "registryTool": {
+      "type": "object",
+      "required": [
+        "id",
+        "name"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "default": ""
+        },
+        "repo": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string",
+          "description": "The binary the tool's connection spawns (v2 mcp coordinate; also valid for cli tools). A rest descriptor conflicts with this (REGISTRY_TOOL_KIND_CONFLICT)."
+        },
+        "version": {
+          "type": "string"
+        },
+        "mcp_registry_id": {
+          "type": "string",
+          "description": "ADR-0013 MCP registry id, e.g. io.github.praxec/cpm-planner. mcp-only: a cli/rest descriptor conflicts with this (REGISTRY_TOOL_KIND_CONFLICT)."
+        },
+        "providers": {
+          "type": "object",
+          "default": {},
+          "propertyNames": {
+            "enum": [
+              "docker",
+              "release",
+              "cargo",
+              "npx",
+              "uvx"
+            ]
+          },
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "ADR-0013 provider chain, provider -> coordinate (image / URL / crate). Doctor offers with consent, never auto-installs (FM5)."
+        },
+        "descriptor": {
+          "$ref": "tool-descriptor.schema.json",
+          "description": "v3: the D1 tool descriptor — lets the registry describe cli and rest tools, not just mcp. Its `kind` must not conflict with the v2 coordinates above."
+        },
+        "suggested_workflows": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "v3: workflow definitionIds (namespace-qualified) that compose this tool."
+        }
+      }
+    },
+    "crossmatrixRow": {
+      "type": "object",
+      "required": [
+        "tool",
+        "workflow",
+        "role"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A tool id present in this registry's `tools`."
+        },
+        "workflow": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A workflow definitionId suggested somewhere in this registry (tool-level or descriptor-level `suggested_workflows`)."
+        },
+        "role": {
+          "enum": [
+            "suggested",
+            "dependency"
+          ],
+          "description": "Provenance of the edge: `suggested` is derived from the tool's suggested_workflows; `dependency` is derived from the workflow's step executor.connection refs (FM7: derived, never hand-maintained)."
+        }
+      }
+    }
+  }
+}
