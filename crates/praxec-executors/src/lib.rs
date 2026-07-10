@@ -7,6 +7,7 @@
 mod arg_render;
 pub mod cli;
 mod conn_util;
+pub mod conn_write;
 pub mod diff;
 pub mod dry_run;
 pub mod human;

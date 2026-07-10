@@ -4,7 +4,7 @@
 //! `gateway.rs` via StructureOS `propose_decomposition` + `move` (#25).
 
 use anyhow::Context;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -221,6 +221,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: SchemaCommand,
     },
+    /// Manage the config's top-level `connections:` block.
+    Connections {
+        #[command(subcommand)]
+        command: ConnectionsCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -230,6 +235,73 @@ pub(crate) enum SchemaCommand {
     /// { observe: true }` read. Includes the execution-tree linkage fields
     /// (`workflow_id`, `parent_workflow_id`, `depth`).
     AuditEvent,
+}
+
+/// D4a — the connection kind the operator names on `connections add --kind`.
+/// A CLI-local mirror of [`praxec_executors::conn_write::ConnectionKind`] so the
+/// clap surface stays typed (exhaustive `--kind` validation) without pulling
+/// clap into the executors crate.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "lowercase")]
+pub(crate) enum CliConnectionKind {
+    Mcp,
+    Cli,
+    Rest,
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ConnectionsCommand {
+    /// D4a — STAGE a new connection (ungranted) under `stagedConnections:`. This
+    /// writes ONLY the connection body; it does NOT grant. A staged connection is
+    /// inert — never in the live `/connections` registry — and is treated exactly
+    /// like a pack-declared, not-yet-granted connection: any spawn attempt fails
+    /// typed with the grant remedy. Granting is the separate, explicit
+    /// `connections grant` act, so a non-human running `add` cannot silently
+    /// obtain a trusted connection. Fail-fast on a duplicate name, an invalid
+    /// kind/field combination, or an unwritable config — never a silent overwrite.
+    Add {
+        /// Path to the gateway YAML config to edit in place.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The connection name, referenced by `executor.connection:`. Must be
+        /// unique in the config and must not contain '/'.
+        name: String,
+        /// The connection kind.
+        #[arg(long, value_enum)]
+        kind: CliConnectionKind,
+        /// Command to spawn — an mcp stdio server, or the cli command. (mcp/cli)
+        #[arg(long)]
+        command: Option<String>,
+        /// A single command argument; repeat for each. (mcp) MCP server args
+        /// often begin with '-' (e.g. `-y`), so hyphen-leading values are
+        /// accepted here.
+        #[arg(long = "arg", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Endpoint URL — an mcp streamable-http server, or the rest base URL. (mcp/rest)
+        #[arg(long)]
+        url: Option<String>,
+        /// Working directory for the command. (cli)
+        #[arg(long)]
+        working_directory: Option<String>,
+        /// An environment entry `KEY=VALUE`; repeat for each. (mcp/cli)
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// A request header `Name: value` (or `Name=value`); repeat for each. (rest)
+        #[arg(long = "header")]
+        headers: Vec<String>,
+    },
+    /// D4a — GRANT a previously-staged connection: the separate, explicit,
+    /// auditable operator trust act. Adds the name to the top-level
+    /// `grant_connections:` list so the config-load gate promotes the staged body
+    /// into the live `/connections` registry, and records a `connections.granted`
+    /// audit event. Fail-fast if the name is not staged or is already granted.
+    Grant {
+        /// Path to the gateway YAML config to edit in place.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The staged connection to grant.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

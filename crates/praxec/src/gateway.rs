@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub(crate) use crate::gateway_config::{
-    ApprovalsCommand, AuditCommand, Cli, Command, CostCommand, InspectCommand, IntentCommand,
-    OneshotServer, SchemaCommand, ack_guards_used, apply_overlays, build_audit_sink,
-    build_workflow_store, cli_principal, headless_policy_from, is_ephemeral_path, load_config,
-    parse_since, resolve_embedder,
+    ApprovalsCommand, AuditCommand, Cli, CliConnectionKind, Command, ConnectionsCommand,
+    CostCommand, InspectCommand, IntentCommand, OneshotServer, SchemaCommand, ack_guards_used,
+    apply_overlays, build_audit_sink, build_workflow_store, cli_principal, headless_policy_from,
+    is_ephemeral_path, load_config, parse_since, resolve_embedder,
 };
 pub use crate::gateway_config::{
     GatewayOverlays, OverlayCtx, build_evidence_store, build_guidance_ack_store,
@@ -173,7 +173,191 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 Ok(())
             }
         },
+        Command::Connections { command } => match command {
+            ConnectionsCommand::Add {
+                config,
+                name,
+                kind,
+                command,
+                args,
+                url,
+                working_directory,
+                env,
+                headers,
+            } => connections_add(
+                &config,
+                &name,
+                kind,
+                command,
+                args,
+                url,
+                working_directory,
+                env,
+                headers,
+            ),
+            ConnectionsCommand::Grant { config, name } => connections_grant(&config, &name).await,
+        },
     }
+}
+
+/// Split a repeatable `KEY<sep>VALUE` flag into pairs, fail-fast on a token with
+/// no separator. Header values may themselves contain the separator, so only the
+/// FIRST occurrence splits.
+fn parse_kv_flag(raw: &[String], sep: char, flag: &str) -> anyhow::Result<Vec<(String, String)>> {
+    raw.iter()
+        .map(|entry| {
+            let (k, v) = entry.split_once(sep).ok_or_else(|| {
+                anyhow::anyhow!("{flag} '{entry}' must be in `KEY{sep}VALUE` form")
+            })?;
+            let k = k.trim();
+            if k.is_empty() {
+                anyhow::bail!("{flag} '{entry}' has an empty key");
+            }
+            Ok((k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Reject flags that do not apply to the chosen connection kind, so a mistyped
+/// invocation (e.g. `--header` on a `cli` connection) fails loud instead of
+/// silently dropping the value.
+fn reject_inapplicable(kind: &str, offending: &[(&str, bool)]) -> anyhow::Result<()> {
+    let bad: Vec<&str> = offending
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(flag, _)| *flag)
+        .collect();
+    if !bad.is_empty() {
+        anyhow::bail!(
+            "these flags do not apply to a `{kind}` connection: {}",
+            bad.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// D4a — `connections add`: build a typed [`ConnectionSpec`] from the parsed
+/// flags (rejecting flags that don't apply to the kind), write it into the
+/// config as a GRANTED connection, and print what was written.
+#[allow(clippy::too_many_arguments)]
+fn connections_add(
+    config: &std::path::Path,
+    name: &str,
+    kind: CliConnectionKind,
+    command: Option<String>,
+    args: Vec<String>,
+    url: Option<String>,
+    working_directory: Option<String>,
+    env: Vec<String>,
+    headers: Vec<String>,
+) -> anyhow::Result<()> {
+    use praxec_executors::conn_write::{ConnectionSpec, add_connection};
+
+    let spec = match kind {
+        CliConnectionKind::Mcp => {
+            reject_inapplicable(
+                "mcp",
+                &[
+                    ("--working-directory", working_directory.is_some()),
+                    ("--header", !headers.is_empty()),
+                ],
+            )?;
+            ConnectionSpec::Mcp {
+                command,
+                args,
+                url,
+                env: parse_kv_flag(&env, '=', "--env")?,
+            }
+        }
+        CliConnectionKind::Cli => {
+            reject_inapplicable(
+                "cli",
+                &[
+                    ("--arg", !args.is_empty()),
+                    ("--url", url.is_some()),
+                    ("--header", !headers.is_empty()),
+                ],
+            )?;
+            let command =
+                command.ok_or_else(|| anyhow::anyhow!("a `cli` connection requires --command"))?;
+            ConnectionSpec::Cli {
+                command,
+                working_directory,
+                env: parse_kv_flag(&env, '=', "--env")?,
+            }
+        }
+        CliConnectionKind::Rest => {
+            reject_inapplicable(
+                "rest",
+                &[
+                    ("--command", command.is_some()),
+                    ("--arg", !args.is_empty()),
+                    ("--working-directory", working_directory.is_some()),
+                    ("--env", !env.is_empty()),
+                ],
+            )?;
+            let base_url = url.ok_or_else(|| {
+                anyhow::anyhow!("a `rest` connection requires --url (the base URL)")
+            })?;
+            ConnectionSpec::Rest {
+                base_url,
+                headers: parse_kv_flag(&headers, ':', "--header")?,
+            }
+        }
+    };
+
+    let written = add_connection(config, name, &spec)?;
+    println!(
+        "connections add: STAGED connection '{name}' (kind: {}) in {}",
+        spec.kind().as_str(),
+        config.display()
+    );
+    println!("{}", serde_json::to_string_pretty(&written)?);
+    println!(
+        "It is NOT yet granted: a staged connection is inert (never in the live registry) until \
+         you run `px connections grant {name}`. This keeps `add` from silently minting a trusted \
+         connection."
+    );
+    Ok(())
+}
+
+/// D4a — `connections grant`: the explicit, auditable operator trust act. Appends
+/// the name to the config's top-level `grant_connections:` list (via the write
+/// primitive) and records a `connections.granted` audit event.
+async fn connections_grant(config: &std::path::Path, name: &str) -> anyhow::Result<()> {
+    use praxec_executors::conn_write::grant_connection;
+
+    // Edit the raw config file first (fail-fast if not staged / already granted).
+    let body = grant_connection(config, name)?;
+    let kind = body
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Emit a governance audit event. The audit sink is read from the (now
+    // updated) resolved config — a durable `audit.sink: file` retains the grant
+    // in the queryable trail; the default stderr sink still surfaces it.
+    let resolved = load_config(&config.to_path_buf())?;
+    let sink = build_audit_sink(&resolved)?;
+    let event = praxec_core::audit::AuditEvent::new("connections.granted")
+        .with_actor("operator")
+        .with_payload(serde_json::json!({
+            "connection": name,
+            "kind": kind,
+            "config": config.display().to_string(),
+        }));
+    sink.record(event).await?;
+
+    println!(
+        "connections grant: GRANTED connection '{name}' (kind: {kind}) in {}",
+        config.display()
+    );
+    println!(
+        "It is now live: the config-load gate promotes it into the `/connections` registry. \
+         Recorded a `connections.granted` audit event."
+    );
+    Ok(())
 }
 
 fn init_tracing(log_format: &str) {

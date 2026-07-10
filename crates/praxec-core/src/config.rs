@@ -2859,7 +2859,10 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     let (repos, overrides) = take_repos_and_overrides(&mut host)?;
     if repos.is_empty() {
         // No repos declared — strip an empty `overrides:` (it's meaningless
-        // without any repo-provided ids to shadow) and return unchanged.
+        // without any repo-provided ids to shadow). Host-level staged
+        // connections (`px connections add` / `grant`) still get the grant gate.
+        let staged_ungranted = apply_staged_connection_grants(&mut host)?;
+        stamp_ungranted_connections(&mut host, staged_ungranted);
         return Ok(host);
     }
 
@@ -2997,8 +3000,106 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     // own definition is live under that key (implicit grant by authorship),
     // gated by the explicit `overrides:` acknowledgment above.
     ungranted_connections.retain(|u| !host_ids.contains(&u.key));
+    // SPEC §9.5 — host-level staged connections (`px connections add` / `grant`):
+    // promote granted staged bodies into the live `/connections` registry and
+    // divert ungranted ones to `_ungrantedConnections` — the same mechanism as
+    // repo-declared connections. Applied after the repo merge so a staged name
+    // colliding with a repo-provided live connection is caught.
+    let staged_ungranted = apply_staged_connection_grants(&mut merged)?;
+    ungranted_connections.extend(staged_ungranted);
     stamp_ungranted_connections(&mut merged, ungranted_connections);
     Ok(merged)
+}
+
+/// SPEC §9.5 — apply the host-level staged-connection grant gate (`px connections
+/// add` / `grant`). This is the operator-authored analog of
+/// [`gate_repo_connections`]: `add` writes a body under top-level
+/// `stagedConnections:` (never live), and `grant` lists its name under top-level
+/// `grant_connections:`. Here, for each staged entry:
+///   - GRANTED (name in `grant_connections:`) → the body is promoted into the
+///     live `/connections` registry (fail-fast on a collision with an existing
+///     live connection — never a silent overwrite);
+///   - UNGRANTED → returned as an [`UngrantedConnection`] for stamping into
+///     `/praxec/_ungrantedConnections`, so a spawn attempt fails typed with the
+///     grant remedy exactly like a pack-declared ungranted connection.
+///
+/// Both `stagedConnections:` and top-level `grant_connections:` are stripped from
+/// the resolved config (internal authoring state, not live registry keys). A
+/// grant naming no staged connection is a hard error (`STALE_CONNECTION_GRANT`,
+/// mirroring the repo path). A config with neither key round-trips unchanged.
+fn apply_staged_connection_grants(config: &mut Value) -> anyhow::Result<Vec<UngrantedConnection>> {
+    let Some(obj) = config.as_object_mut() else {
+        return Ok(Vec::new());
+    };
+    let staged = match obj.remove("stagedConnections") {
+        Some(Value::Object(m)) => m,
+        None | Some(Value::Null) => {
+            // No staged connections — a lone `grant_connections:` grants nothing.
+            if let Some(g) = obj.remove("grant_connections") {
+                if g.as_array().is_some_and(|a| !a.is_empty()) {
+                    bail!(
+                        "STALE_CONNECTION_GRANT: top-level `grant_connections:` lists names, but \
+                         there is no `stagedConnections:` block. Add a connection with \
+                         `px connections add <name> --kind <kind> ...` first (SPEC §9.5)."
+                    );
+                }
+            }
+            return Ok(Vec::new());
+        }
+        Some(_) => bail!(
+            "INVALID_STAGED_CONNECTIONS: top-level `stagedConnections:` must be a mapping of \
+             name → connection body (SPEC §9.5)."
+        ),
+    };
+    let grants: HashSet<String> = match obj.remove("grant_connections") {
+        Some(Value::Array(a)) => a
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        None | Some(Value::Null) => HashSet::new(),
+        Some(_) => bail!(
+            "INVALID_GRANT_CONNECTIONS: top-level `grant_connections:` must be an array of \
+             staged connection names (SPEC §9.5)."
+        ),
+    };
+    // A grant naming a connection that is not staged is stale (mirrors the repo
+    // `STALE_CONNECTION_GRANT`): the operator's mental model has drifted.
+    for g in &grants {
+        if !staged.contains_key(g) {
+            bail!(
+                "STALE_CONNECTION_GRANT: top-level `grant_connections:` lists '{g}', but no \
+                 `stagedConnections:` entry declares it. Add it with \
+                 `px connections add {g} --kind <kind> ...` or remove the grant (SPEC §9.5)."
+            );
+        }
+    }
+    let mut ungranted = Vec::new();
+    for (name, body) in staged {
+        if grants.contains(&name) {
+            let connections = obj
+                .entry("connections")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let cm = connections.as_object_mut().ok_or_else(|| {
+                anyhow::anyhow!("INVALID_CONNECTIONS: `connections:` must be a mapping")
+            })?;
+            if cm.contains_key(&name) {
+                bail!(
+                    "DUPLICATE_CONNECTION: granting staged connection '{name}' collides with an \
+                     existing live `connections:` entry of the same name. Rename or remove one \
+                     (SPEC §9.5)."
+                );
+            }
+            cm.insert(name, body);
+        } else {
+            ungranted.push(UngrantedConnection {
+                key: name.clone(),
+                bare: name,
+                repo: "host config (px connections add)".to_string(),
+                namespace: String::new(),
+            });
+        }
+    }
+    Ok(ungranted)
 }
 
 /// SPEC §9.5 — one pack-declared connection the operator has not granted.
@@ -3105,11 +3206,21 @@ fn stamp_ungranted_connections(config: &mut Value, entries: Vec<UngrantedConnect
     if let Some(fg) = praxec.as_object_mut() {
         let mut map = Map::new();
         for u in entries {
-            let remedy = format!(
-                "add `grant_connections: [{}]` to the `repos:` entry for {} to activate \
-                 this connection",
-                u.bare, u.repo
-            );
+            // Host-staged connections (empty namespace) carry the `px connections
+            // grant` remedy; pack-declared ones carry the per-repo grant remedy.
+            let remedy = if u.namespace.is_empty() {
+                format!(
+                    "run `px connections grant {0}` (or add `{0}` to the top-level \
+                     `grant_connections:`) to activate this operator-staged connection",
+                    u.bare
+                )
+            } else {
+                format!(
+                    "add `grant_connections: [{}]` to the `repos:` entry for {} to activate \
+                     this connection",
+                    u.bare, u.repo
+                )
+            };
             map.insert(
                 u.key,
                 json!({ "repo": u.repo, "namespace": u.namespace, "remedy": remedy }),
