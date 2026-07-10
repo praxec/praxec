@@ -21,12 +21,20 @@ use crate::providers::ProviderId;
 
 /// Resolve the on-disk path for the provider-keys file. Precedence:
 /// 1. `$PRAXEC_PROVIDER_KEYS_FILE` if set + non-empty.
-/// 2. `~/.praxec/providers.env` (`dirs::home_dir().join(".praxec/providers.env")`).
+/// 2. An EXISTING `~/.config/praxec/providers.env` (the XDG config dir, beside
+///    the gateway config) — checked first.
+/// 3. An EXISTING `~/.praxec/providers.env` (legacy home dot-dir).
+/// 4. Otherwise `~/.config/praxec/providers.env` (so a fresh `set-provider-keys`
+///    writes beside the config), falling back to `~/.praxec/providers.env`.
 ///
-/// When `dirs::home_dir()` returns `None` (some sandboxed CI environments),
-/// this returns [`ProviderKeysError::NoConfigDir`] rather than silently falling
-/// back to a relative CWD path — writing secrets to an unexpected, world-
-/// adjacent relative location is a real hazard. The operator must set
+/// The XDG-config-first order fixes the v0.0.17 mismatch (dogfood Finding 17):
+/// keys written next to the gateway config in `~/.config/praxec/` were never
+/// auto-loaded because only `~/.praxec/` was consulted → no credentials → agent
+/// model calls failed fast (surfacing as a spurious sub-second "timeout").
+///
+/// When neither a config nor home dir can be resolved (some sandboxed CI), this
+/// returns [`ProviderKeysError::NoConfigDir`] rather than a relative CWD path —
+/// writing secrets to a world-adjacent relative location is a real hazard; set
 /// `$PRAXEC_PROVIDER_KEYS_FILE` to an explicit absolute path instead.
 pub fn resolve_path() -> Result<PathBuf, ProviderKeysError> {
     if let Ok(p) = std::env::var("PRAXEC_PROVIDER_KEYS_FILE") {
@@ -34,10 +42,18 @@ pub fn resolve_path() -> Result<PathBuf, ProviderKeysError> {
             return Ok(PathBuf::from(p));
         }
     }
-    match dirs::home_dir() {
-        Some(d) => Ok(d.join(".praxec").join("providers.env")),
-        None => Err(ProviderKeysError::NoConfigDir),
+    let xdg = dirs::config_dir().map(|d| d.join("praxec").join("providers.env"));
+    let home = dirs::home_dir().map(|d| d.join(".praxec").join("providers.env"));
+    // Prefer an existing file — the XDG config dir (where the gateway config
+    // lives) first, then the legacy home dot-dir.
+    if let Some(p) = xdg.as_ref().filter(|p| p.exists()) {
+        return Ok(p.clone());
     }
+    if let Some(p) = home.as_ref().filter(|p| p.exists()) {
+        return Ok(p.clone());
+    }
+    // Neither exists yet: default to the XDG config path, else the legacy home path.
+    xdg.or(home).ok_or(ProviderKeysError::NoConfigDir)
 }
 
 /// Errors from the provider-keys file backend.
