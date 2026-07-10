@@ -653,6 +653,7 @@ impl WorkflowRuntime {
                                 .with_correlation(correlation_id)
                                 .with_payload(json!({
                                     "transition": name,
+                                    "affinity": auto_affinity_tier,
                                     "duration_ms": agent_started.elapsed().as_millis() as u64,
                                     "model": model,
                                     "prompt_tokens": prompt_tokens,
