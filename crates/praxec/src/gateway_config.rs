@@ -62,6 +62,16 @@ pub(crate) enum Command {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// P15 — preflight this machine for a config: is every provider key the
+    /// config's models reference resolvable (env / providers.env), and is every
+    /// `kind: mcp` connection binary on PATH? Missing credentials fail (exit
+    /// non-zero — nothing agentic could run); missing tools are warnings (they
+    /// fail loud at invocation and only affect the steps that use them).
+    Doctor {
+        /// Path to the gateway YAML config.
+        #[arg(short, long)]
+        config: PathBuf,
+    },
     /// Print a JSON health snapshot: connections, repos, definition_count, store.
     Health {
         #[arg(short, long)]

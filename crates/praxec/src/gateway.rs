@@ -101,6 +101,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             args,
         } => run_query(config, human, args, overlays).await,
         Command::Check { config } => check(config, &overlays.diagnostics),
+        Command::Doctor { config } => doctor(config),
         Command::Health { config } => health(config),
         Command::Observe { config } => observe(config),
         Command::Migrate { config } => migrate(config),
@@ -284,6 +285,11 @@ async fn orchestrate(
     use praxec_core::model::{Principal, StartWorkflow};
 
     let config = load_config(&config_path)?;
+    // P15 — fail fast on a missing provider credential BEFORE doing any work:
+    // check the providers the config's model bindings reference plus the
+    // orchestrator's own `--model`, instead of failing deep in the first model
+    // call. Missing tools do NOT block (they fail loud at invocation).
+    crate::preflight::guard_provider_credentials(&config, &[model.as_str()])?;
     let runtime = build_runtime_for_orchestrate(&config, &overlays).await?;
 
     // Resolve the mission: drive an existing instance, or START a fresh one from a
@@ -831,6 +837,12 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         // command/query against an ephemeral store is fine; a long-running serve
         // is not. As a config fault, this now degrades rather than crashing.
         guard_durable_serve(&config)?;
+        // P15 — credential preflight: a provider key the config's model
+        // bindings need that is missing means every agent/llm step is doomed
+        // to fail at dispatch. Surface it here as a live DEGRADED state (the
+        // self-documenting HealthReport) instead of the first deep model-call
+        // error. Missing TOOLS never block — they fail loud at invocation.
+        crate::preflight::guard_provider_credentials(&config, &[])?;
         build_oneshot_server(&config, &overlays).await
     }
     .await;
@@ -1270,6 +1282,23 @@ fn migrate(config_path: PathBuf) -> anyhow::Result<()> {
         count,
         config_path.display()
     );
+    Ok(())
+}
+
+/// P15 — the operator's "is my machine set up for this config" command: run
+/// the credential/tooling preflight and print the report. Exits non-zero iff
+/// a required provider credential is missing (a missing `kind: mcp` binary is
+/// reported as a warning — it fails loud at invocation, not at boot).
+fn doctor(config_path: PathBuf) -> anyhow::Result<()> {
+    let config = load_config(&config_path)?;
+    let report = crate::preflight::preflight(&config);
+    print!("{}", crate::preflight::format_report(&report));
+    if !report.ok {
+        anyhow::bail!(
+            "doctor: required provider credential(s) missing — a drive against this \
+             config would fail at the first model call"
+        );
+    }
     Ok(())
 }
 

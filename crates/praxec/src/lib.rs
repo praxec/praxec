@@ -15,4 +15,5 @@ pub mod affinity_resolver;
 
 pub mod gateway;
 pub mod gateway_config;
+pub mod preflight;
 pub mod provision;
