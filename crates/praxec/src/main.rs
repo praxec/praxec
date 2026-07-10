@@ -229,7 +229,14 @@ mod agent {
             )));
             let mcp_host: Arc<dyn ToolHost> = Arc::new(McpToolHost { caller });
             let host: Arc<dyn ToolHost> = Arc::new(CompositeToolHost::new(mcp_host));
-            let mut rig_runner = RigSessionRunner::with_default_provider().with_tool_host(host);
+            // Observability — heartbeat: hand the runner the gateway audit
+            // sink so a governed agent run pulses `agent.heartbeat` events
+            // (per tool-loop turn + within a long silent model call) into the
+            // SAME audit log `agent.invoked`/`agent.completed` land in. An
+            // operator tailing that log can now tell "slow model" from "hung".
+            let mut rig_runner = RigSessionRunner::with_default_provider()
+                .with_tool_host(host)
+                .with_audit_sink(ctx.audit.clone());
             // P12 R1.4 — wire the durable park for agent `await_human`
             // suspend/resume when the gateway has a durable (sqlite) store:
             // the same DB file the workflow store uses. Without it the runner

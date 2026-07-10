@@ -134,6 +134,7 @@ fn session(tools: Vec<String>) -> AgentSession {
         expected_output_keys: Vec::new(),
         expected_output_types: Default::default(),
         await_enabled: false,
+        identity: Default::default(),
     }
 }
 
@@ -1044,6 +1045,7 @@ async fn test_tool_setup_timeout() {
         expected_output_keys: Vec::new(),
         expected_output_types: Default::default(),
         await_enabled: false,
+        identity: Default::default(),
     };
     let runner = RigSessionRunner::new(Arc::new(ScriptedFactory::new(vec![])))
         .with_tool_host(Arc::new(HangingToolHost));
@@ -1450,4 +1452,178 @@ fn sanitize_does_not_shadow_the_reserved_await_human() {
     let n = sanitize_tool_name(AWAIT_HUMAN_TOOL, &taken);
     assert_ne!(n, AWAIT_HUMAN_TOOL);
     assert!(valid_provider_tool_name(&n));
+}
+
+// ═══ Observability — the `agent.heartbeat` liveness pulse ═══════════════════
+
+use praxec_core::audit::MemoryAuditSink;
+
+/// A session stamped with the identity the runtime puts on `agent.invoked`,
+/// so the heartbeat's correlation join can be asserted.
+fn identified_session(tools: Vec<String>) -> AgentSession {
+    AgentSession {
+        identity: crate::session::RunIdentity {
+            workflow_id: Some("wf-hb".into()),
+            correlation_id: Some("cor-hb".into()),
+            transition: Some("do_work".into()),
+        },
+        ..session(tools)
+    }
+}
+
+fn heartbeats(sink: &MemoryAuditSink) -> Vec<praxec_core::audit::AuditEvent> {
+    sink.snapshot()
+        .into_iter()
+        .filter(|e| e.event_type == AGENT_HEARTBEAT_EVENT)
+        .collect()
+}
+
+/// Per-turn liveness: a multi-turn run emits one boundary `agent.heartbeat`
+/// per tool-loop turn, carrying the turn index, model, elapsed time, and the
+/// SAME workflow/correlation identity `agent.invoked` carries — so an operator
+/// tailing the audit log sees turn-by-turn progress between the boundary
+/// events instead of silence.
+#[tokio::test]
+async fn a_multi_turn_run_emits_a_boundary_heartbeat_per_turn() {
+    // Turn 0: the model calls `lookup`. Turn 1: it calls `final_answer`.
+    let factory = ScriptedFactory::new(vec![
+        vec![
+            Ok(StreamEvent::ToolCall(ToolCallRequest {
+                id: "t1".into(),
+                name: "lookup".into(),
+                arguments: r#"{"q":"x"}"#.into(),
+            })),
+            Ok(done()),
+        ],
+        vec![
+            Ok(final_answer(r#"{"status":"success","output":{"ok":true}}"#)),
+            Ok(done()),
+        ],
+    ]);
+    let host = Arc::new(RecordingHost {
+        calls: Mutex::new(vec![]),
+    });
+    let sink = MemoryAuditSink::new();
+    let runner = RigSessionRunner::new(Arc::new(factory))
+        .with_tool_host(host)
+        .with_audit_sink(Arc::new(sink.clone()));
+    let report = runner
+        .run(identified_session(vec!["conn".into()]))
+        .await
+        .unwrap();
+    assert!(matches!(report.outcome, AgentRunOutcome::Completed(_)));
+
+    let beats = heartbeats(&sink);
+    assert_eq!(
+        beats.len(),
+        2,
+        "one boundary heartbeat per turn (2 turns), got {beats:?}"
+    );
+    for (i, beat) in beats.iter().enumerate() {
+        assert_eq!(beat.payload["turn"], json!(i as u64), "turn index");
+        assert_eq!(beat.payload["phase"], json!("turn"));
+        assert_eq!(beat.payload["model"], json!("anthropic:claude-sonnet-4-6"));
+        assert_eq!(beat.payload["transition"], json!("do_work"));
+        assert!(
+            beat.payload["elapsed_ms"].is_u64(),
+            "elapsed_ms present: {beat:?}"
+        );
+        // The correlation join with agent.invoked / agent.completed.
+        assert_eq!(beat.workflow_id.as_deref(), Some("wf-hb"));
+        assert_eq!(beat.correlation_id, "cor-hb");
+    }
+}
+
+/// Non-spammy: a fast single-turn run emits exactly ONE boundary heartbeat
+/// and no within-turn `waiting_on_model` pulse.
+#[tokio::test]
+async fn a_fast_run_emits_only_the_boundary_heartbeat() {
+    let factory = ScriptedFactory::new(vec![vec![
+        Ok(final_answer(r#"{"status":"success","output":{"ok":true}}"#)),
+        Ok(done()),
+    ]]);
+    let sink = MemoryAuditSink::new();
+    let runner = RigSessionRunner::new(Arc::new(factory)).with_audit_sink(Arc::new(sink.clone()));
+    let report = runner.run(identified_session(vec![])).await.unwrap();
+    assert!(matches!(report.outcome, AgentRunOutcome::Completed(_)));
+
+    let beats = heartbeats(&sink);
+    assert_eq!(beats.len(), 1, "exactly one boundary heartbeat: {beats:?}");
+    assert_eq!(beats[0].payload["phase"], json!("turn"));
+    assert_eq!(beats[0].payload["turn"], json!(0));
+}
+
+/// A factory whose single turn goes silent for 70s (paused clock) before the
+/// model answers — the "slow reasoning call" that is 0-CPU from outside and
+/// used to be indistinguishable from a hang.
+struct SlowFirstTokenFactory;
+#[async_trait]
+impl ProviderFactory for SlowFirstTokenFactory {
+    async fn stream(
+        &self,
+        _model: &str,
+        _turn: TurnRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, String>>, ExecutorError> {
+        let delayed = stream::once(async {
+            sleep(Duration::from_secs(70)).await;
+            Ok(final_answer(r#"{"status":"success","output":{"ok":true}}"#))
+        });
+        Ok(Box::pin(delayed.chain(stream::iter(vec![Ok(done())]))))
+    }
+}
+
+/// The within-turn pulse (the actual 0-CPU case): while ONE model call is
+/// silent, the stall watchdog's tick emits a `waiting_on_model` heartbeat
+/// every HEARTBEAT_INTERVAL — BEFORE the stall window fires — so a slow
+/// reasoning turn shows a pulse ("still alive, Ns since last output")
+/// instead of dead air. 70s of silence with a 30s interval and a 120s stall
+/// window ⇒ pulses at 30s and 60s, then a normal completion.
+#[tokio::test(start_paused = true)]
+async fn a_long_silent_model_call_pulses_within_turn_heartbeats() {
+    let sink = MemoryAuditSink::new();
+    let runner = RigSessionRunner::new(Arc::new(SlowFirstTokenFactory))
+        .with_audit_sink(Arc::new(sink.clone()));
+    let mut s = identified_session(vec![]);
+    s.timeout = Duration::from_secs(600);
+    s.stall_timeout = Duration::from_secs(120); // watchdog must NOT fire at 70s
+    let report = runner.run(s).await.unwrap();
+    assert!(
+        matches!(report.outcome, AgentRunOutcome::Completed(_)),
+        "the slow-but-alive turn completes normally: {:?}",
+        report.outcome
+    );
+
+    let beats = heartbeats(&sink);
+    let waiting: Vec<_> = beats
+        .iter()
+        .filter(|b| b.payload["phase"] == json!("waiting_on_model"))
+        .collect();
+    assert_eq!(
+        waiting.len(),
+        2,
+        "70s of silence at a 30s interval pulses at 30s and 60s: {beats:?}"
+    );
+    assert_eq!(waiting[0].payload["seconds_since_last_output"], json!(30));
+    assert_eq!(waiting[1].payload["seconds_since_last_output"], json!(60));
+    // The identity join rides the within-turn pulse too.
+    assert_eq!(waiting[0].correlation_id, "cor-hb");
+    // And the boundary heartbeat for the (single) turn is still there.
+    assert!(
+        beats
+            .iter()
+            .any(|b| b.payload["phase"] == json!("turn") && b.payload["turn"] == json!(0)),
+        "boundary heartbeat present: {beats:?}"
+    );
+}
+
+/// Emit-only: with NO audit sink wired (the default), a run emits nothing and
+/// behaves exactly as before — the heartbeat is a pure observability addition.
+#[tokio::test(start_paused = true)]
+async fn without_a_sink_the_slow_call_still_completes_with_no_emission() {
+    let runner = RigSessionRunner::new(Arc::new(SlowFirstTokenFactory));
+    let mut s = session(vec![]);
+    s.timeout = Duration::from_secs(600);
+    s.stall_timeout = Duration::from_secs(120);
+    let report = runner.run(s).await.unwrap();
+    assert!(matches!(report.outcome, AgentRunOutcome::Completed(_)));
 }

@@ -36,6 +36,7 @@ impl RigSessionRunner {
             max_turns: DEFAULT_MAX_TURNS,
             max_history_bytes: DEFAULT_MAX_HISTORY_BYTES,
             parked_store: None,
+            audit: None,
         }
     }
 
@@ -68,6 +69,17 @@ impl RigSessionRunner {
         store: Arc<dyn praxec_core::ports::ParkedSessionStore>,
     ) -> Self {
         self.parked_store = Some(store);
+        self
+    }
+
+    /// Wire the gateway audit sink so the run emits `agent.heartbeat`
+    /// liveness events (per turn boundary + every
+    /// [`HEARTBEAT_INTERVAL`](crate::rig_runner::HEARTBEAT_INTERVAL) within a
+    /// long silent model call) into the SAME audit log `agent.invoked` /
+    /// `agent.completed` land in. Without it (the default) no heartbeats are
+    /// emitted; all other behavior is identical.
+    pub fn with_audit_sink(mut self, sink: Arc<dyn praxec_core::audit::AuditSink>) -> Self {
+        self.audit = Some(sink);
         self
     }
 
