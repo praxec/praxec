@@ -72,7 +72,7 @@ Configure the harness:\n\
   migrate-agents-from-cli\n\
               Migrate v0.2 --agent flags to a v0.3 models.yaml\n\
   set-provider-keys\n\
-              Write provider API keys to ~/.praxec/providers.env\n\
+              Write provider API keys to ~/.config/praxec/providers.env\n\
 \n\
 Lexicon management:\n\
   lexicon define  Define or redefine a term\n\
@@ -172,14 +172,14 @@ enum Command {
                       once + commit the file."
     )]
     MigrateAgentsFromCli(MigrateAgentsArgs),
-    /// Write provider API keys to ~/.praxec/providers.env
+    /// Write provider API keys to ~/.config/praxec/providers.env
     /// (override via $PRAXEC_PROVIDER_KEYS_FILE). Loaded into env at
     /// px startup; existing env vars take precedence.
     /// Supported providers: anthropic, openai, openrouter, bedrock,
     /// gemini.
     #[command(
         next_help_heading = "Configure the harness",
-        long_about = "Write provider API keys to ~/.praxec/providers.env (override via \
+        long_about = "Write provider API keys to ~/.config/praxec/providers.env (override via \
                       $PRAXEC_PROVIDER_KEYS_FILE). Loaded into env at px startup; \
                       existing env vars take precedence. Without flags, interactively walks all \
                       supported providers (anthropic, openai, openrouter, bedrock, gemini)."
