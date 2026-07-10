@@ -17,6 +17,67 @@ covered by a stability commitment.
 > none were tagged at the time. Versions `0.0.1`–`0.0.5` are the earlier
 > development history, renumbered onto this line.
 
+## [0.0.17] — 2026-07-10 — tool-source ecosystem & governed connections
+
+> **This release bundles every 0.0.16 improvement.** There is no separate 0.0.16
+> cut: the 0.0.16 self-improvement program (observability, self-healing, durable
+> planning, telemetry) ships here alongside the 0.0.17 tool-source ecosystem.
+
+### Added — the tool-source ecosystem (headline)
+
+- **Tool descriptor schema (`praxec.tool/v1`)** — a schema-first descriptor
+  (`schemas/tool-descriptor.schema.json`) that describes a **cli, mcp, or rest**
+  tool uniformly: identity, `kind`, its connection requirement (`reach`, which
+  embeds the existing gateway connection shape verbatim — install = copy, never
+  transform), invocation `operations[]`, and `suggested_workflows[]`. Typed
+  loader with fail-fast `validate()` in `praxec-core::tool_descriptor`.
+- **Tool-source executor** — ingests a descriptor and surfaces its operations as
+  a callable tool through the gateway, dispatching per kind by reusing the
+  existing mcp/cli/rest transports. Fail-fasts (never auto-grants) when the
+  required connection is absent or ungranted.
+- **Registry v3 (`praxec.packs/v3`)** — a compatible superset of the v2 pack
+  registry: each tool may carry a descriptor (so the registry finally spans
+  cli + rest, not just mcp), plus per-tool `suggested_workflows` and a top-level
+  `crossmatrix` (tool × workflow) topology. Typed loader in
+  `praxec-core::registry_v3` with `workflows_for_tool` / `tools_for_workflow`.
+- **Evidence + topology-aware selector** — deterministic candidate ranking
+  (`rank_candidates`) combining lexical relevance, item1 intent-evidence, and
+  registry topology, with an explainable `why` line carrying the exact
+  arithmetic. The compiled-tool-determinism middle of
+  human-intent × tool-determinism × model-generation.
+- **`px connections add` / `px connections grant`** — a governed connection
+  write path. `add` writes a connection **staged/ungranted**; `grant` is the
+  separate, explicit, auditable trust act (emits `connections.granted`).
+
+### Security
+
+- **Operator grant gate for repo-contributed connections.** Repo/pack-declared
+  connections are no longer auto-trusted — a supply-chain hole. They are stamped
+  `_ungrantedConnections` at load and every consumer (cli/mcp/rest) fail-fasts
+  with `UNGRANTED_PACK_CONNECTION` until the operator grants them. A
+  CLI-staged connection (`px connections add`) is treated identically until
+  granted, so no code path can silently obtain a trusted connection.
+
+### Added — observability (0.0.16)
+
+- **Structured harness-event stream** (not LLM tokens) exposing execution
+  topology, cross-platform: `agent.heartbeat` liveness pulses, execution-tree
+  linkage (`parent_workflow_id` + `depth`), audit-granule rotation + retention,
+  a published `AuditEvent` JSON Schema (`praxec schema audit-event`),
+  `praxec observe --follow`, and the MCP `praxec.query { observe }` read.
+- **Intent-evidence on discovery** — `praxec.query` workflow hits carry
+  `evidence:{runs, success_rate, mean_cost}` from recorded outcomes (gated at a
+  minimum run count), so discovery is no longer blind to what actually worked.
+
+### Added / Changed / Fixed — 0.0.16 self-improvement program
+
+- Durable CPM control plane (sqlite + retry circuit-breaker), INCOSE/SEBoK Vee
+  flow, per-model cooldown breaker over the chain-walk, bounded reasoning-stall,
+  credential preflight + `praxec doctor`, cost/affinity telemetry, staged
+  `cargo_scope` build-loop throughput, and pack-wide guard-failure→`outcome:
+  failure` correctness. See `docs/v0.0.16-dogfooding-report.md` for the full
+  program + honest A/B findings.
+
 ## [0.0.15] — 2026-07-09 — resilient serve & self-healing misconfiguration
 
 ### Fixed — HOP: FM-7 exempts the resolved slot cap (typed `snippet.outputs`)
