@@ -955,7 +955,8 @@
             "dry_run",
             "structural_analysis",
             "ingest",
-            "diff"
+            "diff",
+            "tool_source"
           ]
         },
         "connection": {
