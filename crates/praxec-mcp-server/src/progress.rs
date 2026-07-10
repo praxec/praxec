@@ -93,6 +93,12 @@ impl AuditSink for PeerBridgeAuditSink {
     async fn try_list_events(&self) -> anyhow::Result<Option<Vec<AuditEvent>>> {
         self.inner.try_list_events().await
     }
+
+    fn sink_kind(&self) -> &'static str {
+        // Decorator — the observability fail-fast must see the REAL sink kind,
+        // not the bridge.
+        self.inner.sink_kind()
+    }
 }
 
 /// Wrap an audit sink so its events ALSO push to the connected MCP client.

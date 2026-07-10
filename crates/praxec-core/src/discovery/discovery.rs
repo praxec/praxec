@@ -443,6 +443,22 @@ fn default_home() -> Value {
                 "title": "List proxy capabilities",
                 "method": "praxec.query",
                 "args": { "query": "", "kind": "capability" }
+            },
+            {
+                "rel": "observe",
+                "title": "Replay the structured audit event stream (bounded window; the pull complement to `praxec observe --follow`)",
+                "method": "praxec.query",
+                "args": { "observe": true },
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["observe"],
+                    "properties": {
+                        "observe": { "type": "boolean" },
+                        "since": { "type": "string", "description": "RFC3339 floor — only events with timestamp >= since" },
+                        "limit": { "type": "integer", "default": 200 }
+                    },
+                    "additionalProperties": false
+                }
             }
         ]
     })

@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 pub(crate) use crate::gateway_config::{
     ApprovalsCommand, AuditCommand, Cli, Command, CostCommand, InspectCommand, IntentCommand,
-    OneshotServer, ack_guards_used, apply_overlays, build_audit_sink, build_workflow_store,
-    cli_principal, headless_policy_from, is_ephemeral_path, load_config, parse_since,
-    resolve_embedder,
+    OneshotServer, SchemaCommand, ack_guards_used, apply_overlays, build_audit_sink,
+    build_workflow_store, cli_principal, headless_policy_from, is_ephemeral_path, load_config,
+    parse_since, resolve_embedder,
 };
 pub use crate::gateway_config::{
     GatewayOverlays, OverlayCtx, build_evidence_store, build_guidance_ack_store,
@@ -161,6 +161,17 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 task_class,
                 json,
             } => intent_report_cmd(&config, task_class, json).await,
+        },
+        Command::Schema { command } => match command {
+            // Code-first: the schema is GENERATED from the canonical Rust
+            // struct at print time — there is no hand-maintained copy to drift.
+            SchemaCommand::AuditEvent => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&praxec_core::audit::audit_event_schema())?
+                );
+                Ok(())
+            }
         },
     }
 }
@@ -2617,31 +2628,19 @@ fn with_imports(mut config: Value, imported: &CapabilityRegistry) -> Value {
 /// per-writer / rotated files. A client reconstructs the full execution tree
 /// from each event's `workflow_id` + `parent_workflow_id` + `depth`.
 ///
-/// Fail-fast: `--follow` requires `audit.sink: file`. The default sink is
-/// `stderr`, which writes nothing to the audit dir — a tail there would silently
-/// print nothing forever (a fail-open no-op that reads as "no activity"). So we
-/// refuse up front with an actionable message rather than tail an empty dir.
 /// Fail-fast for `observe --follow`: the audit sink MUST be `file`. The default
 /// `stderr` sink writes nothing to the audit dir, so a live tail there would
 /// print an empty stream forever (a silent fail-open reading as "no activity").
 /// Extracted as a pure check so the fail-fast is unit-testable without driving
-/// the infinite poll loop.
+/// the infinite poll loop. The check itself is shared with the MCP `observe`
+/// query ([`praxec_core::audit::require_file_sink`]) so both surfaces reject a
+/// non-file sink with the same rich message.
 fn require_file_sink_for_follow(config: &Value) -> anyhow::Result<()> {
     let sink_kind = config
         .pointer("/audit/sink")
         .and_then(Value::as_str)
         .unwrap_or("stderr");
-    if sink_kind != "file" {
-        anyhow::bail!(
-            "observe --follow requires `audit.sink: file` (current: `{sink_kind}`). \
-             A live tail reads newline-terminated events from the on-disk audit \
-             directory; the `{sink_kind}` sink writes nothing there, so --follow \
-             would print an empty stream forever (a silent fail-open). Set \
-             `audit.sink: file` and `audit.path: <dir>` in your gateway config, \
-             then re-run `praxec observe --follow`."
-        );
-    }
-    Ok(())
+    praxec_core::audit::require_file_sink(sink_kind, "observe --follow")
 }
 
 fn observe_follow(config_path: &PathBuf, since: Option<&str>) -> anyhow::Result<()> {
