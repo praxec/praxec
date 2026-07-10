@@ -16,6 +16,7 @@ pub use crate::gateway_config::{
 // cfg or the lean `--no-default-features` build fails to resolve it (E0432).
 #[cfg(feature = "llm-executor")]
 pub use crate::gateway_config::llm_overlay_registrar;
+pub use crate::provision::detect;
 use anyhow::Context;
 use clap::Parser;
 use praxec_core::SingleKindOverlay;
