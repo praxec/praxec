@@ -10,16 +10,21 @@
 //! A session that declares `tools` but has no `ToolHost` wired **fails fast** —
 //! tools are never silently dropped.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use praxec_core::error::{ErrorClass, ExecutorError};
+use praxec_core::model::ParkedAgentSession;
+use praxec_core::ports::ParkedSessionStore;
 
 use crate::error::{AgentErrorCode, permanent};
-use praxec_llm_executor::{ProviderFactory, StreamEvent, TurnRequest};
+use crate::park::{
+    AWAIT_HUMAN_TOOL, ParkedConversation, PendingToolResult, await_prompt_from_args,
+};
+use praxec_llm_executor::{ProviderFactory, StreamEvent, ToolCallRequest, TurnRequest};
 use rig::OneOrMany;
 use rig::completion::{AssistantContent, Message, ToolDefinition};
 use rig::message::{ToolResult, ToolResultContent, UserContent};
@@ -27,6 +32,7 @@ use serde_json::{Value, json};
 
 use crate::session::{
     AgentResult, AgentRunOutcome, AgentRunReport, AgentSession, AgentSessionRunner, AgentStatus,
+    AgentSuspension,
 };
 pub use crate::tool_budget::{MAX_TOOL_RESULT_BYTES, ToolHost, tool_definition_from};
 pub(crate) use crate::tool_budget::{enforce_history_budget, is_transient};
@@ -254,6 +260,10 @@ pub struct RigSessionRunner {
     pub(crate) tool_host: Option<Arc<dyn ToolHost>>,
     pub(crate) max_turns: u32,
     pub(crate) max_history_bytes: usize,
+    /// P12 R1.4 — the durable park for suspended sessions. `None` disables
+    /// the await capability entirely (an `await_enabled` session then fails
+    /// fast — never a suspend whose conversation can't survive a power cycle).
+    pub(crate) parked_store: Option<Arc<dyn ParkedSessionStore>>,
 }
 
 /// One drained turn's salient content.
@@ -301,22 +311,41 @@ fn accumulate_usage(turns: impl IntoIterator<Item = TurnUsage>) -> TurnUsage {
         .fold(TurnUsage::default(), |acc, u| acc + u)
 }
 
-#[async_trait]
-impl AgentSessionRunner for RigSessionRunner {
-    async fn run(&self, session: AgentSession) -> Result<AgentRunReport, ExecutorError> {
-        // Poka-yoke: declared tools with no host can't be honored — fail fast
-        // rather than running the agent silently toolless.
-        if !session.tools.is_empty() && self.tool_host.is_none() {
-            return Err(ExecutorError::Permanent(format!(
-                "RIG_TOOLS_UNSUPPORTED: session declares tools {:?} but no ToolHost is wired; \
-                 provide a tool host or select the aether runner.",
-                session.tools
-            )));
-        }
+/// The per-run environment `drive_loop` reads but never mutates — assembled
+/// once by `run` (fresh) or `resume` (rebuilt from the parked frame).
+struct LoopEnv<'a> {
+    session: &'a AgentSession,
+    base_tools: &'a [ToolDefinition],
+    /// Sanitized-exposed-name → (connection, real tool name) routing map.
+    tool_conn: &'a HashMap<String, (String, String)>,
+    reasoning: &'a Option<Value>,
+    system_message: &'a str,
+    spill: &'a crate::spill::InMemorySpillStore,
+}
 
-        // List the session's tools once; the runner keeps the per-run
-        // tool→connection map (so `call` can route, and the shared host stays
-        // stateless across concurrent agents).
+/// How one pass of the tool loop ended (before the runner maps it onto
+/// [`AgentRunOutcome`]). A separate enum so `drive_loop` is shared verbatim by
+/// `run` and `resume`.
+enum LoopEnd {
+    /// A conforming `final_answer`.
+    Answer(AgentResult),
+    /// P12 R1.4 — the suspend signal fired and the frame is ALREADY durably
+    /// persisted (park happens before this is returned, so a `Suspended`
+    /// outcome is always backed by a recoverable row).
+    Suspended(AgentSuspension),
+    /// Turn budget exhausted without a result.
+    Exhausted,
+}
+
+impl RigSessionRunner {
+    /// List + sanitize the session's MCP tools and validate the whole exposed
+    /// set (host + injected) against the provider name rule. Shared verbatim
+    /// by `run` and `resume` so a resumed session rebuilds the exact same tool
+    /// surface (sanitization is deterministic over the host's tool list).
+    async fn prepare_tools(
+        &self,
+        session: &AgentSession,
+    ) -> Result<(Vec<ToolDefinition>, HashMap<String, (String, String)>), ExecutorError> {
         // Per-run map from the *sanitized* tool name the model sees to the
         // (connection, real tool name) needed to route the call back. MCP tool
         // names routinely contain characters (e.g. the `.` in `plan.submit`)
@@ -325,8 +354,7 @@ impl AgentSessionRunner for RigSessionRunner {
         // back on invocation (AGENTS — without this, every tool-using agent
         // 400s before it can act).
         let mut base_tools: Vec<ToolDefinition> = Vec::new();
-        let mut tool_conn: std::collections::HashMap<String, (String, String)> =
-            std::collections::HashMap::new();
+        let mut tool_conn: HashMap<String, (String, String)> = HashMap::new();
         if let Some(host) = &self.tool_host {
             // Fail-fast: an unreachable declared connection aborts the run rather
             // than running the agent without a tool it was told it has.
@@ -344,12 +372,14 @@ impl AgentSessionRunner for RigSessionRunner {
         // Poka-yoke: an exposed tool name outside the provider rule
         // (^[a-zA-Z0-9_-]{1,128}$) 400s every turn it appears in. Refuse to start
         // the run rather than emit one — host names are sanitized above, but the
-        // runner-injected final_answer / spill_read bypass that, so validate the
-        // whole exposed set here. Fail-fast, never a silent provider rejection.
+        // runner-injected final_answer / spill_read / await_human bypass that, so
+        // validate the whole exposed set here. Fail-fast, never a silent provider
+        // rejection.
         {
             let injected = [
                 Self::final_answer_tool(),
                 crate::tool_budget::spill_read_tool(),
+                crate::tool_budget::await_human_tool(),
             ];
             if let Some(bad) = base_tools
                 .iter()
@@ -363,11 +393,15 @@ impl AgentSessionRunner for RigSessionRunner {
                 )));
             }
         }
-        // Per-provider reasoning effort (native `additional_params` shape). Use
-        // the step's explicit `reasoning_effort` when set, else the configured
-        // default (`ReasoningTuning.default_effort`, "low") so a *reasoning*
-        // model can lead a chain without spending the whole turn budget on hidden
-        // reasoning. An empty configured default opts out (provider default).
+        Ok((base_tools, tool_conn))
+    }
+
+    /// Per-provider reasoning effort (native `additional_params` shape). Uses
+    /// the step's explicit `reasoning_effort` when set, else the configured
+    /// default (`ReasoningTuning.default_effort`, "low") so a *reasoning*
+    /// model can lead a chain without spending the whole turn budget on hidden
+    /// reasoning. An empty configured default opts out (provider default).
+    fn reasoning_for(session: &AgentSession) -> Option<Value> {
         let effort = session.reasoning_effort.clone().or_else(|| {
             let d = praxec_core::tuning::tuning()
                 .reasoning
@@ -375,23 +409,590 @@ impl AgentSessionRunner for RigSessionRunner {
                 .clone();
             (!d.trim().is_empty()).then_some(d)
         });
-        let reasoning = effort.as_deref().and_then(|level| {
+        effort.as_deref().and_then(|level| {
             let vendor = session.model.split_once(':').map(|(v, _)| v).unwrap_or("");
             praxec_core::tuning::reasoning_params(vendor, level)
-        });
+        })
+    }
+
+    /// P12 R1.4 — the park: called when the parked turn's assistant message
+    /// (carrying the `await_human` call) is already in `history`. Executes the
+    /// turn's OTHER tool calls now — side effects happen exactly once and their
+    /// realized results persist with the frame, never re-run on resume — then
+    /// persists the whole conversation durably keyed by a fresh
+    /// `correlation_id`, and only THEN reports `Suspended`. If persistence
+    /// fails the run fails loudly (`AGENT_PARK_STORE`): a suspend the store
+    /// didn't accept must never be reported as parked.
+    #[allow(clippy::too_many_arguments)]
+    async fn park_and_suspend(
+        &self,
+        env: &LoopEnv<'_>,
+        history: &[Message],
+        ledger: &[String],
+        transcript: &mut String,
+        calls: &[ToolCallRequest],
+        turns_used: u32,
+    ) -> Result<LoopEnd, ExecutorError> {
+        let store = self.parked_store.as_ref().ok_or_else(|| {
+            // Unreachable: `run` fail-fasts `await_enabled` without a store and
+            // the tool is only offered when `await_enabled` — but stay typed.
+            permanent(
+                AgentErrorCode::AwaitUnsupported,
+                "await_human was called but no ParkedSessionStore is wired",
+            )
+        })?;
+        let mut pending: Vec<PendingToolResult> = Vec::with_capacity(calls.len());
+        let mut prompt: Option<String> = None;
+        for c in calls {
+            if c.name == AWAIT_HUMAN_TOOL {
+                if prompt.is_none() {
+                    // The awaited slot: the human's reply becomes this call's
+                    // tool result on resume.
+                    prompt = Some(await_prompt_from_args(&c.arguments));
+                    pending.push(PendingToolResult {
+                        id: c.id.clone(),
+                        text: None,
+                    });
+                } else {
+                    // Exactly ONE await per turn is honored (one correlation, one
+                    // reply). Additional calls get an immediate error result the
+                    // model sees on resume — loud, not silently dropped.
+                    let msg = "ERROR: only one await_human call is honored per turn; \
+                               this call was not delivered"
+                        .to_string();
+                    transcript.push_str(&format!("\n[tool await_human] {msg}\n"));
+                    pending.push(PendingToolResult {
+                        id: c.id.clone(),
+                        text: Some(msg),
+                    });
+                }
+                continue;
+            }
+            // Execute the parked turn's other tools NOW (same dispatch as the
+            // normal path, incl. spill-on-ingress) so resume never re-runs a
+            // side effect.
+            let out = if c.name == "spill_read" {
+                crate::tool_budget::read_spill(env.spill, &c.arguments).await
+            } else {
+                let raw = match (env.tool_conn.get(&c.name), self.tool_host.as_ref()) {
+                    (Some((conn, real)), Some(host)) => host
+                        .call(conn, real, &c.arguments)
+                        .await
+                        .unwrap_or_else(|e| format!("ERROR: {e}")),
+                    // `tool_conn` non-empty implies a host; keep the arm typed.
+                    (Some(_), None) => "ERROR: no ToolHost wired".to_string(),
+                    (None, _) => format!("ERROR: unknown tool '{}'", c.name),
+                };
+                crate::tool_budget::spill_on_ingress(env.spill, &c.name, raw).await
+            };
+            transcript.push_str(&format!("\n[tool {}] {out}\n", c.name));
+            pending.push(PendingToolResult {
+                id: c.id.clone(),
+                text: Some(out),
+            });
+        }
+        let prompt = prompt.ok_or_else(|| {
+            ExecutorError::Permanent(
+                "BUG: park_and_suspend called without an await_human call".to_string(),
+            )
+        })?;
+        let correlation_id = uuid::Uuid::new_v4().to_string();
+        let conversation = ParkedConversation {
+            history: history.to_vec(),
+            ledger: ledger.to_vec(),
+            pending,
+            turns_used,
+        };
+        let to_value = |what: &str, r: serde_json::Result<Value>| {
+            r.map_err(|e| {
+                permanent(
+                    AgentErrorCode::ParkStore,
+                    format!("serializing {what}: {e}"),
+                )
+            })
+        };
+        let record = ParkedAgentSession {
+            correlation_id: correlation_id.clone(),
+            prompt: prompt.clone(),
+            session: to_value("session", serde_json::to_value(env.session))?,
+            conversation: to_value("conversation", serde_json::to_value(&conversation))?,
+            parked_at: chrono::Utc::now(),
+        };
+        store.park(record).await.map_err(|e| {
+            permanent(
+                AgentErrorCode::ParkStore,
+                format!("persisting parked session {correlation_id}: {e}"),
+            )
+        })?;
+        transcript.push_str(&format!(
+            "\n[await_human] parked correlation_id={correlation_id} prompt={prompt:?}\n"
+        ));
+        Ok(LoopEnd::Suspended(AgentSuspension {
+            correlation_id,
+            prompt,
+        }))
+    }
+
+    /// The multi-turn tool loop, shared verbatim by `run` (fresh state,
+    /// `start_turn = 0`) and `resume` (state reconstituted from the parked
+    /// frame, `start_turn = turns_used`) — so a resumed session continues the
+    /// SAME loop, budget included, rather than a re-implementation that would
+    /// drift.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_loop(
+        &self,
+        env: &LoopEnv<'_>,
+        history: &mut Vec<Message>,
+        mut input: Message,
+        ledger: &mut Vec<String>,
+        transcript: &mut String,
+        total_usage: &mut TurnUsage,
+        start_turn: u32,
+    ) -> Result<LoopEnd, ExecutorError> {
+        // AGENT_NO_RESULT poka-yoke state: set when a turn produces neither a
+        // final_answer nor a tool call (a text-only stall — the deepseek/glm
+        // signature). Forces the NEXT turn to offer ONLY `final_answer`,
+        // removing every other tool so the model's sole remaining move is to
+        // terminate with a result instead of exiting empty. The
+        // COMPLETION_PROTOCOL system message only *asks*; restricting the
+        // toolset *steers*.
+        //
+        // We deliberately do NOT also pin `tool_choice = Required`: thinking-
+        // mode models on OpenRouter (qwen3-thinking, glm-5.2) REJECT a forced
+        // tool_choice with a HARD 400 ("tool_choice ... does not support being
+        // set to required or object in thinking mode") — which bricked the very
+        // models that reliably terminate (and hot-looped the retry layer). No
+        // tool_choice value both forces a tool AND is accepted in thinking mode
+        // (only Auto/None are accepted, neither forces), so the single-tool
+        // restriction is the portable steer; the cost-ascending failover chain
+        // remains the ultimate termination guarantee.
+        let mut stalled_no_progress = false;
+        for _turn in start_turn..self.max_turns {
+            // LoopGuard: bound the cumulative history BEFORE it is re-sent, so
+            // a long tool-using loop can never assemble an over-context-window
+            // request (the 2.77M-token failure mode). Elides oldest turn-pairs.
+            enforce_history_budget(history, self.max_history_bytes, env.spill, ledger).await;
+            // Restrict to `final_answer` on the LAST turn (must terminate now)
+            // or immediately after a stall (fail-fast to an answer instead of
+            // burning the whole turn budget re-prompting). `tool_choice` stays
+            // at the provider default (Auto) — see the note above.
+            let force_final = _turn + 1 == self.max_turns || stalled_no_progress;
+            // Tool-set stability invariant (prompt-cache poka-yoke): the
+            // normal-path tool set — `base_tools` (assembled ONCE before the
+            // loop) + `final_answer` + `spill_read` (+ `await_human` iff the
+            // session opted in — constant per session, so still stable) — is
+            // byte-identical every turn, so it stays in the cacheable prefix.
+            // `force_final` shrinking to just `final_answer` is the ONLY
+            // deliberate variance, and it is terminal-only (last turn /
+            // post-stall), so there is no future turn whose cache it could
+            // break. Adding per-turn variance to the else-branch would
+            // silently invalidate the prefix — don't.
+            let tools = if force_final {
+                vec![Self::final_answer_tool()]
+            } else {
+                let mut t = env.base_tools.to_vec();
+                t.push(Self::final_answer_tool());
+                t.push(crate::tool_budget::spill_read_tool());
+                if env.session.await_enabled {
+                    // P12 R1.4 — the suspend signal, offered ONLY on opt-in:
+                    // a session that didn't declare `await_enabled` can never
+                    // suspend (the tool isn't there to call).
+                    t.push(crate::tool_budget::await_human_tool());
+                }
+                t
+            };
+            let turn = TurnRequest {
+                system: Some(env.system_message.to_string()),
+                // The recall ledger rides the OUTGOING prompt only — never the
+                // cached prefix head (system + goal + frozen turns) and never
+                // `history` (`input` is pushed bare below). No-op until the
+                // first elision.
+                prompt: crate::tool_budget::prompt_with_ledger(&input, ledger),
+                tools,
+                history: history.clone(),
+                reasoning: env.reasoning.clone(),
+                tool_choice: None,
+            };
+
+            // Same-model RETRY on transient failures (execution-policy)
+            // BEFORE the executor chain-walk escalates to another model: a
+            // transient blip (timeout/connection/rate-limit) is retried up to
+            // 3x with backoff; capability/permanent errors are NOT retried
+            // (is_transient false) so they fall through to the chain-walk.
+            // Bounded same-model RETRY on transient failures, with
+            // exponential backoff, BEFORE the executor chain-walk escalates
+            // to another model. Only transient classes retry (is_transient);
+            // capability/auth/permanent return immediately so the chain-walk
+            // handles them. (The execution-policy crate's AsyncFnMut Send
+            // bound conflicted with this borrow-heavy run loop — a hand-rolled
+            // loop is the same reliability pattern without the HRTB friction.)
+            const MAX_RETRY_ATTEMPTS: u32 = 2;
+            let mut retry_attempt: u32 = 0;
+            let result = loop {
+                match drain_turn(
+                    &*self.factory,
+                    &env.session.model,
+                    turn.clone(),
+                    env.session.stall_timeout,
+                )
+                .await
+                {
+                    Ok(r) => break r,
+                    // A stall (the only `Timeout` drain_turn can raise) is NOT
+                    // re-run on the same model — re-issuing a model that just
+                    // went silent would burn another stall window for nothing;
+                    // it falls through to the chain-walk, which escalates to the
+                    // next model. Genuine transient blips (connection / 503 /
+                    // rate-limit) still retry in-session with backoff.
+                    Err(e)
+                        if is_transient(&e)
+                            && !matches!(e.class(), ErrorClass::Timeout)
+                            && retry_attempt < MAX_RETRY_ATTEMPTS =>
+                    {
+                        retry_attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(200u64 * (1 << retry_attempt)))
+                            .await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            *total_usage = *total_usage + result.usage;
+            transcript.push_str(&result.transcript_fragment);
+            // Text-only stall? (no final_answer AND no tool call) — read BEFORE
+            // `result.final_answer` is moved below; drives `force_final` next turn.
+            stalled_no_progress = result.final_answer.is_none() && result.tool_calls.is_empty();
+            if let Some(answer) = result.final_answer {
+                // Enforce the output CONTRACT (keys + declared types) at the
+                // boundary. A conforming answer is accepted; a non-conforming
+                // one (missing key OR wrong type) is RE-PROMPTED in-session
+                // rather than returned — otherwise a wrong-type-but-right-keys
+                // answer would be accepted here only to fail the post-run
+                // snippet contract, wasting the whole (expensive) run.
+                // (A turn that calls BOTH final_answer and await_human takes
+                // the answer: the model terminated, so the await is moot.)
+                if conforms(
+                    &answer.output,
+                    &env.session.expected_output_keys,
+                    &env.session.expected_output_types,
+                ) {
+                    return Ok(LoopEnd::Answer(answer));
+                }
+                transcript.push_str("\n[non-conforming final_answer → contract feedback]\n");
+                history.push(input.clone());
+                history.push(Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text(
+                        serde_json::to_string(&answer.output).unwrap_or_default(),
+                    )),
+                });
+                input = Message::user(conformance_feedback(
+                    &env.session.expected_output_keys,
+                    &env.session.expected_output_types,
+                ));
+                continue;
+            }
+            if result.tool_calls.is_empty() {
+                // The model answered without calling `final_answer`. (B) Try
+                // to salvage a conformant JSON object from its text — accept
+                // it only if it parses and meets the criteria.
+                if let Some(answer) = salvage_result(
+                    &result.text,
+                    &env.session.expected_output_keys,
+                    &env.session.expected_output_types,
+                ) {
+                    transcript.push_str("\n[salvaged-text-answer]\n");
+                    return Ok(LoopEnd::Answer(answer));
+                }
+                // Not conforming. Rather than give up on the first miss,
+                // feed the contract back and retry in the same session
+                // (bounded by `max_turns`). Keep strict user/assistant
+                // alternation while doing so.
+                transcript.push_str("\n[non-conforming answer → contract feedback]\n");
+                history.push(input.clone());
+                let said = if result.text.is_empty() {
+                    "(no content)".to_string()
+                } else {
+                    result.text.clone()
+                };
+                history.push(Message::Assistant {
+                    id: None,
+                    content: OneOrMany::one(AssistantContent::text(said)),
+                });
+                input = Message::user(conformance_feedback(
+                    &env.session.expected_output_keys,
+                    &env.session.expected_output_types,
+                ));
+                continue;
+            }
+
+            // Record this turn: the input (user) + the assistant's text +
+            // tool calls. (Pushed BEFORE dispatch so a park below persists a
+            // history that already carries the awaited turn.)
+            history.push(input.clone());
+            let mut assistant: Vec<AssistantContent> = Vec::new();
+            if !result.text.is_empty() {
+                assistant.push(AssistantContent::text(result.text.clone()));
+            }
+            for c in &result.tool_calls {
+                let args = serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({}));
+                assistant.push(AssistantContent::tool_call(
+                    c.id.clone(),
+                    c.name.clone(),
+                    args,
+                ));
+            }
+            history.push(Message::Assistant {
+                id: None,
+                content: OneOrMany::many(assistant).expect("at least one tool call"),
+            });
+
+            // P12 R1.4 — the suspend signal: the model called `await_human`.
+            // STOP the loop, execute the turn's other tools once, persist the
+            // conversation durably, and report first-class Suspended.
+            // Structurally unreachable without opt-in: the tool is only
+            // offered when `await_enabled` (a hallucinated call without
+            // opt-in falls through to the unknown-tool error result below).
+            if env.session.await_enabled
+                && result.tool_calls.iter().any(|c| c.name == AWAIT_HUMAN_TOOL)
+            {
+                return self
+                    .park_and_suspend(
+                        env,
+                        history,
+                        ledger,
+                        transcript,
+                        &result.tool_calls,
+                        _turn + 1,
+                    )
+                    .await;
+            }
+
+            let host = self.tool_host.as_ref().ok_or_else(|| {
+                ExecutorError::Permanent(
+                    "RIG_TOOLS_UNSUPPORTED: model called a tool but no ToolHost is wired"
+                        .to_string(),
+                )
+            })?;
+
+            // Execute the tools; their results become the next user input
+            // (one ToolResult per call), keeping strict alternation.
+            let mut results: Vec<UserContent> = Vec::new();
+            for c in &result.tool_calls {
+                let out = if c.name == "spill_read" {
+                    crate::tool_budget::read_spill(env.spill, &c.arguments).await
+                } else {
+                    let raw = match env.tool_conn.get(&c.name) {
+                        Some((conn, real)) => host
+                            .call(conn, real, &c.arguments)
+                            .await
+                            .unwrap_or_else(|e| format!("ERROR: {e}")),
+                        None => format!("ERROR: unknown tool '{}'", c.name),
+                    };
+                    // Guard the context window: an unbounded tool result would
+                    // 400 every subsequent turn (FM — observed live at 1.86M
+                    // tokens from a filesystem dump). Spill oversized results
+                    // to the per-run store; the model sees a compact handle
+                    // it can page through via spill.read.
+                    crate::tool_budget::spill_on_ingress(env.spill, &c.name, raw).await
+                };
+                transcript.push_str(&format!("\n[tool {}] {out}\n", c.name));
+                results.push(UserContent::ToolResult(ToolResult {
+                    id: c.id.clone(),
+                    call_id: None,
+                    content: OneOrMany::one(ToolResultContent::text(out)),
+                }));
+            }
+            input = Message::User {
+                content: OneOrMany::many(results).expect("at least one tool result"),
+            };
+        }
+        Ok(LoopEnd::Exhausted) // turn budget exhausted
+    }
+
+    /// P12 R1.4 — **resume** a durably parked session: load the frame by
+    /// `correlation_id`, inject the human `reply` as the awaited `await_human`
+    /// call's tool result, and re-enter the SAME tool loop from the parked
+    /// turn, running to a normal outcome (`final_answer` → `Completed`, or
+    /// even a further `Suspended` under a fresh correlation_id).
+    ///
+    /// Frame lifecycle: the row is removed when the resumed segment completes
+    /// (`Completed`) or re-suspends (superseded by the new frame). It is KEPT
+    /// on `NoResult` / `TimedOut` / error so the resume can be retried — note
+    /// the documented trade-off that a retry re-runs the segment's tool calls.
+    ///
+    /// Report scope: `transcript` and token usage cover THIS resumed segment
+    /// only (the suspended run's own report already carried the pre-park
+    /// segment; each segment is separately auditable).
+    ///
+    /// Typed errors, never panics: unknown id → `AGENT_UNKNOWN_CORRELATION`;
+    /// unparseable payload → `AGENT_PARKED_SESSION_CORRUPT`; store I/O →
+    /// `AGENT_PARK_STORE`.
+    pub async fn resume(
+        &self,
+        correlation_id: &str,
+        reply: &str,
+    ) -> Result<AgentRunReport, ExecutorError> {
+        let store = self.parked_store.as_ref().ok_or_else(|| {
+            permanent(
+                AgentErrorCode::AwaitUnsupported,
+                "resume requires a ParkedSessionStore; none is wired",
+            )
+        })?;
+        let record = store.load(correlation_id).await.map_err(|e| {
+            permanent(
+                AgentErrorCode::ParkStore,
+                format!("loading parked session '{correlation_id}': {e}"),
+            )
+        })?;
+        let Some(record) = record else {
+            return Err(permanent(
+                AgentErrorCode::UnknownCorrelation,
+                format!(
+                    "no parked agent session for correlation_id '{correlation_id}' \
+                     (already resumed, or never parked)"
+                ),
+            ));
+        };
+        let session: AgentSession = serde_json::from_value(record.session).map_err(|e| {
+            permanent(
+                AgentErrorCode::ParkedSessionCorrupt,
+                format!("parked session payload for '{correlation_id}': {e}"),
+            )
+        })?;
+        let parked: ParkedConversation =
+            serde_json::from_value(record.conversation).map_err(|e| {
+                permanent(
+                    AgentErrorCode::ParkedSessionCorrupt,
+                    format!("parked conversation payload for '{correlation_id}': {e}"),
+                )
+            })?;
+        // The human's reply becomes the awaited call's tool result; the parked
+        // turn's already-realized results ride along (never re-executed).
+        let input = parked.resume_input(reply)?;
+
+        // Rebuild the run surface exactly as `run` does. Same fail-fasts.
+        if !session.tools.is_empty() && self.tool_host.is_none() {
+            return Err(ExecutorError::Permanent(format!(
+                "RIG_TOOLS_UNSUPPORTED: parked session declares tools {:?} but no ToolHost \
+                 is wired on the resuming runner.",
+                session.tools
+            )));
+        }
+        let (base_tools, tool_conn) = self.prepare_tools(&session).await?;
+        let reasoning = Self::reasoning_for(&session);
+        let system_message = compose_system_message(&session.system_prompt);
+        // FIDELITY LIMIT (documented): the spill store is per-process, so
+        // `spill_read` handles minted before the park are unreadable after a
+        // power cycle — such a read returns the normal "ERROR: unknown slot"
+        // tool result and the agent re-runs the tool. The conversation itself
+        // (rig messages) is byte-faithful.
+        let spill = crate::spill::InMemorySpillStore::new();
+
+        let mut history = parked.history;
+        let mut ledger = parked.ledger;
+        let mut transcript = format!(
+            "[resume] correlation_id={correlation_id} reply={reply:?} \
+             (turns_used={})\n",
+            parked.turns_used
+        );
+        let mut total_usage = TurnUsage::default();
+        // Continue the SAME turn budget; if the session parked on its final
+        // budgeted turn, grant exactly one (force-final) turn so the human's
+        // reply is never dropped on the floor by an already-spent budget.
+        let start_turn = parked.turns_used.min(self.max_turns.saturating_sub(1));
+
+        let env = LoopEnv {
+            session: &session,
+            base_tools: &base_tools,
+            tool_conn: &tool_conn,
+            reasoning: &reasoning,
+            system_message: &system_message,
+            spill: &spill,
+        };
+        let loop_fut = self.drive_loop(
+            &env,
+            &mut history,
+            input,
+            &mut ledger,
+            &mut transcript,
+            &mut total_usage,
+            start_turn,
+        );
+        // A fresh wall-clock window for the resumed segment (the original
+        // window elapsed while parked — awaiting a human for days is normal).
+        let outcome = match tokio::time::timeout(session.timeout, loop_fut).await {
+            Err(_) => AgentRunOutcome::TimedOut,
+            Ok(Ok(LoopEnd::Answer(answer))) => AgentRunOutcome::Completed(answer),
+            Ok(Ok(LoopEnd::Suspended(s))) => AgentRunOutcome::Suspended(s),
+            Ok(Ok(LoopEnd::Exhausted)) => AgentRunOutcome::NoResult,
+            Ok(Err(e)) => {
+                return Err(e);
+            }
+        };
+
+        // Frame cleanup: remove on completion or on supersession by a new
+        // parked frame; keep on NoResult/TimedOut so the resume is retryable.
+        if matches!(
+            outcome,
+            AgentRunOutcome::Completed(_) | AgentRunOutcome::Suspended(_)
+        ) {
+            store.remove(correlation_id).await.map_err(|e| {
+                permanent(
+                    AgentErrorCode::ParkStore,
+                    format!("removing resumed parked session '{correlation_id}': {e}"),
+                )
+            })?;
+        }
+
+        Ok(AgentRunReport {
+            outcome,
+            transcript,
+            model: session.model.clone(),
+            prompt_tokens: total_usage.prompt_tokens,
+            completion_tokens: total_usage.completion_tokens,
+        })
+    }
+}
+
+#[async_trait]
+impl AgentSessionRunner for RigSessionRunner {
+    async fn run(&self, session: AgentSession) -> Result<AgentRunReport, ExecutorError> {
+        // Poka-yoke: declared tools with no host can't be honored — fail fast
+        // rather than running the agent silently toolless.
+        if !session.tools.is_empty() && self.tool_host.is_none() {
+            return Err(ExecutorError::Permanent(format!(
+                "RIG_TOOLS_UNSUPPORTED: session declares tools {:?} but no ToolHost is wired; \
+                 provide a tool host or select the aether runner.",
+                session.tools
+            )));
+        }
+        // P12 R1.4 poka-yoke: an await-capable session without a durable park
+        // can't be honored — a suspend that couldn't persist would lose the
+        // conversation, so refuse to start (mirrors RIG_TOOLS_UNSUPPORTED).
+        if session.await_enabled && self.parked_store.is_none() {
+            return Err(permanent(
+                AgentErrorCode::AwaitUnsupported,
+                "session declares await_enabled but no ParkedSessionStore is wired; \
+                 wire one (with_parked_store) or drop await_enabled",
+            ));
+        }
+
+        let (base_tools, tool_conn) = self.prepare_tools(&session).await?;
+        let reasoning = Self::reasoning_for(&session);
 
         let mut transcript = String::new();
         let mut history: Vec<Message> = Vec::new();
         // The new message each turn: the goal first, then the tool results. The
         // goal stays in `history` after turn 0 so the agent never loses it, and
         // user/assistant strictly alternate (required by Anthropic et al).
-        let mut input: Message = Message::user(session.user_prompt.clone());
+        let input: Message = Message::user(session.user_prompt.clone());
         // Realized token usage summed across every turn (incl. the final-answer
         // turn) — surfaced on the report so the audit can price the run. Lives
-        // outside `loop_fut` so it survives the loop's early returns/timeout.
+        // outside the loop future so it survives the loop's early returns/timeout.
         let mut total_usage = TurnUsage::default();
-        // Per-run spill store: lives outside loop_fut so it persists across all
-        // turns of ONE run but is fresh per run.
+        // Per-run spill store: persists across all turns of ONE run but is
+        // fresh per run.
         let spill = crate::spill::InMemorySpillStore::new();
         // Per-run recall ledger: one line per elided turn-pair. Rendered onto the
         // OUTGOING prompt each turn (never the cached prefix head) so the goal +
@@ -403,242 +1004,31 @@ impl AgentSessionRunner for RigSessionRunner {
         // turn (see COMPLETION_PROTOCOL) — the structural fix for AGENT_NO_RESULT.
         let system_message = compose_system_message(&session.system_prompt);
 
-        let loop_fut = async {
-            // AGENT_NO_RESULT poka-yoke state: set when a turn produces neither a
-            // final_answer nor a tool call (a text-only stall — the deepseek/glm
-            // signature). Forces the NEXT turn to offer ONLY `final_answer`,
-            // removing every other tool so the model's sole remaining move is to
-            // terminate with a result instead of exiting empty. The
-            // COMPLETION_PROTOCOL system message only *asks*; restricting the
-            // toolset *steers*.
-            //
-            // We deliberately do NOT also pin `tool_choice = Required`: thinking-
-            // mode models on OpenRouter (qwen3-thinking, glm-5.2) REJECT a forced
-            // tool_choice with a HARD 400 ("tool_choice ... does not support being
-            // set to required or object in thinking mode") — which bricked the very
-            // models that reliably terminate (and hot-looped the retry layer). No
-            // tool_choice value both forces a tool AND is accepted in thinking mode
-            // (only Auto/None are accepted, neither forces), so the single-tool
-            // restriction is the portable steer; the cost-ascending failover chain
-            // remains the ultimate termination guarantee.
-            let mut stalled_no_progress = false;
-            for _turn in 0..self.max_turns {
-                // LoopGuard: bound the cumulative history BEFORE it is re-sent, so
-                // a long tool-using loop can never assemble an over-context-window
-                // request (the 2.77M-token failure mode). Elides oldest turn-pairs.
-                enforce_history_budget(&mut history, self.max_history_bytes, &spill, &mut ledger)
-                    .await;
-                // Restrict to `final_answer` on the LAST turn (must terminate now)
-                // or immediately after a stall (fail-fast to an answer instead of
-                // burning the whole turn budget re-prompting). `tool_choice` stays
-                // at the provider default (Auto) — see the note above.
-                let force_final = _turn + 1 == self.max_turns || stalled_no_progress;
-                // Tool-set stability invariant (prompt-cache poka-yoke): the
-                // normal-path tool set — `base_tools` (assembled ONCE before the
-                // loop) + `final_answer` + `spill_read` — is byte-identical every
-                // turn, so it stays in the cacheable prefix. `force_final` shrinking
-                // to just `final_answer` is the ONLY deliberate variance, and it is
-                // terminal-only (last turn / post-stall), so there is no future turn
-                // whose cache it could break. Adding per-turn variance to the
-                // else-branch would silently invalidate the prefix — don't.
-                let tools = if force_final {
-                    vec![Self::final_answer_tool()]
-                } else {
-                    let mut t = base_tools.clone();
-                    t.push(Self::final_answer_tool());
-                    t.push(crate::tool_budget::spill_read_tool());
-                    t
-                };
-                let turn = TurnRequest {
-                    system: Some(system_message.clone()),
-                    // The recall ledger rides the OUTGOING prompt only — never the
-                    // cached prefix head (system + goal + frozen turns) and never
-                    // `history` (`input` is pushed bare below). No-op until the
-                    // first elision.
-                    prompt: crate::tool_budget::prompt_with_ledger(&input, &ledger),
-                    tools,
-                    history: history.clone(),
-                    reasoning: reasoning.clone(),
-                    tool_choice: None,
-                };
-
-                // Same-model RETRY on transient failures (execution-policy)
-                // BEFORE the executor chain-walk escalates to another model: a
-                // transient blip (timeout/connection/rate-limit) is retried up to
-                // 3x with backoff; capability/permanent errors are NOT retried
-                // (is_transient false) so they fall through to the chain-walk.
-                // Bounded same-model RETRY on transient failures, with
-                // exponential backoff, BEFORE the executor chain-walk escalates
-                // to another model. Only transient classes retry (is_transient);
-                // capability/auth/permanent return immediately so the chain-walk
-                // handles them. (The execution-policy crate's AsyncFnMut Send
-                // bound conflicted with this borrow-heavy run loop — a hand-rolled
-                // loop is the same reliability pattern without the HRTB friction.)
-                const MAX_RETRY_ATTEMPTS: u32 = 2;
-                let mut retry_attempt: u32 = 0;
-                let result = loop {
-                    match drain_turn(
-                        &*self.factory,
-                        &session.model,
-                        turn.clone(),
-                        session.stall_timeout,
-                    )
-                    .await
-                    {
-                        Ok(r) => break r,
-                        // A stall (the only `Timeout` drain_turn can raise) is NOT
-                        // re-run on the same model — re-issuing a model that just
-                        // went silent would burn another stall window for nothing;
-                        // it falls through to the chain-walk, which escalates to the
-                        // next model. Genuine transient blips (connection / 503 /
-                        // rate-limit) still retry in-session with backoff.
-                        Err(e)
-                            if is_transient(&e)
-                                && !matches!(e.class(), ErrorClass::Timeout)
-                                && retry_attempt < MAX_RETRY_ATTEMPTS =>
-                        {
-                            retry_attempt += 1;
-                            tokio::time::sleep(Duration::from_millis(
-                                200u64 * (1 << retry_attempt),
-                            ))
-                            .await;
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                };
-                total_usage = total_usage + result.usage;
-                transcript.push_str(&result.transcript_fragment);
-                // Text-only stall? (no final_answer AND no tool call) — read BEFORE
-                // `result.final_answer` is moved below; drives `force_final` next turn.
-                stalled_no_progress = result.final_answer.is_none() && result.tool_calls.is_empty();
-                if let Some(answer) = result.final_answer {
-                    // Enforce the output CONTRACT (keys + declared types) at the
-                    // boundary. A conforming answer is accepted; a non-conforming
-                    // one (missing key OR wrong type) is RE-PROMPTED in-session
-                    // rather than returned — otherwise a wrong-type-but-right-keys
-                    // answer would be accepted here only to fail the post-run
-                    // snippet contract, wasting the whole (expensive) run.
-                    if conforms(
-                        &answer.output,
-                        &session.expected_output_keys,
-                        &session.expected_output_types,
-                    ) {
-                        return Ok(Some(answer));
-                    }
-                    transcript.push_str("\n[non-conforming final_answer → contract feedback]\n");
-                    history.push(input.clone());
-                    history.push(Message::Assistant {
-                        id: None,
-                        content: OneOrMany::one(AssistantContent::text(
-                            serde_json::to_string(&answer.output).unwrap_or_default(),
-                        )),
-                    });
-                    input = Message::user(conformance_feedback(
-                        &session.expected_output_keys,
-                        &session.expected_output_types,
-                    ));
-                    continue;
-                }
-                if result.tool_calls.is_empty() {
-                    // The model answered without calling `final_answer`. (B) Try
-                    // to salvage a conformant JSON object from its text — accept
-                    // it only if it parses and meets the criteria.
-                    if let Some(answer) = salvage_result(
-                        &result.text,
-                        &session.expected_output_keys,
-                        &session.expected_output_types,
-                    ) {
-                        transcript.push_str("\n[salvaged-text-answer]\n");
-                        return Ok(Some(answer));
-                    }
-                    // Not conforming. Rather than give up on the first miss,
-                    // feed the contract back and retry in the same session
-                    // (bounded by `max_turns`). Keep strict user/assistant
-                    // alternation while doing so.
-                    transcript.push_str("\n[non-conforming answer → contract feedback]\n");
-                    history.push(input.clone());
-                    let said = if result.text.is_empty() {
-                        "(no content)".to_string()
-                    } else {
-                        result.text.clone()
-                    };
-                    history.push(Message::Assistant {
-                        id: None,
-                        content: OneOrMany::one(AssistantContent::text(said)),
-                    });
-                    input = Message::user(conformance_feedback(
-                        &session.expected_output_keys,
-                        &session.expected_output_types,
-                    ));
-                    continue;
-                }
-                let host = self.tool_host.as_ref().ok_or_else(|| {
-                    ExecutorError::Permanent(
-                        "RIG_TOOLS_UNSUPPORTED: model called a tool but no ToolHost is wired"
-                            .to_string(),
-                    )
-                })?;
-
-                // Record this turn: the input (user) + the assistant's text +
-                // tool calls.
-                history.push(input.clone());
-                let mut assistant: Vec<AssistantContent> = Vec::new();
-                if !result.text.is_empty() {
-                    assistant.push(AssistantContent::text(result.text.clone()));
-                }
-                for c in &result.tool_calls {
-                    let args = serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({}));
-                    assistant.push(AssistantContent::tool_call(
-                        c.id.clone(),
-                        c.name.clone(),
-                        args,
-                    ));
-                }
-                history.push(Message::Assistant {
-                    id: None,
-                    content: OneOrMany::many(assistant).expect("at least one tool call"),
-                });
-
-                // Execute the tools; their results become the next user input
-                // (one ToolResult per call), keeping strict alternation.
-                let mut results: Vec<UserContent> = Vec::new();
-                for c in &result.tool_calls {
-                    let out = if c.name == "spill_read" {
-                        crate::tool_budget::read_spill(&spill, &c.arguments).await
-                    } else {
-                        let raw = match tool_conn.get(&c.name) {
-                            Some((conn, real)) => host
-                                .call(conn, real, &c.arguments)
-                                .await
-                                .unwrap_or_else(|e| format!("ERROR: {e}")),
-                            None => format!("ERROR: unknown tool '{}'", c.name),
-                        };
-                        // Guard the context window: an unbounded tool result would
-                        // 400 every subsequent turn (FM — observed live at 1.86M
-                        // tokens from a filesystem dump). Spill oversized results
-                        // to the per-run store; the model sees a compact handle
-                        // it can page through via spill.read.
-                        crate::tool_budget::spill_on_ingress(&spill, &c.name, raw).await
-                    };
-                    transcript.push_str(&format!("\n[tool {}] {out}\n", c.name));
-                    results.push(UserContent::ToolResult(ToolResult {
-                        id: c.id.clone(),
-                        call_id: None,
-                        content: OneOrMany::one(ToolResultContent::text(out)),
-                    }));
-                }
-                input = Message::User {
-                    content: OneOrMany::many(results).expect("at least one tool result"),
-                };
-            }
-            Ok::<Option<AgentResult>, ExecutorError>(None) // turn budget exhausted
+        let env = LoopEnv {
+            session: &session,
+            base_tools: &base_tools,
+            tool_conn: &tool_conn,
+            reasoning: &reasoning,
+            system_message: &system_message,
+            spill: &spill,
         };
+        let loop_fut = self.drive_loop(
+            &env,
+            &mut history,
+            input,
+            &mut ledger,
+            &mut transcript,
+            &mut total_usage,
+            0,
+        );
 
         let outcome = match tokio::time::timeout(session.timeout, loop_fut).await {
             Err(_) => AgentRunOutcome::TimedOut,
-            Ok(Ok(Some(answer))) => AgentRunOutcome::Completed(answer),
-            Ok(Ok(None)) => AgentRunOutcome::NoResult,
+            Ok(Ok(LoopEnd::Answer(answer))) => AgentRunOutcome::Completed(answer),
+            // P12 R1.4 — first-class suspend: the frame is already durably
+            // parked (park-then-report ordering inside `park_and_suspend`).
+            Ok(Ok(LoopEnd::Suspended(s))) => AgentRunOutcome::Suspended(s),
+            Ok(Ok(LoopEnd::Exhausted)) => AgentRunOutcome::NoResult,
             // A typed failure (malformed final_answer, provider Error, …) must
             // NOT be downgraded to NoResult — propagate it so the step fails with
             // the real cause (AGENTS-02/AGENTS-03), not a silent empty result.

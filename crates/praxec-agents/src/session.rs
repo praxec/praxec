@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use praxec_core::error::ExecutorError;
 
@@ -40,6 +40,23 @@ pub enum AgentRunOutcome {
     NoResult,
     /// Wall-clock timeout (FM4).
     TimedOut,
+    /// P12 R1.4 — the agent hit its suspend signal (`await_human`): the
+    /// tool-loop STOPPED and its conversation was **durably persisted** to the
+    /// [`ParkedSessionStore`](praxec_core::ports::ParkedSessionStore), keyed
+    /// by `correlation_id`. First-class control flow — NOT an error, NOT
+    /// NoResult. A later correlated reply resumes the exact frame via
+    /// [`RigSessionRunner::resume`](crate::rig_runner::RigSessionRunner::resume).
+    Suspended(AgentSuspension),
+}
+
+/// The park receipt carried by [`AgentRunOutcome::Suspended`]: proof the frame
+/// is durably persisted, plus the context a human needs to answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentSuspension {
+    /// Routes the human's later reply back to this exact parked frame.
+    pub correlation_id: String,
+    /// What the agent asked the human (the `await_human` call's `prompt`).
+    pub prompt: String,
 }
 
 /// Runner report: the outcome plus the captured transcript (→ Evidence) and
@@ -60,7 +77,11 @@ pub struct AgentRunReport {
 }
 
 /// Everything needed to run one isolated agent session.
-#[derive(Debug, Clone)]
+///
+/// Serde derives exist for exactly one reason: P12 R1.4 persists the session
+/// alongside its parked conversation so a durable resume can rebuild the run
+/// (model, prompts, tool connections, contract) after a power cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSession {
     /// Resolved `"provider:model"` string.
     pub model: String,
@@ -92,6 +113,14 @@ pub struct AgentSession {
     /// answer is corrected in-session rather than discarded post-run. Empty /
     /// missing entries are not type-checked.
     pub expected_output_types: std::collections::BTreeMap<String, String>,
+    /// P12 R1.4 — opt-in suspend capability. When `true` the runner offers the
+    /// reserved `await_human` tool; calling it parks the session durably
+    /// ([`AgentRunOutcome::Suspended`]). **Default `false`** (and serde
+    /// defaults it for records parked before the field existed): a session
+    /// that doesn't opt in can NEVER suspend — the tool isn't offered, and a
+    /// hallucinated call routes to the normal unknown-tool error result.
+    #[serde(default)]
+    pub await_enabled: bool,
 }
 
 /// Runs ONE autonomous agent session and reports the outcome. The production
@@ -146,6 +175,12 @@ pub mod testing {
         }
         pub fn timed_out() -> Self {
             Self::with_outcome(AgentRunOutcome::TimedOut)
+        }
+        pub fn suspended(correlation_id: &str, prompt: &str) -> Self {
+            Self::with_outcome(AgentRunOutcome::Suspended(AgentSuspension {
+                correlation_id: correlation_id.into(),
+                prompt: prompt.into(),
+            }))
         }
         fn with_outcome(outcome: AgentRunOutcome) -> Self {
             Self {

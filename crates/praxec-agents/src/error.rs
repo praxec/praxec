@@ -40,6 +40,28 @@ pub enum AgentErrorCode {
     /// A provider stream surfaced an `Error` event (rate-limit/503/auth) —
     /// propagated rather than buried in the transcript (AGENTS-03).
     ProviderError,
+    /// P12 R1.4 — the agent parked on `await_human`; the executor surfaces
+    /// this as a typed signal DISTINCT from every failure class so the
+    /// chain-walk never escalates it to another model (classify:
+    /// ContentOther, not Capability). Carries the `correlation_id` a later
+    /// resume needs. Interim wiring: the runtime-level park/waiting state is
+    /// the remaining await/resume integration.
+    Suspended,
+    /// P12 R1.4 — a session declares `await_enabled` but the runner has no
+    /// [`ParkedSessionStore`](praxec_core::ports::ParkedSessionStore) wired;
+    /// a suspend it couldn't persist would lose the conversation, so the run
+    /// fails fast at start (mirrors RIG_TOOLS_UNSUPPORTED).
+    AwaitUnsupported,
+    /// P12 R1.4 — `resume` was called with a `correlation_id` that has no
+    /// parked session (already resumed / never parked / removed).
+    UnknownCorrelation,
+    /// P12 R1.4 — a parked session row exists but its payload can't be
+    /// reconstituted (bad JSON, missing awaited slot). Typed, never a panic.
+    ParkedSessionCorrupt,
+    /// P12 R1.4 — the parked-session store itself failed (I/O) while
+    /// persisting or loading a frame. Surfaced as Permanent so neither the
+    /// same-model retry nor the chain-walk re-runs the whole agent.
+    ParkStore,
 }
 
 impl AgentErrorCode {
@@ -59,6 +81,11 @@ impl AgentErrorCode {
             AgentErrorCode::EventShapeDrift => "AGENT_EVENT_SHAPE_DRIFT",
             AgentErrorCode::ProcessFailed => "AGENT_PROCESS_FAILED",
             AgentErrorCode::ProviderError => "AGENT_PROVIDER_ERROR",
+            AgentErrorCode::Suspended => "AGENT_SUSPENDED",
+            AgentErrorCode::AwaitUnsupported => "AGENT_AWAIT_UNSUPPORTED",
+            AgentErrorCode::UnknownCorrelation => "AGENT_UNKNOWN_CORRELATION",
+            AgentErrorCode::ParkedSessionCorrupt => "AGENT_PARKED_SESSION_CORRUPT",
+            AgentErrorCode::ParkStore => "AGENT_PARK_STORE",
         }
     }
 }
@@ -90,6 +117,15 @@ mod tests {
         assert_eq!(
             AgentErrorCode::ProviderError.as_wire_code(),
             "AGENT_PROVIDER_ERROR"
+        );
+        assert_eq!(AgentErrorCode::Suspended.as_wire_code(), "AGENT_SUSPENDED");
+        assert_eq!(
+            AgentErrorCode::UnknownCorrelation.as_wire_code(),
+            "AGENT_UNKNOWN_CORRELATION"
+        );
+        assert_eq!(
+            AgentErrorCode::ParkedSessionCorrupt.as_wire_code(),
+            "AGENT_PARKED_SESSION_CORRUPT"
         );
     }
 

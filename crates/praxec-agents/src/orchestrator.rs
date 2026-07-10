@@ -238,6 +238,8 @@ impl TransitionChooser for AgentChooser {
             stall_timeout: self.timeout,
             expected_output_keys: vec![],
             expected_output_types: Default::default(),
+            // A decision call is one synchronous turn — never suspendable.
+            await_enabled: false,
         };
         // PROPAGATE a runner error (missing API key, 401, model-resolution,
         // network) as `Err` — the pre-fix `.ok()?` swallowed EVERY such error

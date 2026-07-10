@@ -14,6 +14,7 @@ pub mod error;
 pub mod executor;
 pub mod file_tools;
 pub mod orchestrator;
+pub mod park;
 pub mod rig_runner;
 pub mod session;
 pub mod spill;

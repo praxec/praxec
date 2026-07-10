@@ -358,6 +358,30 @@ pub struct SubworkflowSuspend {
     pub child_workflow_id: String,
 }
 
+/// P12 R1.4 (`docs/await-resume-architecture.md`) — one durably parked agent
+/// tool-loop session, awaiting an out-of-band signal (a human reply). Written
+/// by the agent runner when a session hits its suspend signal; keyed by
+/// `correlation_id`, which routes the later reply back to this exact frame.
+///
+/// `session` and `conversation` are OPAQUE JSON blobs owned by the agents
+/// crate — core stores them durably but never interprets agentic state (the
+/// same layering that keeps autonomy out of the substrate).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParkedAgentSession {
+    /// Routes a later signal back to this exact suspended frame.
+    pub correlation_id: String,
+    /// What the agent asked the human — the surfacable context for the
+    /// pending-awaits drain (interactive mediator or headless `px approvals`).
+    pub prompt: String,
+    /// Serialized `AgentSession` (opaque to core).
+    pub session: Value,
+    /// Serialized conversation state — message history + pending tool
+    /// results (opaque to core).
+    pub conversation: Value,
+    /// When the frame parked.
+    pub parked_at: DateTime<Utc>,
+}
+
 /// SPEC §33 D2 — the transition the executor selected this turn, plus
 /// its arguments. The runtime maps this onto the same dispatch path
 /// `praxec.command` uses: guards run, blackboard updates, audit

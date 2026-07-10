@@ -203,6 +203,7 @@ impl AgentExecutor {
             stall_timeout: Duration::from_secs(stall_seconds),
             expected_output_keys: cfg.expected_output_keys.clone(),
             expected_output_types: cfg.expected_output_types.clone(),
+            await_enabled: cfg.await_enabled,
         };
 
         let report = self.runner.run(session).await?;
@@ -241,6 +242,25 @@ impl AgentExecutor {
             AgentRunOutcome::NoResult => Err(permanent(
                 AgentErrorCode::NoResult,
                 "agent run ended without a conforming `final_answer` call",
+            )),
+            // P12 R1.4 — the agent parked on a human gate. This is NOT a
+            // model failure: the wire code AGENT_SUSPENDED classifies as
+            // ContentOther (never Capability/GaveUp), so the chain-walk
+            // surfaces it immediately instead of escalating to the next model
+            // — which would run a duplicate agent while the parked frame
+            // awaits its human. The conversation is already durably persisted
+            // under `correlation_id`; `RigSessionRunner::resume(correlation_id,
+            // reply)` continues it. Mapping this to a first-class runtime
+            // park/waiting state (instead of a typed step failure) is the
+            // remaining await/resume integration.
+            AgentRunOutcome::Suspended(s) => Err(permanent(
+                AgentErrorCode::Suspended,
+                format!(
+                    "agent parked awaiting a human reply (correlation_id={}, prompt={:?}); \
+                     the conversation is durably persisted — resume via \
+                     RigSessionRunner::resume(correlation_id, reply)",
+                    s.correlation_id, s.prompt
+                ),
             )),
             AgentRunOutcome::Completed(result) => match result.status {
                 AgentStatus::Failed => Err(permanent(
@@ -732,6 +752,62 @@ mod tests {
                 })
             }
         }
+    }
+
+    /// P12 R1.4 — a Suspended outcome is a typed AGENT_SUSPENDED signal
+    /// carrying the correlation_id, and it is NOT chain-escalated: with a
+    /// two-model chain, the second model must never run (that would start a
+    /// duplicate agent while the parked frame awaits its human reply).
+    #[tokio::test]
+    async fn a_suspended_agent_surfaces_typed_and_is_not_escalated() {
+        let runner = Arc::new(MockSessionRunner::suspended("corr-42", "approve the plan?"));
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(TwoModelResolver));
+        let err = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "do something", "await_enabled": true }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("a suspension surfaces as a typed signal");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("AGENT_SUSPENDED"), "got {msg}");
+        assert!(
+            msg.contains("corr-42"),
+            "the resume handle (correlation_id) must be carried: {msg}"
+        );
+        let sessions = runner.sessions();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a suspension must never escalate to the next model in the chain"
+        );
+        // And the opt-in flag reached the session.
+        assert!(
+            sessions[0].await_enabled,
+            "await_enabled must plumb through"
+        );
+    }
+
+    /// `await_enabled` defaults off: an ordinary config yields a session that
+    /// cannot suspend.
+    #[tokio::test]
+    async fn await_enabled_defaults_to_false_in_the_session() {
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        exec.execute(request(
+            json!({ "affinity": "coding", "goal": "build" }),
+            bare_def(),
+        ))
+        .await
+        .expect("success");
+        assert!(!runner.sessions()[0].await_enabled);
     }
 
     #[tokio::test]

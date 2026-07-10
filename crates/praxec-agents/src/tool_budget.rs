@@ -35,6 +35,7 @@ impl RigSessionRunner {
             tool_host: None,
             max_turns: DEFAULT_MAX_TURNS,
             max_history_bytes: DEFAULT_MAX_HISTORY_BYTES,
+            parked_store: None,
         }
     }
 
@@ -54,6 +55,19 @@ impl RigSessionRunner {
     /// elision path without assembling a megabyte of fixture data.
     pub fn with_max_history_bytes(mut self, bytes: usize) -> Self {
         self.max_history_bytes = bytes;
+        self
+    }
+
+    /// P12 R1.4 — wire the durable [`ParkedSessionStore`] backing suspend /
+    /// resume. Required for any session with `await_enabled` (the runner
+    /// fails fast without it — a suspend that can't persist would lose the
+    /// conversation). The production backend is
+    /// `praxec_core::store::SqliteParkedSessionStore`.
+    pub fn with_parked_store(
+        mut self,
+        store: Arc<dyn praxec_core::ports::ParkedSessionStore>,
+    ) -> Self {
+        self.parked_store = Some(store);
         self
     }
 
@@ -148,11 +162,11 @@ pub(crate) fn history_bytes(history: &[Message]) -> usize {
 }
 
 /// Tool names the runner injects itself rather than routing to a host
-/// (`final_answer`, `spill_read`). A host tool may NOT shadow them, so
-/// `sanitize_tool_name` treats these as already-taken and disambiguates a
-/// colliding host name — otherwise the injected tool's handler would silently
-/// swallow the host call.
-pub(crate) const RESERVED_TOOL_NAMES: [&str; 2] = ["final_answer", "spill_read"];
+/// (`final_answer`, `spill_read`, `await_human`). A host tool may NOT shadow
+/// them, so `sanitize_tool_name` treats these as already-taken and
+/// disambiguates a colliding host name — otherwise the injected tool's handler
+/// would silently swallow the host call.
+pub(crate) const RESERVED_TOOL_NAMES: [&str; 3] = ["final_answer", "spill_read", "await_human"];
 
 /// The provider tool-name rule shared by Anthropic and Google:
 /// `^[a-zA-Z0-9_-]{1,128}$`. A name outside it 400s every turn it is offered
@@ -188,6 +202,32 @@ pub(crate) fn spill_read_tool() -> ToolDefinition {
                     "maxItems": 2,
                     "items": { "type": "integer" },
                     "description": "Optional [start, end] byte range."
+                }
+            }
+        }),
+    }
+}
+
+/// P12 R1.4 — the injected suspend-signal tool, offered ONLY when the session
+/// opts in (`await_enabled`). Calling it is the explicit trigger for
+/// [`AgentRunOutcome::Suspended`](crate::session::AgentRunOutcome::Suspended):
+/// the runner stops the loop, persists the conversation durably, and a human's
+/// later correlated reply becomes this call's tool result on resume.
+pub(crate) fn await_human_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: crate::park::AWAIT_HUMAN_TOOL.to_string(),
+        description: "Pause this session and ask a human. Call this when you need a decision, \
+             approval, or information only a human can provide. The session suspends \
+             durably; when the human answers, their reply arrives as this tool's \
+             result and you continue from here. At most one await_human call per turn."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "required": ["prompt"],
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The question or request to put to the human, with enough context to answer it."
                 }
             }
         }),
