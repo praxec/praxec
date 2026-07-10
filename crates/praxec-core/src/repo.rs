@@ -388,6 +388,38 @@ pub(crate) fn rewrite_workflow_refs(value: &mut Value, namespace: &str) {
     }
 }
 
+/// Enumerate every definition YAML under a repo's declared layout directories
+/// (the exact files [`load_repo`] reads). Best-effort: an unreadable manifest
+/// or layout dir yields an empty / partial list rather than erroring. Used by
+/// the staleness tracker so a pack edit triggers the same gated reload as a
+/// config edit (v0.0.17 dogfood Finding 6 — a repo edit was previously invisible
+/// to a running gateway until an explicit reload / SIGHUP).
+pub fn definition_files(repo_path: &Path) -> Vec<PathBuf> {
+    let Ok(manifest) = load_manifest(repo_path) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for layout_dir in [
+        &manifest.layout.capabilities,
+        &manifest.layout.flows,
+        &manifest.layout.skills,
+        &manifest.layout.scripts,
+        &manifest.layout.connections,
+    ] {
+        let dir = repo_path.join(layout_dir);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("yaml") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// Collect every fully-qualified definitionId provided by a repo (the keys
 /// of every prefixable block in the aggregate Value). Used by the host-side
 /// loader to seed V20 (namespace uniqueness via separate map) and V23
@@ -777,6 +809,36 @@ workflows:
             unscanned_definition_warnings(td.path(), &m.layout).is_empty(),
             "default-dir tier must not warn"
         );
+    }
+
+    #[test]
+    fn definition_files_lists_layout_dir_yaml_only() {
+        // The freshness tracker (Finding 6) watches exactly these files, so a
+        // pack edit triggers reload. Only .yaml under layout dirs; non-yaml and
+        // files outside the layout are ignored.
+        let td = TempDir::new().unwrap();
+        write_manifest(td.path(), &minimal_manifest("swe")); // default layout dirs
+        write_file(
+            td.path(),
+            "capabilities/cap.a.yaml",
+            "workflows:\n  cap.a:\n    title: A\n",
+        );
+        write_file(
+            td.path(),
+            "flows/flow.b.yaml",
+            "workflows:\n  flow.b:\n    title: B\n",
+        );
+        write_file(td.path(), "flows/README.md", "not a def"); // ignored (not yaml)
+        write_file(td.path(), "docs/notes.yaml", "x: 1\n"); // ignored (not a layout dir)
+
+        let files = definition_files(td.path());
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
+            .collect();
+        assert!(names.contains(&"cap.a.yaml".to_string()), "got {names:?}");
+        assert!(names.contains(&"flow.b.yaml".to_string()), "got {names:?}");
+        assert_eq!(files.len(), 2, "only layout-dir yaml expected, got {names:?}");
     }
 
     #[test]

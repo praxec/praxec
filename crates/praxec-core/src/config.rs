@@ -193,12 +193,14 @@ fn load_include_entry(
 /// string `include:` entries and `file://` object entries, resolved relative
 /// to the file that lists them — the same base rule as `load_yaml_inner`).
 ///
-/// Scope (v1, deliberate): remote includes (`https://` / `git+https://`) and
-/// `repos:` working trees are NOT enumerated — the staleness recheck watches
-/// the config file set only; a repo edit is picked up by the explicit
-/// `praxec.command {reload}` / SIGHUP paths. Unreadable or unparsable files
-/// are skipped rather than erroring: this feeds the lazy staleness probe on
-/// a LIVE server, which must degrade to "track less" — never fail a request.
+/// Scope: local `include:` files AND every declared `repos:` working tree's
+/// definition YAML are enumerated, so an edit to a pack file triggers the same
+/// gated reload as a config edit (v0.0.17 dogfood Finding 6 — a repo edit was
+/// previously invisible on a running gateway until an explicit reload / SIGHUP).
+/// Remote includes (`https://` / `git+https://`) are NOT enumerated. Unreadable
+/// or unparsable files are skipped rather than erroring: this feeds the lazy
+/// staleness probe on a LIVE server, which must degrade to "track less" — never
+/// fail a request.
 pub fn local_config_file_set(path: impl AsRef<Path>) -> Vec<PathBuf> {
     let mut visited = HashSet::new();
     let mut out = Vec::new();
@@ -223,32 +225,55 @@ fn collect_local_config_files(path: &Path, visited: &mut HashSet<PathBuf>, out: 
     let Some(parent) = canonical.parent() else {
         return;
     };
-    let Some(includes) = value.get("include").and_then(Value::as_array) else {
-        return;
-    };
-    for inc in includes {
-        match inc {
-            Value::String(rel) => {
-                collect_local_config_files(&parent.join(rel), visited, out);
+    if let Some(includes) = value.get("include").and_then(Value::as_array) {
+        for inc in includes {
+            match inc {
+                Value::String(rel) => {
+                    collect_local_config_files(&parent.join(rel), visited, out);
+                }
+                Value::Object(_) => {
+                    // Mirror load_include_entry's file:// resolution; skip remote.
+                    let Some(rel) = inc
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| uri.strip_prefix("file://"))
+                    else {
+                        continue;
+                    };
+                    let p = Path::new(rel);
+                    let full = if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        parent.join(rel)
+                    };
+                    collect_local_config_files(&full, visited, out);
+                }
+                _ => {}
             }
-            Value::Object(_) => {
-                // Mirror load_include_entry's file:// resolution; skip remote.
-                let Some(rel) = inc
-                    .get("uri")
-                    .and_then(Value::as_str)
-                    .and_then(|uri| uri.strip_prefix("file://"))
-                else {
-                    continue;
-                };
-                let p = Path::new(rel);
-                let full = if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    parent.join(rel)
-                };
-                collect_local_config_files(&full, visited, out);
+        }
+    }
+
+    // Track every declared repo's definition YAML so a pack edit triggers the
+    // same gated reload as a config edit (Finding 6). Best-effort: an unreadable
+    // repo just contributes nothing.
+    if let Some(repos) = value.get("repos").and_then(Value::as_array) {
+        for repo in repos {
+            let Some(rel) = repo.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let p = Path::new(rel);
+            let repo_path = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                parent.join(rel)
+            };
+            for f in crate::repo::definition_files(&repo_path) {
+                if let Ok(canonical) = f.canonicalize() {
+                    if visited.insert(canonical.clone()) {
+                        out.push(canonical);
+                    }
+                }
             }
-            _ => {}
         }
     }
 }
