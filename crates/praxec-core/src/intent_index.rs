@@ -597,7 +597,7 @@ mod tests {
     fn annotate_requires_matching_task_class_and_template() {
         let mut hits = vec![workflow_hit("flow.x", Some("engineering"))];
         let st = [
-            stats("flow.x", "research", 10),   // same template, other class
+            stats("flow.x", "research", 10),    // same template, other class
             stats("flow.y", "engineering", 10), // same class, other template
         ];
         annotate_hits_with_evidence(&mut hits, &st, 3);

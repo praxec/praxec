@@ -69,6 +69,7 @@ pub mod slot;
 pub mod store;
 pub mod templating;
 pub mod tier;
+pub mod tool_descriptor;
 pub mod tuning;
 pub mod use_binding;
 pub mod validate;
@@ -97,6 +98,7 @@ pub use store::{
     ConfigDefinitionStore, FileWorkflowStore, InMemoryEvidenceStore, InMemoryWorkflowStore,
     SqliteWorkflowStore,
 };
+pub use tool_descriptor::{ToolDescriptor, ToolDescriptorError, ToolKind};
 
 // ---------------------------------------------------------------------------
 // Backward-compat aliases — these modules were moved into subdirectories

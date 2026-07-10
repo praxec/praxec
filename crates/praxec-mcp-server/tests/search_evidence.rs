@@ -197,7 +197,11 @@ async fn search_without_history_or_store_omits_evidence_and_still_works() {
     // Non-file sink: events are not stored — degrade to an unannotated search,
     // NOT the observe-style fail-fast (evidence is an annotation, not a read
     // the caller asked for).
-    let resp = search(&server_with(Arc::new(MemoryAuditSink::new()), items()), "flow").await;
+    let resp = search(
+        &server_with(Arc::new(MemoryAuditSink::new()), items()),
+        "flow",
+    )
+    .await;
     let h = hit(&resp, "flow.fresh");
     assert!(h.get("evidence").is_none(), "got: {resp}");
     assert!(resp.get("error").is_none(), "search must not fail: {resp}");
