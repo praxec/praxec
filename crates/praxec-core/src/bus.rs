@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{broadcast, oneshot};
 
+use crate::model::Principal;
+
 /// Identifies a parked interaction so a reply routes back to the right
 /// orchestrator without putting the reply channel on the (cloning) broadcast.
 pub type RequestId = u64;
@@ -35,6 +37,47 @@ pub enum InteractionKind {
     Form,
     /// Open-ended back-and-forth.
     Discuss,
+}
+
+impl InteractionKind {
+    /// P16 — is this a `human_decision`: a human-only gate whose resolution must
+    /// be bound to a proven-human identity? The guard rule: **reject a
+    /// `human_decision` resolution whose principal is not a proven human,
+    /// regardless of the connection's role.** [`Bus::answer`] enforces it.
+    ///
+    /// Only [`InteractionKind::Approve`] (the gate) is a decision; the
+    /// conversational kinds may be relayed/consumed by a mediator and stay
+    /// ungated. Exhaustive match, so a new kind forces an explicit choice here.
+    pub fn requires_human(self) -> bool {
+        match self {
+            InteractionKind::Approve => true,
+            InteractionKind::Answer | InteractionKind::Form | InteractionKind::Discuss => false,
+        }
+    }
+}
+
+/// P16 — why [`Bus::answer`] refused to deliver a reply.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BusError {
+    /// No parked interaction for this request (already answered or expired).
+    #[error("no parked interaction for request {0} (already answered or expired)")]
+    UnknownRequest(RequestId),
+    /// `HITL_NON_HUMAN_RESOLVER` — a `human_decision` may be resolved only by a
+    /// proven-human principal (one whose roles include
+    /// [`Principal::HUMAN_ROLE`]). An agent/LLM/policy or role-less principal is
+    /// refused fail-closed and the interaction **stays parked** for a later
+    /// human drain. Relaying the request to a human is fine; answering is not.
+    #[error(
+        "HITL_NON_HUMAN_RESOLVER: request {request_id} is a human_decision \
+         ({kind:?}) and principal `{subject}` is not a proven human (no `human` \
+         role); the reply is refused and the interaction stays parked for a \
+         human drain"
+    )]
+    NonHumanResolver {
+        request_id: RequestId,
+        kind: InteractionKind,
+        subject: String,
+    },
 }
 
 /// A human's reply to a parked interaction.
@@ -67,9 +110,18 @@ pub enum MissionEvent {
     Resolved { mission_id: String, status: String },
 }
 
+/// A parked interaction awaiting an answer. Carries its [`InteractionKind`] so
+/// [`Bus::answer`] can enforce the P16 origin rule (a `human_decision` resolves
+/// only to a proven-human principal) at the single choke point where every
+/// reply is accepted.
+struct Pending {
+    kind: InteractionKind,
+    tx: oneshot::Sender<InteractionReply>,
+}
+
 struct Inner {
     events: broadcast::Sender<MissionEvent>,
-    pending: Mutex<HashMap<RequestId, oneshot::Sender<InteractionReply>>>,
+    pending: Mutex<HashMap<RequestId, Pending>>,
     next_id: AtomicU64,
 }
 
@@ -121,7 +173,7 @@ impl Bus {
         Self::with_capacity(256)
     }
 
-    fn pending(&self) -> MutexGuard<'_, HashMap<RequestId, oneshot::Sender<InteractionReply>>> {
+    fn pending(&self) -> MutexGuard<'_, HashMap<RequestId, Pending>> {
         // Recover from a poisoned lock rather than panic (the map is plain data).
         self.inner
             .pending
@@ -155,7 +207,7 @@ impl Bus {
         // Register BEFORE announcing, so a consumer that answers the instant it
         // sees the event always finds the pending entry. The lock guard is dropped
         // at `;` (never held across the await below).
-        self.pending().insert(request_id, tx);
+        self.pending().insert(request_id, Pending { kind, tx });
         // RAII cleanup: if this future is dropped while still parked (the mission
         // was cancelled / timed out mid-interaction), the guard removes the pending
         // entry so its `oneshot::Sender` can't accumulate in a long-lived bus. On
@@ -174,13 +226,49 @@ impl Bus {
     }
 
     /// Consumer side: **answer** a parked interaction, resuming its orchestrator.
-    /// Returns `false` if the request is unknown (already answered / expired).
-    pub fn answer(&self, request_id: RequestId, reply: InteractionReply) -> bool {
-        let tx = self.pending().remove(&request_id);
-        match tx {
-            Some(tx) => tx.send(reply).is_ok(),
-            None => false,
+    /// `principal` is WHO is answering — it must come from the consumer's
+    /// authenticated channel (e.g. the gateway's configured identity), never
+    /// from model-authored content.
+    ///
+    /// P16 origin enforcement: when the parked interaction is a
+    /// `human_decision` ([`InteractionKind::requires_human`]), the reply is
+    /// accepted only from a proven-human principal ([`Principal::is_human`]).
+    /// Any other principal — an agent, an LLM (including the top, human-facing
+    /// one running headless), a policy, or an anonymous/role-less caller — gets
+    /// [`BusError::NonHumanResolver`] and the interaction **stays parked**
+    /// (fail-closed): the orchestrator keeps waiting for a human drain.
+    ///
+    /// Errors with [`BusError::UnknownRequest`] when the request has no parked
+    /// entry (already answered / expired).
+    pub fn answer(
+        &self,
+        request_id: RequestId,
+        reply: InteractionReply,
+        principal: &Principal,
+    ) -> Result<(), BusError> {
+        let mut pending = self.pending();
+        let entry = pending
+            .get(&request_id)
+            .ok_or(BusError::UnknownRequest(request_id))?;
+        if entry.kind.requires_human() && !principal.is_human() {
+            // Reject WITHOUT removing the entry — the interaction stays parked
+            // so a proven human can still resolve it later.
+            return Err(BusError::NonHumanResolver {
+                request_id,
+                kind: entry.kind,
+                subject: principal.subject.clone(),
+            });
         }
+        let entry = pending
+            .remove(&request_id)
+            .ok_or(BusError::UnknownRequest(request_id))?;
+        drop(pending);
+        // A closed receiver means the parked future was dropped (cancelled /
+        // timed out) — the request is effectively expired.
+        entry
+            .tx
+            .send(reply)
+            .map_err(|_| BusError::UnknownRequest(request_id))
     }
 
     /// Count of parked (unanswered) interactions — a consumer's inbox depth.
@@ -200,18 +288,39 @@ mod tests {
     use super::*;
 
     // ── helpers ────────────────────────────────────────────────────────────
-    // Spawn a parked Approve interaction and return the bus, the parked task's
-    // handle, and the announced Interaction event (so each test asserts ONE thing).
+    // Spawn a parked interaction and return the bus, the parked task's handle,
+    // and the announced Interaction event (so each test asserts ONE thing).
+
+    /// A proven-human principal (roles contain `human`).
+    fn human() -> Principal {
+        Principal {
+            subject: "operator".into(),
+            roles: vec![Principal::HUMAN_ROLE.into()],
+            permissions: Vec::new(),
+        }
+    }
+
+    /// A non-human principal — an agent identity with roles, none of them human.
+    fn agent() -> Principal {
+        Principal {
+            subject: "agent:orchestrator".into(),
+            roles: vec!["agent".into()],
+            permissions: Vec::new(),
+        }
+    }
 
     async fn parked() -> (Bus, tokio::task::JoinHandle<InteractionReply>, MissionEvent) {
+        parked_as(InteractionKind::Approve).await
+    }
+
+    async fn parked_as(
+        kind: InteractionKind,
+    ) -> (Bus, tokio::task::JoinHandle<InteractionReply>, MissionEvent) {
         let bus = Bus::new();
         let mut rx = bus.subscribe();
         let handle = {
             let bus = bus.clone();
-            tokio::spawn(async move {
-                bus.request_interaction("m1", InteractionKind::Approve, "ship it?")
-                    .await
-            })
+            tokio::spawn(async move { bus.request_interaction("m1", kind, "ship it?").await })
         };
         let event = loop {
             match rx.recv().await {
@@ -372,27 +481,31 @@ mod tests {
     // ── answer (resume) ──────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn answer_returns_true_for_a_parked_request() {
+    async fn answer_succeeds_for_a_parked_request() {
         let (bus, _h, event) = parked().await;
-        assert!(bus.answer(request_id_of(&event), InteractionReply::default()));
+        assert!(
+            bus.answer(request_id_of(&event), InteractionReply::default(), &human())
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn answer_clears_the_pending_entry() {
         let (bus, _h, event) = parked().await;
-        bus.answer(request_id_of(&event), InteractionReply::default());
+        let _ = bus.answer(request_id_of(&event), InteractionReply::default(), &human());
         assert_eq!(bus.pending_count(), 0);
     }
 
     #[tokio::test]
     async fn answer_delivers_the_approved_flag_to_the_parked_orchestrator() {
         let (bus, handle, event) = parked().await;
-        bus.answer(
+        let _ = bus.answer(
             request_id_of(&event),
             InteractionReply {
                 approved: true,
                 text: String::new(),
             },
+            &human(),
         );
         assert!(handle.await.unwrap_or_default().approved);
     }
@@ -400,27 +513,157 @@ mod tests {
     #[tokio::test]
     async fn answer_delivers_the_reply_text_to_the_parked_orchestrator() {
         let (bus, handle, event) = parked().await;
-        bus.answer(
+        let _ = bus.answer(
             request_id_of(&event),
             InteractionReply {
                 approved: false,
                 text: "go".into(),
             },
+            &human(),
         );
         assert_eq!(handle.await.unwrap_or_default().text, "go");
     }
 
     #[tokio::test]
-    async fn answer_returns_false_for_an_unknown_request() {
+    async fn answer_errors_for_an_unknown_request() {
         let bus = Bus::new();
-        assert!(!bus.answer(999, InteractionReply::default()));
+        assert_eq!(
+            bus.answer(999, InteractionReply::default(), &human()),
+            Err(BusError::UnknownRequest(999))
+        );
     }
 
     #[tokio::test]
     async fn answering_an_unknown_request_leaves_a_parked_one_pending() {
         let (bus, _h, _event) = parked().await;
-        bus.answer(424242, InteractionReply::default());
+        let _ = bus.answer(424242, InteractionReply::default(), &human());
         assert_eq!(bus.pending_count(), 1);
+    }
+
+    // ── P16 origin enforcement (human_decision resolves only to a human) ─────
+
+    #[tokio::test]
+    async fn a_human_principal_may_resolve_a_human_decision() {
+        let (bus, handle, event) = parked_as(InteractionKind::Approve).await;
+        let result = bus.answer(
+            request_id_of(&event),
+            InteractionReply {
+                approved: true,
+                text: String::new(),
+            },
+            &human(),
+        );
+        assert!(result.is_ok());
+        assert!(handle.await.unwrap_or_default().approved);
+    }
+
+    #[tokio::test]
+    async fn an_agent_principal_answering_a_human_decision_is_rejected() {
+        let (bus, _h, event) = parked_as(InteractionKind::Approve).await;
+        let result = bus.answer(
+            request_id_of(&event),
+            InteractionReply {
+                approved: true,
+                text: String::new(),
+            },
+            &agent(),
+        );
+        assert!(matches!(result, Err(BusError::NonHumanResolver { .. })));
+    }
+
+    #[tokio::test]
+    async fn the_rejection_names_the_offending_subject() {
+        let (bus, _h, event) = parked_as(InteractionKind::Approve).await;
+        let err = bus
+            .answer(request_id_of(&event), InteractionReply::default(), &agent())
+            .expect_err("a non-human resolver must be rejected");
+        assert!(matches!(
+            err,
+            BusError::NonHumanResolver { ref subject, .. } if subject == "agent:orchestrator"
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_principal_answering_a_human_decision_is_rejected() {
+        // Fail-closed: no identity claim at all → anonymous, role-less → refused.
+        let (bus, _h, event) = parked_as(InteractionKind::Approve).await;
+        let result = bus.answer(
+            request_id_of(&event),
+            InteractionReply::default(),
+            &Principal::anonymous(),
+        );
+        assert!(matches!(result, Err(BusError::NonHumanResolver { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_roleless_principal_answering_a_human_decision_is_rejected() {
+        // A subject with NO roles is not a proven human (fail-closed).
+        let (bus, _h, event) = parked_as(InteractionKind::Approve).await;
+        let roleless = Principal {
+            subject: "operator".into(),
+            roles: Vec::new(),
+            permissions: Vec::new(),
+        };
+        let result = bus.answer(
+            request_id_of(&event),
+            InteractionReply::default(),
+            &roleless,
+        );
+        assert!(matches!(result, Err(BusError::NonHumanResolver { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_non_human_answer_leaves_the_request_parked() {
+        let (bus, _h, event) = parked_as(InteractionKind::Approve).await;
+        let _ = bus.answer(request_id_of(&event), InteractionReply::default(), &agent());
+        assert_eq!(bus.pending_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_human_can_still_resolve_after_a_non_human_was_rejected() {
+        let (bus, handle, event) = parked_as(InteractionKind::Approve).await;
+        let _ = bus.answer(
+            request_id_of(&event),
+            InteractionReply {
+                approved: true,
+                text: String::new(),
+            },
+            &agent(),
+        );
+        let result = bus.answer(
+            request_id_of(&event),
+            InteractionReply {
+                approved: true,
+                text: String::new(),
+            },
+            &human(),
+        );
+        assert!(result.is_ok());
+        assert!(handle.await.unwrap_or_default().approved);
+    }
+
+    #[tokio::test]
+    async fn a_non_human_may_answer_a_non_decision_interaction() {
+        // Only human_decision kinds are gated; a conversational Answer is not.
+        let (bus, handle, event) = parked_as(InteractionKind::Answer).await;
+        let result = bus.answer(
+            request_id_of(&event),
+            InteractionReply {
+                approved: false,
+                text: "42".into(),
+            },
+            &agent(),
+        );
+        assert!(result.is_ok());
+        assert_eq!(handle.await.unwrap_or_default().text, "42");
+    }
+
+    #[tokio::test]
+    async fn only_the_approve_kind_is_a_human_decision() {
+        assert!(InteractionKind::Approve.requires_human());
+        assert!(!InteractionKind::Answer.requires_human());
+        assert!(!InteractionKind::Form.requires_human());
+        assert!(!InteractionKind::Discuss.requires_human());
     }
 
     #[tokio::test]
