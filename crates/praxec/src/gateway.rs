@@ -1207,8 +1207,10 @@ async fn build_hot_components(
 /// store (the repos declared `writable: true`, carried in `_writableRepos`).
 /// Reads keep flowing through the merged config store; this is purely the
 /// governed write sink. The provenance gate is seeded with the operator's
-/// top-level `connections:` names — an authored definition may reference those
-/// but never introduce a raw command of its own.
+/// top-level `connections:` names (host-declared + explicitly
+/// `grant_connections:`-granted pack connections; ungranted pack declarations
+/// never reach `/connections` — SPEC §9.5) — an authored definition may
+/// reference those but never introduce a raw command of its own.
 ///
 /// Fail-loud (no silent no-op) when the flag is on but no writable repo is
 /// declared: that's a misconfiguration the operator must see at startup.
@@ -1247,6 +1249,12 @@ fn maybe_enable_authoring(
     }
 
     let store = praxec_core::store::RepoDefinitionStore::from_repos(roots, audit.clone())?;
+    // SPEC §9.5 — this seed is the authoring trust anchor, and it is safe to
+    // take every `/connections` key ONLY because the merge-time grant gate
+    // (`gate_repo_connections` in praxec-core) has already diverted every
+    // pack-declared connection the operator did not `grant_connections:` into
+    // `/praxec/_ungrantedConnections`. What remains here is exactly
+    // host-declared + operator-granted — never an ungranted pack connection.
     let allowed_connections: Vec<String> = config
         .pointer("/connections")
         .and_then(Value::as_object)

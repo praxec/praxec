@@ -102,6 +102,14 @@
           "path": {
             "type": "string",
             "description": "Directory containing a `praxec.repo.yaml` manifest. Accepts absolute, relative (resolved against the host config's directory), or `~/`-prefixed paths."
+          },
+          "grant_connections": {
+            "type": "array",
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "description": "SPEC §9.5 — operator grant for this repo's declared connections. A pack may DECLARE `connections:`, but a declared connection only goes live when its name (bare pack-local, or fully-qualified `<namespace>/<name>`) is listed here. Ungranted declarations are diverted to `/praxec/_ungrantedConnections` and are never spawnable. Granting a connection the repo does not declare fails at load (STALE_CONNECTION_GRANT)."
           }
         }
       },

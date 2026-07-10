@@ -484,6 +484,228 @@ fn non_boolean_writable_is_rejected() {
     assert!(msg.contains("writable"), "msg should name the field: {msg}");
 }
 
+// ---------- SPEC §9.5 — connection GRANT GATE ----------
+//
+// A layered repo may DECLARE `connections:`, but only the OPERATOR activates
+// them via `grant_connections:` on the `repos:` entry. Ungranted declarations
+// are never merged live; they are stamped under
+// `/praxec/_ungrantedConnections` with the exact YAML remedy.
+
+/// Build a pack repo (namespace `packns`, name `conn-pack`) declaring two
+/// connections plus a workflow, so tests can assert the grant gate is
+/// connection-scoped (workflows still load either way).
+fn seed_conn_repo(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir.join("connections")).unwrap();
+    std::fs::create_dir_all(dir.join("capabilities")).unwrap();
+    std::fs::write(
+        dir.join("praxec.repo.yaml"),
+        "schema: praxec.repo/v1\nname: conn-pack\nnamespace: packns\nversion: 0.1.0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("connections/tools.yaml"),
+        r#"
+connections:
+  gh-mcp:
+    kind: mcp
+    command: gh-mcp-server
+  audit-api:
+    kind: rest
+    baseUrl: "https://audit.example"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("capabilities/cap.audit.yaml"),
+        "workflows:\n  cap.audit:\n    title: Audit\n    initial: ready\n    states:\n      ready:\n        terminal: true\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn ungranted_pack_connection_is_not_live_and_is_stamped_with_remedy() {
+    let td = TempDir::new().unwrap();
+    let repo_dir = td.path().join("conn-pack");
+    seed_conn_repo(&repo_dir);
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n",
+        repo_dir.display(),
+    );
+    let path = write_host(&td, &host);
+    let (config, _diagnostics) = load_resolved_with_repos(&path).expect("pack loads");
+
+    // NOT merged live: neither connection reaches the spawnable registry —
+    // which is also exactly what the authoring provenance gate seeds from.
+    assert!(
+        config.pointer("/connections/packns~1gh-mcp").is_none(),
+        "ungranted mcp connection must not be live"
+    );
+    assert!(
+        config.pointer("/connections/packns~1audit-api").is_none(),
+        "ungranted rest connection must not be live"
+    );
+    // NOT silently dropped: stamped as self-documenting diagnostic state.
+    let stamp = config
+        .pointer("/praxec/_ungrantedConnections/packns~1gh-mcp")
+        .expect("ungranted connection stamped");
+    assert_eq!(stamp["repo"].as_str(), Some("conn-pack"));
+    assert_eq!(stamp["namespace"].as_str(), Some("packns"));
+    let remedy = stamp["remedy"].as_str().expect("remedy present");
+    assert!(
+        remedy.contains("grant_connections: [gh-mcp]"),
+        "remedy carries the exact YAML fix: {remedy}"
+    );
+    assert!(
+        remedy.contains("conn-pack"),
+        "remedy names the repo: {remedy}"
+    );
+    // The pack's non-connection content still loads — the gate is
+    // connection-scoped, not a pack quarantine.
+    assert!(
+        config.pointer("/workflows/packns~1cap.audit").is_some(),
+        "pack workflows load regardless of connection grants"
+    );
+}
+
+#[test]
+fn granted_pack_connection_is_live_and_not_stamped() {
+    let td = TempDir::new().unwrap();
+    let repo_dir = td.path().join("conn-pack");
+    seed_conn_repo(&repo_dir);
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n    grant_connections: [gh-mcp, audit-api]\n",
+        repo_dir.display(),
+    );
+    let path = write_host(&td, &host);
+    let (config, _diagnostics) = load_resolved_with_repos(&path).expect("granted pack loads");
+    assert!(
+        config.pointer("/connections/packns~1gh-mcp").is_some(),
+        "granted connection is live under its namespaced key"
+    );
+    assert!(
+        config.pointer("/connections/packns~1audit-api").is_some(),
+        "granted connection is live under its namespaced key"
+    );
+    assert!(
+        config.pointer("/praxec/_ungrantedConnections").is_none(),
+        "nothing left to stamp when every declaration is granted"
+    );
+}
+
+#[test]
+fn partial_grant_gates_each_connection_independently() {
+    let td = TempDir::new().unwrap();
+    let repo_dir = td.path().join("conn-pack");
+    seed_conn_repo(&repo_dir);
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n    grant_connections: [gh-mcp]\n",
+        repo_dir.display(),
+    );
+    let path = write_host(&td, &host);
+    let (config, _diagnostics) = load_resolved_with_repos(&path).expect("partial grant loads");
+    assert!(
+        config.pointer("/connections/packns~1gh-mcp").is_some(),
+        "granted connection is live"
+    );
+    assert!(
+        config.pointer("/connections/packns~1audit-api").is_none(),
+        "ungranted sibling stays diverted"
+    );
+    assert!(
+        config
+            .pointer("/praxec/_ungrantedConnections/packns~1audit-api")
+            .is_some(),
+        "ungranted sibling is stamped"
+    );
+    assert!(
+        config
+            .pointer("/praxec/_ungrantedConnections/packns~1gh-mcp")
+            .is_none(),
+        "granted connection is not stamped"
+    );
+}
+
+#[test]
+fn grant_accepts_fully_qualified_connection_name() {
+    let td = TempDir::new().unwrap();
+    let repo_dir = td.path().join("conn-pack");
+    seed_conn_repo(&repo_dir);
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n    grant_connections: [packns/gh-mcp, audit-api]\n",
+        repo_dir.display(),
+    );
+    let path = write_host(&td, &host);
+    let (config, _diagnostics) = load_resolved_with_repos(&path).expect("qualified grant loads");
+    assert!(
+        config.pointer("/connections/packns~1gh-mcp").is_some(),
+        "fully-qualified grant activates the connection"
+    );
+}
+
+#[test]
+fn host_declared_connections_are_live_without_any_grant() {
+    // Back-compat: the operator writing a connection in the host config IS
+    // the grant. Only repo-CONTRIBUTED connections pass through the gate.
+    let td = TempDir::new().unwrap();
+    let repo_dir = td.path().join("conn-pack");
+    seed_conn_repo(&repo_dir);
+    let host = format!(
+        r#"
+version: "1.0.0"
+repos:
+  - path: "{repo}"
+connections:
+  my-tool:
+    kind: cli
+    command: my-tool
+"#,
+        repo = repo_dir.display(),
+    );
+    let path = write_host(&td, &host);
+    let (config, _diagnostics) = load_resolved_with_repos(&path).expect("host connections load");
+    assert!(
+        config.pointer("/connections/my-tool").is_some(),
+        "host-declared connection is live with no grant machinery"
+    );
+    assert!(
+        config.pointer("/connections/packns~1gh-mcp").is_none(),
+        "pack connection still requires its own grant"
+    );
+}
+
+#[test]
+fn stale_connection_grant_is_rejected() {
+    let td = TempDir::new().unwrap();
+    let repo_dir = td.path().join("conn-pack");
+    seed_conn_repo(&repo_dir);
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n    grant_connections: [gh-mpc]\n",
+        repo_dir.display(),
+    );
+    let path = write_host(&td, &host);
+    let err = load_resolved_with_repos(&path).expect_err("stale grant must error");
+    let msg = format!("{:#}", err);
+    assert!(msg.contains("STALE_CONNECTION_GRANT"), "msg: {msg}");
+    assert!(msg.contains("gh-mpc"), "msg names the stale grant: {msg}");
+    assert!(msg.contains("conn-pack"), "msg names the repo: {msg}");
+}
+
+#[test]
+fn non_array_grant_connections_is_rejected() {
+    let td = TempDir::new().unwrap();
+    let repo_dir = td.path().join("conn-pack");
+    seed_conn_repo(&repo_dir);
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n    grant_connections: gh-mcp\n",
+        repo_dir.display(),
+    );
+    let path = write_host(&td, &host);
+    let err = load_resolved_with_repos(&path).expect_err("non-array grant must error");
+    let msg = format!("{:#}", err);
+    assert!(msg.contains("INVALID_REPO_ENTRY"), "msg: {msg}");
+    assert!(msg.contains("grant_connections"), "msg: {msg}");
+}
+
 #[test]
 fn v23_rejects_stale_override_with_no_collision() {
     // An `overrides:` entry that doesn't actually shadow a repo-provided
