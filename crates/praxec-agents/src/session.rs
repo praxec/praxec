@@ -76,6 +76,23 @@ pub struct AgentRunReport {
     pub completion_tokens: u64,
 }
 
+/// Correlating identity for observability events emitted DURING a run
+/// (`agent.heartbeat`) — the same identity the runtime stamps on
+/// `agent.invoked` / `agent.completed`, so an in-run heartbeat joins their
+/// correlation in the audit stream. All-`None` (the default, and the value
+/// deserialized for parked frames persisted before this existed) simply omits
+/// the fields from the emitted events.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunIdentity {
+    /// The workflow instance the agent step belongs to.
+    pub workflow_id: Option<String>,
+    /// The step's audit correlation id — `agent.invoked` carries the same one,
+    /// so a heartbeat is joinable to its boundary events.
+    pub correlation_id: Option<String>,
+    /// The transition being driven.
+    pub transition: Option<String>,
+}
+
 /// Everything needed to run one isolated agent session.
 ///
 /// Serde derives exist for exactly one reason: P12 R1.4 persists the session
@@ -121,6 +138,12 @@ pub struct AgentSession {
     /// hallucinated call routes to the normal unknown-tool error result.
     #[serde(default)]
     pub await_enabled: bool,
+    /// Correlating identity for the in-run `agent.heartbeat` audit events.
+    /// Defaulted (all-`None`) for callers that run sessions outside a governed
+    /// step (e.g. the orchestrator's decision calls) and for parked frames
+    /// persisted before the field existed.
+    #[serde(default)]
+    pub identity: RunIdentity,
 }
 
 /// Runs ONE autonomous agent session and reports the outcome. The production

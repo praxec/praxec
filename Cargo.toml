@@ -16,21 +16,21 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.15"
+version = "0.0.17"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/praxec/praxec"
 
 [workspace.dependencies]
-praxec-core = { path = "crates/praxec-core", version = "0.0.15" }
-praxec-executors = { path = "crates/praxec-executors", version = "0.0.15" }
-praxec-mcp-server = { path = "crates/praxec-mcp-server", version = "0.0.15" }
-praxec-test = { path = "crates/praxec-test", version = "0.0.15" }
-praxec-llm-executor = { path = "crates/praxec-llm-executor", version = "0.0.15" }
-praxec-agents = { path = "crates/praxec-agents", version = "0.0.15" }
-praxec-cockpit = { path = "crates/praxec-cockpit", version = "0.0.15" }
-praxec-embeddings = { path = "crates/praxec-embeddings", version = "0.0.15" }
+praxec-core = { path = "crates/praxec-core", version = "0.0.17" }
+praxec-executors = { path = "crates/praxec-executors", version = "0.0.17" }
+praxec-mcp-server = { path = "crates/praxec-mcp-server", version = "0.0.17" }
+praxec-test = { path = "crates/praxec-test", version = "0.0.17" }
+praxec-llm-executor = { path = "crates/praxec-llm-executor", version = "0.0.17" }
+praxec-agents = { path = "crates/praxec-agents", version = "0.0.17" }
+praxec-cockpit = { path = "crates/praxec-cockpit", version = "0.0.17" }
+praxec-embeddings = { path = "crates/praxec-embeddings", version = "0.0.17" }
 # praxec-tui and praxec-agents are workspace members in this repo.
 # The praxec-pro-gateway binary was retired; its wiring was folded into
 # the praxec binary behind the default-on `agents` cargo feature.
@@ -72,7 +72,9 @@ which = "7"
 typify = "0.6"
 prettyplease = "0.2"
 syn = { version = "2", features = ["full"] }
-schemars = "0.8"
+# `chrono` feature: praxec-core derives `JsonSchema` on `AuditEvent`, whose
+# `timestamp` is a `chrono::DateTime<Utc>` (published event schema, code-first).
+schemars = { version = "0.8", features = ["chrono"] }
 
 # T26 — clippy::unwrap_used is enabled per-crate via
 # `#![cfg_attr(not(test), warn(clippy::unwrap_used))]` in each lib.rs.

@@ -17,6 +17,9 @@ workspace = true
 praxec-core = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# The `observe` query parses the caller's RFC3339 `since` floor and compares
+# event timestamps.
+chrono = { workspace = true }
 futures = { workspace = true }
 rmcp = { workspace = true }
 schemars = { workspace = true }
@@ -29,4 +32,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 praxec-executors = { workspace = true }
 serde_yaml = { workspace = true }
-chrono = { workspace = true }
+tempfile = { workspace = true }

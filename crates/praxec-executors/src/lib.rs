@@ -7,6 +7,7 @@
 mod arg_render;
 pub mod cli;
 mod conn_util;
+pub mod conn_write;
 pub mod diff;
 pub mod dry_run;
 pub mod human;
@@ -23,6 +24,7 @@ pub mod registry_executor;
 pub mod rest;
 pub mod script;
 pub mod structural_analysis;
+pub mod tool_source;
 pub mod untrusted_execution;
 pub mod workflow;
 
@@ -72,6 +74,9 @@ pub const REGISTERED_EXECUTOR_KINDS: &[&str] = &[
     "structural_analysis",
     "ingest",
     "diff",
+    // D2 (v0.0.17) — surfaces a D1 tool descriptor's operations as callable,
+    // delegating to the cli/mcp/rest executors above (no new transport).
+    "tool_source",
 ];
 
 /// Every executor `kind` the codebase implements. This is now identical to
@@ -110,12 +115,14 @@ pub const ALL_EXECUTOR_KINDS: &[&str] = &[
     "structural_analysis",
     "ingest",
     "diff",
+    "tool_source",
 ];
 pub use registry::HashMapExecutorRegistry;
 pub use registry_executor::RegistryExecutor;
 pub use rest::{RestConnection, RestConnections, RestExecutor};
 pub use script::ScriptExecutor;
 pub use structural_analysis::{REQUIRED_RULES, StructuralAnalysisExecutor};
+pub use tool_source::ToolSourceExecutor;
 pub use workflow::WorkflowExecutor;
 
 use std::sync::Arc;
@@ -180,10 +187,25 @@ pub fn default_registry_with_late_workflow(
     // `workflow` is registered runtime-less here; the runtime is injected via
     // `set_runtime` after it has been built around this registry.
     let workflow = Arc::new(WorkflowExecutor::late(audit.clone()));
+    // The transport executors are constructed once and shared: registered
+    // under their own kinds AND composed into `tool_source` (D2), so
+    // connection caches and grant gates are never duplicated.
+    let cli_executor: Arc<dyn praxec_core::ports::Executor> =
+        Arc::new(CliExecutor::new(cli_connections));
+    let mcp_dyn: Arc<dyn praxec_core::ports::Executor> = mcp_executor;
+    let rest_executor: Arc<dyn praxec_core::ports::Executor> =
+        Arc::new(RestExecutor::new(rest_connections));
+    let tool_source = Arc::new(ToolSourceExecutor::new(
+        config,
+        cli_executor.clone(),
+        mcp_dyn.clone(),
+        rest_executor.clone(),
+    ));
     let registry = HashMapExecutorRegistry::new()
-        .with("cli", Arc::new(CliExecutor::new(cli_connections)))
-        .with("mcp", mcp_executor as Arc<dyn praxec_core::ports::Executor>)
-        .with("rest", Arc::new(RestExecutor::new(rest_connections)))
+        .with("cli", cli_executor)
+        .with("mcp", mcp_dyn)
+        .with("rest", rest_executor)
+        .with("tool_source", tool_source)
         .with("human", Arc::new(HumanExecutor::with_audit(audit)))
         .with("noop", Arc::new(NoopExecutor))
         .with("script", Arc::new(ScriptExecutor::new()))

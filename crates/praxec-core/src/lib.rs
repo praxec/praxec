@@ -58,6 +58,7 @@ pub mod promotion;
 pub mod provider_keys;
 pub mod providers;
 pub mod proxy_workflow;
+pub mod registry_v3;
 pub mod reliability;
 pub mod repo;
 pub mod repo_git;
@@ -69,6 +70,7 @@ pub mod slot;
 pub mod store;
 pub mod templating;
 pub mod tier;
+pub mod tool_descriptor;
 pub mod tuning;
 pub mod use_binding;
 pub mod validate;
@@ -79,8 +81,9 @@ pub use audit::{
 };
 pub use capability::{Capability, CapabilityRegistry, CapabilitySource};
 pub use discovery::{
-    DiscoveryIndex, DiscoveryItem, DiscoveryKind, DiscoveryLink, InMemoryDiscoveryIndex, SearchHit,
-    SearchRequest,
+    DiscoveryIndex, DiscoveryItem, DiscoveryKind, DiscoveryLink, EvidenceSignal,
+    InMemoryDiscoveryIndex, RankedCandidate, SearchHit, SearchRequest, TopologySignal,
+    rank_candidates,
 };
 pub use error::{ErrorClass, ExecutorError, RuntimeError};
 pub use fs::{Filesystem, InMemoryFilesystem, RealFilesystem};
@@ -90,6 +93,10 @@ pub use model::*;
 pub use overlay::SingleKindOverlay;
 pub use ports::*;
 pub use proxy_workflow::{DEFAULT_PROXY_STATE, DEFAULT_PROXY_WORKFLOW_ID, compile_proxy_workflow};
+pub use registry_v3::{
+    CrossmatrixRole, CrossmatrixRow, Pack, PackTier, Registry, RegistryError, RegistrySchema,
+    RegistryTool,
+};
 pub use reliability::{Backoff, FallbackPolicy, ReliabilityPolicy, RetryPolicy};
 pub use repo::{REPO_MANIFEST_SCHEMA_V1, RepoLayout, RepoManifest, load_manifest, load_repo};
 pub use runtime::WorkflowRuntime;
@@ -97,6 +104,7 @@ pub use store::{
     ConfigDefinitionStore, FileWorkflowStore, InMemoryEvidenceStore, InMemoryWorkflowStore,
     SqliteWorkflowStore,
 };
+pub use tool_descriptor::{ToolDescriptor, ToolDescriptorError, ToolKind};
 
 // ---------------------------------------------------------------------------
 // Backward-compat aliases — these modules were moved into subdirectories

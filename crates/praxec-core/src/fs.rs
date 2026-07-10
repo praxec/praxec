@@ -42,6 +42,11 @@ pub trait Filesystem: Send + Sync {
 
     /// Read and return the full contents of the file at `path`.
     async fn read_to_string(&self, path: &Path) -> anyhow::Result<String>;
+
+    /// Delete the file at `path`. Used by audit retention to prune expired
+    /// rotated log files. Errors (including "not found") propagate so the
+    /// caller can surface a failed prune rather than assume it happened.
+    async fn remove_file(&self, path: &Path) -> anyhow::Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +114,11 @@ impl Filesystem for RealFilesystem {
     async fn read_to_string(&self, path: &Path) -> anyhow::Result<String> {
         let s = tokio::fs::read_to_string(path).await?;
         Ok(s)
+    }
+
+    async fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
+        tokio::fs::remove_file(path).await?;
+        Ok(())
     }
 }
 
@@ -243,6 +253,18 @@ impl Filesystem for InMemoryFilesystem {
                     .map_err(|e| anyhow::anyhow!("file is not valid UTF-8: {e}"))?;
                 Ok(s)
             }
+            None => Err(anyhow::anyhow!("file not found: {}", path.display())),
+        }
+    }
+
+    async fn remove_file(&self, path: &Path) -> anyhow::Result<()> {
+        let mut state = self
+            .inner
+            .lock()
+            .expect("LOCK_POISONED: in-memory filesystem state");
+        let key = path.to_string_lossy().into_owned();
+        match state.files.remove(&key) {
+            Some(_) => Ok(()),
             None => Err(anyhow::anyhow!("file not found: {}", path.display())),
         }
     }

@@ -240,6 +240,8 @@ impl TransitionChooser for AgentChooser {
             expected_output_types: Default::default(),
             // A decision call is one synchronous turn — never suspendable.
             await_enabled: false,
+            // Decision calls run outside a governed step — no audit identity.
+            identity: Default::default(),
         };
         // PROPAGATE a runner error (missing API key, 401, model-resolution,
         // network) as `Err` — the pre-fix `.ok()?` swallowed EVERY such error

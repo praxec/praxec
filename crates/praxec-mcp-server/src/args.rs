@@ -220,7 +220,19 @@ pub struct QueryArgs {
     /// content hash (SPEC §8.4 — the basis for an edit). Distinct from
     /// `workflow_id` (a running instance) and `subject` (a guidance fragment).
     pub definition_id: Option<String>,
-    /// Search result cap. Modifier on `search`.
+    /// Observability read: present-and-true (alone) → bounded replay of the
+    /// structured audit event stream — the SAME events `praxec observe
+    /// --follow` emits (heartbeat pulses excluded), each carrying
+    /// `workflow_id` / `parent_workflow_id` / `depth` so the client can
+    /// rebuild the execution tree. An MCP call returns a response, not a
+    /// stream, so this is the PULL complement to the CLI tail: "give me
+    /// events since X" — re-query with the returned `next_since` cursor to
+    /// tail. Requires `audit.sink: file` (fails fast otherwise).
+    pub observe: Option<bool>,
+    /// RFC3339 floor for `observe` — only events with `timestamp >= since`
+    /// are returned. Modifier on `observe` only.
+    pub since: Option<String>,
+    /// Search result cap. Modifier on `search` and `observe`.
     #[schemars(schema_with = "integer_schema")]
     pub limit: Option<u64>,
 }

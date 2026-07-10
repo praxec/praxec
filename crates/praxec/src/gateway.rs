@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub(crate) use crate::gateway_config::{
-    ApprovalsCommand, AuditCommand, Cli, Command, CostCommand, InspectCommand, IntentCommand,
-    OneshotServer, ack_guards_used, apply_overlays, build_audit_sink, build_workflow_store,
-    cli_principal, headless_policy_from, is_ephemeral_path, load_config, parse_since,
-    resolve_embedder,
+    ApprovalsCommand, AuditCommand, Cli, CliConnectionKind, Command, ConnectionsCommand,
+    CostCommand, InspectCommand, IntentCommand, OneshotServer, SchemaCommand, ack_guards_used,
+    apply_overlays, build_audit_sink, build_workflow_store, cli_principal, headless_policy_from,
+    is_ephemeral_path, load_config, parse_since, resolve_embedder,
 };
 pub use crate::gateway_config::{
     GatewayOverlays, OverlayCtx, build_evidence_store, build_guidance_ack_store,
@@ -103,7 +103,17 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
         Command::Check { config } => check(config, &overlays.diagnostics),
         Command::Doctor { config } => doctor(config),
         Command::Health { config } => health(config),
-        Command::Observe { config } => observe(config),
+        Command::Observe {
+            config,
+            follow,
+            since,
+        } => {
+            if follow {
+                observe_follow(&config, since.as_deref())
+            } else {
+                observe(config)
+            }
+        }
         Command::Migrate { config } => migrate(config),
         Command::Inspect { command } => match command {
             InspectCommand::Workflow { config, id } => inspect_workflow(&config, &id).await,
@@ -152,7 +162,202 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 json,
             } => intent_report_cmd(&config, task_class, json).await,
         },
+        Command::Schema { command } => match command {
+            // Code-first: the schema is GENERATED from the canonical Rust
+            // struct at print time — there is no hand-maintained copy to drift.
+            SchemaCommand::AuditEvent => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&praxec_core::audit::audit_event_schema())?
+                );
+                Ok(())
+            }
+        },
+        Command::Connections { command } => match command {
+            ConnectionsCommand::Add {
+                config,
+                name,
+                kind,
+                command,
+                args,
+                url,
+                working_directory,
+                env,
+                headers,
+            } => connections_add(
+                &config,
+                &name,
+                kind,
+                command,
+                args,
+                url,
+                working_directory,
+                env,
+                headers,
+            ),
+            ConnectionsCommand::Grant { config, name } => connections_grant(&config, &name).await,
+        },
     }
+}
+
+/// Split a repeatable `KEY<sep>VALUE` flag into pairs, fail-fast on a token with
+/// no separator. Header values may themselves contain the separator, so only the
+/// FIRST occurrence splits.
+fn parse_kv_flag(raw: &[String], sep: char, flag: &str) -> anyhow::Result<Vec<(String, String)>> {
+    raw.iter()
+        .map(|entry| {
+            let (k, v) = entry.split_once(sep).ok_or_else(|| {
+                anyhow::anyhow!("{flag} '{entry}' must be in `KEY{sep}VALUE` form")
+            })?;
+            let k = k.trim();
+            if k.is_empty() {
+                anyhow::bail!("{flag} '{entry}' has an empty key");
+            }
+            Ok((k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+/// Reject flags that do not apply to the chosen connection kind, so a mistyped
+/// invocation (e.g. `--header` on a `cli` connection) fails loud instead of
+/// silently dropping the value.
+fn reject_inapplicable(kind: &str, offending: &[(&str, bool)]) -> anyhow::Result<()> {
+    let bad: Vec<&str> = offending
+        .iter()
+        .filter(|(_, present)| *present)
+        .map(|(flag, _)| *flag)
+        .collect();
+    if !bad.is_empty() {
+        anyhow::bail!(
+            "these flags do not apply to a `{kind}` connection: {}",
+            bad.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// D4a — `connections add`: build a typed [`ConnectionSpec`] from the parsed
+/// flags (rejecting flags that don't apply to the kind), write it into the
+/// config as a GRANTED connection, and print what was written.
+#[allow(clippy::too_many_arguments)]
+fn connections_add(
+    config: &std::path::Path,
+    name: &str,
+    kind: CliConnectionKind,
+    command: Option<String>,
+    args: Vec<String>,
+    url: Option<String>,
+    working_directory: Option<String>,
+    env: Vec<String>,
+    headers: Vec<String>,
+) -> anyhow::Result<()> {
+    use praxec_executors::conn_write::{ConnectionSpec, add_connection};
+
+    let spec = match kind {
+        CliConnectionKind::Mcp => {
+            reject_inapplicable(
+                "mcp",
+                &[
+                    ("--working-directory", working_directory.is_some()),
+                    ("--header", !headers.is_empty()),
+                ],
+            )?;
+            ConnectionSpec::Mcp {
+                command,
+                args,
+                url,
+                env: parse_kv_flag(&env, '=', "--env")?,
+            }
+        }
+        CliConnectionKind::Cli => {
+            reject_inapplicable(
+                "cli",
+                &[
+                    ("--arg", !args.is_empty()),
+                    ("--url", url.is_some()),
+                    ("--header", !headers.is_empty()),
+                ],
+            )?;
+            let command =
+                command.ok_or_else(|| anyhow::anyhow!("a `cli` connection requires --command"))?;
+            ConnectionSpec::Cli {
+                command,
+                working_directory,
+                env: parse_kv_flag(&env, '=', "--env")?,
+            }
+        }
+        CliConnectionKind::Rest => {
+            reject_inapplicable(
+                "rest",
+                &[
+                    ("--command", command.is_some()),
+                    ("--arg", !args.is_empty()),
+                    ("--working-directory", working_directory.is_some()),
+                    ("--env", !env.is_empty()),
+                ],
+            )?;
+            let base_url = url.ok_or_else(|| {
+                anyhow::anyhow!("a `rest` connection requires --url (the base URL)")
+            })?;
+            ConnectionSpec::Rest {
+                base_url,
+                headers: parse_kv_flag(&headers, ':', "--header")?,
+            }
+        }
+    };
+
+    let written = add_connection(config, name, &spec)?;
+    println!(
+        "connections add: STAGED connection '{name}' (kind: {}) in {}",
+        spec.kind().as_str(),
+        config.display()
+    );
+    println!("{}", serde_json::to_string_pretty(&written)?);
+    println!(
+        "It is NOT yet granted: a staged connection is inert (never in the live registry) until \
+         you run `px connections grant {name}`. This keeps `add` from silently minting a trusted \
+         connection."
+    );
+    Ok(())
+}
+
+/// D4a — `connections grant`: the explicit, auditable operator trust act. Appends
+/// the name to the config's top-level `grant_connections:` list (via the write
+/// primitive) and records a `connections.granted` audit event.
+async fn connections_grant(config: &std::path::Path, name: &str) -> anyhow::Result<()> {
+    use praxec_executors::conn_write::grant_connection;
+
+    // Edit the raw config file first (fail-fast if not staged / already granted).
+    let body = grant_connection(config, name)?;
+    let kind = body
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Emit a governance audit event. The audit sink is read from the (now
+    // updated) resolved config — a durable `audit.sink: file` retains the grant
+    // in the queryable trail; the default stderr sink still surfaces it.
+    let resolved = load_config(&config.to_path_buf())?;
+    let sink = build_audit_sink(&resolved)?;
+    let event = praxec_core::audit::AuditEvent::new("connections.granted")
+        .with_actor("operator")
+        .with_payload(serde_json::json!({
+            "connection": name,
+            "kind": kind,
+            "config": config.display().to_string(),
+        }));
+    sink.record(event).await?;
+
+    println!(
+        "connections grant: GRANTED connection '{name}' (kind: {kind}) in {}",
+        config.display()
+    );
+    println!(
+        "It is now live: the config-load gate promotes it into the `/connections` registry. \
+         Recorded a `connections.granted` audit event."
+    );
+    Ok(())
 }
 
 fn init_tracing(log_format: &str) {
@@ -1186,8 +1391,10 @@ async fn build_hot_components(
 /// store (the repos declared `writable: true`, carried in `_writableRepos`).
 /// Reads keep flowing through the merged config store; this is purely the
 /// governed write sink. The provenance gate is seeded with the operator's
-/// top-level `connections:` names — an authored definition may reference those
-/// but never introduce a raw command of its own.
+/// top-level `connections:` names (host-declared + explicitly
+/// `grant_connections:`-granted pack connections; ungranted pack declarations
+/// never reach `/connections` — SPEC §9.5) — an authored definition may
+/// reference those but never introduce a raw command of its own.
 ///
 /// Fail-loud (no silent no-op) when the flag is on but no writable repo is
 /// declared: that's a misconfiguration the operator must see at startup.
@@ -1226,6 +1433,12 @@ fn maybe_enable_authoring(
     }
 
     let store = praxec_core::store::RepoDefinitionStore::from_repos(roots, audit.clone())?;
+    // SPEC §9.5 — this seed is the authoring trust anchor, and it is safe to
+    // take every `/connections` key ONLY because the merge-time grant gate
+    // (`gate_repo_connections` in praxec-core) has already diverted every
+    // pack-declared connection the operator did not `grant_connections:` into
+    // `/praxec/_ungrantedConnections`. What remains here is exactly
+    // host-declared + operator-granted — never an ungranted pack connection.
     let allowed_connections: Vec<String> = config
         .pointer("/connections")
         .and_then(Value::as_object)
@@ -1509,28 +1722,12 @@ fn observe(config_path: PathBuf) -> anyhow::Result<()> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("missing /audit/path in config"))?;
 
-    let today = chrono::Utc::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
-    let file_name = format!("{today}-audit.log");
-    let file_path = std::path::PathBuf::from(audit_path).join(&file_name);
-
-    let mut records: Vec<Value> = Vec::new();
-    if file_path.exists() {
-        let content = std::fs::read_to_string(&file_path)
-            .with_context(|| format!("reading audit file {}", file_path.display()))?;
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            match serde_json::from_str::<Value>(trimmed) {
-                Ok(v) => records.push(v),
-                Err(_) => continue, // skip unparseable lines leniently
-            }
-        }
-    }
+    // Merge EVERY rotated / per-writer `*.log` file in the audit dir, not just
+    // today's `{today}-audit.log`. Rotation and the per-writer `{pid}`
+    // filename component both mean the telemetry an operator wants is spread
+    // across many files; reading one hardcoded name silently dropped the rest.
+    // Governance read → the `agent.heartbeat` pulse stream is excluded.
+    let records = read_audit_records(std::path::Path::new(audit_path))?;
 
     let report = aggregate_calls(&records);
 
@@ -1589,6 +1786,44 @@ fn observe(config_path: PathBuf) -> anyhow::Result<()> {
     println!("\n---\n{}", serde_json::to_string(&summary)?);
 
     Ok(())
+}
+
+/// Read and merge every `*.log` audit file in `dir` into a flat `Vec<Value>`,
+/// EXCLUDING the `agent.heartbeat` pulse stream (`*-heartbeat.log`) — a
+/// governance read. Unparseable lines are skipped leniently (an unparseable
+/// line is an observability gap, not a hard failure for a read-only report). A
+/// missing directory yields an empty vec.
+fn read_audit_records(dir: &std::path::Path) -> anyhow::Result<Vec<Value>> {
+    let mut paths: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("log"))
+            .filter(|p| !praxec_core::audit::is_heartbeat_log(p))
+            .collect(),
+        // A not-yet-created audit dir is "no events", not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading audit directory {}", dir.display()));
+        }
+    };
+    paths.sort();
+
+    let mut records: Vec<Value> = Vec::new();
+    for path in paths {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading audit file {}", path.display()))?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+                records.push(v);
+            }
+        }
+    }
+    Ok(records)
 }
 
 // ── Pure helper: aggregate audit records ─────────────────────────────────
@@ -2532,7 +2767,8 @@ fn approvals_tail(config_path: &PathBuf) -> anyhow::Result<()> {
         std::collections::HashMap::new();
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
-        tail_dir_once(audit_dir, &mut file_offsets, |event| {
+        // Governance read → exclude the heartbeat pulse stream.
+        tail_dir_once(audit_dir, &mut file_offsets, true, |event| {
             if event.get("event_type").and_then(Value::as_str) == Some("human.approval.requested") {
                 let id = event.get("id").and_then(Value::as_str).unwrap_or("?");
                 let queue = event
@@ -2578,15 +2814,90 @@ fn with_imports(mut config: Value, imported: &CapabilityRegistry) -> Value {
     Value::Object(root.clone())
 }
 
-/// Poll a directory of rotated log files for new lines. Tracks per-file byte
-/// offsets in `file_offsets` so each call only reads appended bytes. Newly
-/// appearing files (rotation events) are picked up automatically.
+/// L1 observability — stream the execution tree live. Replays the audit dir
+/// (from the start, or `--since`), emitting each event as one structured JSON
+/// line, then polls (~250ms) re-globbing for newly-appended lines and new
+/// per-writer / rotated files. A client reconstructs the full execution tree
+/// from each event's `workflow_id` + `parent_workflow_id` + `depth`.
 ///
-/// `handler` is called once per parsed JSON line; errors on individual lines
-/// are silently skipped to keep the tail running.
+/// Fail-fast for `observe --follow`: the audit sink MUST be `file`. The default
+/// `stderr` sink writes nothing to the audit dir, so a live tail there would
+/// print an empty stream forever (a silent fail-open reading as "no activity").
+/// Extracted as a pure check so the fail-fast is unit-testable without driving
+/// the infinite poll loop. The check itself is shared with the MCP `observe`
+/// query ([`praxec_core::audit::require_file_sink`]) so both surfaces reject a
+/// non-file sink with the same rich message.
+fn require_file_sink_for_follow(config: &Value) -> anyhow::Result<()> {
+    let sink_kind = config
+        .pointer("/audit/sink")
+        .and_then(Value::as_str)
+        .unwrap_or("stderr");
+    praxec_core::audit::require_file_sink(sink_kind, "observe --follow")
+}
+
+fn observe_follow(config_path: &PathBuf, since: Option<&str>) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+
+    require_file_sink_for_follow(&config)?;
+    let audit_dir = config
+        .pointer("/audit/path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!("audit.path is required for observe --follow (audit.sink: file)")
+        })?;
+
+    let since = since.map(parse_since).transpose()?;
+
+    // Emit one compact JSON line per event, honoring the optional `--since`
+    // floor. Shared by the initial replay and the live poll so both apply the
+    // same filter and framing.
+    let emit = |event: &Value| {
+        if let Some(floor) = since {
+            let ts = event
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
+            match ts {
+                Some(t) if t < floor => return,
+                _ => {}
+            }
+        }
+        if let Ok(line) = serde_json::to_string(event) {
+            println!("{line}");
+        }
+    };
+
+    // Replay from offset 0 (seeding per-file offsets to EOF) THEN poll — a
+    // single shared code path via `tail_dir_once`. Governance read → the
+    // `agent.heartbeat` pulse stream is excluded (tree edges live on
+    // `workflow.started`, not heartbeats).
+    let mut file_offsets: std::collections::HashMap<PathBuf, u64> =
+        std::collections::HashMap::new();
+    tail_dir_once(audit_dir, &mut file_offsets, true, emit);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        tail_dir_once(audit_dir, &mut file_offsets, true, emit);
+    }
+}
+
+/// Poll a directory of rotated / per-writer log files for new lines. Tracks
+/// per-file byte offsets in `file_offsets` so each call only reads appended
+/// bytes. Newly appearing files (rotation events, a fresh per-writer `{pid}`
+/// file) are picked up automatically.
+///
+/// Only NEWLINE-TERMINATED lines are handled: a partial trailing line (a record
+/// mid-append, whose closing `\n` hasn't been written yet) is left unconsumed —
+/// the offset advances only past the last `\n` — so the next poll re-reads it
+/// once complete. This avoids parsing (and dropping) a half-written JSON record.
+///
+/// When `skip_heartbeat` is set, the `agent.heartbeat` pulse stream
+/// (`*-heartbeat.log`) is excluded — a governance read that must not drown in
+/// liveness noise. `handler` is called once per parsed JSON line; unparseable
+/// lines are skipped to keep the tail running.
 fn tail_dir_once(
     dir: &str,
     file_offsets: &mut std::collections::HashMap<PathBuf, u64>,
+    skip_heartbeat: bool,
     mut handler: impl FnMut(&Value),
 ) {
     let entries = match std::fs::read_dir(dir) {
@@ -2597,6 +2908,7 @@ fn tail_dir_once(
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("log"))
+        .filter(|p| !(skip_heartbeat && praxec_core::audit::is_heartbeat_log(p)))
         .collect();
     paths.sort();
 
@@ -2607,20 +2919,32 @@ fn tail_dir_once(
             continue;
         }
         if let Ok(file) = std::fs::File::open(&path) {
-            use std::io::{BufRead, BufReader, Seek, SeekFrom};
+            use std::io::{BufReader, Read, Seek, SeekFrom};
             let mut reader = BufReader::new(file);
-            reader.seek(SeekFrom::Start(*offset)).ok();
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if reader.seek(SeekFrom::Start(*offset)).is_err() {
+                continue;
+            }
+            let mut buf = String::new();
+            if reader.read_to_string(&mut buf).is_err() {
+                // A non-UTF8 read (partial multibyte at the boundary) — leave the
+                // offset put and retry on the next poll once more bytes land.
+                continue;
+            }
+            // Only consume through the LAST newline; hold any partial trailing
+            // line for the next poll (don't advance the offset past it).
+            let consumed = match buf.rfind('\n') {
+                Some(idx) => idx + 1,
+                None => continue, // no complete line yet
+            };
+            for line in buf[..consumed].lines() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
                     if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
                         handler(&event);
                     }
                 }
-                line.clear();
             }
-            *offset = reader.stream_position().unwrap_or(file_len);
+            *offset += consumed as u64;
         }
     }
 }
@@ -2668,7 +2992,9 @@ fn audit_tail(config_path: &PathBuf, filter: &Option<String>) -> anyhow::Result<
     loop {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let filter_ref = filter.as_deref();
-        tail_dir_once(audit_dir, &mut file_offsets, |event| {
+        // A general audit tail — keep the heartbeat stream visible so
+        // `--filter agent.heartbeat` still works.
+        tail_dir_once(audit_dir, &mut file_offsets, false, |event| {
             let event_type = event
                 .get("event_type")
                 .and_then(Value::as_str)
@@ -2692,13 +3018,117 @@ mod tests {
         GatewayOverlays, ack_guards_used, aggregate_calls, build_audit_sink, build_evidence_store,
         build_runtime_for_orchestrate, build_workflow_store, drive_outcome_to_result,
         guard_durable_serve, headless_policy_from, is_ephemeral_path, maybe_enable_authoring,
-        maybe_enable_sandbox, resolve_embedder,
+        maybe_enable_sandbox, require_file_sink_for_follow, resolve_embedder, tail_dir_once,
     };
     use praxec_agents::orchestrator::DriveOutcome;
     use praxec_agents::orchestrator::HeadlessPolicy;
     use praxec_core::sandbox::{BwrapProvider, SandboxProvider};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::sync::Arc;
+
+    // ── L1 observability — observe --follow ────────────────────────────────
+
+    /// (e) — `observe --follow` fails fast when `audit.sink != file`, with a
+    /// rich message naming the `audit.sink: file` requirement. The default
+    /// `stderr` sink would tail an empty dir forever (silent fail-open).
+    #[test]
+    fn observe_follow_rejects_non_file_sink_with_rich_error() {
+        for sink in ["stderr", "memory", "none"] {
+            let cfg = json!({ "audit": { "sink": sink } });
+            let err = require_file_sink_for_follow(&cfg)
+                .expect_err("a non-file sink must fail fast")
+                .to_string();
+            assert!(
+                err.contains("audit.sink: file"),
+                "message names the required sink: {err}"
+            );
+            assert!(
+                err.contains(sink),
+                "message names the offending sink: {err}"
+            );
+            assert!(
+                err.contains("--follow"),
+                "message names the offending mode: {err}"
+            );
+        }
+        // The default (absent sink) is `stderr` → also rejected.
+        assert!(require_file_sink_for_follow(&json!({})).is_err());
+        // `file` is accepted.
+        assert!(require_file_sink_for_follow(&json!({ "audit": { "sink": "file" } })).is_ok());
+    }
+
+    /// (f) — follow-mode reads only newline-terminated appended lines: a
+    /// partial trailing line (record mid-append) is held back until its `\n`
+    /// lands, then delivered exactly once. Exercises the shared `tail_dir_once`
+    /// poll-tailer the follow loop is built on.
+    #[test]
+    fn follow_mode_reads_appended_lines_and_holds_partial_trailing_line() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+        let log = dir.path().join("2026-04-02-1-audit.log");
+
+        let mut offsets = std::collections::HashMap::new();
+
+        // First poll: one complete line + a partial (no trailing newline).
+        std::fs::write(
+            &log,
+            "{\"event_type\":\"workflow.started\",\"depth\":0}\n{\"event_type\":\"parti",
+        )
+        .unwrap();
+        let mut seen: Vec<String> = Vec::new();
+        tail_dir_once(dir_str, &mut offsets, true, |e: &Value| {
+            seen.push(e["event_type"].as_str().unwrap().to_string());
+        });
+        assert_eq!(
+            seen,
+            vec!["workflow.started"],
+            "only the newline-terminated line is delivered; the partial is held"
+        );
+
+        // Complete the partial line + append another — a second poll delivers
+        // the previously-partial line exactly once (not truncated, not dropped).
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        write!(f, "al\"}}\n{{\"event_type\":\"workflow.completed\"}}\n").unwrap();
+        seen.clear();
+        tail_dir_once(dir_str, &mut offsets, true, |e: &Value| {
+            seen.push(e["event_type"].as_str().unwrap().to_string());
+        });
+        assert_eq!(
+            seen,
+            vec!["partial", "workflow.completed"],
+            "the completed partial line is delivered once, then the new line"
+        );
+    }
+
+    /// Governance read → follow-mode (skip_heartbeat=true) excludes the
+    /// `*-heartbeat.log` per-writer pulse stream.
+    #[test]
+    fn follow_mode_excludes_the_heartbeat_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+        std::fs::write(
+            dir.path().join("2026-04-02-1-audit.log"),
+            "{\"event_type\":\"workflow.started\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("2026-04-02-1-heartbeat.log"),
+            "{\"event_type\":\"agent.heartbeat\"}\n",
+        )
+        .unwrap();
+
+        let mut offsets = std::collections::HashMap::new();
+        let mut seen: Vec<String> = Vec::new();
+        tail_dir_once(dir_str, &mut offsets, true, |e: &Value| {
+            seen.push(e["event_type"].as_str().unwrap().to_string());
+        });
+        assert_eq!(
+            seen,
+            vec!["workflow.started"],
+            "heartbeat pulse stream is excluded from the governance follow read"
+        );
+    }
 
     // ── ADR-0009 — the headless `orchestrate` CLI ──────────────────────────
 

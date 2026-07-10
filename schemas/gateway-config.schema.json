@@ -34,6 +34,22 @@
       },
       "default": {}
     },
+    "stagedConnections": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/connection"
+      },
+      "default": {},
+      "description": "SPEC §9.5 — operator-staged, not-yet-granted connections (written by `px connections add`). Same entry shape as `connections:`, but a staged connection is INERT: it is never in the live `/connections` registry until its name is listed in the top-level `grant_connections:`. Ungranted staged entries are diverted to `/praxec/_ungrantedConnections` at load, so a spawn attempt fails typed with the grant remedy — treated identically to a pack-declared, ungranted connection."
+    },
+    "grant_connections": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "SPEC §9.5 — the names of `stagedConnections:` entries the operator has GRANTED (via `px connections grant <name>`). On load, each granted staged body is promoted into the live `/connections` registry. Granting a name with no staged entry fails at load (STALE_CONNECTION_GRANT). This is the host-level analog of a `repos:` entry's `grant_connections:`."
+    },
     "proxy": {
       "$ref": "#/$defs/proxyConfig"
     },
@@ -102,6 +118,14 @@
           "path": {
             "type": "string",
             "description": "Directory containing a `praxec.repo.yaml` manifest. Accepts absolute, relative (resolved against the host config's directory), or `~/`-prefixed paths."
+          },
+          "grant_connections": {
+            "type": "array",
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "description": "SPEC §9.5 — operator grant for this repo's declared connections. A pack may DECLARE `connections:`, but a declared connection only goes live when its name (bare pack-local, or fully-qualified `<namespace>/<name>`) is listed here. Ungranted declarations are diverted to `/praxec/_ungrantedConnections` and are never spawnable. Granting a connection the repo does not declare fails at load (STALE_CONNECTION_GRANT)."
           }
         }
       },
@@ -931,7 +955,8 @@
             "dry_run",
             "structural_analysis",
             "ingest",
-            "diff"
+            "diff",
+            "tool_source"
           ]
         },
         "connection": {

@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use praxec_core::audit::{AuditEvent, AuditSink};
 use praxec_core::error::{ErrorClass, ExecutorError};
 use praxec_core::model::ParkedAgentSession;
 use praxec_core::ports::ParkedSessionStore;
@@ -32,7 +33,7 @@ use serde_json::{Value, json};
 
 use crate::session::{
     AgentResult, AgentRunOutcome, AgentRunReport, AgentSession, AgentSessionRunner, AgentStatus,
-    AgentSuspension,
+    AgentSuspension, RunIdentity,
 };
 pub use crate::tool_budget::{MAX_TOOL_RESULT_BYTES, ToolHost, tool_definition_from};
 pub(crate) use crate::tool_budget::{enforce_history_budget, is_transient};
@@ -66,6 +67,67 @@ pub const DEFAULT_MAX_TURNS: u32 = 24;
 pub const DEFAULT_MAX_HISTORY_BYTES: usize = 1024 * 1024;
 
 pub const TOOL_SETUP_TIMEOUT: Duration = Duration::from_secs(60); // Bounding tool setup to prevent hung server stalls
+
+/// The audit `event_type` of the in-run liveness pulse — see [`HeartbeatEmitter`].
+pub const AGENT_HEARTBEAT_EVENT: &str = "agent.heartbeat";
+
+/// How often a long in-flight model call pulses a within-turn
+/// [`AGENT_HEARTBEAT_EVENT`] while the stream is silent, so an operator tailing
+/// the audit log can tell "waiting on a slow reasoning model" (pulses) from
+/// "hung" (silence) BEFORE the stall watchdog fires. Also bounds heartbeat
+/// volume: a turn emits at most one pulse per interval, never per-token.
+// TODO: surface in config
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Periodic, externally-observable liveness pulse for a governed agent run.
+///
+/// From OUTSIDE a headless drive, "waiting on a slow reasoning-model call"
+/// (benign, 0 CPU) and "hung" (also 0 CPU) look identical when the audit
+/// stream only carries the run's boundaries (`agent.invoked` /
+/// `agent.completed`). This emitter closes that gap with `agent.heartbeat`
+/// events on the SAME audit sink: one at every tool-loop turn boundary
+/// (`phase: "turn"`), plus one every [`HEARTBEAT_INTERVAL`] while a single
+/// long model call is in flight (`phase: "waiting_on_model"`). Emit-only —
+/// a sink failure never affects the run.
+pub(crate) struct HeartbeatEmitter {
+    sink: Arc<dyn AuditSink>,
+    identity: RunIdentity,
+    model: String,
+    /// tokio's `Instant` (not std's) so paused-clock tests advance it.
+    run_started: tokio::time::Instant,
+}
+
+impl HeartbeatEmitter {
+    fn new(sink: Arc<dyn AuditSink>, session: &AgentSession) -> Self {
+        Self {
+            sink,
+            identity: session.identity.clone(),
+            model: session.model.clone(),
+            run_started: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Record one `agent.heartbeat`. Infallible by design: the heartbeat is
+    /// pure observability, so a sink error is dropped rather than failing (or
+    /// retrying inside) the run it narrates.
+    async fn emit(&self, turn: u32, phase: &str, seconds_since_last_output: u64) {
+        let mut event = AuditEvent::new(AGENT_HEARTBEAT_EVENT).with_payload(json!({
+            "turn": turn,
+            "phase": phase,
+            "model": self.model,
+            "elapsed_ms": self.run_started.elapsed().as_millis() as u64,
+            "seconds_since_last_output": seconds_since_last_output,
+            "transition": self.identity.transition,
+        }));
+        if let Some(w) = &self.identity.workflow_id {
+            event = event.with_workflow(w.clone());
+        }
+        if let Some(c) = &self.identity.correlation_id {
+            event = event.with_correlation(c.clone());
+        }
+        let _ = self.sink.record(event).await;
+    }
+}
 
 /// The completion protocol the runner ALWAYS injects into the system message.
 ///
@@ -264,6 +326,11 @@ pub struct RigSessionRunner {
     /// the await capability entirely (an `await_enabled` session then fails
     /// fast — never a suspend whose conversation can't survive a power cycle).
     pub(crate) parked_store: Option<Arc<dyn ParkedSessionStore>>,
+    /// The gateway audit sink the in-run [`HeartbeatEmitter`] records to —
+    /// the SAME sink `agent.invoked`/`agent.completed` land in, so an operator
+    /// tails one log. `None` (the default) emits no heartbeats; every other
+    /// behavior is unchanged.
+    pub(crate) audit: Option<Arc<dyn AuditSink>>,
 }
 
 /// One drained turn's salient content.
@@ -321,6 +388,10 @@ struct LoopEnv<'a> {
     reasoning: &'a Option<Value>,
     system_message: &'a str,
     spill: &'a crate::spill::InMemorySpillStore,
+    /// The run's liveness pulse (`None` when no audit sink is wired) —
+    /// emit-only, threaded so both the per-turn boundary and the within-turn
+    /// watchdog tick pulse through one emitter.
+    heartbeat: &'a Option<HeartbeatEmitter>,
 }
 
 /// How one pass of the tool loop ended (before the runner maps it onto
@@ -568,6 +639,13 @@ impl RigSessionRunner {
         // remains the ultimate termination guarantee.
         let mut stalled_no_progress = false;
         for _turn in start_turn..self.max_turns {
+            // Observability: the per-turn liveness pulse. Every turn boundary
+            // lands one `agent.heartbeat` in the audit stream, so an operator
+            // tailing the log sees turn-by-turn progress instead of silence
+            // between `agent.invoked` and `agent.completed`. Emit-only.
+            if let Some(hb) = env.heartbeat {
+                hb.emit(_turn, "turn", 0).await;
+            }
             // LoopGuard: bound the cumulative history BEFORE it is re-sent, so
             // a long tool-using loop can never assemble an over-context-window
             // request (the 2.77M-token failure mode). Elides oldest turn-pairs.
@@ -634,6 +712,8 @@ impl RigSessionRunner {
                     &env.session.model,
                     turn.clone(),
                     env.session.stall_timeout,
+                    env.heartbeat.as_ref(),
+                    _turn,
                 )
                 .await
                 {
@@ -888,6 +968,13 @@ impl RigSessionRunner {
         // tool result and the agent re-runs the tool. The conversation itself
         // (rig messages) is byte-faithful.
         let spill = crate::spill::InMemorySpillStore::new();
+        // The resumed segment gets its own heartbeat clock (`elapsed_ms`
+        // restarts) — mirroring the report scope: each segment is separately
+        // auditable, and the parked wall time (days, maybe) is not "elapsed".
+        let heartbeat = self
+            .audit
+            .as_ref()
+            .map(|sink| HeartbeatEmitter::new(sink.clone(), &session));
 
         let mut history = parked.history;
         let mut ledger = parked.ledger;
@@ -909,6 +996,7 @@ impl RigSessionRunner {
             reasoning: &reasoning,
             system_message: &system_message,
             spill: &spill,
+            heartbeat: &heartbeat,
         };
         let loop_fut = self.drive_loop(
             &env,
@@ -1004,6 +1092,12 @@ impl AgentSessionRunner for RigSessionRunner {
         // turn (see COMPLETION_PROTOCOL) — the structural fix for AGENT_NO_RESULT.
         let system_message = compose_system_message(&session.system_prompt);
 
+        // The run's liveness pulse — only when an audit sink is wired.
+        let heartbeat = self
+            .audit
+            .as_ref()
+            .map(|sink| HeartbeatEmitter::new(sink.clone(), &session));
+
         let env = LoopEnv {
             session: &session,
             base_tools: &base_tools,
@@ -1011,6 +1105,7 @@ impl AgentSessionRunner for RigSessionRunner {
             reasoning: &reasoning,
             system_message: &system_message,
             spill: &spill,
+            heartbeat: &heartbeat,
         };
         let loop_fut = self.drive_loop(
             &env,
@@ -1061,11 +1156,21 @@ impl AgentSessionRunner for RigSessionRunner {
 
 /// Drain one streamed turn: accumulate text, capture tool calls, and parse a
 /// `final_answer` envelope if present.
+///
+/// `heartbeat`/`turn_index`: the run's liveness pulse. While the stream is
+/// silent, the stall watchdog's wait is chunked into [`HEARTBEAT_INTERVAL`]
+/// ticks; each expired tick that is still inside the stall window emits one
+/// within-turn `agent.heartbeat` (`phase: "waiting_on_model"`), so a single
+/// slow reasoning call shows a pulse instead of dead air. The stall semantics
+/// are unchanged: total silence ≥ `stall_timeout` still raises the same
+/// `ExecutorError::Timeout`.
 async fn drain_turn(
     factory: &dyn ProviderFactory,
     model: &str,
     turn: TurnRequest,
     stall_timeout: Duration,
+    heartbeat: Option<&HeartbeatEmitter>,
+    turn_index: u32,
 ) -> Result<TurnResult, ExecutorError> {
     let mut stream = factory
         .stream(model, turn)
@@ -1081,19 +1186,44 @@ async fn drain_turn(
     // the window — so a streaming-but-slow model runs unbounded while a model
     // that hangs at first token is caught in `stall_timeout` and surfaces as a
     // Timeout the chain-walk escalates (rather than burning the full session
-    // budget on dead air). `None` from the timeout = the stream went silent.
-    loop {
-        let item = match tokio::time::timeout(stall_timeout, stream.next()).await {
-            Ok(Some(item)) => item,
-            Ok(None) => break, // stream ended normally
-            Err(_) => {
+    // budget on dead air). `None` from the inner wait = the stream went silent
+    // past the whole window. tokio's `Instant` (not std's) so paused-clock
+    // tests advance it with the timers.
+    let mut last_event = tokio::time::Instant::now();
+    'drain: loop {
+        // Wait for the next stream event in HEARTBEAT_INTERVAL-bounded ticks
+        // (never past the remaining stall window). An expired tick is NOT a
+        // stall yet — it pulses the heartbeat and keeps waiting; only total
+        // silence ≥ `stall_timeout` escalates.
+        let item = 'wait: loop {
+            let silent = last_event.elapsed();
+            let remaining = stall_timeout.saturating_sub(silent);
+            if remaining.is_zero() {
                 local_transcript.push_str(&format!(
                     "\n[stalled] no stream event for {}s — escalating\n",
                     stall_timeout.as_secs()
                 ));
                 return Err(ExecutorError::Timeout(stall_timeout.as_secs()));
             }
+            match tokio::time::timeout(remaining.min(HEARTBEAT_INTERVAL), stream.next()).await {
+                Ok(Some(item)) => break 'wait item,
+                Ok(None) => break 'drain, // stream ended normally
+                Err(_) => {
+                    // Tick expired, still inside the stall window: pulse (the
+                    // 0-CPU "waiting on a slow model" case an observer could
+                    // not previously distinguish from a hang), then re-check.
+                    let silent = last_event.elapsed();
+                    if silent < stall_timeout {
+                        if let Some(hb) = heartbeat {
+                            hb.emit(turn_index, "waiting_on_model", silent.as_secs())
+                                .await;
+                        }
+                    }
+                    continue 'wait;
+                }
+            }
         };
+        last_event = tokio::time::Instant::now();
         match item {
             Ok(StreamEvent::Text { chunk }) => {
                 local_transcript.push_str(&chunk);

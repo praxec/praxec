@@ -2859,7 +2859,10 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     let (repos, overrides) = take_repos_and_overrides(&mut host)?;
     if repos.is_empty() {
         // No repos declared — strip an empty `overrides:` (it's meaningless
-        // without any repo-provided ids to shadow) and return unchanged.
+        // without any repo-provided ids to shadow). Host-level staged
+        // connections (`px connections add` / `grant`) still get the grant gate.
+        let staged_ungranted = apply_staged_connection_grants(&mut host)?;
+        stamp_ungranted_connections(&mut host, staged_ungranted);
         return Ok(host);
     }
 
@@ -2873,12 +2876,17 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     // Spec A §5 — namespace → priority, carried into the merged config for
     // `hop_slot:` cap-resolution tie-breaking (see `stamp_repo_priority`).
     let mut repo_priorities: Vec<(String, i64)> = Vec::new();
+    // SPEC §9.5 — pack-declared connections the operator has NOT granted,
+    // diverted out of the live registry and stamped as self-documenting
+    // diagnostic state (see `stamp_ungranted_connections`).
+    let mut ungranted_connections: Vec<UngrantedConnection> = Vec::new();
 
     for RepoDecl {
         source,
         writable,
         push,
         priority,
+        grant_connections,
     } in repos
     {
         // Resolve to a local path: a local dir relative to the host config (same
@@ -2902,7 +2910,7 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
                     .with_context(|| format!("importing repo {uri}"))?
             }
         };
-        let (manifest, repo_value) = crate::repo::load_repo(&repo_path)
+        let (manifest, mut repo_value) = crate::repo::load_repo(&repo_path)
             .with_context(|| format!("loading repo at {}", repo_path.display()))?;
         if writable {
             writable_repo_roots.push((repo_path.display().to_string(), push));
@@ -2920,9 +2928,23 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
             );
         }
         repo_priorities.push((manifest.namespace.clone(), priority));
+        // Collect ids BEFORE the grant gate strips ungranted connections, so
+        // a host definition colliding with an ungranted pack connection still
+        // trips V23 (the operator must acknowledge the shadowing either way).
         for id in crate::repo::aggregate_ids(&repo_value) {
             repo_provided_ids.insert(id);
         }
+        // SPEC §9.5 — connection GRANT GATE. A pack DECLARES connections; only
+        // the OPERATOR activates them (the `human:intent` trust factor). Any
+        // connection this repo contributed that is not listed in the host's
+        // `grant_connections:` is diverted out of the live `/connections`
+        // registry here, before the merge — so it can never be spawned and
+        // never seeds the authoring provenance gate.
+        ungranted_connections.extend(gate_repo_connections(
+            &mut repo_value,
+            &manifest,
+            &grant_connections,
+        )?);
         repo_aggregate = deep_merge(repo_aggregate, repo_value);
     }
 
@@ -2971,7 +2993,241 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
 
     // Spec A §5 — carry namespace priorities forward for `hop_slot:` resolution.
     stamp_repo_priority(&mut merged, repo_priorities);
+
+    // SPEC §9.5 — surface ungranted pack connections as live, self-documenting
+    // DEGRADED state (the #23 pattern): each entry carries the exact YAML
+    // remedy. Keys the host itself (re)declares are skipped — the operator's
+    // own definition is live under that key (implicit grant by authorship),
+    // gated by the explicit `overrides:` acknowledgment above.
+    ungranted_connections.retain(|u| !host_ids.contains(&u.key));
+    // SPEC §9.5 — host-level staged connections (`px connections add` / `grant`):
+    // promote granted staged bodies into the live `/connections` registry and
+    // divert ungranted ones to `_ungrantedConnections` — the same mechanism as
+    // repo-declared connections. Applied after the repo merge so a staged name
+    // colliding with a repo-provided live connection is caught.
+    let staged_ungranted = apply_staged_connection_grants(&mut merged)?;
+    ungranted_connections.extend(staged_ungranted);
+    stamp_ungranted_connections(&mut merged, ungranted_connections);
     Ok(merged)
+}
+
+/// SPEC §9.5 — apply the host-level staged-connection grant gate (`px connections
+/// add` / `grant`). This is the operator-authored analog of
+/// [`gate_repo_connections`]: `add` writes a body under top-level
+/// `stagedConnections:` (never live), and `grant` lists its name under top-level
+/// `grant_connections:`. Here, for each staged entry:
+///   - GRANTED (name in `grant_connections:`) → the body is promoted into the
+///     live `/connections` registry (fail-fast on a collision with an existing
+///     live connection — never a silent overwrite);
+///   - UNGRANTED → returned as an [`UngrantedConnection`] for stamping into
+///     `/praxec/_ungrantedConnections`, so a spawn attempt fails typed with the
+///     grant remedy exactly like a pack-declared ungranted connection.
+///
+/// Both `stagedConnections:` and top-level `grant_connections:` are stripped from
+/// the resolved config (internal authoring state, not live registry keys). A
+/// grant naming no staged connection is a hard error (`STALE_CONNECTION_GRANT`,
+/// mirroring the repo path). A config with neither key round-trips unchanged.
+fn apply_staged_connection_grants(config: &mut Value) -> anyhow::Result<Vec<UngrantedConnection>> {
+    let Some(obj) = config.as_object_mut() else {
+        return Ok(Vec::new());
+    };
+    let staged = match obj.remove("stagedConnections") {
+        Some(Value::Object(m)) => m,
+        None | Some(Value::Null) => {
+            // No staged connections — a lone `grant_connections:` grants nothing.
+            if let Some(g) = obj.remove("grant_connections") {
+                if g.as_array().is_some_and(|a| !a.is_empty()) {
+                    bail!(
+                        "STALE_CONNECTION_GRANT: top-level `grant_connections:` lists names, but \
+                         there is no `stagedConnections:` block. Add a connection with \
+                         `px connections add <name> --kind <kind> ...` first (SPEC §9.5)."
+                    );
+                }
+            }
+            return Ok(Vec::new());
+        }
+        Some(_) => bail!(
+            "INVALID_STAGED_CONNECTIONS: top-level `stagedConnections:` must be a mapping of \
+             name → connection body (SPEC §9.5)."
+        ),
+    };
+    let grants: HashSet<String> = match obj.remove("grant_connections") {
+        Some(Value::Array(a)) => a
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        None | Some(Value::Null) => HashSet::new(),
+        Some(_) => bail!(
+            "INVALID_GRANT_CONNECTIONS: top-level `grant_connections:` must be an array of \
+             staged connection names (SPEC §9.5)."
+        ),
+    };
+    // A grant naming a connection that is not staged is stale (mirrors the repo
+    // `STALE_CONNECTION_GRANT`): the operator's mental model has drifted.
+    for g in &grants {
+        if !staged.contains_key(g) {
+            bail!(
+                "STALE_CONNECTION_GRANT: top-level `grant_connections:` lists '{g}', but no \
+                 `stagedConnections:` entry declares it. Add it with \
+                 `px connections add {g} --kind <kind> ...` or remove the grant (SPEC §9.5)."
+            );
+        }
+    }
+    let mut ungranted = Vec::new();
+    for (name, body) in staged {
+        if grants.contains(&name) {
+            let connections = obj
+                .entry("connections")
+                .or_insert_with(|| Value::Object(Map::new()));
+            let cm = connections.as_object_mut().ok_or_else(|| {
+                anyhow::anyhow!("INVALID_CONNECTIONS: `connections:` must be a mapping")
+            })?;
+            if cm.contains_key(&name) {
+                bail!(
+                    "DUPLICATE_CONNECTION: granting staged connection '{name}' collides with an \
+                     existing live `connections:` entry of the same name. Rename or remove one \
+                     (SPEC §9.5)."
+                );
+            }
+            cm.insert(name, body);
+        } else {
+            ungranted.push(UngrantedConnection {
+                key: name.clone(),
+                bare: name,
+                repo: "host config (px connections add)".to_string(),
+                namespace: String::new(),
+            });
+        }
+    }
+    Ok(ungranted)
+}
+
+/// SPEC §9.5 — one pack-declared connection the operator has not granted.
+/// Carried from the grant gate to [`stamp_ungranted_connections`].
+struct UngrantedConnection {
+    /// Fully-qualified live-registry key the connection would occupy
+    /// (`<namespace>/<name>`).
+    key: String,
+    /// Bare pack-local name — what the operator writes in `grant_connections:`.
+    bare: String,
+    /// Manifest `name` of the declaring repo.
+    repo: String,
+    /// Manifest `namespace` of the declaring repo.
+    namespace: String,
+}
+
+/// SPEC §9.5 — apply the connection grant gate to one loaded repo aggregate.
+///
+/// Every connection key this repo contributed is admitted into the live
+/// `/connections` ONLY when the host's `grant_connections:` for this repo
+/// lists it (bare pack-local name or fully-qualified `<namespace>/<name>`).
+/// Ungranted keys are REMOVED from the aggregate (never merged live) and
+/// returned for diagnostic stamping — not silently dropped.
+///
+/// A grant naming a connection this repo does not declare is a hard error
+/// (`STALE_CONNECTION_GRANT`, mirroring `STALE_OVERRIDE`): a grant that grants
+/// nothing means the operator's mental model and the pack have drifted.
+fn gate_repo_connections(
+    repo_value: &mut Value,
+    manifest: &crate::repo::RepoManifest,
+    grants: &[String],
+) -> anyhow::Result<Vec<UngrantedConnection>> {
+    let conn_keys: Vec<String> = repo_value
+        .pointer("/connections")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    let ns_prefix = format!("{}/", manifest.namespace);
+    for grant in grants {
+        let matches = conn_keys
+            .iter()
+            .any(|k| k == grant || k.strip_prefix(&ns_prefix) == Some(grant.as_str()));
+        if !matches {
+            bail!(
+                "STALE_CONNECTION_GRANT: the `repos:` entry for '{}' lists '{}' in \
+                 `grant_connections`, but that repo declares no such connection \
+                 (declared: {:?}). Remove the grant or correct the name (SPEC §9.5).",
+                manifest.name,
+                grant,
+                conn_keys
+            );
+        }
+    }
+    if conn_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ungranted = Vec::new();
+    let block = repo_value
+        .pointer_mut("/connections")
+        .and_then(Value::as_object_mut)
+        .expect("conn_keys non-empty implies /connections object");
+    for key in conn_keys {
+        let bare = key
+            .strip_prefix(&ns_prefix)
+            .unwrap_or(key.as_str())
+            .to_string();
+        let granted = grants.iter().any(|g| *g == key || *g == bare);
+        if !granted {
+            block.remove(&key);
+            ungranted.push(UngrantedConnection {
+                key,
+                bare,
+                repo: manifest.name.clone(),
+                namespace: manifest.namespace.clone(),
+            });
+        }
+    }
+    if block.is_empty() {
+        if let Some(obj) = repo_value.as_object_mut() {
+            obj.remove("connections");
+        }
+    }
+    Ok(ungranted)
+}
+
+/// SPEC §9.5 — record pack-declared-but-ungranted connections under
+/// `/praxec/_ungrantedConnections` (internal resolved-config metadata, not an
+/// operator-authored key — mirrors [`stamp_writable_repos`]/`_writableRepos`).
+/// Keyed by the fully-qualified connection key the pack's workflows reference;
+/// each entry names the declaring repo and carries the exact YAML remedy. The
+/// executors read this to turn a spawn attempt into a typed
+/// `UNGRANTED_PACK_CONNECTION` failure instead of a bare not-found. No-op when
+/// empty.
+fn stamp_ungranted_connections(config: &mut Value, entries: Vec<UngrantedConnection>) {
+    if entries.is_empty() {
+        return;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let praxec = obj
+        .entry("praxec")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(fg) = praxec.as_object_mut() {
+        let mut map = Map::new();
+        for u in entries {
+            // Host-staged connections (empty namespace) carry the `px connections
+            // grant` remedy; pack-declared ones carry the per-repo grant remedy.
+            let remedy = if u.namespace.is_empty() {
+                format!(
+                    "run `px connections grant {0}` (or add `{0}` to the top-level \
+                     `grant_connections:`) to activate this operator-staged connection",
+                    u.bare
+                )
+            } else {
+                format!(
+                    "add `grant_connections: [{}]` to the `repos:` entry for {} to activate \
+                     this connection",
+                    u.bare, u.repo
+                )
+            };
+            map.insert(
+                u.key,
+                json!({ "repo": u.repo, "namespace": u.namespace, "remedy": remedy }),
+            );
+        }
+        fg.insert("_ungrantedConnections".into(), Value::Object(map));
+    }
 }
 
 /// Spec A §5 — record declared repos' `namespace → priority` under
@@ -3037,6 +3293,15 @@ struct RepoDecl {
     /// (`HOP_SLOT_AMBIGUOUS`). Default `0`. Carried into the merged config as a
     /// `namespace → priority` map (see [`stamp_repo_priority`]).
     priority: i64,
+    /// SPEC §9.5 — operator grant for pack-contributed connections. A layered
+    /// repo may DECLARE `connections:`, but a declared connection only goes
+    /// live when the OPERATOR lists its name here (bare pack-local name or the
+    /// fully-qualified `<namespace>/<name>` form). The grant lives ONLY in the
+    /// host config — a pack can never grant itself. Ungranted declarations are
+    /// diverted to `/praxec/_ungrantedConnections` (see
+    /// [`gate_repo_connections`] / [`stamp_ungranted_connections`]). Default
+    /// empty: no pack connection is ever live without an explicit grant.
+    grant_connections: Vec<String>,
 }
 
 /// Where a declared repo comes from.
@@ -3129,6 +3394,31 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
             )
         })?,
     };
+    // SPEC §9.5 — optional `grant_connections:` (default empty), the operator's
+    // explicit activation of this repo's declared connections.
+    let grant_connections: Vec<String> = match entry.get("grant_connections") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .map(|v| match v {
+                Value::String(s) if !s.is_empty() => Ok(s.clone()),
+                Value::String(_) => bail!(
+                    "INVALID_REPO_ENTRY: `repos[{index}].grant_connections` entries MUST be \
+                     non-empty connection names"
+                ),
+                other => bail!(
+                    "INVALID_REPO_ENTRY: `repos[{index}].grant_connections` entries MUST be \
+                     strings ({})",
+                    short_value_kind(other)
+                ),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?,
+        Some(other) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}].grant_connections` must be an array of \
+             connection names ({})",
+            short_value_kind(other)
+        ),
+    };
     // SPEC §9 — a repo is either local (`path`) or remote (`uri`, imported via
     // git). Exactly one; a remote repo may pin a `ref` (default `main`).
     let path = entry.get("path").and_then(Value::as_str);
@@ -3161,6 +3451,7 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
         writable,
         push,
         priority,
+        grant_connections,
     })
 }
 
