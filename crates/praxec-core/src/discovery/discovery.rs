@@ -389,6 +389,15 @@ pub struct DiscoveryLink {
 pub struct SearchHit {
     pub score: f32,
     pub item: DiscoveryItem,
+    /// Workflow hits only: the intent-index track record for this template
+    /// within its declared task-class (`{runs, success_rate, mean_cost_usd}`),
+    /// attached by [`crate::intent_index::annotate_hits_with_evidence`] so a
+    /// caller picks by evidence, not blind. Omitted when the sample is thinner
+    /// than the tuning `intent.min_runs` gate, when no audit history is
+    /// readable, or for non-workflow / unclassified hits — missing evidence is
+    /// the normal state of a fresh system, never an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<crate::intent_index::IntentEvidence>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -533,6 +542,7 @@ impl DiscoveryIndex for InMemoryDiscoveryIndex {
                     Some(SearchHit {
                         score: if want_all { 1.0 } else { score },
                         item: d.clone(),
+                        evidence: None,
                     })
                 } else {
                     None
@@ -706,6 +716,7 @@ impl DiscoveryIndex for SemanticDiscoveryIndex {
                     Some(SearchHit {
                         score,
                         item: self.items[i].clone(),
+                        evidence: None,
                     })
                 } else {
                     None

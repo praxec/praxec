@@ -72,7 +72,7 @@ impl PraxecServer {
         };
         let limit = parsed.limit as usize;
 
-        let hits = self
+        let mut hits = self
             .discovery
             .search(SearchRequest {
                 query: query.clone(),
@@ -80,6 +80,12 @@ impl PraxecServer {
                 limit,
             })
             .await?;
+
+        // Evidence loop, last hop — annotate workflow hits with the intent
+        // index's historical track record so the caller chooses by evidence,
+        // not blind. Never fails the search: missing/thin evidence is the
+        // normal state (fresh system, non-file sink), silently omitted.
+        self.attach_intent_evidence(&mut hits).await;
 
         Ok(json!({
             "query": query,
@@ -89,6 +95,51 @@ impl PraxecServer {
                 { "rel": "home", "method": "praxec.query", "args": {} }
             ]
         }))
+    }
+
+    /// Attach per-`(task_class, template)` intent evidence to workflow search
+    /// hits. Reuses the exact read + aggregate path of `praxec intent report`:
+    /// [`AuditSink::try_list_events`] over the runtime's sink →
+    /// [`observations_from_audit`] → [`aggregate`], gated by the tuning
+    /// `intent.min_runs` threshold (the same "trust the rate" bar the report
+    /// flags thin samples with).
+    ///
+    /// Graceful degrade by design — evidence is an annotation, never a
+    /// precondition: a non-file sink (no stored events), an empty audit dir,
+    /// or even a genuine read error all leave the hits unannotated and the
+    /// search successful. A read error is logged (it IS a defect signal) but
+    /// must not turn a working search into a failure.
+    ///
+    /// [`AuditSink::try_list_events`]: praxec_core::audit::AuditSink::try_list_events
+    /// [`observations_from_audit`]: praxec_core::intent_index::observations_from_audit
+    /// [`aggregate`]: praxec_core::intent_index::aggregate
+    async fn attach_intent_evidence(&self, hits: &mut [praxec_core::discovery::SearchHit]) {
+        use praxec_core::intent_index::{
+            IntentParams, aggregate, annotate_hits_with_evidence, observations_from_audit,
+        };
+        // Only pay the audit read when a hit could carry evidence at all.
+        if !hits
+            .iter()
+            .any(|h| h.item.kind == DiscoveryKind::Workflow && h.item.task_class().is_some())
+        {
+            return;
+        }
+        let events = match self.runtime.audit().try_list_events().await {
+            Ok(Some(events)) if !events.is_empty() => events,
+            // Non-file sink (events not stored) or no history yet — the
+            // normal fresh-system state; evidence is simply absent.
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "intent-evidence audit read failed — returning search hits without evidence"
+                );
+                return;
+            }
+        };
+        let models = praxec_core::model_catalog::model_catalog().models;
+        let stats = aggregate(&observations_from_audit(&events, &models));
+        annotate_hits_with_evidence(hits, &stats, IntentParams::from_tuning().min_runs);
     }
 
     pub(crate) async fn handle_describe(

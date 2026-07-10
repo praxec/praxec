@@ -25,7 +25,7 @@
 use crate::audit::AuditEvent;
 use crate::cost_report::{ReportOptions, build_cost_report};
 use crate::model_catalog::ModelEntry;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -70,6 +70,63 @@ pub struct IntentStats {
     /// Missions with ≥1 declared outcome — the runs that count as success
     /// evidence. The selector trusts the rate only once this clears `min_runs`.
     pub evidence_runs: usize,
+}
+
+/// The evidence summary surfaced on a *workflow* search hit — the last hop of
+/// the evidence loop: a model picking a template sees its historical track
+/// record for the declared task-class instead of choosing blind. This is
+/// evidence only, NOT a selection policy (that's the later-phase selector);
+/// the caller still chooses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntentEvidence {
+    /// Evidence runs (missions with ≥1 declared outcome) — the denominator of
+    /// `success_rate`. Always ≥ the annotator's `min_runs` gate: thinner
+    /// samples are omitted entirely rather than shown as noise.
+    pub runs: usize,
+    /// `successes / runs` over the evidence runs.
+    pub success_rate: f64,
+    /// Mean realized USD over the pair's priced missions; omitted when none
+    /// were priced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_cost_usd: Option<f64>,
+}
+
+/// Annotate discovery search hits with intent evidence. Only `kind: workflow`
+/// hits carrying a `process:` task-class tag can match (the intent index keys
+/// on `(task_class, template_id)`, and a workflow item's `id` IS the
+/// `outcome.recorded` `template_id`). A pair below `min_runs` evidence runs is
+/// omitted — a thin sample reads as no evidence, never as noise. Pure over the
+/// already-computed [`aggregate`] output; no store access here.
+///
+/// `min_runs` is clamped to ≥1: even under a pathological `min_runs: 0`
+/// tuning override, a pair with zero evidence runs (only vacuously-met
+/// 0-outcome terminals) must never surface a `0%` rate as "evidence".
+pub fn annotate_hits_with_evidence(
+    hits: &mut [crate::discovery::SearchHit],
+    stats: &[IntentStats],
+    min_runs: usize,
+) {
+    let min_runs = min_runs.max(1);
+    for hit in hits {
+        if hit.item.kind != crate::discovery::DiscoveryKind::Workflow {
+            continue;
+        }
+        let Some(task_class) = hit.item.task_class() else {
+            continue;
+        };
+        hit.evidence = stats
+            .iter()
+            .find(|s| {
+                s.task_class == task_class
+                    && s.template_id == hit.item.id
+                    && s.evidence_runs >= min_runs
+            })
+            .map(|s| IntentEvidence {
+                runs: s.evidence_runs,
+                success_rate: s.success_rate,
+                mean_cost_usd: s.mean_cost_usd,
+            });
+    }
 }
 
 /// The decision thresholds — data, not code (from [`tuning`](crate::tuning)).
@@ -452,6 +509,135 @@ mod tests {
             payload.get("task_class").is_none(),
             "unclassified ⇒ no task_class key"
         );
+    }
+
+    fn workflow_hit(id: &str, task_class: Option<&str>) -> crate::discovery::SearchHit {
+        let mut tags = vec!["other".to_string()];
+        if let Some(tc) = task_class {
+            tags.push(format!("{}{tc}", crate::discovery::PROCESS_TAG_PREFIX));
+        }
+        crate::discovery::SearchHit {
+            score: 1.0,
+            item: crate::discovery::DiscoveryItem {
+                id: id.into(),
+                kind: crate::discovery::DiscoveryKind::Workflow,
+                title: id.into(),
+                description: String::new(),
+                tags,
+                examples: vec![],
+                aliases: vec![],
+                text: String::new(),
+                links: vec![],
+                verb: None,
+                body: None,
+                source: None,
+            },
+            evidence: None,
+        }
+    }
+
+    fn stats(template: &str, task_class: &str, evidence_runs: usize) -> IntentStats {
+        IntentStats {
+            task_class: task_class.into(),
+            template_id: template.into(),
+            runs: evidence_runs,
+            successes: evidence_runs,
+            success_rate: 1.0,
+            mean_cost_usd: Some(0.02),
+            evidence_runs,
+        }
+    }
+
+    #[test]
+    fn annotate_attaches_evidence_at_or_above_min_runs() {
+        let mut hits = vec![workflow_hit("flow.x", Some("engineering"))];
+        annotate_hits_with_evidence(&mut hits, &[stats("flow.x", "engineering", 3)], 3);
+        let ev = hits[0].evidence.as_ref().expect("evidence attached");
+        assert_eq!(ev.runs, 3);
+        assert_eq!(ev.success_rate, 1.0);
+        assert_eq!(ev.mean_cost_usd, Some(0.02));
+    }
+
+    #[test]
+    fn annotate_omits_evidence_below_min_runs() {
+        // A thin sample is NO evidence, not noisy evidence.
+        let mut hits = vec![workflow_hit("flow.x", Some("engineering"))];
+        annotate_hits_with_evidence(&mut hits, &[stats("flow.x", "engineering", 2)], 3);
+        assert!(hits[0].evidence.is_none(), "below min_runs ⇒ omitted");
+    }
+
+    #[test]
+    fn annotate_skips_non_workflow_and_unclassified_hits() {
+        let mut hits = vec![
+            workflow_hit("flow.untagged", None),
+            crate::discovery::SearchHit {
+                item: crate::discovery::DiscoveryItem {
+                    kind: crate::discovery::DiscoveryKind::Capability,
+                    ..workflow_hit("flow.x", Some("engineering")).item
+                },
+                ..workflow_hit("flow.x", Some("engineering"))
+            },
+        ];
+        let st = [
+            stats("flow.untagged", "(unclassified)", 10),
+            stats("flow.x", "engineering", 10),
+        ];
+        annotate_hits_with_evidence(&mut hits, &st, 3);
+        assert!(
+            hits[0].evidence.is_none(),
+            "an untagged workflow has no task_class to key evidence on"
+        );
+        assert!(
+            hits[1].evidence.is_none(),
+            "only kind: workflow hits carry template evidence"
+        );
+    }
+
+    #[test]
+    fn annotate_requires_matching_task_class_and_template() {
+        let mut hits = vec![workflow_hit("flow.x", Some("engineering"))];
+        let st = [
+            stats("flow.x", "research", 10),   // same template, other class
+            stats("flow.y", "engineering", 10), // same class, other template
+        ];
+        annotate_hits_with_evidence(&mut hits, &st, 3);
+        assert!(hits[0].evidence.is_none());
+    }
+
+    #[test]
+    fn annotate_never_surfaces_zero_evidence_even_at_min_runs_zero() {
+        // Pathological `min_runs: 0` tuning must not surface a 0-run "0%" —
+        // the clamp keeps zero-evidence pairs invisible.
+        let mut hits = vec![workflow_hit("flow.gamey", Some("engineering"))];
+        let mut st = stats("flow.gamey", "engineering", 0);
+        st.runs = 5; // 5 vacuously-met 0-outcome terminals
+        st.successes = 0;
+        st.success_rate = 0.0;
+        annotate_hits_with_evidence(&mut hits, &[st], 0);
+        assert!(hits[0].evidence.is_none());
+    }
+
+    #[test]
+    fn search_hit_serialization_omits_absent_evidence() {
+        // Old-client compatibility: no `evidence` key at all when unannotated;
+        // an unpriced pair omits `mean_cost_usd` rather than emitting null.
+        let bare = serde_json::to_value(workflow_hit("flow.x", Some("engineering"))).unwrap();
+        assert!(bare.get("evidence").is_none(), "got: {bare}");
+
+        let mut annotated = workflow_hit("flow.x", Some("engineering"));
+        annotated.evidence = Some(IntentEvidence {
+            runs: 4,
+            success_rate: 0.75,
+            mean_cost_usd: None,
+        });
+        let v = serde_json::to_value(&annotated).unwrap();
+        assert_eq!(v["evidence"]["runs"], 4);
+        assert_eq!(v["evidence"]["success_rate"], 0.75);
+        assert!(v["evidence"].get("mean_cost_usd").is_none(), "got: {v}");
+
+        // And the old wire shape (no evidence key) still deserializes.
+        let round: crate::discovery::SearchHit = serde_json::from_value(bare).unwrap();
+        assert!(round.evidence.is_none());
     }
 
     #[test]
