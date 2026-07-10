@@ -745,16 +745,25 @@ impl WorkflowRuntime {
                         // Mirrors the direct-submit suspend path
                         // (runtime_submit.rs::suspend_on_subworkflow).
                         if let Some(suspend) = result.suspend.clone() {
+                            let mut payload = json!({
+                                "transition": transition_name,
+                                "fromState": from_state,
+                                "chainDepth": steps.len(),
+                            });
+                            match &suspend {
+                                crate::model::StepSuspend::Subworkflow(s) => {
+                                    payload["childWorkflowId"] = json!(s.child_workflow_id);
+                                }
+                                crate::model::StepSuspend::AgentAwait(a) => {
+                                    payload["correlationId"] = json!(a.correlation_id);
+                                    payload["prompt"] = json!(a.prompt);
+                                }
+                            }
                             self.record_or_self_event(
                                 instance
                                     .audit_event("chain.suspended")
                                     .with_correlation(correlation_id)
-                                    .with_payload(json!({
-                                        "transition": transition_name,
-                                        "fromState": from_state,
-                                        "chainDepth": steps.len(),
-                                        "childWorkflowId": suspend.child_workflow_id,
-                                    })),
+                                    .with_payload(payload),
                             )
                             .await;
                             return Ok(ChainOutcome::Suspended {
@@ -796,6 +805,12 @@ impl WorkflowRuntime {
                         // child. Guarded by transition identity. Mirrors the
                         // direct-submit advance path in runtime_submit.rs.
                         crate::runtime::runtime_submit::clear_subworkflow_wait_on_advance(
+                            &mut instance.context,
+                            &transition_name,
+                        );
+                        // P12 R1.4 — likewise drop a consumed `_agent_await`
+                        // (a resumed session completed and is now advancing).
+                        crate::runtime::runtime_submit::clear_agent_await_on_advance(
                             &mut instance.context,
                             &transition_name,
                         );

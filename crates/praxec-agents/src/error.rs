@@ -40,12 +40,12 @@ pub enum AgentErrorCode {
     /// A provider stream surfaced an `Error` event (rate-limit/503/auth) —
     /// propagated rather than buried in the transcript (AGENTS-03).
     ProviderError,
-    /// P12 R1.4 — the agent parked on `await_human`; the executor surfaces
-    /// this as a typed signal DISTINCT from every failure class so the
-    /// chain-walk never escalates it to another model (classify:
-    /// ContentOther, not Capability). Carries the `correlation_id` a later
-    /// resume needs. Interim wiring: the runtime-level park/waiting state is
-    /// the remaining await/resume integration.
+    /// P12 R1.4 — the agent parked on `await_human`. The executor now maps a
+    /// suspension to a first-class `ExecuteResult.suspend` (the runtime parks
+    /// the mission `waiting`), so this code no longer rides the executor's
+    /// happy path; it remains reserved/stable for any surface that must name
+    /// the suspended condition as a typed signal (classify: ContentOther,
+    /// never Capability — a suspend must not chain-escalate).
     Suspended,
     /// P12 R1.4 — a session declares `await_enabled` but the runner has no
     /// [`ParkedSessionStore`](praxec_core::ports::ParkedSessionStore) wired;
@@ -55,6 +55,10 @@ pub enum AgentErrorCode {
     /// P12 R1.4 — `resume` was called with a `correlation_id` that has no
     /// parked session (already resumed / never parked / removed).
     UnknownCorrelation,
+    /// P12 R1.4 — the transition is parked on an `_agent_await` marker but the
+    /// re-submit carried no non-empty `arguments.reply`; a resume without the
+    /// human's answer is refused (never a silent duplicate fresh run).
+    AwaitReplyRequired,
     /// P12 R1.4 — a parked session row exists but its payload can't be
     /// reconstituted (bad JSON, missing awaited slot). Typed, never a panic.
     ParkedSessionCorrupt,
@@ -84,6 +88,7 @@ impl AgentErrorCode {
             AgentErrorCode::Suspended => "AGENT_SUSPENDED",
             AgentErrorCode::AwaitUnsupported => "AGENT_AWAIT_UNSUPPORTED",
             AgentErrorCode::UnknownCorrelation => "AGENT_UNKNOWN_CORRELATION",
+            AgentErrorCode::AwaitReplyRequired => "AGENT_AWAIT_REPLY_REQUIRED",
             AgentErrorCode::ParkedSessionCorrupt => "AGENT_PARKED_SESSION_CORRUPT",
             AgentErrorCode::ParkStore => "AGENT_PARK_STORE",
         }

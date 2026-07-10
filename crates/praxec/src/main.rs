@@ -229,8 +229,29 @@ mod agent {
             )));
             let mcp_host: Arc<dyn ToolHost> = Arc::new(McpToolHost { caller });
             let host: Arc<dyn ToolHost> = Arc::new(CompositeToolHost::new(mcp_host));
-            let runner: Arc<dyn AgentSessionRunner> =
-                Arc::new(RigSessionRunner::with_default_provider().with_tool_host(host));
+            let mut rig_runner = RigSessionRunner::with_default_provider().with_tool_host(host);
+            // P12 R1.4 — wire the durable park for agent `await_human`
+            // suspend/resume when the gateway has a durable (sqlite) store:
+            // the same DB file the workflow store uses. Without it the runner
+            // fails fast on any `await_enabled` session (never a suspend whose
+            // conversation can't survive a restart). An open failure is
+            // defense-in-depth only — building the sqlite workflow store from
+            // the same path would already have failed the boot.
+            match praxec::gateway::build_parked_session_store(&ctx.config) {
+                Ok(Some(parked)) => {
+                    tracing::info!("wired sqlite ParkedSessionStore for agent await/resume");
+                    rig_runner = rig_runner.with_parked_store(parked);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "PARKED_STORE_UNAVAILABLE: agent await/resume park store failed to \
+                         open; `await_enabled` agent sessions will fail fast"
+                    );
+                }
+            }
+            let runner: Arc<dyn AgentSessionRunner> = Arc::new(rig_runner);
             let resolver = build_agent_model_resolver(&ctx.config);
             let mut agent_executor = AgentExecutor::new(runner, resolver);
 

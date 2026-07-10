@@ -1046,6 +1046,17 @@ impl AgentSessionRunner for RigSessionRunner {
             completion_tokens: total_usage.completion_tokens,
         })
     }
+
+    /// P12 R1.4 — the trait surface for the inherent durable resume, so
+    /// callers holding `Arc<dyn AgentSessionRunner>` (the agent executor) can
+    /// route a human reply back to the parked frame.
+    async fn resume(
+        &self,
+        correlation_id: &str,
+        reply: &str,
+    ) -> Result<AgentRunReport, ExecutorError> {
+        RigSessionRunner::resume(self, correlation_id, reply).await
+    }
 }
 
 /// Drain one streamed turn: accumulate text, capture tool calls, and parse a

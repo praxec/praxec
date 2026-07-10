@@ -1282,16 +1282,18 @@ async fn resume_injects_the_reply_and_continues_to_final_answer() {
     }
     // The resume turn's input carried the human reply as the awaited tool's
     // result AND the pre-park lookup's realized result (not re-run).
-    let prompts = factory.prompts.lock().unwrap();
-    let resume_prompt = prompts.last().unwrap();
-    assert!(
-        resume_prompt.contains("yes, approved"),
-        "the reply must arrive as the awaited tool result, got: {resume_prompt}"
-    );
-    assert!(
-        resume_prompt.contains("found"),
-        "the parked turn's realized tool result must ride along, got: {resume_prompt}"
-    );
+    {
+        let prompts = factory.prompts.lock().unwrap();
+        let resume_prompt = prompts.last().unwrap();
+        assert!(
+            resume_prompt.contains("yes, approved"),
+            "the reply must arrive as the awaited tool result, got: {resume_prompt}"
+        );
+        assert!(
+            resume_prompt.contains("found"),
+            "the parked turn's realized tool result must ride along, got: {resume_prompt}"
+        );
+    } // prompts guard dropped here — before the .await below (clippy::await_holding_lock)
     assert_eq!(
         host.calls.lock().unwrap().len(),
         1,

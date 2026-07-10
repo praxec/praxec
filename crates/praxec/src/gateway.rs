@@ -9,7 +9,7 @@ pub(crate) use crate::gateway_config::{
 };
 pub use crate::gateway_config::{
     GatewayOverlays, OverlayCtx, build_evidence_store, build_guidance_ack_store,
-    build_script_ack_store, collect_diagnostics_with,
+    build_parked_session_store, build_script_ack_store, collect_diagnostics_with,
 };
 // `llm_overlay_registrar` is gated on the optional llm-executor feature; its
 // only caller (main.rs) is also gated, so the re-export must carry the same
@@ -118,6 +118,9 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 id,
                 outcome,
             } => approvals_resolve(&config, &id, &outcome).await,
+            ApprovalsCommand::Resume { config, id, reply } => {
+                approvals_resume_await(&config, &id, &reply, overlays).await
+            }
             ApprovalsCommand::Tail { config } => approvals_tail(&config),
         },
         Command::Fuzz {
@@ -1989,7 +1992,8 @@ async fn approvals_list(config_path: &PathBuf, all: bool) -> anyhow::Result<()> 
     // (propagated via `?`) from "sink doesn't store events" (`Ok(None)`) and
     // "stored but the queue is empty" (`Ok(Some(vec![]))`). A failed read can
     // no longer masquerade as an empty approval queue.
-    let events = match sink.try_list_events().await? {
+    let events_opt = sink.try_list_events().await?;
+    match &events_opt {
         None => {
             let sink_kind = config
                 .pointer("/audit/sink")
@@ -2004,66 +2008,203 @@ async fn approvals_list(config_path: &PathBuf, all: bool) -> anyhow::Result<()> 
                     println!("No approval requests found.");
                 }
             }
-            return Ok(());
         }
-        Some(events) => events,
-    };
-    if events.is_empty() {
-        println!("No approval requests found.");
-        return Ok(());
-    }
+        Some(events) if events.is_empty() => {
+            println!("No approval requests found.");
+        }
+        Some(events) => {
+            let mut pending = Vec::new();
+            let mut resolved_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
 
-    let mut pending = Vec::new();
-    let mut resolved_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for event in events {
+                if event.event_type == "human.approval.resolved" {
+                    if let Some(approval_id) =
+                        event.payload.get("approval_id").and_then(Value::as_str)
+                    {
+                        resolved_ids.insert(approval_id.to_string());
+                    }
+                }
 
-    for event in &events {
-        let _event_id = &event.id;
+                if event.event_type == "human.approval.requested" {
+                    pending.push(event);
+                }
+            }
 
-        if event.event_type == "human.approval.resolved" {
-            if let Some(approval_id) = event.payload.get("approval_id").and_then(Value::as_str) {
-                resolved_ids.insert(approval_id.to_string());
+            for event in &pending {
+                let id = &event.id;
+                let status = if resolved_ids.contains(id) {
+                    "resolved"
+                } else {
+                    "pending"
+                };
+                if !all && resolved_ids.contains(id) {
+                    continue;
+                }
+                println!("[{status}] {id}");
+                println!(
+                    "  queue:      {}",
+                    event
+                        .payload
+                        .get("queue")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                );
+                println!(
+                    "  transition: {}",
+                    event
+                        .payload
+                        .get("transition")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                );
+                println!(
+                    "  workflow:   {}",
+                    event.workflow_id.as_deref().unwrap_or("?")
+                );
+                println!();
             }
         }
+    }
 
-        if event.event_type == "human.approval.requested" {
-            pending.push(event);
+    // ── P12 R1.4 — parked agent awaits (`await_human`) ─────────────────────
+    // The durable parked-session store is the source of truth for pending
+    // agent awaits (a row exists exactly while the frame awaits its human);
+    // the audit trail contributes the workflow/transition context when the
+    // sink stores events.
+    if let Some(parked) = build_parked_session_store(&config)? {
+        let sessions = parked.list().await?;
+        if !sessions.is_empty() {
+            println!("Parked agent awaits (await_human):");
+            for s in &sessions {
+                // Join with the suspend audit event for workflow context.
+                let hit = events_opt.as_ref().and_then(|events| {
+                    events.iter().rev().find(|e| {
+                        e.event_type == "agent.await.suspended"
+                            && e.payload.get("correlation_id").and_then(Value::as_str)
+                                == Some(s.correlation_id.as_str())
+                    })
+                });
+                println!("[awaiting] {}", s.correlation_id);
+                println!("  prompt:     {}", s.prompt);
+                println!("  parked_at:  {}", s.parked_at.to_rfc3339());
+                if let Some(e) = hit {
+                    println!("  workflow:   {}", e.workflow_id.as_deref().unwrap_or("?"));
+                    println!(
+                        "  transition: {}",
+                        e.payload
+                            .get("transition")
+                            .and_then(Value::as_str)
+                            .unwrap_or("?")
+                    );
+                }
+                println!(
+                    "  resume:     praxec approvals resume --config {} {} --reply \"<answer>\"",
+                    config_path.display(),
+                    s.correlation_id
+                );
+                println!();
+            }
         }
     }
 
-    for event in &pending {
-        let id = &event.id;
-        let status = if resolved_ids.contains(id) {
-            "resolved"
-        } else {
-            "pending"
-        };
-        if !all && resolved_ids.contains(id) {
-            continue;
-        }
-        println!("[{status}] {id}");
-        println!(
-            "  queue:      {}",
-            event
-                .payload
-                .get("queue")
-                .and_then(Value::as_str)
-                .unwrap_or("?")
-        );
-        println!(
-            "  transition: {}",
-            event
-                .payload
-                .get("transition")
-                .and_then(Value::as_str)
-                .unwrap_or("?")
-        );
-        println!(
-            "  workflow:   {}",
-            event.workflow_id.as_deref().unwrap_or("?")
-        );
-        println!();
-    }
+    Ok(())
+}
 
+/// P12 R1.4 — the operator resume driver for a parked agent `await_human`
+/// session. Locates the workflow + transition parked on `correlation_id`
+/// (via the `agent.await.suspended` audit event), then re-submits that
+/// transition — through the SAME governed one-shot submit pipeline every
+/// caller uses (guards, versioning, audit, the human-origin gate) — as a
+/// human principal with `arguments.reply`. The agent executor routes the
+/// reply to the runner's correlated `resume`, the session continues from the
+/// exact parked turn, and the workflow advances on its result.
+async fn approvals_resume_await(
+    config_path: &PathBuf,
+    id: &str,
+    reply: &str,
+    overlays: GatewayOverlays,
+) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let parked = build_parked_session_store(&config)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "approvals resume requires store.kind: sqlite (the durable parked-session store)"
+        )
+    })?;
+    let record = parked.load(id).await?.ok_or_else(|| {
+        anyhow::anyhow!("no parked agent session '{id}' (already resumed, or never parked)")
+    })?;
+
+    // Locate the parked workflow + transition via the suspend audit event.
+    let events = build_audit_sink(&config)?
+        .try_list_events()
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "audit.sink does not store events, so the parked workflow can't be located. \
+                 Resume manually: re-submit the parked transition with `arguments.reply` via \
+                 `praxec command` (as a human: --human)."
+            )
+        })?;
+    let hit = events
+        .iter()
+        .rev()
+        .find(|e| {
+            e.event_type == "agent.await.suspended"
+                && e.payload.get("correlation_id").and_then(Value::as_str) == Some(id)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no agent.await.suspended audit event names correlation '{id}'; resume \
+                 manually via `praxec command`."
+            )
+        })?;
+    let workflow_id = hit
+        .workflow_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("audit event for '{id}' carries no workflow id"))?;
+    let transition = hit
+        .payload
+        .get("transition")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("audit event for '{id}' carries no transition"))?
+        .to_string();
+
+    // Read the LIVE version + verify the workflow is still parked on THIS
+    // frame (protects against a stale audit hit after a later re-park).
+    let store = build_workflow_store(&config)?;
+    let inst = store.load(&workflow_id).await?;
+    let live = inst
+        .context
+        .pointer("/_agent_await/correlation_id")
+        .and_then(Value::as_str);
+    if live != Some(id) {
+        anyhow::bail!(
+            "workflow {workflow_id} is not currently parked on '{id}' \
+             (its live await marker is {live:?})"
+        );
+    }
+    let expected_version = inst.version;
+
+    println!("resuming parked agent session {id}");
+    println!("  workflow:   {workflow_id}");
+    println!("  transition: {transition}");
+    println!("  prompt:     {}", record.prompt);
+
+    let bundle = build_oneshot_server(&config, &overlays).await?;
+    let resp = bundle
+        .server
+        .dispatch_command(
+            json!({
+                "workflowId": workflow_id,
+                "expectedVersion": expected_version,
+                "transition": transition,
+                "arguments": { "reply": reply },
+            }),
+            cli_principal(true),
+        )
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&resp)?);
     Ok(())
 }
 

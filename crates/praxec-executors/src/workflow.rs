@@ -55,7 +55,7 @@ use serde_json::{Map, Value, json};
 use praxec_core::audit::{AuditEvent, AuditSink};
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{
-    ExecuteRequest, ExecuteResult, GetWorkflow, ParentLink, Principal, StartWorkflow,
+    ExecuteRequest, ExecuteResult, GetWorkflow, ParentLink, Principal, StartWorkflow, StepSuspend,
     SubworkflowSuspend,
 };
 use praxec_core::ports::Executor;
@@ -579,9 +579,9 @@ impl Executor for WorkflowExecutor {
                 evidence: vec![],
                 child_workflow_id: Some(sub_workflow_id.clone()),
                 next_transition: None,
-                suspend: Some(SubworkflowSuspend {
+                suspend: Some(StepSuspend::Subworkflow(SubworkflowSuspend {
                     child_workflow_id: sub_workflow_id,
-                }),
+                })),
                 telemetry: None,
             }),
         }

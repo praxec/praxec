@@ -46,6 +46,34 @@ pub const MAX_SECONDS_CEILING: u64 = 3600;
 /// model legitimately streaming a slow "thinking" phase keeps resetting it.
 pub const DEFAULT_STALL_SECONDS: u64 = 120;
 
+/// The durable `_agent_await` wait marker, read off the workflow context when
+/// it belongs to the transition being dispatched (transition-identity guarded,
+/// mirroring the runtime's `agent_await_for`). `Some(_)` means this dispatch
+/// is a RESUME of a parked frame, not a fresh run.
+struct AgentAwaitMarker {
+    correlation_id: String,
+    prompt: String,
+}
+
+fn agent_await_marker(request: &ExecuteRequest) -> Option<AgentAwaitMarker> {
+    let wait = request.workflow.context.get("_agent_await")?;
+    let marker_transition = wait.get("transition").and_then(Value::as_str)?;
+    if request.transition.as_deref() != Some(marker_transition) {
+        return None;
+    }
+    Some(AgentAwaitMarker {
+        correlation_id: wait
+            .get("correlation_id")
+            .and_then(Value::as_str)?
+            .to_string(),
+        prompt: wait
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
 pub struct AgentExecutor {
     runner: Arc<dyn AgentSessionRunner>,
     resolver: Arc<dyn AgentModelResolver>,
@@ -207,6 +235,18 @@ impl AgentExecutor {
         };
 
         let report = self.runner.run(session).await?;
+        Self::result_from_report(report, max_seconds)
+    }
+
+    /// Map one runner report onto the executor result contract — shared by the
+    /// fresh-run path ([`Self::run_one`]) and the correlated-resume path, so a
+    /// resumed session honors the exact same fail-fasts (FM1/FM12) and
+    /// telemetry/evidence shape a fresh one does.
+    fn result_from_report(
+        report: crate::session::AgentRunReport,
+        max_seconds: u64,
+    ) -> Result<ExecuteResult, ExecutorError> {
+        let model = report.model.clone();
 
         // Per-call cost telemetry: price the realized token usage off the
         // model catalog (degrade-to-None when uncatalogued — never fail). The
@@ -243,25 +283,29 @@ impl AgentExecutor {
                 AgentErrorCode::NoResult,
                 "agent run ended without a conforming `final_answer` call",
             )),
-            // P12 R1.4 — the agent parked on a human gate. This is NOT a
-            // model failure: the wire code AGENT_SUSPENDED classifies as
-            // ContentOther (never Capability/GaveUp), so the chain-walk
-            // surfaces it immediately instead of escalating to the next model
-            // — which would run a duplicate agent while the parked frame
-            // awaits its human. The conversation is already durably persisted
-            // under `correlation_id`; `RigSessionRunner::resume(correlation_id,
-            // reply)` continues it. Mapping this to a first-class runtime
-            // park/waiting state (instead of a typed step failure) is the
-            // remaining await/resume integration.
-            AgentRunOutcome::Suspended(s) => Err(permanent(
-                AgentErrorCode::Suspended,
-                format!(
-                    "agent parked awaiting a human reply (correlation_id={}, prompt={:?}); \
-                     the conversation is durably persisted — resume via \
-                     RigSessionRunner::resume(correlation_id, reply)",
-                    s.correlation_id, s.prompt
-                ),
-            )),
+            // P12 R1.4 — the agent parked on a human gate. FIRST-CLASS
+            // control flow, not a failure: the conversation is already
+            // durably persisted under `correlation_id`, and the runtime maps
+            // this suspend to the same durable waiting representation a
+            // `kind: workflow` park uses (an `_agent_await` context marker +
+            // a `waiting` mission status). A human resumes by re-submitting
+            // the transition with `arguments.reply`. Returning `Ok` here also
+            // ends the chain-walk (a suspend must never escalate to the next
+            // model — that would run a duplicate agent while the parked frame
+            // awaits its human).
+            AgentRunOutcome::Suspended(s) => Ok(ExecuteResult {
+                output: json!({}),
+                evidence,
+                child_workflow_id: None,
+                next_transition: None,
+                suspend: Some(praxec_core::model::StepSuspend::AgentAwait(
+                    praxec_core::model::AgentAwaitSuspend {
+                        correlation_id: s.correlation_id,
+                        prompt: s.prompt,
+                    },
+                )),
+                telemetry,
+            }),
             AgentRunOutcome::Completed(result) => match result.status {
                 AgentStatus::Failed => Err(permanent(
                     AgentErrorCode::ResultFailed,
@@ -308,6 +352,39 @@ impl Executor for AgentExecutor {
         }
 
         let cfg = AgentExecutorConfig::from_value(request.executor_config.clone())?;
+
+        // P12 R1.4 — the resume path: when THIS transition previously parked
+        // on `await_human`, the workflow context carries a durable
+        // `_agent_await` marker (written by the runtime's
+        // `suspend_on_agent_await`, transition-identity guarded). A re-submit
+        // of the transition is then a RESUME of the parked frame, not a fresh
+        // run: the human's `arguments.reply` is routed to the runner's
+        // correlated resume, which re-enters the exact parked tool-loop turn.
+        // A re-fire without a reply fails typed (never a silent duplicate
+        // agent run while the parked frame still awaits its human).
+        if let Some(wait) = agent_await_marker(&request) {
+            let correlation_id = wait.correlation_id;
+            let reply = match request.arguments.get("reply").and_then(Value::as_str) {
+                Some(r) if !r.trim().is_empty() => r,
+                _ => {
+                    return Err(permanent(
+                        AgentErrorCode::AwaitReplyRequired,
+                        format!(
+                            "this transition is parked on an agent `await_human` gate \
+                             (correlation_id={correlation_id}, prompt={:?}); re-submit it \
+                             with a non-empty `arguments.reply` to resume the parked session",
+                            wait.prompt
+                        ),
+                    ));
+                }
+            };
+            let max_seconds = cfg
+                .max_seconds
+                .unwrap_or(DEFAULT_MAX_SECONDS)
+                .min(MAX_SECONDS_CEILING);
+            let report = self.runner.resume(&correlation_id, reply).await?;
+            return Self::result_from_report(report, max_seconds);
+        }
 
         // System prompt = in-scope skills (the agent's instructions, §33.12).
         let system_prompt = assemble_system_message(
@@ -754,27 +831,34 @@ mod tests {
         }
     }
 
-    /// P12 R1.4 — a Suspended outcome is a typed AGENT_SUSPENDED signal
-    /// carrying the correlation_id, and it is NOT chain-escalated: with a
-    /// two-model chain, the second model must never run (that would start a
-    /// duplicate agent while the parked frame awaits its human reply).
+    /// P12 R1.4 — a Suspended outcome is FIRST-CLASS: the executor returns
+    /// `Ok(ExecuteResult)` whose `suspend` carries the AgentAwait source with
+    /// the correlation_id (the runtime then parks the mission `waiting`), and
+    /// it is NOT chain-escalated: with a two-model chain, the second model
+    /// must never run (that would start a duplicate agent while the parked
+    /// frame awaits its human reply).
     #[tokio::test]
-    async fn a_suspended_agent_surfaces_typed_and_is_not_escalated() {
+    async fn a_suspended_agent_returns_a_first_class_suspend_and_is_not_escalated() {
         let runner = Arc::new(MockSessionRunner::suspended("corr-42", "approve the plan?"));
         let exec = AgentExecutor::new(runner.clone(), Arc::new(TwoModelResolver));
-        let err = exec
+        let result = exec
             .execute(request(
                 json!({ "affinity": "coding", "goal": "do something", "await_enabled": true }),
                 bare_def(),
             ))
             .await
-            .expect_err("a suspension surfaces as a typed signal");
-        let msg = format!("{err:?}");
-        assert!(msg.contains("AGENT_SUSPENDED"), "got {msg}");
-        assert!(
-            msg.contains("corr-42"),
-            "the resume handle (correlation_id) must be carried: {msg}"
+            .expect("a suspension is first-class control flow, not an error");
+        let suspend = result
+            .suspend
+            .expect("a suspended agent must return ExecuteResult.suspend");
+        let awaiting = suspend
+            .as_agent_await()
+            .expect("an agent suspension is the AgentAwait source");
+        assert_eq!(
+            awaiting.correlation_id, "corr-42",
+            "the resume handle (correlation_id) must be carried"
         );
+        assert_eq!(awaiting.prompt, "approve the plan?");
         let sessions = runner.sessions();
         assert_eq!(
             sessions.len(),
@@ -786,6 +870,118 @@ mod tests {
             sessions[0].await_enabled,
             "await_enabled must plumb through"
         );
+    }
+
+    // ── P12 R1.4 — the correlated-resume path ────────────────────────────
+
+    /// The `_agent_await` marker for `transition` in the workflow context.
+    fn awaiting_request(reply_args: serde_json::Value) -> ExecuteRequest {
+        let mut req = request(
+            json!({ "affinity": "coding", "goal": "do something", "await_enabled": true }),
+            bare_def(),
+        );
+        req.transition = Some("do_work".into());
+        req.arguments = reply_args;
+        req.workflow.context = json!({
+            "_agent_await": {
+                "correlation_id": "corr-42",
+                "prompt": "approve the plan?",
+                "transition": "do_work",
+            }
+        });
+        req
+    }
+
+    /// A re-submit of a parked transition WITH `arguments.reply` routes to the
+    /// runner's correlated `resume` — never a fresh `run` (which would start a
+    /// duplicate agent).
+    #[tokio::test]
+    async fn a_reply_on_a_parked_transition_resumes_the_exact_frame() {
+        let runner = Arc::new(
+            MockSessionRunner::suspended("unused", "unused").with_resume_outcome(
+                AgentRunOutcome::Completed(AgentResult {
+                    status: AgentStatus::Success,
+                    output: json!({ "verdict": "shipped" }),
+                    internal_monologue: None,
+                }),
+            ),
+        );
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(TwoModelResolver));
+        let result = exec
+            .execute(awaiting_request(json!({ "reply": "yes, approved" })))
+            .await
+            .expect("resume completes the step");
+        assert_eq!(result.output, json!({ "verdict": "shipped" }));
+        assert_eq!(
+            runner.resumes(),
+            vec![("corr-42".to_string(), "yes, approved".to_string())],
+            "the reply must route to the parked frame's correlation_id"
+        );
+        assert!(
+            runner.sessions().is_empty(),
+            "a resume must never start a fresh session"
+        );
+    }
+
+    /// A re-fire of a parked transition WITHOUT a reply fails typed — never a
+    /// silent fresh run alongside the still-parked frame.
+    #[tokio::test]
+    async fn a_parked_transition_without_a_reply_fails_typed() {
+        let runner = Arc::new(MockSessionRunner::suspended("unused", "unused"));
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(TwoModelResolver));
+        let err = exec
+            .execute(awaiting_request(json!({})))
+            .await
+            .expect_err("no reply → typed refusal");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("AGENT_AWAIT_REPLY_REQUIRED"), "got {msg}");
+        assert!(msg.contains("corr-42"), "carries the resume handle: {msg}");
+        assert!(runner.sessions().is_empty(), "must not run");
+        assert!(runner.resumes().is_empty(), "must not resume without reply");
+    }
+
+    /// An `_agent_await` belonging to a DIFFERENT transition is ignored — the
+    /// dispatched transition runs fresh (transition-identity guard).
+    #[tokio::test]
+    async fn an_await_marker_for_another_transition_does_not_hijack_a_fresh_run() {
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({ "ok": true }),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        let mut req = awaiting_request(json!({}));
+        req.transition = Some("other_step".into());
+        let result = exec.execute(req).await.expect("fresh run");
+        assert_eq!(result.output, json!({ "ok": true }));
+        assert_eq!(runner.sessions().len(), 1, "fresh run happened");
+        assert!(runner.resumes().is_empty());
+    }
+
+    /// A resume that itself re-suspends surfaces as a NEW first-class suspend
+    /// under the fresh correlation_id (the runtime re-parks the mission).
+    #[tokio::test]
+    async fn a_resume_that_resuspends_carries_the_new_correlation() {
+        let runner = Arc::new(
+            MockSessionRunner::suspended("unused", "unused").with_resume_outcome(
+                AgentRunOutcome::Suspended(crate::session::AgentSuspension {
+                    correlation_id: "corr-43".into(),
+                    prompt: "and the budget?".into(),
+                }),
+            ),
+        );
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(TwoModelResolver));
+        let result = exec
+            .execute(awaiting_request(json!({ "reply": "yes" })))
+            .await
+            .expect("a re-suspension is first-class");
+        let suspend = result.suspend.expect("suspend present");
+        let awaiting = suspend.as_agent_await().expect("AgentAwait source");
+        assert_eq!(awaiting.correlation_id, "corr-43");
+        assert_eq!(awaiting.prompt, "and the budget?");
     }
 
     /// `await_enabled` defaults off: an ordinary config yields a session that

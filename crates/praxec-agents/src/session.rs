@@ -129,6 +129,26 @@ pub struct AgentSession {
 #[async_trait]
 pub trait AgentSessionRunner: Send + Sync {
     async fn run(&self, session: AgentSession) -> Result<AgentRunReport, ExecutorError>;
+
+    /// P12 R1.4 — resume a durably parked session (one that previously ended
+    /// [`AgentRunOutcome::Suspended`]) by injecting the human `reply` as the
+    /// awaited `await_human` call's tool result and re-entering the tool loop
+    /// from the parked turn. The production impl is
+    /// [`RigSessionRunner::resume`](crate::rig_runner::RigSessionRunner::resume).
+    ///
+    /// Default: typed fail-fast. A runner without park support can never have
+    /// produced a `Suspended` outcome, so a resume against it is a wiring bug
+    /// — surface it loudly rather than silently starting a fresh session.
+    async fn resume(
+        &self,
+        correlation_id: &str,
+        _reply: &str,
+    ) -> Result<AgentRunReport, ExecutorError> {
+        Err(ExecutorError::Permanent(format!(
+            "AGENT_AWAIT_UNSUPPORTED: this session runner cannot resume parked session \
+             '{correlation_id}' (no ParkedSessionStore-backed resume support)"
+        )))
+    }
 }
 
 /// Resolves a config `ModelBinding` (agent name / affinity) to a
@@ -164,6 +184,8 @@ pub mod testing {
     pub struct MockSessionRunner {
         report: AgentRunReport,
         seen: Mutex<Vec<AgentSession>>,
+        resumes: Mutex<Vec<(String, String)>>,
+        resume_report: Option<AgentRunReport>,
     }
 
     impl MockSessionRunner {
@@ -192,10 +214,27 @@ pub mod testing {
                     completion_tokens: 0,
                 },
                 seen: Mutex::new(Vec::new()),
+                resumes: Mutex::new(Vec::new()),
+                resume_report: None,
             }
+        }
+        /// Canned outcome for `resume` calls (leaves `run`'s report untouched).
+        pub fn with_resume_outcome(mut self, outcome: AgentRunOutcome) -> Self {
+            self.resume_report = Some(AgentRunReport {
+                outcome,
+                transcript: "{\"kind\":\"text\",\"message\":\"mock-resume\"}".into(),
+                model: "mock:model".into(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            });
+            self
         }
         pub fn sessions(&self) -> Vec<AgentSession> {
             self.seen.lock().unwrap().clone()
+        }
+        /// The `(correlation_id, reply)` pairs `resume` was called with.
+        pub fn resumes(&self) -> Vec<(String, String)> {
+            self.resumes.lock().unwrap().clone()
         }
     }
 
@@ -204,6 +243,23 @@ pub mod testing {
         async fn run(&self, session: AgentSession) -> Result<AgentRunReport, ExecutorError> {
             self.seen.lock().unwrap().push(session);
             Ok(self.report.clone())
+        }
+
+        async fn resume(
+            &self,
+            correlation_id: &str,
+            reply: &str,
+        ) -> Result<AgentRunReport, ExecutorError> {
+            self.resumes
+                .lock()
+                .unwrap()
+                .push((correlation_id.to_string(), reply.to_string()));
+            match &self.resume_report {
+                Some(report) => Ok(report.clone()),
+                None => Err(ExecutorError::Permanent(
+                    "MOCK_RESUME_UNCONFIGURED: set with_resume_outcome".into(),
+                )),
+            }
         }
     }
 

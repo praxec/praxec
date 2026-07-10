@@ -319,12 +319,12 @@ pub struct ExecuteResult {
     /// into the runtime. Each turn becomes a real audited transition;
     /// caps and audit invariants stay intact.
     pub next_transition: Option<NextTransition>,
-    /// P2 — a `kind: workflow` executor whose child is non-terminal returns
-    /// `Some(_)`: the runtime durably suspends the parent on the child instead
-    /// of advancing the transition. `None` for every other outcome.
-    /// (`ExecuteResult` is an in-process runtime value, never serialized, so no
-    /// serde attribute is needed; `Default` supplies `None`.)
-    pub suspend: Option<SubworkflowSuspend>,
+    /// The ONE step-suspend channel (`docs/await-resume-architecture.md`):
+    /// `Some(_)` means the executor durably parked instead of advancing, and
+    /// the runtime responds `waiting` — never a failure. `None` for every
+    /// other outcome. (`ExecuteResult` is an in-process runtime value, never
+    /// serialized, so no serde attribute is needed; `Default` supplies `None`.)
+    pub suspend: Option<StepSuspend>,
     /// Per-call cost telemetry — realized token usage + USD cost for an
     /// executor that ran a model (currently `kind: agent` auto-drive). The
     /// runtime folds these into the `agent.completed` audit event so every
@@ -349,6 +349,39 @@ pub struct ExecutorTelemetry {
     pub cost_usd: Option<f64>,
 }
 
+/// Why an executor suspended its step instead of advancing — the typed,
+/// exhaustively-matched set of suspend sources (`docs/await-resume-architecture.md`:
+/// one primitive, pluggable signal sources). Every variant maps to the SAME
+/// runtime representation: a durable context wait-marker + a `waiting`
+/// response (`MissionStatus::Waiting`), never a failure.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepSuspend {
+    /// P2 — a `kind: workflow` child is non-terminal; park the parent on it.
+    Subworkflow(SubworkflowSuspend),
+    /// P12 R1.4 — a `kind: agent` session hit `await_human`; its conversation
+    /// is already durably parked in the [`ParkedSessionStore`](crate::ports::ParkedSessionStore)
+    /// under `correlation_id`. Park the workflow on the awaited human reply.
+    AgentAwait(AgentAwaitSuspend),
+}
+
+impl StepSuspend {
+    /// The sub-workflow suspend, when that is this suspend's source.
+    pub fn as_subworkflow(&self) -> Option<&SubworkflowSuspend> {
+        match self {
+            StepSuspend::Subworkflow(s) => Some(s),
+            StepSuspend::AgentAwait(_) => None,
+        }
+    }
+
+    /// The agent-await suspend, when that is this suspend's source.
+    pub fn as_agent_await(&self) -> Option<&AgentAwaitSuspend> {
+        match self {
+            StepSuspend::AgentAwait(a) => Some(a),
+            StepSuspend::Subworkflow(_) => None,
+        }
+    }
+}
+
 /// P2 — a `kind: workflow` executor whose child is non-terminal returns this
 /// instead of advancing: the parent is durably suspended on the child
 /// (recorded as `_subworkflow_wait` context data) and re-driven when the child
@@ -356,6 +389,19 @@ pub struct ExecutorTelemetry {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct SubworkflowSuspend {
     pub child_workflow_id: String,
+}
+
+/// P12 R1.4 — a `kind: agent` step parked on `await_human`. The runtime
+/// records this as an `_agent_await` context marker (mirrors
+/// `_subworkflow_wait`) and responds `waiting`; a human later resumes by
+/// re-submitting the SAME transition with `arguments.reply`, which the agent
+/// executor routes to the runner's correlated `resume`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct AgentAwaitSuspend {
+    /// Routes the human's reply back to the exact parked agent frame.
+    pub correlation_id: String,
+    /// What the agent asked the human — surfaced to the approvals drain.
+    pub prompt: String,
 }
 
 /// P12 R1.4 (`docs/await-resume-architecture.md`) — one durably parked agent

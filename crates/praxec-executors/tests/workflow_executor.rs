@@ -229,6 +229,9 @@ async fn non_terminal_child_suspends_instead_of_polling() {
     let suspend = result
         .suspend
         .expect("a non-terminal child must produce ExecuteResult.suspend");
+    let suspend = suspend
+        .as_subworkflow()
+        .expect("a workflow executor suspend is the Subworkflow variant");
     assert!(
         !suspend.child_workflow_id.is_empty(),
         "suspend must carry the child workflow id"
@@ -336,7 +339,10 @@ async fn reevaluation_reuses_the_recorded_child() {
     let child_id = first
         .suspend
         .expect("first pass must suspend")
-        .child_workflow_id;
+        .as_subworkflow()
+        .expect("a workflow executor suspend is the Subworkflow variant")
+        .child_workflow_id
+        .clone();
 
     // Re-drive: feed the recorded child id back via `_subworkflow_wait`.
     let reused = executor
@@ -357,7 +363,9 @@ async fn reevaluation_reuses_the_recorded_child() {
     );
     // Still non-terminal → still suspended on the same child.
     assert_eq!(
-        reused.suspend.map(|s| s.child_workflow_id),
+        reused
+            .suspend
+            .and_then(|s| s.as_subworkflow().map(|s| s.child_workflow_id.clone())),
         Some(child_id),
         "the reused non-terminal child must suspend again on the same id"
     );
