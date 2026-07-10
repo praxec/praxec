@@ -838,7 +838,11 @@ workflows:
             .collect();
         assert!(names.contains(&"cap.a.yaml".to_string()), "got {names:?}");
         assert!(names.contains(&"flow.b.yaml".to_string()), "got {names:?}");
-        assert_eq!(files.len(), 2, "only layout-dir yaml expected, got {names:?}");
+        assert_eq!(
+            files.len(),
+            2,
+            "only layout-dir yaml expected, got {names:?}"
+        );
     }
 
     #[test]
