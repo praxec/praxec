@@ -87,10 +87,34 @@ impl PraxecServer {
         // normal state (fresh system, non-file sink), silently omitted.
         self.attach_intent_evidence(&mut hits).await;
 
+        // Selector (D6) — re-rank the annotated hits by the deterministic
+        // relevance + evidence (+ topology) blend and surface the explainable
+        // `why`, instead of returning raw lexical order. `rank_candidates` is
+        // total (one entry per hit) and stable, so every hit maps and the order
+        // is fully determined. `registry: None` for now → relevance+evidence
+        // blend; the topology term activates once a registry is wired here.
+        let ranked = praxec_core::discovery::rank_candidates(&hits, None);
+        let hit_by_id: std::collections::HashMap<&str, &praxec_core::discovery::SearchHit> =
+            hits.iter().map(|h| (h.item.id.as_str(), h)).collect();
+        let items: Vec<Value> = ranked
+            .iter()
+            .filter_map(|r| {
+                let hit = hit_by_id.get(r.id.as_str())?;
+                let mut v = serde_json::to_value(hit).ok()?;
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "ranking".to_string(),
+                        json!({ "score": r.score, "why": r.why }),
+                    );
+                }
+                Some(v)
+            })
+            .collect();
+
         Ok(json!({
             "query": query,
             "kind": kind.map(|k| k.as_str()),
-            "items": hits,
+            "items": items,
             "links": [
                 { "rel": "home", "method": "praxec.query", "args": {} }
             ]
