@@ -72,7 +72,9 @@ which = "7"
 typify = "0.6"
 prettyplease = "0.2"
 syn = { version = "2", features = ["full"] }
-schemars = "0.8"
+# `chrono` feature: praxec-core derives `JsonSchema` on `AuditEvent`, whose
+# `timestamp` is a `chrono::DateTime<Utc>` (published event schema, code-first).
+schemars = { version = "0.8", features = ["chrono"] }
 
 # T26 — clippy::unwrap_used is enabled per-crate via
 # `#![cfg_attr(not(test), warn(clippy::unwrap_used))]` in each lib.rs.

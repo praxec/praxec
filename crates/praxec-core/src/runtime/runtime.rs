@@ -598,6 +598,16 @@ impl WorkflowRuntime {
                     .audit_event("workflow.started")
                     .with_correlation(&correlation_id)
                     .with_actor(&request.principal.subject)
+                    // L1 tree-linkage — stamp the tree edge from the persisted
+                    // instance (its `parent` ParentLink + `depth`), NOT a
+                    // task-local. `workflow.started` is the natural carrier of
+                    // the parent→child edge; an observer reconstructs the
+                    // execution tree from workflow_id + parent_workflow_id +
+                    // depth without every executor emit site stamping.
+                    .with_topology(
+                        instance.parent.as_ref().map(|p| p.workflow_id.clone()),
+                        instance.depth,
+                    )
                     .with_payload(json!({
                         "definitionId": instance.definition_id,
                         "state": instance.state,

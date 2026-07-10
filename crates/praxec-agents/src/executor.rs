@@ -232,6 +232,14 @@ impl AgentExecutor {
             expected_output_keys: cfg.expected_output_keys.clone(),
             expected_output_types: cfg.expected_output_types.clone(),
             await_enabled: cfg.await_enabled,
+            // The identity the runtime stamps on `agent.invoked` — carried so
+            // the runner's in-run `agent.heartbeat` events join the same
+            // workflow + correlation in the audit stream.
+            identity: crate::session::RunIdentity {
+                workflow_id: Some(request.workflow.id.clone()),
+                correlation_id: request.correlation_id.clone(),
+                transition: request.transition.clone(),
+            },
         };
 
         let report = self.runner.run(session).await?;
