@@ -216,3 +216,35 @@ fn unreadable_config_fails_fast() {
     let err = add_connection(Path::new("/no/such/config.yaml"), "x", &mcp_spec()).unwrap_err();
     assert!(matches!(err, ConnWriteError::Io(_)));
 }
+
+// ── F12: writer and reader share one key source of truth ────────────────────
+
+#[test]
+fn staged_and_grant_keys_match_the_core_gate() {
+    // The key names are OWNED by praxec-core (`config::STAGED_CONNECTIONS_KEY`
+    // / `config::GRANT_CONNECTIONS_KEY`) — the reader side of the grant gate.
+    // Prove the writer emits exactly those top-level keys, so a future
+    // re-hardcoded literal in either crate fails here instead of silently
+    // staging connections the gate never sees.
+    use praxec_core::config::{GRANT_CONNECTIONS_KEY, STAGED_CONNECTIONS_KEY};
+
+    let (_d, path) = write_config(BASE);
+    add_connection(&path, "github", &mcp_spec()).expect("add");
+    grant_connection(&path, "github").expect("grant");
+
+    let raw: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&path).expect("read config"))
+            .expect("valid yaml");
+    assert!(
+        raw.get(STAGED_CONNECTIONS_KEY)
+            .and_then(|s| s.get("github"))
+            .is_some(),
+        "add writes under core's `{STAGED_CONNECTIONS_KEY}:`"
+    );
+    assert!(
+        raw.get(GRANT_CONNECTIONS_KEY)
+            .and_then(|g| g.as_sequence())
+            .is_some_and(|g| g.iter().any(|v| v.as_str() == Some("github"))),
+        "grant writes under core's `{GRANT_CONNECTIONS_KEY}:`"
+    );
+}
