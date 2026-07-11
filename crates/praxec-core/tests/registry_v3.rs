@@ -137,9 +137,6 @@ tools:
           kind: rest
           baseUrl: https://httpbin.org
           headers: {}
-        auth:
-          scheme: header
-          headers: [X-Api-Key]
       operations:
         - id: get-anything
           verb: fetch

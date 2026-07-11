@@ -2,7 +2,7 @@
   "$id": "https://praxec.dev/schemas/tool-descriptor.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "PraxecToolDescriptor",
-  "description": "v0.0.17 tool-source ecosystem contract (D1). A descriptor is a manifest over existing primitives: `reach.connection` is a LITERAL gateway `connections:` entry (copy, never transform), `reach.grant_as` names the bare token the operator must add to `grant_connections:` (the descriptor never grants), and `provision` mirrors the ADR-0013 packs/v2 provider chain. Auth is declared by NAME only — never secret values.",
+  "description": "v0.0.17 tool-source ecosystem contract (D1). A descriptor is a manifest over existing primitives: `reach.connection` is a LITERAL gateway `connections:` entry (copy, never transform), `reach.grant_as` names the bare token the operator must add to `grant_connections:` (the descriptor never grants), and `provision` mirrors the ADR-0013 packs/v2 provider chain. No auth block: credential handling is a v0.0.18 item, enforce-then-declare.",
   "type": "object",
   "required": [
     "schema_version",
@@ -112,42 +112,6 @@
         "connection": {
           "$ref": "gateway-config.schema.json#/$defs/connection",
           "description": "The LITERAL connections entry, copied verbatim into /connections on install. Same $ref the gateway config already validates; kind here MUST match the top-level kind."
-        },
-        "auth": {
-          "$ref": "#/$defs/authRequirement"
-        }
-      }
-    },
-    "authRequirement": {
-      "type": "object",
-      "required": [
-        "scheme"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "scheme": {
-          "enum": [
-            "none",
-            "env",
-            "header",
-            "bearer"
-          ]
-        },
-        "env": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [],
-          "description": "Env var NAMES the tool needs. Never secret values — those enter only via `px connections add` (D4a)."
-        },
-        "headers": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          },
-          "default": [],
-          "description": "Header NAMES the tool needs. Never secret values."
         }
       }
     },

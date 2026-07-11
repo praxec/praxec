@@ -2,18 +2,18 @@
 //!
 //! Covers the design's FMECA rows that live at the descriptor boundary:
 //! FM2 (kind ↔ reach.connection.kind mismatch fails typed, no partial
-//! install), FM3 (auth is names-only; value-bearing fields fail schema
-//! validation), plus grant-token extraction (the descriptor *declares* the
+//! install), plus grant-token extraction (the descriptor *declares* the
 //! grant, never performs it) and the copy-never-transform invariant
 //! (`reach.connection` round-trips verbatim against the gateway
-//! `$defs/connection` shape).
+//! `$defs/connection` shape). The `auth` block was removed for v0.0.17
+//! (F8: declared-but-unenforced auth is a footgun; returns in v0.0.18
+//! enforce-then-declare) — a descriptor still carrying it must fail schema.
 
 use serde_json::{Value, json};
 
 use praxec_core::discovery::ScriptVerb;
 use praxec_core::tool_descriptor::{
-    AuthScheme, ProvisionProvider, ToolDescriptor, ToolDescriptorError, ToolKind,
-    validate_gateway_connection,
+    ProvisionProvider, ToolDescriptor, ToolDescriptorError, ToolKind, validate_gateway_connection,
 };
 
 // ── fixtures ──────────────────────────────────────────────────────────────
@@ -36,10 +36,6 @@ fn mcp_descriptor() -> Value {
                 "command": "docker",
                 "args": ["run", "-i", "--rm", "ghcr.io/github/github-mcp-server"],
                 "env": {}
-            },
-            "auth": {
-                "scheme": "env",
-                "env": ["GITHUB_PERSONAL_ACCESS_TOKEN"]
             }
         },
         "provision": {
@@ -100,10 +96,6 @@ fn rest_descriptor() -> Value {
                 "kind": "rest",
                 "baseUrl": "https://httpbin.org",
                 "headers": {}
-            },
-            "auth": {
-                "scheme": "header",
-                "headers": ["X-Api-Key"]
             }
         },
         "operations": [
@@ -138,9 +130,6 @@ fn valid_mcp_descriptor_parses() {
         provision.providers,
         vec![ProvisionProvider::Docker, ProvisionProvider::Release]
     );
-    let auth = d.reach.auth.as_ref().expect("auth present");
-    assert_eq!(auth.scheme, AuthScheme::Env);
-    assert_eq!(auth.env, vec!["GITHUB_PERSONAL_ACCESS_TOKEN"]);
     assert_eq!(d.suggested_workflows, vec!["github/flow.triage-issues"]);
 }
 
@@ -304,14 +293,16 @@ fn unknown_verb_fails_schema() {
     assert!(matches!(&err, ToolDescriptorError::Schema(_)));
 }
 
-// ── FM3 — auth is names-only; value-shaped fields fail ────────────────────
+// ── F8 — the removed auth block stays removed until it is enforced ────────
 
 #[test]
-fn value_bearing_auth_field_fails_schema() {
+fn auth_block_fails_schema_until_enforced() {
     let mut doc = mcp_descriptor();
-    // A descriptor trying to smuggle a secret VALUE alongside the names.
-    doc["reach"]["auth"]["values"] = json!({ "GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_secret" });
-    let err = load(doc).expect_err("authRequirement additionalProperties: false must reject");
+    // v0.0.17 drafts declared `reach.auth` but nothing enforced it; the
+    // block was removed (F8) and must be REJECTED, not silently ignored,
+    // until v0.0.18 ships enforcement alongside the declaration.
+    doc["reach"]["auth"] = json!({ "scheme": "env", "env": ["GITHUB_PERSONAL_ACCESS_TOKEN"] });
+    let err = load(doc).expect_err("reach additionalProperties: false must reject auth");
     assert!(
         matches!(&err, ToolDescriptorError::Schema(_)),
         "expected Schema error, got: {err}"
