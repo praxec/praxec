@@ -856,6 +856,9 @@ mod semantic_tests {
                 .any(|w| t.contains(w)) as i32 as f32;
             Ok(vec![speed, auth])
         }
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Ok(())
+        }
         fn dimensions(&self) -> usize {
             2
         }
@@ -871,6 +874,9 @@ mod semantic_tests {
     impl EmbeddingProvider for FailingEmbedder {
         async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
             Err(EmbeddingError::BackendFailed("backend down".into()))
+        }
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Err(EmbeddingError::HealthCheckFailed("backend down".into()))
         }
         fn dimensions(&self) -> usize {
             2
@@ -891,6 +897,10 @@ mod semantic_tests {
             } else {
                 Ok(vec![1.0, 0.0])
             }
+        }
+        /// Healthy overall — only the one poisoned item fails.
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Ok(())
         }
         fn dimensions(&self) -> usize {
             2

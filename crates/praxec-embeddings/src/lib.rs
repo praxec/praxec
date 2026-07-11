@@ -10,7 +10,7 @@
 //! default; the live catalog refresh is a later slice).
 
 use async_trait::async_trait;
-use praxec_core::embeddings::{EmbeddingError, EmbeddingProvider};
+use praxec_core::embeddings::{EmbeddingError, EmbeddingProvider, HEALTH_PROBE_TEXT};
 use rig::client::{EmbeddingsClient, ProviderClient};
 use rig::embeddings::EmbeddingModel as _;
 use rig::providers::{gemini, ollama, openai, openrouter};
@@ -377,6 +377,20 @@ impl EmbeddingProvider for RigEmbedder {
         checked_dims(result, self.dims, self.backend)
     }
 
+    /// Probe the chosen provider with one short embed. `from_choice` only proves
+    /// the *client* could be constructed (key present, vendor known); it never
+    /// touches the network, so a wrong key, a retired model, or a stopped local
+    /// Ollama is invisible until the first real query. This is where that shows up.
+    /// It also re-checks the catalog `dims` against what the model actually returns.
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        self.embed(HEALTH_PROBE_TEXT)
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                EmbeddingError::HealthCheckFailed(format!("{} ({}): {e}", self.backend, self.dims))
+            })
+    }
+
     fn dimensions(&self) -> usize {
         self.dims
     }
@@ -523,6 +537,98 @@ mod tests {
         let result = RigEmbedder::from_choice("frobnicate", "x", 768);
         assert!(result.is_err());
         assert!(result.err().unwrap().to_string().contains("unsupported"));
+    }
+
+    // ── health_check (D1) ────────────────────────────────────────────────────
+    //
+    // `from_choice` only proves the client could be *constructed* — it never
+    // touches the network. These exercise the probe that actually does.
+
+    /// A stub Ollama that answers `POST /api/embed` with `dims`-wide vectors.
+    async fn stub_ollama(dims: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let json = serde_json::json!({
+            "model": "stub",
+            "embeddings": [vec![0.1_f64; dims]],
+        })
+        .to_string();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = json.clone();
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// One test, three phases: `OLLAMA_API_BASE_URL` is process-global, so these
+    /// cannot race each other in parallel test threads.
+    #[tokio::test]
+    async fn rig_health_check_probes_the_live_backend() {
+        // SAFETY: test-local env var; the phases below are sequential.
+        macro_rules! point_at {
+            ($url:expr) => {
+                unsafe { std::env::set_var("OLLAMA_API_BASE_URL", $url) }
+            };
+        }
+
+        // 1. Reachable backend, honest width → healthy.
+        point_at!(stub_ollama(3).await);
+        let emb = RigEmbedder::from_choice("ollama", "nomic-embed-text", 3).unwrap();
+        emb.health_check()
+            .await
+            .expect("a reachable, conforming backend is healthy");
+
+        // 2. Reachable, but the width contradicts the catalog → NOT healthy. Only a
+        //    real embed can catch this; a connection ping never would.
+        point_at!(stub_ollama(3).await);
+        let emb = RigEmbedder::from_choice("ollama", "nomic-embed-text", 768).unwrap();
+        let err = emb
+            .health_check()
+            .await
+            .expect_err("a wrong-width backend is not healthy");
+        assert!(
+            matches!(err, EmbeddingError::HealthCheckFailed(_)),
+            "expected HealthCheckFailed, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("dimension mismatch"),
+            "the probe must surface the contract breach: {err}"
+        );
+
+        // 3. Unreachable backend → Err, bounded, no panic.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = l.local_addr().unwrap();
+            drop(l);
+            format!("http://{a}")
+        };
+        point_at!(&dead);
+        let emb = RigEmbedder::from_choice("ollama", "nomic-embed-text", 3).unwrap();
+        let started = std::time::Instant::now();
+        let err = emb
+            .health_check()
+            .await
+            .expect_err("an unreachable backend is not healthy");
+        assert!(
+            matches!(err, EmbeddingError::HealthCheckFailed(_)),
+            "expected HealthCheckFailed, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the probe must be bounded"
+        );
+
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("OLLAMA_API_BASE_URL") };
     }
 
     #[test]

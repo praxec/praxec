@@ -14,12 +14,15 @@
 //! 10. Tier 3 skipped when embedder is `None`.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use praxec_core::{
     embeddings::{
-        EMBEDDING_COSINE_THRESHOLD, EmbeddingError, EmbeddingProvider, HttpEmbedder, NoopEmbedder,
-        RequestFormat, cosine_similarity, entry_embed_text, parse_embeddings_config,
+        EMBEDDING_COSINE_THRESHOLD, EmbeddingError, EmbeddingProvider, HttpEmbedder, HttpPolicy,
+        NoopEmbedder, RequestFormat, cosine_similarity, entry_embed_text, parse_embeddings_config,
     },
     lexicon::build_entry,
     lexicon_candidates::rank_candidates_with_embedding,
@@ -47,6 +50,10 @@ impl FixedVectorEmbedder {
 impl EmbeddingProvider for FixedVectorEmbedder {
     async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
         Ok(self.vector.clone())
+    }
+
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        Ok(())
     }
 
     fn dimensions(&self) -> usize {
@@ -95,40 +102,88 @@ fn near_x() -> Vec<f32> {
 // Minimal HTTP mock server (tokio TcpListener)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Spawn a one-shot HTTP server that responds once with `response_body` and
-/// returns the address it is listening on.
-async fn one_shot_http_server(response_body: &'static str) -> SocketAddr {
+/// A raw 200 response carrying `json`.
+fn http_ok(json: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+        json.len()
+    )
+}
+
+/// A raw response with no body — for the error statuses.
+fn http_status(code: u16, reason: &str) -> String {
+    format!("HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+}
+
+/// Spawn an HTTP server that serves `responses` in order (the last one repeating
+/// forever), counting requests. The count is how retry behaviour is asserted —
+/// deterministically, without leaning on wall-clock timing.
+async fn scripted_http_server(responses: Vec<String>) -> (SocketAddr, Arc<AtomicUsize>) {
+    assert!(!responses.is_empty(), "script at least one response");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let response_json = response_body;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
     tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        // Read & discard the request.
-        let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf).await.unwrap_or(0);
-        let _ = n; // we only care that data arrived; body is in buf
-        let content_len = response_json.len();
-        let http_response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {content_len}\r\nConnection: close\r\n\r\n{response_json}"
-        );
-        stream.write_all(http_response.as_bytes()).await.unwrap();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            let body = responses[n.min(responses.len() - 1)].clone();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let _ = stream.write_all(body.as_bytes()).await;
+        }
     });
+    (addr, hits)
+}
+
+/// Spawn a server that accepts the connection and then answers *nothing*, holding
+/// it open — the flaky-endpoint shape that hangs a client with no timeout (the
+/// v0.0.17 failure). Counts connections, so a retry would be visible.
+async fn stalled_http_server() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    tokio::spawn(async move {
+        // Streams are held, never answered: dropping them would send a FIN and let
+        // the client fail early. Only the timeout may end this wait.
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(stream);
+        }
+    });
+    (addr, hits)
+}
+
+/// An address nothing is listening on: bind, learn the port, drop the listener.
+async fn dead_port() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
     addr
 }
 
-/// Spawn a one-shot HTTP server that returns 500.
-async fn one_shot_http_server_error() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 4096];
-        let _ = stream.read(&mut buf).await;
-        let resp =
-            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        stream.write_all(resp.as_bytes()).await.unwrap();
-    });
-    addr
+/// Fast, deterministic bounds — CI must not wait out production-sized budgets.
+fn fast_policy() -> HttpPolicy {
+    HttpPolicy {
+        connect_timeout: Duration::from_millis(500),
+        request_timeout: Duration::from_millis(300),
+        max_retries: 2,
+        retry_backoff: Duration::from_millis(10),
+    }
+}
+
+fn embedder_at(addr: SocketAddr, dimensions: usize, policy: HttpPolicy) -> HttpEmbedder {
+    HttpEmbedder::with_policy(
+        format!("http://{addr}/api/embeddings"),
+        "nomic-embed-text",
+        dimensions,
+        RequestFormat::Ollama,
+        None,
+        policy,
+    )
+    .expect("client must build")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -151,20 +206,24 @@ fn noop_embedder_dimensions_is_zero() {
     assert_eq!(emb.dimensions(), 0);
 }
 
+/// The noop embedder is trivially healthy — it embeds nothing, so there is no
+/// backend that can be down. It must never be the thing that fails a health gate.
+#[tokio::test]
+async fn noop_embedder_health_check_is_ok() {
+    NoopEmbedder
+        .health_check()
+        .await
+        .expect("NoopEmbedder is always healthy");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 2 — HttpEmbedder ollama adapter
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn http_embedder_ollama_parses_embedding_field() {
-    let addr = one_shot_http_server(r#"{"embedding":[0.1,0.2,0.3]}"#).await;
-    let emb = HttpEmbedder::new(
-        format!("http://{addr}/api/embeddings"),
-        "nomic-embed-text",
-        3,
-        RequestFormat::Ollama,
-        None,
-    );
+    let (addr, _) = scripted_http_server(vec![http_ok(r#"{"embedding":[0.1,0.2,0.3]}"#)]).await;
+    let emb = embedder_at(addr, 3, fast_policy());
     let vec = emb.embed("test text").await.unwrap();
     assert_eq!(vec, vec![0.1_f32, 0.2_f32, 0.3_f32]);
 }
@@ -174,14 +233,9 @@ async fn http_embedder_ollama_parses_embedding_field() {
 // not silently hand back a mis-sized vector that corrupts cosine similarity.
 #[tokio::test]
 async fn http_embedder_rejects_dimension_mismatch() {
-    let addr = one_shot_http_server(r#"{"embedding":[0.1,0.2,0.3]}"#).await;
-    let emb = HttpEmbedder::new(
-        format!("http://{addr}/api/embeddings"),
-        "nomic-embed-text",
-        4, // configured 4, backend returns 3
-        RequestFormat::Ollama,
-        None,
-    );
+    let (addr, hits) = scripted_http_server(vec![http_ok(r#"{"embedding":[0.1,0.2,0.3]}"#)]).await;
+    // configured 4, backend returns 3
+    let emb = embedder_at(addr, 4, fast_policy());
     let err = emb.embed("test text").await.unwrap_err();
     match err {
         EmbeddingError::BackendFailed(msg) => {
@@ -190,6 +244,9 @@ async fn http_embedder_rejects_dimension_mismatch() {
         }
         other => panic!("expected BackendFailed, got {other:?}"),
     }
+    // A dimension mismatch is deterministic — the same backend will return the
+    // same wrong width forever. Retrying it is pure latency, so we must not.
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "must not retry a mismatch");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -198,14 +255,17 @@ async fn http_embedder_rejects_dimension_mismatch() {
 
 #[tokio::test]
 async fn http_embedder_openai_compatible_parses_data_0_embedding() {
-    let addr = one_shot_http_server(r#"{"data":[{"embedding":[0.5,0.6,0.7]}]}"#).await;
-    let emb = HttpEmbedder::new(
+    let (addr, _) =
+        scripted_http_server(vec![http_ok(r#"{"data":[{"embedding":[0.5,0.6,0.7]}]}"#)]).await;
+    let emb = HttpEmbedder::with_policy(
         format!("http://{addr}/v1/embeddings"),
         "text-embedding-ada-002",
         3,
         RequestFormat::OpenAiCompatible,
         None,
-    );
+        fast_policy(),
+    )
+    .expect("client must build");
     let vec = emb.embed("test text").await.unwrap();
     assert_eq!(vec, vec![0.5_f32, 0.6_f32, 0.7_f32]);
 }
@@ -332,18 +392,295 @@ fn build_entry_with_none_embedding_stores_no_embedding_field() {
 
 #[tokio::test]
 async fn http_embedder_backend_failure_returns_backend_failed_error() {
-    let addr = one_shot_http_server_error().await;
-    let emb = HttpEmbedder::new(
-        format!("http://{addr}/api/embeddings"),
-        "nomic-embed-text",
-        768,
-        RequestFormat::Ollama,
-        None,
-    );
+    let (addr, _) = scripted_http_server(vec![http_status(500, "Internal Server Error")]).await;
+    let emb = embedder_at(addr, 768, fast_policy());
     let err = emb.embed("test").await.expect_err("must fail on 500");
     assert!(
         matches!(err, EmbeddingError::BackendFailed(_)),
         "expected BackendFailed; got {err:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D2 — dependability: timeout, bounded retry, health probe
+//
+// The grounded defect: `HttpEmbedder` used to build `reqwest::Client::new()` with
+// no timeout, so a flaky endpoint HUNG the caller instead of failing. These tests
+// are what make that irreproducible.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// D2-T1 — a backend that accepts the connection and then never answers must
+/// produce a typed `Timeout` inside the budget, not hang.
+#[tokio::test]
+async fn http_embedder_times_out_instead_of_hanging() {
+    let (addr, hits) = stalled_http_server().await;
+    let policy = fast_policy(); // request_timeout = 300ms
+    let emb = embedder_at(addr, 3, policy);
+
+    let started = Instant::now();
+    let err = emb
+        .embed("test")
+        .await
+        .expect_err("a stalled backend must fail");
+    let elapsed = started.elapsed();
+
+    match err {
+        EmbeddingError::Timeout(after) => assert_eq!(after, policy.request_timeout),
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+    // Generous upper bound: the point is that it *terminates* — the pre-fix client
+    // would still be waiting. Tight enough to catch a retry-multiplied wait.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "must fail fast; took {elapsed:?}"
+    );
+    // A timeout is not retried: retrying would multiply the very latency the
+    // timeout exists to bound.
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "a timeout must not be retried"
+    );
+}
+
+/// D2-T2 — a transient 5xx is retried, and the retry's success is returned.
+#[tokio::test]
+async fn http_embedder_retries_a_transient_5xx_then_succeeds() {
+    let (addr, hits) = scripted_http_server(vec![
+        http_status(503, "Service Unavailable"),
+        http_ok(r#"{"embedding":[0.1,0.2,0.3]}"#),
+    ])
+    .await;
+    let emb = embedder_at(addr, 3, fast_policy());
+
+    let vec = emb.embed("test").await.expect("the retry must succeed");
+    assert_eq!(vec, vec![0.1_f32, 0.2_f32, 0.3_f32]);
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "one failure, one retry");
+}
+
+/// D2-T2 — retries are bounded: a permanently-5xx backend fails after exactly
+/// `1 + max_retries` attempts. No infinite loop.
+#[tokio::test]
+async fn http_embedder_bounds_retries_on_a_persistent_5xx() {
+    let (addr, hits) = scripted_http_server(vec![http_status(500, "Internal Server Error")]).await;
+    let policy = fast_policy(); // max_retries = 2
+    let emb = embedder_at(addr, 3, policy);
+
+    let err = emb
+        .embed("test")
+        .await
+        .expect_err("persistent 500 must fail");
+    assert!(
+        err.to_string().contains("500"),
+        "the last failure must be reported verbatim: {err}"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst) as u32,
+        1 + policy.max_retries,
+        "attempts must be bounded by the policy"
+    );
+}
+
+/// D2-T2 — a 4xx is a deterministic verdict (bad model, bad key, wrong URL).
+/// Retrying only gets the same answer slower.
+#[tokio::test]
+async fn http_embedder_does_not_retry_a_4xx() {
+    let (addr, hits) = scripted_http_server(vec![http_status(400, "Bad Request")]).await;
+    let emb = embedder_at(addr, 3, fast_policy());
+
+    let err = emb.embed("test").await.expect_err("400 must fail");
+    assert!(
+        matches!(err, EmbeddingError::BackendFailed(_)),
+        "expected BackendFailed; got {err:?}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1, "a 4xx must not be retried");
+}
+
+/// A 429 is the one 4xx that *is* transient — the backend is telling us to slow
+/// down, not that the request is wrong.
+#[tokio::test]
+async fn http_embedder_retries_a_429() {
+    let (addr, hits) = scripted_http_server(vec![
+        http_status(429, "Too Many Requests"),
+        http_ok(r#"{"embedding":[0.1,0.2,0.3]}"#),
+    ])
+    .await;
+    let emb = embedder_at(addr, 3, fast_policy());
+
+    emb.embed("test").await.expect("the retry must succeed");
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "429 is retryable");
+}
+
+/// D1-T2 / D2-T3 — the health probe answers Ok against a live backend.
+#[tokio::test]
+async fn health_check_succeeds_against_a_healthy_backend() {
+    let (addr, hits) = scripted_http_server(vec![http_ok(r#"{"embedding":[0.1,0.2,0.3]}"#)]).await;
+    let emb = embedder_at(addr, 3, fast_policy());
+
+    emb.health_check().await.expect("a live backend is healthy");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "the probe is one round-trip"
+    );
+}
+
+/// D2-T3 — the probe against a dead port fails fast with a diagnosable error.
+/// Fail-fast, not a silent lexical downgrade: the embedder reports; the caller decides.
+#[tokio::test]
+async fn health_check_fails_fast_against_a_dead_port() {
+    let addr = dead_port().await;
+    let emb = embedder_at(addr, 3, fast_policy());
+
+    let started = Instant::now();
+    let err = emb
+        .health_check()
+        .await
+        .expect_err("a dead port is not healthy");
+    let elapsed = started.elapsed();
+
+    match &err {
+        EmbeddingError::HealthCheckFailed(msg) => {
+            assert!(
+                msg.contains(&addr.to_string()),
+                "the error must name the endpoint it probed: {msg}"
+            );
+        }
+        other => panic!("expected HealthCheckFailed, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the probe must fail fast; took {elapsed:?}"
+    );
+}
+
+/// The probe is a real embed, so it also proves the *dimension contract* — the
+/// thing no connection-level ping can tell you. A backend that is reachable but
+/// returns the wrong width is not healthy.
+#[tokio::test]
+async fn health_check_fails_on_a_dimension_mismatch() {
+    let (addr, _) = scripted_http_server(vec![http_ok(r#"{"embedding":[0.1,0.2,0.3]}"#)]).await;
+    let emb = embedder_at(addr, 768, fast_policy()); // backend returns 3
+
+    let err = emb
+        .health_check()
+        .await
+        .expect_err("a wrong-width backend is not healthy");
+    assert!(
+        err.to_string().contains("dimension mismatch"),
+        "the probe must surface the contract breach: {err}"
+    );
+}
+
+/// A stalled backend surfaces as a typed `Timeout` through the probe too — the
+/// timeout is the most actionable thing we can report, so it is not re-wrapped.
+#[tokio::test]
+async fn health_check_times_out_on_a_stalled_backend() {
+    let (addr, _) = stalled_http_server().await;
+    let emb = embedder_at(addr, 3, fast_policy());
+
+    let err = emb
+        .health_check()
+        .await
+        .expect_err("a stalled backend is not healthy");
+    assert!(
+        matches!(err, EmbeddingError::Timeout(_)),
+        "expected a typed Timeout; got {err:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D2 — the dependability knobs are config-wired (no knob that does nothing)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn embeddings_config(extra: Value) -> Value {
+    let mut block = json!({
+        "backend": "ollama",
+        "url": "http://localhost:11434/api/embeddings",
+        "model": "nomic-embed-text",
+        "dimensions": 768
+    });
+    if let (Some(b), Some(e)) = (block.as_object_mut(), extra.as_object()) {
+        for (k, v) in e {
+            b.insert(k.clone(), v.clone());
+        }
+    }
+    json!({ "version": "1", "embeddings": block })
+}
+
+#[test]
+fn config_parse_applies_the_default_policy_when_knobs_are_absent() {
+    let emb = parse_embeddings_config(&embeddings_config(json!({})))
+        .unwrap()
+        .expect("ollama backend parses");
+    assert_eq!(emb.policy(), HttpPolicy::default());
+    // The whole point: the default is never "no timeout".
+    assert!(emb.policy().request_timeout > Duration::ZERO);
+    assert!(emb.policy().connect_timeout > Duration::ZERO);
+}
+
+#[test]
+fn config_parse_wires_every_policy_knob_through() {
+    let emb = parse_embeddings_config(&embeddings_config(json!({
+        "connect_timeout_ms": 250,
+        "request_timeout_ms": 1500,
+        "max_retries": 5,
+        "retry_backoff_ms": 25
+    })))
+    .unwrap()
+    .expect("ollama backend parses");
+    assert_eq!(
+        emb.policy(),
+        HttpPolicy {
+            connect_timeout: Duration::from_millis(250),
+            request_timeout: Duration::from_millis(1500),
+            max_retries: 5,
+            retry_backoff: Duration::from_millis(25),
+        }
+    );
+}
+
+#[test]
+fn config_parse_allows_zero_retries() {
+    // 0 is meaningful (retry off) — unlike a 0 timeout, which is nonsense.
+    let emb = parse_embeddings_config(&embeddings_config(json!({ "max_retries": 0 })))
+        .unwrap()
+        .expect("ollama backend parses");
+    assert_eq!(emb.policy().max_retries, 0);
+}
+
+#[test]
+fn config_parse_rejects_a_zero_timeout() {
+    let err = parse_embeddings_config(&embeddings_config(json!({ "request_timeout_ms": 0 })))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("request_timeout_ms"),
+        "error must name the offending knob: {err}"
+    );
+}
+
+#[test]
+fn config_parse_rejects_a_malformed_timeout_rather_than_defaulting() {
+    // Silently defaulting a typo'd timeout would restore the unbounded wait these
+    // knobs exist to prevent — the failure must be loud.
+    let err = parse_embeddings_config(&embeddings_config(json!({ "connect_timeout_ms": "soon" })))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("connect_timeout_ms"),
+        "error must name the offending knob: {err}"
+    );
+}
+
+#[test]
+fn config_parse_rejects_a_malformed_retry_count() {
+    let err = parse_embeddings_config(&embeddings_config(json!({ "max_retries": -1 })))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("max_retries"),
+        "error must name the offending knob: {err}"
     );
 }
 
