@@ -197,11 +197,15 @@ pub fn rank_candidates(hits: &[SearchHit], registry: Option<&Registry>) -> Vec<R
                             .collect()
                     })
                     .unwrap_or_default(),
+                // A tool is the *other* column of the crossmatrix, never the
+                // `workflow` one: asking "which tools does this tool link to"
+                // is not a question the topology answers.
                 DiscoveryKind::Capability
                 | DiscoveryKind::Connection
                 | DiscoveryKind::Guidance
                 | DiscoveryKind::Script
-                | DiscoveryKind::Agent => Vec::new(),
+                | DiscoveryKind::Agent
+                | DiscoveryKind::Tool => Vec::new(),
             };
             let topology = TopologySignal::from_linked_tools(linked_tools);
 
