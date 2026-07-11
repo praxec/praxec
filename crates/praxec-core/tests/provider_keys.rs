@@ -26,18 +26,24 @@ fn resolve_path_honors_env_override() {
 }
 
 #[test]
-fn resolve_path_defaults_under_praxec_home() {
+fn resolve_path_defaults_under_config_dir() {
     let _guard = env_lock().lock().unwrap();
     // SAFETY: env_lock() serializes access across this test binary; no
     // other crate code touches PRAXEC_PROVIDER_KEYS_FILE.
     unsafe {
         std::env::remove_var("PRAXEC_PROVIDER_KEYS_FILE");
     }
-    let p = provider_keys::resolve_path().expect("home_dir resolves on supported platforms");
-    // The default is dirs::home_dir().join(".praxec/providers.env"); on every
-    // supported platform `dirs::home_dir` returns Some. Assert the suffix
-    // rather than the absolute path (which varies by user).
-    assert!(p.ends_with(".praxec/providers.env"), "got {}", p.display());
+    let p = provider_keys::resolve_path().expect("config/home dir resolves on supported platforms");
+    // With no env override, resolution prefers an existing file (XDG config dir
+    // `<config>/praxec/providers.env` first, then legacy `~/.praxec/`), and when
+    // neither exists yet DEFAULTS to the XDG config path. So the result ends in
+    // either `praxec/providers.env` (XDG) or `.praxec/providers.env` (legacy) —
+    // assert the suffix rather than an absolute path (which varies by user/env).
+    assert!(
+        p.ends_with("praxec/providers.env") || p.ends_with(".praxec/providers.env"),
+        "got {}",
+        p.display()
+    );
 }
 
 #[test]
@@ -47,9 +53,9 @@ fn resolve_path_whitespace_env_falls_through_to_default() {
     unsafe {
         std::env::set_var("PRAXEC_PROVIDER_KEYS_FILE", "   ");
     }
-    let p = provider_keys::resolve_path().expect("whitespace env falls through to home_dir");
+    let p = provider_keys::resolve_path().expect("whitespace env falls through to a default");
     assert!(
-        p.ends_with(".praxec/providers.env") || p.ends_with("praxec-providers.env"),
+        p.ends_with("praxec/providers.env") || p.ends_with(".praxec/providers.env"),
         "whitespace env should fall through; got {}",
         p.display()
     );

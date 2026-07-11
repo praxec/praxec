@@ -25,13 +25,12 @@
 
 use std::path::Path;
 
+// F12 — the staged/grant key names are owned by praxec-core (the reader side:
+// `apply_staged_connection_grants`). This writer imports them so the two sides
+// can never drift apart.
+use praxec_core::config::{GRANT_CONNECTIONS_KEY, STAGED_CONNECTIONS_KEY};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-
-/// Top-level key holding operator-staged (not-yet-granted) connection bodies.
-pub const STAGED_CONNECTIONS_KEY: &str = "stagedConnections";
-/// Top-level key holding the names of staged connections the operator granted.
-pub const GRANT_CONNECTIONS_KEY: &str = "grant_connections";
 
 /// The three connection kinds a connection entry may take. Typed so every writer
 /// matches exhaustively (poka-yoke) instead of switching on a loose string.

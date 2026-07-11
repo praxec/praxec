@@ -193,12 +193,14 @@ fn load_include_entry(
 /// string `include:` entries and `file://` object entries, resolved relative
 /// to the file that lists them — the same base rule as `load_yaml_inner`).
 ///
-/// Scope (v1, deliberate): remote includes (`https://` / `git+https://`) and
-/// `repos:` working trees are NOT enumerated — the staleness recheck watches
-/// the config file set only; a repo edit is picked up by the explicit
-/// `praxec.command {reload}` / SIGHUP paths. Unreadable or unparsable files
-/// are skipped rather than erroring: this feeds the lazy staleness probe on
-/// a LIVE server, which must degrade to "track less" — never fail a request.
+/// Scope: local `include:` files AND every declared `repos:` working tree's
+/// definition YAML are enumerated, so an edit to a pack file triggers the same
+/// gated reload as a config edit (v0.0.17 dogfood Finding 6 — a repo edit was
+/// previously invisible on a running gateway until an explicit reload / SIGHUP).
+/// Remote includes (`https://` / `git+https://`) are NOT enumerated. Unreadable
+/// or unparsable files are skipped rather than erroring: this feeds the lazy
+/// staleness probe on a LIVE server, which must degrade to "track less" — never
+/// fail a request.
 pub fn local_config_file_set(path: impl AsRef<Path>) -> Vec<PathBuf> {
     let mut visited = HashSet::new();
     let mut out = Vec::new();
@@ -223,32 +225,55 @@ fn collect_local_config_files(path: &Path, visited: &mut HashSet<PathBuf>, out: 
     let Some(parent) = canonical.parent() else {
         return;
     };
-    let Some(includes) = value.get("include").and_then(Value::as_array) else {
-        return;
-    };
-    for inc in includes {
-        match inc {
-            Value::String(rel) => {
-                collect_local_config_files(&parent.join(rel), visited, out);
+    if let Some(includes) = value.get("include").and_then(Value::as_array) {
+        for inc in includes {
+            match inc {
+                Value::String(rel) => {
+                    collect_local_config_files(&parent.join(rel), visited, out);
+                }
+                Value::Object(_) => {
+                    // Mirror load_include_entry's file:// resolution; skip remote.
+                    let Some(rel) = inc
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .and_then(|uri| uri.strip_prefix("file://"))
+                    else {
+                        continue;
+                    };
+                    let p = Path::new(rel);
+                    let full = if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        parent.join(rel)
+                    };
+                    collect_local_config_files(&full, visited, out);
+                }
+                _ => {}
             }
-            Value::Object(_) => {
-                // Mirror load_include_entry's file:// resolution; skip remote.
-                let Some(rel) = inc
-                    .get("uri")
-                    .and_then(Value::as_str)
-                    .and_then(|uri| uri.strip_prefix("file://"))
-                else {
-                    continue;
-                };
-                let p = Path::new(rel);
-                let full = if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    parent.join(rel)
-                };
-                collect_local_config_files(&full, visited, out);
+        }
+    }
+
+    // Track every declared repo's definition YAML so a pack edit triggers the
+    // same gated reload as a config edit (Finding 6). Best-effort: an unreadable
+    // repo just contributes nothing.
+    if let Some(repos) = value.get("repos").and_then(Value::as_array) {
+        for repo in repos {
+            let Some(rel) = repo.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let p = Path::new(rel);
+            let repo_path = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                parent.join(rel)
+            };
+            for f in crate::repo::definition_files(&repo_path) {
+                if let Ok(canonical) = f.canonicalize() {
+                    if visited.insert(canonical.clone()) {
+                        out.push(canonical);
+                    }
+                }
             }
-            _ => {}
         }
     }
 }
@@ -3011,6 +3036,17 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     Ok(merged)
 }
 
+/// SPEC §9.5 — top-level config key holding operator-staged (not-yet-granted)
+/// connection bodies (`px connections add`). Single source of truth for the
+/// key name: the writer (`praxec-executors::conn_write`) imports it from here,
+/// so the staging side and this grant gate can never drift apart.
+pub const STAGED_CONNECTIONS_KEY: &str = "stagedConnections";
+/// SPEC §9.5 — top-level config key listing the staged-connection names the
+/// operator granted (`px connections grant`). Same key name is also used per
+/// `repos:` entry for pack-declared connections. Single source of truth —
+/// see [`STAGED_CONNECTIONS_KEY`].
+pub const GRANT_CONNECTIONS_KEY: &str = "grant_connections";
+
 /// SPEC §9.5 — apply the host-level staged-connection grant gate (`px connections
 /// add` / `grant`). This is the operator-authored analog of
 /// [`gate_repo_connections`]: `add` writes a body under top-level
@@ -3031,34 +3067,35 @@ fn apply_staged_connection_grants(config: &mut Value) -> anyhow::Result<Vec<Ungr
     let Some(obj) = config.as_object_mut() else {
         return Ok(Vec::new());
     };
-    let staged = match obj.remove("stagedConnections") {
+    let staged = match obj.remove(STAGED_CONNECTIONS_KEY) {
         Some(Value::Object(m)) => m,
         None | Some(Value::Null) => {
             // No staged connections — a lone `grant_connections:` grants nothing.
-            if let Some(g) = obj.remove("grant_connections") {
+            if let Some(g) = obj.remove(GRANT_CONNECTIONS_KEY) {
                 if g.as_array().is_some_and(|a| !a.is_empty()) {
                     bail!(
-                        "STALE_CONNECTION_GRANT: top-level `grant_connections:` lists names, but \
-                         there is no `stagedConnections:` block. Add a connection with \
-                         `px connections add <name> --kind <kind> ...` first (SPEC §9.5)."
+                        "STALE_CONNECTION_GRANT: top-level `{GRANT_CONNECTIONS_KEY}:` lists \
+                         names, but there is no `{STAGED_CONNECTIONS_KEY}:` block. Add a \
+                         connection with `px connections add <name> --kind <kind> ...` first \
+                         (SPEC §9.5)."
                     );
                 }
             }
             return Ok(Vec::new());
         }
         Some(_) => bail!(
-            "INVALID_STAGED_CONNECTIONS: top-level `stagedConnections:` must be a mapping of \
-             name → connection body (SPEC §9.5)."
+            "INVALID_STAGED_CONNECTIONS: top-level `{STAGED_CONNECTIONS_KEY}:` must be a mapping \
+             of name → connection body (SPEC §9.5)."
         ),
     };
-    let grants: HashSet<String> = match obj.remove("grant_connections") {
+    let grants: HashSet<String> = match obj.remove(GRANT_CONNECTIONS_KEY) {
         Some(Value::Array(a)) => a
             .into_iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect(),
         None | Some(Value::Null) => HashSet::new(),
         Some(_) => bail!(
-            "INVALID_GRANT_CONNECTIONS: top-level `grant_connections:` must be an array of \
+            "INVALID_GRANT_CONNECTIONS: top-level `{GRANT_CONNECTIONS_KEY}:` must be an array of \
              staged connection names (SPEC §9.5)."
         ),
     };
@@ -3067,8 +3104,8 @@ fn apply_staged_connection_grants(config: &mut Value) -> anyhow::Result<Vec<Ungr
     for g in &grants {
         if !staged.contains_key(g) {
             bail!(
-                "STALE_CONNECTION_GRANT: top-level `grant_connections:` lists '{g}', but no \
-                 `stagedConnections:` entry declares it. Add it with \
+                "STALE_CONNECTION_GRANT: top-level `{GRANT_CONNECTIONS_KEY}:` lists '{g}', but \
+                 no `{STAGED_CONNECTIONS_KEY}:` entry declares it. Add it with \
                  `px connections add {g} --kind <kind> ...` or remove the grant (SPEC §9.5)."
             );
         }
@@ -3076,6 +3113,19 @@ fn apply_staged_connection_grants(config: &mut Value) -> anyhow::Result<Vec<Ungr
     let mut ungranted = Vec::new();
     for (name, body) in staged {
         if grants.contains(&name) {
+            // F9 — a granted body is about to go LIVE: validate it against the
+            // gateway config's `$defs/connection` shape BEFORE promotion. `px
+            // connections add` constructs well-formed bodies, but the staged
+            // block is operator-editable YAML — a hand-edited or drifted body
+            // must fail fast here, never become a live (spawnable) connection.
+            if let Err(reason) = crate::tool_descriptor::validate_gateway_connection(&body) {
+                bail!(
+                    "INVALID_STAGED_CONNECTION: '{name}': {reason}. The granted \
+                     `{STAGED_CONNECTIONS_KEY}:` body does not match the gateway `connection` \
+                     shape, so it cannot be promoted live. Fix the staged body or remove '{name}' \
+                     from `{GRANT_CONNECTIONS_KEY}:` (SPEC §9.5)."
+                );
+            }
             let connections = obj
                 .entry("connections")
                 .or_insert_with(|| Value::Object(Map::new()));
@@ -3396,7 +3446,7 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
     };
     // SPEC §9.5 — optional `grant_connections:` (default empty), the operator's
     // explicit activation of this repo's declared connections.
-    let grant_connections: Vec<String> = match entry.get("grant_connections") {
+    let grant_connections: Vec<String> = match entry.get(GRANT_CONNECTIONS_KEY) {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(arr)) => arr
             .iter()

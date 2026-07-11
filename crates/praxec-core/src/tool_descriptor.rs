@@ -20,9 +20,6 @@
 //!   (SPEC §9.5); until then the connection is diverted to
 //!   `/praxec/_ungrantedConnections` and every operation fails typed
 //!   `UNGRANTED_PACK_CONNECTION`. Granting stays a separate operator act.
-//! - **`auth` is names-only.** Env var / header NAMES, never secret values
-//!   (values enter only via `px connections add`, D4a). The schema's
-//!   `additionalProperties: false` rejects value-bearing fields (FM3).
 //! - **`kind` is a closed enum** ([`ToolKind`], exhaustive `match`, no
 //!   `Other(String)` escape) mirroring
 //!   [`crate::discovery::DiscoveryKind`] / [`crate::discovery::ScriptVerb`].
@@ -169,34 +166,6 @@ impl ToolKind {
     }
 }
 
-/// Auth requirement scheme — names-only declaration of what the connection
-/// needs. Closed enum, same idiom as [`ToolKind`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthScheme {
-    /// The tool needs no credentials.
-    None,
-    /// Credentials arrive as environment variables (names in `env`).
-    Env,
-    /// Credentials arrive as HTTP headers (names in `headers`).
-    Header,
-    /// A bearer token (the header name is implied: `Authorization`).
-    Bearer,
-}
-
-impl AuthScheme {
-    pub const ALL_TOKENS: &'static [&'static str] = &["none", "env", "header", "bearer"];
-
-    pub fn as_token(self) -> &'static str {
-        match self {
-            AuthScheme::None => "none",
-            AuthScheme::Env => "env",
-            AuthScheme::Header => "header",
-            AuthScheme::Bearer => "bearer",
-        }
-    }
-}
-
 /// One entry in the ADR-0013 packs/v2 provider chain (ordered,
 /// first-available wins). Closed enum, same idiom as [`ToolKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,21 +192,15 @@ impl ProvisionProvider {
     }
 }
 
-/// Names-only auth declaration (FM3: secret values never enter a descriptor;
-/// they enter exactly once, via `px connections add`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuthRequirement {
-    pub scheme: AuthScheme,
-    /// Env var NAMES (keys), never values.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub env: Vec<String>,
-    /// Header NAMES, never values.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub headers: Vec<String>,
-}
-
 /// The connection requirement — ties the descriptor to the D3 grant model.
+///
+/// NOTE (F8, v0.0.18): the descriptor intentionally carries NO `auth` block.
+/// A declared-but-unenforced auth requirement shipped in v0.0.17 drafts and
+/// was removed: advertising credential requirements the executor never checks
+/// or injects is a security footgun. Auth/credential handling returns in
+/// v0.0.18 as enforce-then-declare — the field comes back only together with
+/// the enforcement (env presence checks / header injection) in the D2
+/// tool-source executor.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Reach {
@@ -251,8 +214,6 @@ pub struct Reach {
     /// copy-never-transform; shape is enforced by the schema's `$ref` into
     /// `gateway-config.schema.json#/$defs/connection` at load time.
     pub connection: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<AuthRequirement>,
 }
 
 /// Provisioning hint — mirrors the ADR-0013 `praxec.packs/v2` tool entry (no

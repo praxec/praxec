@@ -707,6 +707,77 @@ fn non_array_grant_connections_is_rejected() {
 }
 
 #[test]
+fn granting_a_malformed_staged_connection_fails_fast() {
+    // F9 — promotion is a trust boundary: a granted staged body that does not
+    // match `$defs/connection` must FAIL the load, never become a live
+    // connection. (`px connections add` writes well-formed bodies, but the
+    // staged block is operator-editable YAML.)
+    let td = TempDir::new().unwrap();
+    let host = r#"
+version: "1.0.0"
+stagedConnections:
+  broken:
+    kind: carrier-pigeon
+grant_connections: [broken]
+"#;
+    let path = write_host(&td, host);
+    let err = load_resolved_with_repos(&path).expect_err("malformed promotion must error");
+    let msg = format!("{:#}", err);
+    assert!(msg.contains("INVALID_STAGED_CONNECTION"), "msg: {msg}");
+    assert!(msg.contains("broken"), "msg names the connection: {msg}");
+}
+
+#[test]
+fn malformed_staged_connection_without_a_grant_stays_inert() {
+    // F9 scope — the validation gate sits on PROMOTION (the trust boundary).
+    // An ungranted staged body never goes live, so a malformed one is inert
+    // diagnostic state, not a load failure.
+    let td = TempDir::new().unwrap();
+    let host = r#"
+version: "1.0.0"
+stagedConnections:
+  broken:
+    kind: carrier-pigeon
+"#;
+    let path = write_host(&td, host);
+    let (config, _diags) =
+        load_resolved_with_repos(&path).expect("ungranted staged body must not fail the load");
+    assert!(
+        config.pointer("/connections/broken").is_none(),
+        "malformed staged body must never be live"
+    );
+    assert!(
+        config
+            .pointer("/praxec/_ungrantedConnections/broken")
+            .is_some(),
+        "staged body is stamped ungranted"
+    );
+}
+
+#[test]
+fn granting_a_well_formed_staged_connection_promotes_it_live() {
+    // F9 companion — the validation gate admits a body that DOES match
+    // `$defs/connection` (guards against the validator rejecting everything).
+    let td = TempDir::new().unwrap();
+    let host = r#"
+version: "1.0.0"
+stagedConnections:
+  gh:
+    kind: cli
+    command: gh
+grant_connections: [gh]
+"#;
+    let path = write_host(&td, host);
+    let (config, _diags) = load_resolved_with_repos(&path).expect("valid promotion succeeds");
+    assert_eq!(
+        config
+            .pointer("/connections/gh/kind")
+            .and_then(Value::as_str),
+        Some("cli")
+    );
+}
+
+#[test]
 fn v23_rejects_stale_override_with_no_collision() {
     // An `overrides:` entry that doesn't actually shadow a repo-provided
     // id is almost certainly an author mistake (renamed id, deleted repo).

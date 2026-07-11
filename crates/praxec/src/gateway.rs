@@ -195,7 +195,9 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 env,
                 headers,
             ),
-            ConnectionsCommand::Grant { config, name } => connections_grant(&config, &name).await,
+            ConnectionsCommand::Grant { config, name, yes } => {
+                connections_grant(&config, &name, yes).await
+            }
         },
     }
 }
@@ -321,11 +323,46 @@ fn connections_add(
     Ok(())
 }
 
+/// F13 — the grant was invoked without a provable operator origin: stdin is not
+/// a terminal (so this is an agent/pack/script shelling out, not a human at a
+/// keyboard) and no explicit `--yes` operator-intent flag was passed. The CLI
+/// mirror of the P16 `HITL_NON_HUMAN_RESOLVER` rule: the trust act is refused
+/// fail-closed and NOTHING is written — the connection stays staged for a later
+/// human grant.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "GRANT_REQUIRES_OPERATOR: `connections grant {name}` is the explicit human \
+     trust act (it promotes a staged connection into the live registry), but \
+     stdin is not a terminal, so this invocation cannot be proven to originate \
+     from an interactive operator. The grant is refused and '{name}' stays \
+     staged. A human at a terminal may simply re-run the command; a deliberate \
+     non-interactive grant must state operator intent explicitly with `--yes`."
+)]
+struct GrantRequiresOperator {
+    name: String,
+}
+
 /// D4a — `connections grant`: the explicit, auditable operator trust act. Appends
 /// the name to the config's top-level `grant_connections:` list (via the write
 /// primitive) and records a `connections.granted` audit event.
-async fn connections_grant(config: &std::path::Path, name: &str) -> anyhow::Result<()> {
+///
+/// F13 origin gate (mirrors P16, which binds `human_decision` resolution to a
+/// proven-human principal at the `Bus::answer` choke point): the CLI has no
+/// principal plumbing, so the operator-origin signal here is the interactive
+/// terminal — a non-TTY stdin without an explicit `--yes` is refused
+/// fail-closed with [`GrantRequiresOperator`] BEFORE any config write.
+async fn connections_grant(config: &std::path::Path, name: &str, yes: bool) -> anyhow::Result<()> {
     use praxec_executors::conn_write::grant_connection;
+    use std::io::IsTerminal;
+
+    // The origin gate runs FIRST: refuse before touching the config file.
+    let origin = if std::io::stdin().is_terminal() {
+        "operator-tty"
+    } else if yes {
+        "operator-flag"
+    } else {
+        return Err(GrantRequiresOperator { name: name.into() }.into());
+    };
 
     // Edit the raw config file first (fail-fast if not staged / already granted).
     let body = grant_connection(config, name)?;
@@ -346,6 +383,9 @@ async fn connections_grant(config: &std::path::Path, name: &str) -> anyhow::Resu
             "connection": name,
             "kind": kind,
             "config": config.display().to_string(),
+            // F13 — how operator origin was proven: an interactive terminal
+            // ("operator-tty") or the explicit `--yes` flag ("operator-flag").
+            "origin": origin,
         }));
     sink.record(event).await?;
 

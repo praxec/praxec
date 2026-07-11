@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 
 use praxec_core::discovery::ScriptVerb;
 use praxec_core::tool_descriptor::{
-    AuthScheme, ProvisionProvider, TOOL_DESCRIPTOR_SCHEMA, TOOL_DESCRIPTOR_SCHEMA_VERSION,
-    ToolDescriptor, ToolKind,
+    ProvisionProvider, TOOL_DESCRIPTOR_SCHEMA, TOOL_DESCRIPTOR_SCHEMA_VERSION, ToolDescriptor,
+    ToolKind,
 };
 
 fn workspace_root() -> PathBuf {
@@ -106,17 +106,6 @@ fn schema_operation_verb_enum_matches_script_verb_all_tokens() {
     let schema = descriptor_schema();
     let tokens = enum_tokens(&schema, "/$defs/operation/properties/verb/enum");
     assert_set_eq("operation.verb enum", ScriptVerb::ALL_TOKENS, &tokens);
-}
-
-#[test]
-fn schema_auth_scheme_enum_matches_auth_scheme_all_tokens() {
-    let schema = descriptor_schema();
-    let tokens = enum_tokens(&schema, "/$defs/authRequirement/properties/scheme/enum");
-    assert_set_eq(
-        "authRequirement.scheme enum",
-        AuthScheme::ALL_TOKENS,
-        &tokens,
-    );
 }
 
 #[test]
@@ -206,8 +195,7 @@ fn maximal_descriptor() -> Value {
         "reach": {
             "connection_name": "maximal",
             "grant_as": "maximal",
-            "connection": { "kind": "mcp", "command": "maximal-server", "args": [], "env": {} },
-            "auth": { "scheme": "env", "env": ["MAXIMAL_TOKEN"], "headers": ["X-Maximal"] }
+            "connection": { "kind": "mcp", "command": "maximal-server", "args": [], "env": {} }
         },
         "provision": {
             "mcp_registry_id": "dev.praxec/maximal",
@@ -253,7 +241,6 @@ fn maximal_descriptor_loads_and_round_trips_all_schema_properties() {
     let cases: &[(&str, &str, &str)] = &[
         ("top-level", "", "/properties"),
         ("reach", "/reach", "/$defs/reach/properties"),
-        ("auth", "/reach/auth", "/$defs/authRequirement/properties"),
         ("provision", "/provision", "/$defs/provision/properties"),
         ("operation", "/operations/0", "/$defs/operation/properties"),
     ];

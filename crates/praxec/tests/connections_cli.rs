@@ -65,8 +65,10 @@ fn add_stages_ungranted_then_grant_promotes_live() {
         "staged connection must be stamped ungranted"
     );
 
-    // grant — the separate explicit trust act; promotes it live.
-    let out = run(&path, &["grant", "github"]);
+    // grant — the separate explicit trust act; promotes it live. The test
+    // harness is non-interactive (stdin is not a TTY), so the F13 origin gate
+    // requires the explicit `--yes` operator-intent flag.
+    let out = run(&path, &["grant", "github", "--yes"]);
     assert!(
         out.status.success(),
         "grant failed: {}",
@@ -99,10 +101,78 @@ fn duplicate_add_exits_non_zero() {
 #[test]
 fn grant_of_unstaged_exits_non_zero() {
     let (_d, path) = write_base();
-    let out = run(&path, &["grant", "ghost"]);
+    // `--yes` clears the F13 origin gate so this exercises the unstaged
+    // fail-fast, not the operator check.
+    let out = run(&path, &["grant", "ghost", "--yes"]);
     assert!(
         !out.status.success(),
         "granting an unstaged connection must exit non-zero"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("GRANT_REQUIRES_OPERATOR"),
+        "with --yes the failure must be the unstaged fail-fast, not the origin gate"
+    );
+}
+
+/// F13 — the operator-origin gate on `grant` (the CLI mirror of the P16
+/// human-origin rule): a NON-INTERACTIVE grant (stdin not a TTY — this test
+/// spawns the binary with a null stdin) is refused fail-closed with
+/// `GRANT_REQUIRES_OPERATOR` and writes NOTHING, unless explicit operator
+/// intent is stated with `--yes`.
+#[test]
+fn non_interactive_grant_is_refused_without_yes_and_succeeds_with_it() {
+    let (_d, path) = write_base();
+    assert!(
+        run(
+            &path,
+            &["add", "github", "--kind", "mcp", "--command", "npx"]
+        )
+        .status
+        .success(),
+        "stage the connection"
+    );
+
+    // Without --yes: refused with the typed code, connection stays staged.
+    let out = run(&path, &["grant", "github"]);
+    assert!(
+        !out.status.success(),
+        "a non-interactive grant without --yes must exit non-zero"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("GRANT_REQUIRES_OPERATOR"),
+        "the refusal must carry the typed GRANT_REQUIRES_OPERATOR code, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let resolved = praxec_core::config::load_resolved_with_repos(&path)
+        .expect("resolves after refused grant")
+        .0;
+    assert!(
+        resolved.pointer("/connections/github").is_none(),
+        "a refused grant must not promote the connection live"
+    );
+    assert!(
+        resolved
+            .pointer("/praxec/_ungrantedConnections/github")
+            .is_some(),
+        "a refused grant must leave the connection staged"
+    );
+
+    // With --yes: explicit operator intent — the grant proceeds.
+    let out = run(&path, &["grant", "github", "--yes"]);
+    assert!(
+        out.status.success(),
+        "grant --yes failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let resolved = praxec_core::config::load_resolved_with_repos(&path)
+        .expect("resolves after grant")
+        .0;
+    assert_eq!(
+        resolved
+            .pointer("/connections/github/kind")
+            .and_then(serde_json::Value::as_str),
+        Some("mcp"),
+        "an explicit --yes grant must promote the connection live"
     );
 }
 
