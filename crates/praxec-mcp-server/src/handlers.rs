@@ -95,8 +95,18 @@ impl PraxecServer {
         // `discovery.registry` (and re-loads on every reload); `None` when the
         // operator configured none, which zeroes the topology term uniformly and
         // leaves the relevance+evidence blend exactly as it was.
+        //
+        // D7 — and the learned selector policy, whose activation bar comes from
+        // the operator's tuning (`intent.policy_min_runs`), exactly as the
+        // annotator above takes `intent.min_runs`. A template with too little
+        // accrued evidence falls through to the blend above, unchanged: on a
+        // fresh install nothing here re-ranks anything.
         let registry = self.registry.current();
-        let ranked = praxec_core::discovery::rank_candidates(&hits, registry.as_deref());
+        let ranked = praxec_core::discovery::rank_candidates(
+            &hits,
+            registry.as_deref(),
+            &praxec_core::discovery::SelectorPolicy::from_tuning(),
+        );
         let hit_by_id: std::collections::HashMap<&str, &praxec_core::discovery::SearchHit> =
             hits.iter().map(|h| (h.item.id.as_str(), h)).collect();
         let items: Vec<Value> = ranked
