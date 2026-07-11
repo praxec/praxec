@@ -301,6 +301,13 @@ pub(crate) enum ConnectionsCommand {
         config: PathBuf,
         /// The staged connection to grant.
         name: String,
+        /// Explicit operator intent for a NON-INTERACTIVE grant. Granting is
+        /// the human trust act (F13, the CLI mirror of the P16 human-origin
+        /// rule): when stdin is not a terminal the grant is refused fail-closed
+        /// with `GRANT_REQUIRES_OPERATOR` unless this flag is passed. A human
+        /// at a terminal never needs it.
+        #[arg(long = "yes", visible_alias = "force", default_value_t = false)]
+        yes: bool,
     },
 }
 
