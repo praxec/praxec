@@ -68,6 +68,7 @@ pub mod sandbox;
 pub mod skills;
 pub mod slot;
 pub mod store;
+pub mod structural_fingerprint;
 pub mod templating;
 pub mod tier;
 pub mod tool_descriptor;

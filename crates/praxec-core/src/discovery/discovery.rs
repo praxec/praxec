@@ -358,6 +358,18 @@ pub struct DiscoveryItem {
     /// non-guidance items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Workflows only (v0.0.18 mechanism #2): the canonical fingerprint of this
+    /// flow's control-flow graph, written at catalog time by
+    /// [`index_from_config`] via
+    /// [`structural_fingerprint::fingerprint`](crate::structural_fingerprint::fingerprint).
+    /// It rides the search response, so praxec-meta can compare / cluster / dedup
+    /// flows by their real graph without re-reading every YAML.
+    ///
+    /// `None` for every non-workflow item — a tool, a skill or a connection has
+    /// no state machine, and a fabricated fingerprint there would be a lie the
+    /// dedup pass would act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_fingerprint: Option<String>,
 }
 
 /// The tag prefix that carries a flow's `process` / `taskClass` into the
@@ -433,6 +445,7 @@ impl DiscoveryItem {
             body: None,
             // Provenance, same meaning as a guidance fragment's `source`.
             source: descriptor.source_repo.clone(),
+            structural_fingerprint: None,
         }
     }
 }
@@ -1131,6 +1144,7 @@ mod semantic_tests {
             verb: None,
             body: None,
             source: None,
+            structural_fingerprint: None,
         }
     }
 

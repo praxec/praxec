@@ -57,6 +57,7 @@ fn item(id: &str, kind: DiscoveryKind) -> DiscoveryItem {
         verb: None,
         body: None,
         source: None,
+        structural_fingerprint: None,
     }
 }
 

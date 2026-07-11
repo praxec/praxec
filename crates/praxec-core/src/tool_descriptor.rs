@@ -317,7 +317,18 @@ pub struct ToolDescriptor {
     /// [`SemanticDiscoveryIndex::build_with_tools`]: crate::discovery::SemanticDiscoveryIndex::build_with_tools
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f64>>,
-    /// Reserved v0.0.18 forward-compat slot (structural dedup fingerprint).
+    /// Reserved forward-compat slot (structural dedup fingerprint).
+    ///
+    /// Still `None` after v0.0.18 D5, deliberately: the structural fingerprint is
+    /// the hash of a *workflow's control-flow graph*
+    /// ([`structural_fingerprint::fingerprint`](crate::structural_fingerprint::fingerprint)),
+    /// and a [`ToolDescriptor`] is a `cli` / `mcp` / `rest` tool — it has no
+    /// states and no transitions. Writing a graph hash here would be a
+    /// fabrication the dedup pass would then act on. The populated slot lives on
+    /// the workflow's catalog entry
+    /// ([`DiscoveryItem::structural_fingerprint`](crate::discovery::DiscoveryItem::structural_fingerprint)).
+    /// If tool-vs-tool dedup ever earns its place, this is where its own
+    /// (different) fingerprint would go.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structural_fingerprint: Option<String>,
 }

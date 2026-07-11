@@ -348,6 +348,7 @@ fn script_item(subject: &str, entry: &Value) -> DiscoveryItem {
         verb: Some(verb),
         body,
         source: Some(source),
+        structural_fingerprint: None,
     }
 }
 
@@ -388,6 +389,7 @@ fn guidance_item(subject: &str, entry: &Value) -> DiscoveryItem {
         verb: Some(verb),
         body: Some(body),
         source: Some(source),
+        structural_fingerprint: None,
     }
 }
 
@@ -474,6 +476,11 @@ fn workflow_item(id: &str, def: &Value) -> DiscoveryItem {
         verb: None,
         body: None,
         source: None,
+        // v0.0.18 mechanism #2 — every cataloged workflow carries the canonical
+        // fingerprint of its graph. Computed here, at the one seam both startup
+        // and hot-reload build the catalog through, so a reloaded/newly-minted
+        // flow is fingerprinted the moment it enters the catalog.
+        structural_fingerprint: Some(crate::structural_fingerprint::fingerprint(def)),
     }
 }
 
@@ -523,6 +530,7 @@ fn capability_item(exposure: &Value) -> Option<DiscoveryItem> {
         verb: None,
         body: None,
         source: None,
+        structural_fingerprint: None,
     })
 }
 
@@ -545,6 +553,7 @@ fn connection_item(name: &str, conn: &Value) -> DiscoveryItem {
         verb: None,
         body: None,
         source: None,
+        structural_fingerprint: None,
     }
 }
 
