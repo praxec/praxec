@@ -22,9 +22,8 @@ use clap::Parser;
 use praxec_core::SingleKindOverlay;
 use praxec_core::WorkflowRuntime;
 use praxec_core::capability::CapabilityRegistry;
-use praxec_core::discovery::{
-    DiscoveryIndex, DiscoveryKind, InMemoryDiscoveryIndex, SemanticDiscoveryIndex,
-};
+use praxec_core::discovery::DiscoveryIndex;
+use praxec_core::embeddings::EmbeddingProvider;
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::ports::{
     EvidenceStore, ExecutorRegistry, GuidanceAcknowledgmentStore, ScriptAcknowledgmentStore,
@@ -713,8 +712,12 @@ async fn build_runtime_for_orchestrate(
     }
 
     let audit = build_audit_sink(config)?;
+    // `orchestrate` is headless: it drives workflows and never serves discovery
+    // (the index below is discarded). Embedding the catalog here would buy a
+    // network round-trip per item for an index nobody queries.
+    let no_embedder: Arc<dyn EmbeddingProvider> = Arc::new(praxec_core::embeddings::NoopEmbedder);
     let (initial_defs, initial_executors, _discovery, workflow_handle) =
-        build_hot_components(config, &audit).await?;
+        build_hot_components(config, &audit, &no_embedder).await?;
     let swappable_defs = Arc::new(SwappableDefinitionStore::new(initial_defs));
     let swappable_executors = Arc::new(SwappableExecutorRegistry::new(initial_executors));
     let store = build_workflow_store(config)?;
@@ -815,8 +818,16 @@ async fn build_oneshot_server(
     // the live peer per call. Durable audit is unchanged (the bridge delegates).
     let (audit, progress_peer) = praxec_mcp_server::progress_bridge(build_audit_sink(config)?);
 
+    // Semantic discovery is an opt-in add-on (see `resolve_embedder`): a live
+    // embedder only when a model is registered AND not disabled via
+    // `praxec.embeddings.enabled: false`; otherwise the free lexical index +
+    // `NoopEmbedder`. Resolved HERE, before the components are built, so startup
+    // gets its index from the SAME `build_hot_components` seam a reload does —
+    // the semantic index used to be bolted on after the fact, which is exactly
+    // why reload never re-embedded.
+    let embedder = resolve_embedder(config);
     let (initial_defs, initial_executors, initial_discovery, workflow_handle) =
-        build_hot_components(config, &audit).await?;
+        build_hot_components(config, &audit, &embedder).await?;
 
     let swappable_defs = Arc::new(SwappableDefinitionStore::new(initial_defs));
     let swappable_executors = Arc::new(SwappableExecutorRegistry::new(initial_executors));
@@ -1005,12 +1016,9 @@ async fn build_oneshot_server(
              satisfied and the workflow would stall forever (wiring regression in serve_with)."
         );
     }
-    // Semantic discovery is an opt-in add-on (see `resolve_embedder`): a live
-    // embedder only when a model is registered AND not disabled via
-    // `praxec.embeddings.enabled: false`; otherwise the free lexical index +
-    // `NoopEmbedder`. When live, we attach it (the lexicon Tier-3 path) and swap
-    // a `SemanticDiscoveryIndex` over the items below.
-    let embedder = resolve_embedder(config);
+    // The discovery index itself is already built (semantic or, loudly, lexical)
+    // by `build_hot_components` above. What's left is the lexicon's own Tier-3
+    // path, which hangs off the server rather than the index.
     server = server.with_embedder(embedder.clone());
     if embedder.backend_name() != "noop" {
         // H5 — backfill embeddings over the config-loaded lexicon so Tier-3
@@ -1018,19 +1026,6 @@ async fn build_oneshot_server(
         // (per-term failures are logged, not fatal); no-ops under NoopEmbedder.
         // Must run AFTER `with_embedder`, which is why it lives here.
         server.backfill_lexicon_embeddings().await;
-        // Build the semantic index over every item (incl. guidance/skills) and
-        // swap it in for this startup. (A config hot-reload reverts to lexical
-        // until restart — re-embedding on reload is a follow-up.)
-        let mut items = swappable_discovery.list(None).await?;
-        items.extend(
-            swappable_discovery
-                .list(Some(DiscoveryKind::Guidance))
-                .await?,
-        );
-        let count = items.len();
-        let semantic = Arc::new(SemanticDiscoveryIndex::build(items, embedder.clone()).await?);
-        swappable_discovery.swap(semantic);
-        tracing::info!(items = count, "semantic discovery index built");
     }
     // CMP-001 — single-tenant operators can assert a default identity via
     // `gateway.principal: { subject, roles, permissions }`. Per-request `_meta`
@@ -1350,7 +1345,14 @@ async fn reload_gated(
             "config": config_path.display().to_string(),
         });
     }
-    match build_hot_components(&new_config, audit).await {
+    // Re-resolve from the NEW config: an operator who turns
+    // `praxec.embeddings.enabled` on (or registers a model) gets semantic
+    // discovery at the next reload, and one who turns it off gets lexical —
+    // without a restart. The rebuilt index is semantic whenever this embedder is
+    // live and healthy, which is the whole point of the reload path now sharing
+    // `build_hot_components` with startup.
+    let embedder = resolve_embedder(&new_config);
+    match build_hot_components(&new_config, audit, &embedder).await {
         Ok((new_defs, new_executors, new_discovery, new_workflow_handle)) => {
             // Re-wire the fresh runtime-less `kind: workflow` handle against the
             // SAME long-lived runtime, and re-apply the overlays so the reloaded
@@ -1393,6 +1395,11 @@ async fn reload_gated(
 async fn build_hot_components(
     config: &Value,
     audit: &Arc<dyn praxec_core::audit::AuditSink>,
+    // The embedder the returned discovery index is built against. Passed in (not
+    // resolved here) because the one caller that discards the index —
+    // `build_runtime_for_orchestrate` — has no business paying for a health probe
+    // and a full catalog embed on every headless drive.
+    embedder: &Arc<dyn EmbeddingProvider>,
 ) -> anyhow::Result<(
     Arc<dyn praxec_core::ports::DefinitionStore>,
     Arc<dyn praxec_core::ports::ExecutorRegistry>,
@@ -1419,10 +1426,13 @@ async fn build_hot_components(
     let executors = maybe_enable_sandbox(&effective_config, executors)?;
     let definitions: Arc<dyn praxec_core::ports::DefinitionStore> =
         Arc::new(ConfigDefinitionStore::from_config(&effective_config));
-    // CMP-031 — fails fast on an unknown `discovery.include` token rather than
-    // shipping a silently partial index.
-    let discovery: Arc<dyn DiscoveryIndex> =
-        Arc::new(InMemoryDiscoveryIndex::from_config(&effective_config)?);
+    // The one seam that decides semantic-vs-lexical, shared by startup and every
+    // hot-reload — so a reload re-embeds instead of silently dropping to lexical
+    // (and a degrade, when the embedder is unusable, is audited, not swallowed).
+    // Still fails fast (CMP-031) on an unknown `discovery.include` token rather
+    // than shipping a silently partial index.
+    let discovery =
+        praxec_core::discovery::build_discovery_index(&effective_config, embedder, audit).await?;
     Ok((definitions, executors, discovery, workflow_handle))
 }
 
@@ -3056,12 +3066,14 @@ fn audit_tail(config_path: &PathBuf, filter: &Option<String>) -> anyhow::Result<
 mod tests {
     use super::{
         GatewayOverlays, ack_guards_used, aggregate_calls, build_audit_sink, build_evidence_store,
-        build_runtime_for_orchestrate, build_workflow_store, drive_outcome_to_result,
-        guard_durable_serve, headless_policy_from, is_ephemeral_path, maybe_enable_authoring,
-        maybe_enable_sandbox, require_file_sink_for_follow, resolve_embedder, tail_dir_once,
+        build_hot_components, build_runtime_for_orchestrate, build_workflow_store,
+        drive_outcome_to_result, guard_durable_serve, headless_policy_from, is_ephemeral_path,
+        maybe_enable_authoring, maybe_enable_sandbox, reload_gated, require_file_sink_for_follow,
+        resolve_embedder, tail_dir_once,
     };
     use praxec_agents::orchestrator::DriveOutcome;
     use praxec_agents::orchestrator::HeadlessPolicy;
+    use praxec_core::discovery::DiscoveryIndex;
     use praxec_core::sandbox::{BwrapProvider, SandboxProvider};
     use serde_json::{Value, json};
     use std::sync::Arc;
@@ -3267,6 +3279,190 @@ mod tests {
         // discovery. Deterministic: this path never touches `load_choice`.
         let cfg = json!({ "praxec": { "embeddings": { "enabled": false } } });
         assert_eq!(resolve_embedder(&cfg).backend_name(), "noop");
+    }
+
+    // ── D3 re-embed-on-reload — the gateway wiring ─────────────────────────
+    //
+    // `build_hot_components` is the function the hot-reload path
+    // (`reload_gated`) calls to rebuild the discovery index; it used to hand back
+    // a lexical `InMemoryDiscoveryIndex` unconditionally, so every reload silently
+    // dropped semantic discovery until the process restarted. These exercise that
+    // exact call.
+
+    /// Fake embedder whose axis 0 fires on cache/speed words — so the query
+    /// "speed" can only be answered by an index that embedded the item's text.
+    struct SpeedAxisEmbedder;
+
+    #[async_trait::async_trait]
+    impl praxec_core::embeddings::EmbeddingProvider for SpeedAxisEmbedder {
+        async fn embed(
+            &self,
+            text: &str,
+        ) -> Result<Vec<f32>, praxec_core::embeddings::EmbeddingError> {
+            let t = text.to_lowercase();
+            let speed = ["speed", "cache", "latency"].iter().any(|w| t.contains(w)) as i32 as f32;
+            Ok(vec![speed, 1.0 - speed])
+        }
+        async fn health_check(&self) -> Result<(), praxec_core::embeddings::EmbeddingError> {
+            Ok(())
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn backend_name(&self) -> &'static str {
+            "speed-axis-fake"
+        }
+    }
+
+    fn cache_flow_config() -> Value {
+        json!({
+            "praxec": { "embeddings": { "enabled": false } },
+            "workflows": {
+                "optimize": {
+                    "title": "Optimize",
+                    "description": "add a cache layer to responses",
+                    "initialState": "ready",
+                    "states": { "ready": {} }
+                }
+            }
+        })
+    }
+
+    async fn search_ids(index: &Arc<dyn praxec_core::discovery::DiscoveryIndex>) -> Vec<String> {
+        index
+            .search(praxec_core::discovery::SearchRequest {
+                query: "speed".into(),
+                kind: None,
+                limit: 10,
+            })
+            .await
+            .expect("search")
+            .into_iter()
+            .map(|h| h.item.id)
+            .collect()
+    }
+
+    /// D3-T1 — with a live embedder, the index the reload path builds is
+    /// SEMANTIC: it answers a query that shares no keyword with any item.
+    #[tokio::test]
+    async fn hot_reload_rebuild_is_semantic_when_an_embedder_is_live() {
+        let audit: Arc<dyn praxec_core::audit::AuditSink> =
+            Arc::new(praxec_core::audit::MemoryAuditSink::new());
+        let embedder: Arc<dyn praxec_core::embeddings::EmbeddingProvider> =
+            Arc::new(SpeedAxisEmbedder);
+
+        let (_defs, _execs, discovery, _handle) =
+            build_hot_components(&cache_flow_config(), &audit, &embedder)
+                .await
+                .expect("components build");
+
+        assert_eq!(
+            search_ids(&discovery).await,
+            vec!["optimize"],
+            "a reload with a live embedder must rebuild a SEMANTIC index, not a lexical one"
+        );
+    }
+
+    /// D3-T2 — no embedder: the rebuild stays lexical, unchanged behaviour.
+    #[tokio::test]
+    async fn hot_reload_rebuild_stays_lexical_without_an_embedder() {
+        let audit_sink = praxec_core::audit::MemoryAuditSink::new();
+        let audit: Arc<dyn praxec_core::audit::AuditSink> = Arc::new(audit_sink.clone());
+        let embedder: Arc<dyn praxec_core::embeddings::EmbeddingProvider> =
+            Arc::new(praxec_core::embeddings::NoopEmbedder);
+
+        let (_defs, _execs, discovery, _handle) =
+            build_hot_components(&cache_flow_config(), &audit, &embedder)
+                .await
+                .expect("components build");
+
+        assert!(
+            search_ids(&discovery).await.is_empty(),
+            "no embedder → lexical index → no semantic hit"
+        );
+        assert!(
+            audit_sink.snapshot().is_empty(),
+            "lexical-by-configuration is not a degrade and must stay silent"
+        );
+    }
+
+    /// D3-T2 end-to-end — the real `reload_gated` path (the one SIGHUP, the
+    /// in-band `reload` command and the staleness recheck all run): a config
+    /// edit is picked up by the swapped-in discovery index, and with embeddings
+    /// off nothing is reported as degraded.
+    #[tokio::test]
+    async fn reload_gated_swaps_in_an_index_built_from_the_new_config() {
+        use praxec_core::hot_reload::{
+            SwappableDefinitionStore, SwappableDiscoveryIndex, SwappableExecutorRegistry,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("praxec.yaml");
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_string(&cache_flow_config()).unwrap(),
+        )
+        .unwrap();
+
+        let overlays = GatewayOverlays::default();
+        let config = crate::gateway_config::load_config(&cfg_path).unwrap();
+        let runtime = build_runtime_for_orchestrate(&config, &overlays)
+            .await
+            .expect("runtime");
+
+        let audit_sink = praxec_core::audit::MemoryAuditSink::new();
+        let audit: Arc<dyn praxec_core::audit::AuditSink> = Arc::new(audit_sink.clone());
+        let embedder: Arc<dyn praxec_core::embeddings::EmbeddingProvider> =
+            Arc::new(praxec_core::embeddings::NoopEmbedder);
+        let (defs, execs, discovery, handle) = build_hot_components(&config, &audit, &embedder)
+            .await
+            .expect("components build");
+        handle.set_runtime((*runtime).clone());
+        let swappable_defs = Arc::new(SwappableDefinitionStore::new(defs));
+        let swappable_execs = Arc::new(SwappableExecutorRegistry::new(execs));
+        let swappable_discovery = Arc::new(SwappableDiscoveryIndex::new(discovery));
+
+        // The operator adds a workflow and reloads.
+        let mut edited = cache_flow_config();
+        edited["workflows"]["ship"] = json!({
+            "title": "Ship",
+            "description": "release the build",
+            "initialState": "ready",
+            "states": { "ready": {} }
+        });
+        std::fs::write(&cfg_path, serde_json::to_string(&edited).unwrap()).unwrap();
+
+        let outcome = reload_gated(
+            &swappable_defs,
+            &swappable_execs,
+            &swappable_discovery,
+            &cfg_path,
+            &audit,
+            &runtime,
+            &overlays.registrars,
+        )
+        .await;
+        assert_eq!(outcome["status"], "reloaded", "reload completes: {outcome}");
+
+        let hits = swappable_discovery
+            .search(praxec_core::discovery::SearchRequest {
+                query: "release".into(),
+                kind: None,
+                limit: 10,
+            })
+            .await
+            .expect("search the swapped-in index");
+        assert_eq!(
+            hits.iter().map(|h| h.item.id.as_str()).collect::<Vec<_>>(),
+            vec!["ship"],
+            "the reloaded index carries the newly added workflow"
+        );
+        assert!(
+            !audit_sink
+                .event_types()
+                .contains(&"discovery.index_degraded".to_string()),
+            "embeddings off → lexical is the configured answer, not a degrade"
+        );
     }
 
     #[test]

@@ -652,6 +652,15 @@ impl SemanticDiscoveryIndex {
         })
     }
 
+    /// How many items carry a live embedding. Zero over a non-empty index means
+    /// every embed failed and the index ranks purely lexically — it *presents* as
+    /// semantic while behaving as lexical, so the builder
+    /// ([`crate::discovery::build_discovery_index`]) checks this and degrades
+    /// explicitly rather than shipping the illusion.
+    pub fn embedded_count(&self) -> usize {
+        self.embeddings.iter().filter(|e| e.is_some()).count()
+    }
+
     fn kind_ok(item: &DiscoveryItem, kind: Option<DiscoveryKind>) -> bool {
         match kind {
             Some(k) => k == item.kind,

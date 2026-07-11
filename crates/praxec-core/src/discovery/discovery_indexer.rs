@@ -1,12 +1,23 @@
-//! Build a `Vec<DiscoveryItem>` from a parsed gateway config.
+//! Build a `Vec<DiscoveryItem>` from a parsed gateway config, and from those
+//! items the [`DiscoveryIndex`] that config actually calls for —
+//! [`build_discovery_index`] is the single seam BOTH gateway startup and gateway
+//! hot-reload construct their index through.
 //!
 //! Honors the `discovery.include` config knob (`["proxy", "workflows",
 //! "connections"]` by default for proxy + workflows, capped to those listed).
 
-use anyhow::bail;
-use serde_json::Value;
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::discovery::{DiscoveryItem, DiscoveryKind, DiscoveryLink};
+use anyhow::bail;
+use serde_json::{Value, json};
+
+use crate::audit::{AuditEvent, AuditSink};
+use crate::discovery::{
+    DiscoveryIndex, DiscoveryItem, DiscoveryKind, DiscoveryLink, InMemoryDiscoveryIndex,
+    SemanticDiscoveryIndex,
+};
+use crate::embeddings::EmbeddingProvider;
 use crate::proxy_workflow::DEFAULT_PROXY_WORKFLOW_ID;
 
 /// The set of tokens accepted in `discovery.include`. A token outside this set
@@ -87,6 +98,170 @@ pub fn index_from_config(config: &Value) -> anyhow::Result<Vec<DiscoveryItem>> {
     }
 
     Ok(items)
+}
+
+// ---------------------------------------------------------------------------
+// The index seam — one function, both lifecycles.
+//
+// Semantic embeddings used to be built ONLY at gateway startup, while the
+// hot-reload rebuild constructed a lexical `InMemoryDiscoveryIndex` — so every
+// config/pack reload silently, permanently downgraded discovery to lexical.
+// Two construction sites drifted apart; there is now exactly one, and both
+// startup and reload call it. Reload therefore RE-EMBEDS, and a degrade is
+// never sticky: the next reload with a healthy embedder restores semantics.
+// ---------------------------------------------------------------------------
+
+/// Audit event emitted when an index that should have been semantic came out
+/// lexical. Degrading is allowed (a dead embedder must not take discovery down
+/// with it); degrading *quietly* is the defect — that is what made "embeddings
+/// are on" stop being true without anyone noticing.
+pub const DISCOVERY_INDEX_DEGRADED: &str = "discovery.index_degraded";
+
+/// Whole-of-rebuild budget: health probe + embedding every item, together.
+///
+/// The reload runs on the request path (SIGHUP, the in-band `reload` command, and
+/// the lazy staleness recheck all await it), so an embedder that is merely *slow*
+/// must not hold a request open indefinitely. [`HttpEmbedder`]'s own timeouts bound
+/// each individual call, but nothing bounds the pass — and an arbitrary
+/// [`EmbeddingProvider`] impl may bound nothing at all. Exceeding this budget is a
+/// loud degrade to lexical, recoverable on the next reload, never a wedge.
+///
+/// [`HttpEmbedder`]: crate::embeddings::HttpEmbedder
+pub const SEMANTIC_REBUILD_BUDGET: Duration = Duration::from_secs(60);
+
+/// Build the discovery index this config calls for: a [`SemanticDiscoveryIndex`]
+/// when a live embedder is registered AND proves healthy, a lexical
+/// [`InMemoryDiscoveryIndex`] otherwise.
+///
+/// The two failure modes are deliberately distinguished:
+///
+/// - **No embedder** (`NoopEmbedder`): lexical is the *configured* answer, not a
+///   degrade. Silent, because nothing went wrong.
+/// - **Embedder present but unusable** (unhealthy, timed out, or every item
+///   failed to embed): lexical is a *degrade* — emitted at WARN and audited as
+///   [`DISCOVERY_INDEX_DEGRADED`], so the operator sees the semantic surface is
+///   off and why. The (re)load itself always completes.
+///
+/// A config-level fault (unknown `discovery.include` token) still fails fast:
+/// that's a defect to fix, not a runtime condition to degrade around.
+pub async fn build_discovery_index(
+    config: &Value,
+    embedder: &Arc<dyn EmbeddingProvider>,
+    audit: &Arc<dyn AuditSink>,
+) -> anyhow::Result<Arc<dyn DiscoveryIndex>> {
+    let items = index_from_config(config)?;
+
+    if embedder.backend_name() == NOOP_BACKEND {
+        return Ok(Arc::new(InMemoryDiscoveryIndex::new(items)));
+    }
+
+    // One deadline across both awaits below, so the worst case is the budget —
+    // not the budget once per phase.
+    let deadline = tokio::time::Instant::now() + SEMANTIC_REBUILD_BUDGET;
+
+    // Prove the backend answers NOW (the D2 health contract). Doing this before
+    // the N item-embeds means a dead endpoint costs one round-trip, not N.
+    match tokio::time::timeout_at(deadline, embedder.health_check()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Ok(degrade("health_check_failed", e.to_string(), items, embedder, audit).await);
+        }
+        Err(_) => {
+            return Ok(degrade(
+                "health_check_timeout",
+                format!("embedder did not answer within {SEMANTIC_REBUILD_BUDGET:?}"),
+                items,
+                embedder,
+                audit,
+            )
+            .await);
+        }
+    }
+
+    // `items` is kept intact for the lexical fallback: on timeout the build
+    // future (and the items moved into it) is dropped.
+    let semantic = match tokio::time::timeout_at(
+        deadline,
+        SemanticDiscoveryIndex::build(items.clone(), embedder.clone()),
+    )
+    .await
+    {
+        Ok(Ok(index)) => index,
+        Ok(Err(e)) => {
+            return Ok(degrade("embed_failed", e.to_string(), items, embedder, audit).await);
+        }
+        Err(_) => {
+            return Ok(degrade(
+                "embed_timeout",
+                format!(
+                    "embedding {} items exceeded {SEMANTIC_REBUILD_BUDGET:?}",
+                    items.len()
+                ),
+                items,
+                embedder,
+                audit,
+            )
+            .await);
+        }
+    };
+
+    // The backend passed its probe and then died: `build` tolerates per-item
+    // failures, so it hands back an index with zero vectors, which ranks purely
+    // lexically while presenting as semantic. That is the silent downgrade under
+    // another name — degrade explicitly instead.
+    if semantic.embedded_count() == 0 && !items.is_empty() {
+        return Ok(degrade(
+            "all_items_failed_to_embed",
+            format!("{} items, 0 embedded", items.len()),
+            items,
+            embedder,
+            audit,
+        )
+        .await);
+    }
+
+    tracing::info!(
+        backend = embedder.backend_name(),
+        items = items.len(),
+        embedded = semantic.embedded_count(),
+        "semantic discovery index built"
+    );
+    Ok(Arc::new(semantic))
+}
+
+/// The `backend_name()` of the disabled embedder — the one value that means
+/// "lexical was asked for", as opposed to "semantic was asked for and failed".
+const NOOP_BACKEND: &str = "noop";
+
+/// Fall back to lexical, loudly: WARN for the operator's console, an audit event
+/// for anything watching the stream. Returns the lexical index so the caller's
+/// (re)load completes.
+async fn degrade(
+    reason: &'static str,
+    detail: String,
+    items: Vec<DiscoveryItem>,
+    embedder: &Arc<dyn EmbeddingProvider>,
+    audit: &Arc<dyn AuditSink>,
+) -> Arc<dyn DiscoveryIndex> {
+    tracing::warn!(
+        backend = embedder.backend_name(),
+        reason,
+        detail = %detail,
+        items = items.len(),
+        "discovery index DEGRADED to lexical: an embedder is registered but unusable — \
+         semantic search is OFF until a reload finds it healthy again"
+    );
+    let _ = audit
+        .record(
+            AuditEvent::new(DISCOVERY_INDEX_DEGRADED).with_payload(json!({
+                "backend": embedder.backend_name(),
+                "reason": reason,
+                "detail": detail,
+                "items": items.len(),
+            })),
+        )
+        .await;
+    Arc::new(InMemoryDiscoveryIndex::new(items))
 }
 
 /// SPEC §22 — convert a `scripts:` entry into a DiscoveryItem. Mirror of
@@ -348,4 +523,346 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod index_seam_tests {
+    //! D3 (re-embed-on-reload). Every case here runs the SAME call the gateway's
+    //! hot-reload makes — `build_discovery_index` over a freshly-loaded config —
+    //! because the defect was that reload built its index somewhere else.
+
+    use super::*;
+    use crate::audit::MemoryAuditSink;
+    use crate::discovery::SearchRequest;
+    use crate::embeddings::{EmbeddingError, EmbeddingProvider};
+    use async_trait::async_trait;
+
+    /// Deterministic 2-axis fake (mirrors `discovery::semantic_tests`): axis 0
+    /// fires on speed/cache words, axis 1 on auth words. So the query "speed"
+    /// matches an item that only ever says "cache" — a question ONLY a semantic
+    /// index can answer, which is how these tests tell the two indexes apart
+    /// without reaching for the concrete type.
+    struct HealthyEmbedder;
+
+    #[async_trait]
+    impl EmbeddingProvider for HealthyEmbedder {
+        async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            let t = text.to_lowercase();
+            let speed = ["speed", "fast", "cache", "latency"]
+                .iter()
+                .any(|w| t.contains(w)) as i32 as f32;
+            let auth = ["auth", "login", "identity"].iter().any(|w| t.contains(w)) as i32 as f32;
+            Ok(vec![speed, auth])
+        }
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Ok(())
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn backend_name(&self) -> &'static str {
+            "healthy-fake"
+        }
+    }
+
+    /// The endpoint is down: the probe says so, and every embed would too.
+    struct DeadEmbedder;
+
+    #[async_trait]
+    impl EmbeddingProvider for DeadEmbedder {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            Err(EmbeddingError::BackendFailed("connection refused".into()))
+        }
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Err(EmbeddingError::HealthCheckFailed(
+                "connection refused".into(),
+            ))
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn backend_name(&self) -> &'static str {
+            "dead-fake"
+        }
+    }
+
+    /// Passes its probe, then dies — the "fails mid-reload" case. Without the
+    /// zero-embedding check this yields a `SemanticDiscoveryIndex` holding no
+    /// vectors at all: lexical behaviour wearing a semantic label, silently.
+    struct DiesAfterProbeEmbedder;
+
+    #[async_trait]
+    impl EmbeddingProvider for DiesAfterProbeEmbedder {
+        async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            if text == crate::embeddings::HEALTH_PROBE_TEXT {
+                return Ok(vec![1.0, 0.0]);
+            }
+            Err(EmbeddingError::BackendFailed("backend died".into()))
+        }
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Ok(())
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn backend_name(&self) -> &'static str {
+            "dies-after-probe"
+        }
+    }
+
+    /// Never answers. The wedge the reload path must be immune to.
+    struct StallingEmbedder;
+
+    #[async_trait]
+    impl EmbeddingProvider for StallingEmbedder {
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+            tokio::time::sleep(Duration::from_secs(86_400)).await;
+            unreachable!("the rebuild budget must expire first")
+        }
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            tokio::time::sleep(Duration::from_secs(86_400)).await;
+            unreachable!("the rebuild budget must expire first")
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        fn backend_name(&self) -> &'static str {
+            "stalling"
+        }
+    }
+
+    fn noop() -> Arc<dyn EmbeddingProvider> {
+        Arc::new(crate::embeddings::NoopEmbedder)
+    }
+
+    /// Two workflows with no keyword overlap with the query "speed".
+    fn config(cache_description: &str) -> Value {
+        json!({
+            "workflows": {
+                "optimize": { "title": "Optimize", "description": cache_description },
+                "login": { "title": "Login", "description": "auth and identity" },
+            }
+        })
+    }
+
+    async fn ids_for(index: &Arc<dyn DiscoveryIndex>, query: &str) -> Vec<String> {
+        index
+            .search(SearchRequest {
+                query: query.into(),
+                kind: None,
+                limit: 10,
+            })
+            .await
+            .expect("search")
+            .into_iter()
+            .map(|h| h.item.id)
+            .collect()
+    }
+
+    fn degrade_reasons(audit: &MemoryAuditSink) -> Vec<String> {
+        audit
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.event_type == DISCOVERY_INDEX_DEGRADED)
+            .map(|e| e.payload["reason"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// D3-T1 — the regression test for the actual defect (`gateway.rs:1424`
+    /// rebuilt a lexical index). With a healthy embedder the rebuilt index
+    /// answers a query no lexical index can.
+    #[tokio::test]
+    async fn rebuild_with_healthy_embedder_is_semantic_not_lexical() {
+        let audit_sink = MemoryAuditSink::new();
+        let audit: Arc<dyn AuditSink> = Arc::new(audit_sink.clone());
+        let cfg = config("add a cache layer to responses");
+
+        // Baseline: the lexical index the reload path used to build finds
+        // nothing for "speed" — no item contains the word.
+        let lexical: Arc<dyn DiscoveryIndex> =
+            Arc::new(InMemoryDiscoveryIndex::from_config(&cfg).unwrap());
+        assert!(
+            ids_for(&lexical, "speed").await.is_empty(),
+            "precondition: 'speed' is answerable only semantically"
+        );
+
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(HealthyEmbedder);
+        let index = build_discovery_index(&cfg, &embedder, &audit)
+            .await
+            .expect("rebuild completes");
+
+        assert_eq!(
+            ids_for(&index, "speed").await.first().map(String::as_str),
+            Some("optimize"),
+            "a reload with a live embedder must produce a SEMANTIC index"
+        );
+        assert!(
+            degrade_reasons(&audit_sink).is_empty(),
+            "a healthy rebuild is not a degrade"
+        );
+    }
+
+    /// D3-T2 — no embedder configured: lexical, exactly as before, and silent.
+    /// Lexical-because-unconfigured is not a degrade and must not be shouted
+    /// about (or the signal that matters gets drowned).
+    #[tokio::test]
+    async fn no_embedder_configured_stays_lexical_and_silent() {
+        let audit_sink = MemoryAuditSink::new();
+        let audit: Arc<dyn AuditSink> = Arc::new(audit_sink.clone());
+        let cfg = config("add a cache layer to responses");
+
+        let index = build_discovery_index(&cfg, &noop(), &audit)
+            .await
+            .expect("rebuild completes");
+
+        assert!(
+            ids_for(&index, "speed").await.is_empty(),
+            "no embedder → lexical behaviour, unchanged"
+        );
+        assert_eq!(
+            ids_for(&index, "cache").await,
+            vec!["optimize"],
+            "lexical search still works"
+        );
+        assert!(
+            audit_sink.snapshot().is_empty(),
+            "nothing degraded — nothing to report"
+        );
+    }
+
+    /// D3-T4 — the embedder is down at reload time: the reload COMPLETES, the
+    /// index degrades to lexical, and the degrade is audited with a reason. The
+    /// assertion is on the observable signal, not merely on "it didn't crash".
+    #[tokio::test]
+    async fn dead_embedder_completes_the_rebuild_and_degrades_loudly() {
+        let audit_sink = MemoryAuditSink::new();
+        let audit: Arc<dyn AuditSink> = Arc::new(audit_sink.clone());
+        let cfg = config("add a cache layer to responses");
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(DeadEmbedder);
+
+        let index = build_discovery_index(&cfg, &embedder, &audit)
+            .await
+            .expect("a dead embedder must never fail the reload");
+
+        assert!(
+            ids_for(&index, "speed").await.is_empty(),
+            "degraded to lexical"
+        );
+        assert_eq!(
+            ids_for(&index, "cache").await,
+            vec!["optimize"],
+            "discovery still answers lexically — the degrade is not an outage"
+        );
+        assert_eq!(degrade_reasons(&audit_sink), vec!["health_check_failed"]);
+        let event = audit_sink
+            .snapshot()
+            .into_iter()
+            .find(|e| e.event_type == DISCOVERY_INDEX_DEGRADED)
+            .expect("degrade event");
+        assert_eq!(event.payload["backend"], "dead-fake");
+        assert!(
+            event.payload["detail"]
+                .as_str()
+                .unwrap()
+                .contains("connection refused"),
+            "the audit event names the underlying reason: {}",
+            event.payload
+        );
+    }
+
+    /// D3-T4 (second failure mode) — probe passes, backend dies before the item
+    /// embeds land. An index with zero vectors ranks lexically; shipping it as
+    /// "semantic" would be the silent downgrade all over again.
+    #[tokio::test]
+    async fn backend_dying_after_the_probe_still_degrades_loudly() {
+        let audit_sink = MemoryAuditSink::new();
+        let audit: Arc<dyn AuditSink> = Arc::new(audit_sink.clone());
+        let cfg = config("add a cache layer to responses");
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(DiesAfterProbeEmbedder);
+
+        let index = build_discovery_index(&cfg, &embedder, &audit)
+            .await
+            .expect("rebuild completes");
+
+        assert_eq!(
+            ids_for(&index, "cache").await,
+            vec!["optimize"],
+            "still answers lexically"
+        );
+        assert_eq!(
+            degrade_reasons(&audit_sink),
+            vec!["all_items_failed_to_embed"]
+        );
+    }
+
+    /// A stalled embedder must not hold the reload open. The clock is paused, so
+    /// the budget expires without the test sleeping for real: the rebuild returns
+    /// (lexical + audited), it does not hang.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_embedder_cannot_wedge_the_rebuild() {
+        let audit_sink = MemoryAuditSink::new();
+        let audit: Arc<dyn AuditSink> = Arc::new(audit_sink.clone());
+        let cfg = config("add a cache layer to responses");
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(StallingEmbedder);
+
+        let index = build_discovery_index(&cfg, &embedder, &audit)
+            .await
+            .expect("the rebuild completes despite the stall");
+
+        assert_eq!(ids_for(&index, "cache").await, vec!["optimize"]);
+        assert_eq!(degrade_reasons(&audit_sink), vec!["health_check_timeout"]);
+    }
+
+    /// D3 requirement 3 — a degrade is NOT sticky. The same gateway, reloading
+    /// again once the embedder is back, gets its semantic index back. (Before
+    /// this deliverable the downgrade was permanent until restart.)
+    #[tokio::test]
+    async fn degrade_is_not_sticky_the_next_reload_restores_semantics() {
+        let audit_sink = MemoryAuditSink::new();
+        let audit: Arc<dyn AuditSink> = Arc::new(audit_sink.clone());
+        let cfg = config("add a cache layer to responses");
+
+        let dead: Arc<dyn EmbeddingProvider> = Arc::new(DeadEmbedder);
+        let degraded = build_discovery_index(&cfg, &dead, &audit).await.unwrap();
+        assert!(ids_for(&degraded, "speed").await.is_empty());
+
+        let healthy: Arc<dyn EmbeddingProvider> = Arc::new(HealthyEmbedder);
+        let restored = build_discovery_index(&cfg, &healthy, &audit).await.unwrap();
+        assert_eq!(
+            ids_for(&restored, "speed")
+                .await
+                .first()
+                .map(String::as_str),
+            Some("optimize"),
+            "the next reload with a healthy embedder restores semantic search"
+        );
+    }
+
+    /// D3-T3 — an item whose description changed is re-embedded against the NEW
+    /// text. A stale vector carried over from the previous index would keep
+    /// answering the old question; nothing is cached, so nothing can go stale.
+    #[tokio::test]
+    async fn changed_description_is_re_embedded_on_reload() {
+        let audit: Arc<dyn AuditSink> = Arc::new(MemoryAuditSink::new());
+        let embedder: Arc<dyn EmbeddingProvider> = Arc::new(HealthyEmbedder);
+
+        // v1: `optimize` is about auth — semantically nothing to do with "speed".
+        let v1 = build_discovery_index(&config("auth and identity checks"), &embedder, &audit)
+            .await
+            .unwrap();
+        assert!(
+            ids_for(&v1, "speed").await.is_empty(),
+            "v1 has no speed-adjacent item"
+        );
+
+        // v2: the operator edits the description to talk about caching.
+        let v2 = build_discovery_index(&config("add a cache layer"), &embedder, &audit)
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_for(&v2, "speed").await.first().map(String::as_str),
+            Some("optimize"),
+            "the edited description was embedded fresh, not reused from v1"
+        );
+    }
 }
