@@ -19,6 +19,8 @@ use crate::discovery::{
 };
 use crate::embeddings::EmbeddingProvider;
 use crate::proxy_workflow::DEFAULT_PROXY_WORKFLOW_ID;
+use crate::registry_v3::Registry;
+use crate::tool_descriptor::ToolDescriptor;
 
 /// The set of tokens accepted in `discovery.include`. A token outside this set
 /// is almost always a typo (e.g. `workflow` for `workflows`) which would
@@ -133,6 +135,13 @@ pub const SEMANTIC_REBUILD_BUDGET: Duration = Duration::from_secs(60);
 /// when a live embedder is registered AND proves healthy, a lexical
 /// [`InMemoryDiscoveryIndex`] otherwise.
 ///
+/// `registry` is the loaded D4b [`Registry`] (D6), or `None` when the operator
+/// configured none. Its tool descriptors join the SAME catalog the config's
+/// workflows/capabilities live in, so `praxec.query {kind: "tool"}` answers from
+/// one index through one scorer — semantic *and* lexical, because a registry is
+/// searchable whether or not embeddings are on. This is the only place tools
+/// enter discovery: one index-construction seam, as with D3.
+///
 /// The two failure modes are deliberately distinguished:
 ///
 /// - **No embedder** (`NoopEmbedder`): lexical is the *configured* answer, not a
@@ -143,16 +152,24 @@ pub const SEMANTIC_REBUILD_BUDGET: Duration = Duration::from_secs(60);
 ///   off and why. The (re)load itself always completes.
 ///
 /// A config-level fault (unknown `discovery.include` token) still fails fast:
-/// that's a defect to fix, not a runtime condition to degrade around.
+/// that's a defect to fix, not a runtime condition to degrade around. (A broken
+/// *registry* fails even earlier — the caller never gets a `Registry` to pass.)
 pub async fn build_discovery_index(
     config: &Value,
+    registry: Option<&Registry>,
     embedder: &Arc<dyn EmbeddingProvider>,
     audit: &Arc<dyn AuditSink>,
 ) -> anyhow::Result<Arc<dyn DiscoveryIndex>> {
     let items = index_from_config(config)?;
+    // Owned: `build_with_tools` stamps each descriptor's `embedding` slot with
+    // the vector it was indexed by, so it needs `&mut`.
+    let mut tools: Vec<ToolDescriptor> =
+        registry.map(Registry::tool_descriptors).unwrap_or_default();
 
     if embedder.backend_name() == NOOP_BACKEND {
-        return Ok(Arc::new(InMemoryDiscoveryIndex::new(items)));
+        return Ok(Arc::new(InMemoryDiscoveryIndex::new(catalog(
+            &items, &tools,
+        ))));
     }
 
     // One deadline across both awaits below, so the worst case is the budget —
@@ -164,9 +181,11 @@ pub async fn build_discovery_index(
     match tokio::time::timeout_at(deadline, embedder.health_check()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
+            let items = catalog(&items, &tools);
             return Ok(degrade("health_check_failed", e.to_string(), items, embedder, audit).await);
         }
         Err(_) => {
+            let items = catalog(&items, &tools);
             return Ok(degrade(
                 "health_check_timeout",
                 format!("embedder did not answer within {SEMANTIC_REBUILD_BUDGET:?}"),
@@ -178,25 +197,27 @@ pub async fn build_discovery_index(
         }
     }
 
-    // `items` is kept intact for the lexical fallback: on timeout the build
-    // future (and the items moved into it) is dropped.
-    let semantic = match tokio::time::timeout_at(
+    // `items` / `tools` are kept intact for the lexical fallback: on timeout the
+    // build future (and the items moved into it) is dropped. Awaited into a
+    // binding first so the `&mut tools` borrow ends before the arms below reach
+    // for `&tools` again.
+    let catalog_len = items.len() + tools.len();
+    let built = tokio::time::timeout_at(
         deadline,
-        SemanticDiscoveryIndex::build(items.clone(), embedder.clone()),
+        SemanticDiscoveryIndex::build_with_tools(items.clone(), &mut tools, embedder.clone()),
     )
-    .await
-    {
+    .await;
+    let semantic = match built {
         Ok(Ok(index)) => index,
         Ok(Err(e)) => {
+            let items = catalog(&items, &tools);
             return Ok(degrade("embed_failed", e.to_string(), items, embedder, audit).await);
         }
         Err(_) => {
+            let items = catalog(&items, &tools);
             return Ok(degrade(
                 "embed_timeout",
-                format!(
-                    "embedding {} items exceeded {SEMANTIC_REBUILD_BUDGET:?}",
-                    items.len()
-                ),
+                format!("embedding {catalog_len} items exceeded {SEMANTIC_REBUILD_BUDGET:?}"),
                 items,
                 embedder,
                 audit,
@@ -209,10 +230,11 @@ pub async fn build_discovery_index(
     // failures, so it hands back an index with zero vectors, which ranks purely
     // lexically while presenting as semantic. That is the silent downgrade under
     // another name — degrade explicitly instead.
-    if semantic.embedded_count() == 0 && !items.is_empty() {
+    if semantic.embedded_count() == 0 && catalog_len > 0 {
+        let items = catalog(&items, &tools);
         return Ok(degrade(
             "all_items_failed_to_embed",
-            format!("{} items, 0 embedded", items.len()),
+            format!("{catalog_len} items, 0 embedded"),
             items,
             embedder,
             audit,
@@ -222,11 +244,23 @@ pub async fn build_discovery_index(
 
     tracing::info!(
         backend = embedder.backend_name(),
-        items = items.len(),
+        items = catalog_len,
+        tools = tools.len(),
         embedded = semantic.embedded_count(),
         "semantic discovery index built"
     );
     Ok(Arc::new(semantic))
+}
+
+/// The full lexical catalog — the config's items plus the registry's tools,
+/// projected through the SAME [`DiscoveryItem::from_tool_descriptor`] the
+/// semantic builder uses. Every non-semantic path (no embedder, and each
+/// degrade) goes through here, so a degraded index loses the *vectors*, never a
+/// whole category of item.
+fn catalog(items: &[DiscoveryItem], tools: &[ToolDescriptor]) -> Vec<DiscoveryItem> {
+    let mut all = items.to_vec();
+    all.extend(tools.iter().map(DiscoveryItem::from_tool_descriptor));
+    all
 }
 
 /// The `backend_name()` of the disabled embedder — the one value that means
@@ -687,7 +721,7 @@ mod index_seam_tests {
         );
 
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(HealthyEmbedder);
-        let index = build_discovery_index(&cfg, &embedder, &audit)
+        let index = build_discovery_index(&cfg, None, &embedder, &audit)
             .await
             .expect("rebuild completes");
 
@@ -711,7 +745,7 @@ mod index_seam_tests {
         let audit: Arc<dyn AuditSink> = Arc::new(audit_sink.clone());
         let cfg = config("add a cache layer to responses");
 
-        let index = build_discovery_index(&cfg, &noop(), &audit)
+        let index = build_discovery_index(&cfg, None, &noop(), &audit)
             .await
             .expect("rebuild completes");
 
@@ -740,7 +774,7 @@ mod index_seam_tests {
         let cfg = config("add a cache layer to responses");
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(DeadEmbedder);
 
-        let index = build_discovery_index(&cfg, &embedder, &audit)
+        let index = build_discovery_index(&cfg, None, &embedder, &audit)
             .await
             .expect("a dead embedder must never fail the reload");
 
@@ -780,7 +814,7 @@ mod index_seam_tests {
         let cfg = config("add a cache layer to responses");
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(DiesAfterProbeEmbedder);
 
-        let index = build_discovery_index(&cfg, &embedder, &audit)
+        let index = build_discovery_index(&cfg, None, &embedder, &audit)
             .await
             .expect("rebuild completes");
 
@@ -805,7 +839,7 @@ mod index_seam_tests {
         let cfg = config("add a cache layer to responses");
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(StallingEmbedder);
 
-        let index = build_discovery_index(&cfg, &embedder, &audit)
+        let index = build_discovery_index(&cfg, None, &embedder, &audit)
             .await
             .expect("the rebuild completes despite the stall");
 
@@ -823,11 +857,15 @@ mod index_seam_tests {
         let cfg = config("add a cache layer to responses");
 
         let dead: Arc<dyn EmbeddingProvider> = Arc::new(DeadEmbedder);
-        let degraded = build_discovery_index(&cfg, &dead, &audit).await.unwrap();
+        let degraded = build_discovery_index(&cfg, None, &dead, &audit)
+            .await
+            .unwrap();
         assert!(ids_for(&degraded, "speed").await.is_empty());
 
         let healthy: Arc<dyn EmbeddingProvider> = Arc::new(HealthyEmbedder);
-        let restored = build_discovery_index(&cfg, &healthy, &audit).await.unwrap();
+        let restored = build_discovery_index(&cfg, None, &healthy, &audit)
+            .await
+            .unwrap();
         assert_eq!(
             ids_for(&restored, "speed")
                 .await
@@ -847,16 +885,17 @@ mod index_seam_tests {
         let embedder: Arc<dyn EmbeddingProvider> = Arc::new(HealthyEmbedder);
 
         // v1: `optimize` is about auth — semantically nothing to do with "speed".
-        let v1 = build_discovery_index(&config("auth and identity checks"), &embedder, &audit)
-            .await
-            .unwrap();
+        let v1 =
+            build_discovery_index(&config("auth and identity checks"), None, &embedder, &audit)
+                .await
+                .unwrap();
         assert!(
             ids_for(&v1, "speed").await.is_empty(),
             "v1 has no speed-adjacent item"
         );
 
         // v2: the operator edits the description to talk about caching.
-        let v2 = build_discovery_index(&config("add a cache layer"), &embedder, &audit)
+        let v2 = build_discovery_index(&config("add a cache layer"), None, &embedder, &audit)
             .await
             .unwrap();
         assert_eq!(

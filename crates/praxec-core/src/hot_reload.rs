@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::discovery::{DiscoveryIndex, DiscoveryItem, DiscoveryKind, SearchHit, SearchRequest};
 use crate::ports::{DefinitionStore, Executor, ExecutorRegistry};
+use crate::registry_v3::Registry;
 
 // ---------------------------------------------------------------------------
 // P6b — lazy TTL-based config-staleness recheck.
@@ -257,6 +258,46 @@ impl DiscoveryIndex for SwappableDiscoveryIndex {
             .expect("LOCK_POISONED: swappable discovery index")
             .clone();
         index.home().await
+    }
+}
+
+/// D6 — the loaded `praxec.packs/v3` [`Registry`], hot-swappable alongside the
+/// discovery index.
+///
+/// It is swappable for the same reason the index is: the registry feeds BOTH the
+/// index's tool catalog and the selector's topology term, and those two are read
+/// from the same config. Pinning the topology at startup while the index rebuilt
+/// on every reload would recreate the D3 defect one layer up — a reloaded gateway
+/// ranking against a registry it no longer serves.
+///
+/// `None` is the configured-no-registry state, not an error: ranking then carries
+/// a uniform zero topology term (exactly today's behavior) and the catalog holds
+/// no tools.
+pub struct SwappableRegistry {
+    inner: RwLock<Option<Arc<Registry>>>,
+}
+
+impl SwappableRegistry {
+    pub fn new(initial: Option<Arc<Registry>>) -> Self {
+        Self {
+            inner: RwLock::new(initial),
+        }
+    }
+
+    /// The registry in force right now. Cloned out (rather than borrowed) so a
+    /// reload can swap while a search is mid-rank.
+    pub fn current(&self) -> Option<Arc<Registry>> {
+        self.inner
+            .read()
+            .expect("LOCK_POISONED: swappable registry")
+            .clone()
+    }
+
+    pub fn swap(&self, new: Option<Arc<Registry>>) {
+        *self
+            .inner
+            .write()
+            .expect("LOCK_POISONED: swappable registry") = new;
     }
 }
 

@@ -28,6 +28,7 @@ use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::ports::{
     EvidenceStore, ExecutorRegistry, GuidanceAcknowledgmentStore, ScriptAcknowledgmentStore,
 };
+use praxec_core::registry_v3::Registry;
 use praxec_core::sandbox::{BwrapProvider, OciProvider, SandboxProvider};
 use praxec_core::store::ConfigDefinitionStore;
 use praxec_executors::{
@@ -716,7 +717,10 @@ async fn build_runtime_for_orchestrate(
     // (the index below is discarded). Embedding the catalog here would buy a
     // network round-trip per item for an index nobody queries.
     let no_embedder: Arc<dyn EmbeddingProvider> = Arc::new(praxec_core::embeddings::NoopEmbedder);
-    let (initial_defs, initial_executors, _discovery, workflow_handle) =
+    // The registry is discarded with the index for the same reason (nothing here
+    // ranks candidates) — but it is still LOADED, so a broken `discovery.registry`
+    // fails an orchestrate run exactly as it fails a serve.
+    let (initial_defs, initial_executors, _discovery, _registry, workflow_handle) =
         build_hot_components(config, &audit, &no_embedder).await?;
     let swappable_defs = Arc::new(SwappableDefinitionStore::new(initial_defs));
     let swappable_executors = Arc::new(SwappableExecutorRegistry::new(initial_executors));
@@ -794,6 +798,7 @@ async fn build_oneshot_server(
 ) -> anyhow::Result<OneshotServer> {
     use praxec_core::hot_reload::{
         SwappableDefinitionStore, SwappableDiscoveryIndex, SwappableExecutorRegistry,
+        SwappableRegistry,
     };
 
     // CMP-002 — enforce the validation suite on the SERVING path, not just at
@@ -826,12 +831,15 @@ async fn build_oneshot_server(
     // the semantic index used to be bolted on after the fact, which is exactly
     // why reload never re-embedded.
     let embedder = resolve_embedder(config);
-    let (initial_defs, initial_executors, initial_discovery, workflow_handle) =
+    let (initial_defs, initial_executors, initial_discovery, initial_registry, workflow_handle) =
         build_hot_components(config, &audit, &embedder).await?;
 
     let swappable_defs = Arc::new(SwappableDefinitionStore::new(initial_defs));
     let swappable_executors = Arc::new(SwappableExecutorRegistry::new(initial_executors));
     let swappable_discovery = Arc::new(SwappableDiscoveryIndex::new(initial_discovery));
+    // D6 — the registry that built the index above is the one the selector ranks
+    // against, and both swap together on reload (see `reload_gated`).
+    let swappable_registry = Arc::new(SwappableRegistry::new(initial_registry));
 
     let store = build_workflow_store(config)?;
     // Durable when store.kind=sqlite (evidence lives in a distinct `evidence`
@@ -988,6 +996,7 @@ async fn build_oneshot_server(
 
     let mut server = PraxecServer::new(runtime.clone())
         .with_discovery(swappable_discovery.clone() as Arc<dyn DiscoveryIndex>)
+        .with_registry(swappable_registry.clone())
         .with_lexicon(lexicon_base)
         .with_ack_store(guidance_ack.clone())
         .with_script_ack_store(script_ack.clone())
@@ -1054,6 +1063,7 @@ async fn build_oneshot_server(
         swappable_defs,
         swappable_executors,
         swappable_discovery,
+        swappable_registry,
     })
 }
 
@@ -1097,6 +1107,7 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         swappable_defs,
         swappable_executors,
         swappable_discovery,
+        swappable_registry,
     } = match healthy {
         Ok(oneshot) => oneshot,
         Err(err) => return serve_degraded(config_path, err).await,
@@ -1123,16 +1134,18 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         let defs = swappable_defs.clone();
         let execs = swappable_executors.clone();
         let disc = swappable_discovery.clone();
+        let reg = swappable_registry.clone();
         let cfg = config_path.clone();
         let aud = audit.clone();
         let rt = runtime.clone();
         let regs = overlays.registrars.clone();
         let tracker = staleness_tracker.clone();
         let hook: praxec_mcp_server::ReloadHook = Arc::new(move || {
-            let (defs, execs, disc, cfg, aud, rt, regs, tracker) = (
+            let (defs, execs, disc, reg, cfg, aud, rt, regs, tracker) = (
                 defs.clone(),
                 execs.clone(),
                 disc.clone(),
+                reg.clone(),
                 cfg.clone(),
                 aud.clone(),
                 rt.clone(),
@@ -1140,7 +1153,8 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                 tracker.clone(),
             );
             Box::pin(async move {
-                let outcome = reload_gated(&defs, &execs, &disc, &cfg, &aud, &rt, &regs).await;
+                let outcome =
+                    reload_gated(&defs, &execs, &disc, &reg, &cfg, &aud, &rt, &regs).await;
                 tracker.recapture(praxec_core::config::local_config_file_set(&cfg));
                 outcome
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
@@ -1158,16 +1172,18 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         let defs = swappable_defs.clone();
         let execs = swappable_executors.clone();
         let disc = swappable_discovery.clone();
+        let reg = swappable_registry.clone();
         let cfg = config_path.clone();
         let aud = audit.clone();
         let rt = runtime.clone();
         let regs = overlays.registrars.clone();
         let tracker = staleness_tracker.clone();
         let hook: praxec_mcp_server::StalenessHook = Arc::new(move || {
-            let (defs, execs, disc, cfg, aud, rt, regs, tracker) = (
+            let (defs, execs, disc, reg, cfg, aud, rt, regs, tracker) = (
                 defs.clone(),
                 execs.clone(),
                 disc.clone(),
+                reg.clone(),
                 cfg.clone(),
                 aud.clone(),
                 rt.clone(),
@@ -1181,7 +1197,7 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                 tracing::info!(
                     "config changed on disk — triggering gated reload (staleness recheck)"
                 );
-                let _ = reload_gated(&defs, &execs, &disc, &cfg, &aud, &rt, &regs).await;
+                let _ = reload_gated(&defs, &execs, &disc, &reg, &cfg, &aud, &rt, &regs).await;
                 // Recapture regardless of outcome: a REJECTED edit is audited
                 // once (config.reload_rejected), not retried every TTL until
                 // the operator saves the file again.
@@ -1202,6 +1218,7 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         let reload_defs = swappable_defs.clone();
         let reload_executors = swappable_executors.clone();
         let reload_discovery = swappable_discovery.clone();
+        let reload_registry = swappable_registry.clone();
         let reload_config_path = config_path.clone();
         let reload_audit = audit.clone();
         let reload_runtime = runtime.clone();
@@ -1223,6 +1240,7 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                     &reload_defs,
                     &reload_executors,
                     &reload_discovery,
+                    &reload_registry,
                     &reload_config_path,
                     &reload_audit,
                     &reload_runtime,
@@ -1296,10 +1314,12 @@ async fn serve_degraded(config_path: PathBuf, err: anyhow::Error) -> anyhow::Res
 /// definition store / executor registry / discovery index against the SAME
 /// long-lived runtime and audits `config.reloaded`. Returns the outcome as JSON
 /// so the in-band caller learns what happened (incl. the reloaded `repos:`).
+#[allow(clippy::too_many_arguments)]
 async fn reload_gated(
     swappable_defs: &Arc<praxec_core::hot_reload::SwappableDefinitionStore>,
     swappable_executors: &Arc<praxec_core::hot_reload::SwappableExecutorRegistry>,
     swappable_discovery: &Arc<praxec_core::hot_reload::SwappableDiscoveryIndex>,
+    swappable_registry: &Arc<praxec_core::hot_reload::SwappableRegistry>,
     config_path: &PathBuf,
     audit: &Arc<dyn praxec_core::audit::AuditSink>,
     runtime: &WorkflowRuntime,
@@ -1353,7 +1373,7 @@ async fn reload_gated(
     // `build_hot_components` with startup.
     let embedder = resolve_embedder(&new_config);
     match build_hot_components(&new_config, audit, &embedder).await {
-        Ok((new_defs, new_executors, new_discovery, new_workflow_handle)) => {
+        Ok((new_defs, new_executors, new_discovery, new_registry, new_workflow_handle)) => {
             // Re-wire the fresh runtime-less `kind: workflow` handle against the
             // SAME long-lived runtime, and re-apply the overlays so the reloaded
             // registry keeps hosting `kind: llm` / `kind: agent`.
@@ -1363,6 +1383,11 @@ async fn reload_gated(
             swappable_defs.swap(new_defs);
             swappable_executors.swap(new_executors);
             swappable_discovery.swap(new_discovery);
+            // D6 — index and topology swap together, from the same rebuild. A
+            // registry that failed to load never reaches here (the `Err` arm below
+            // keeps the previous everything), so the selector can never rank
+            // against a registry the index doesn't hold.
+            swappable_registry.swap(new_registry);
             let _ = audit
                 .record(
                     praxec_core::audit::AuditEvent::new("config.reloaded").with_payload(json!({
@@ -1392,6 +1417,36 @@ async fn reload_gated(
     }
 }
 
+/// D6 — load the `praxec.packs/v3` registry the config points at.
+///
+/// Absent `discovery.registry` ⇒ `None` ⇒ today's behavior exactly: no tool
+/// catalog in the index, a uniform zero topology term in ranking.
+///
+/// Present-but-unloadable ⇒ **fail fast**. An operator who named a registry and
+/// got a gateway that quietly ranks without it has been lied to: the tools they
+/// expect to find are simply missing from `praxec.query`, with nothing to read
+/// but silence. A typed `REGISTRY_*` error at boot (and at reload, where it keeps
+/// the previous config live) is the only honest answer.
+fn load_registry(config: &Value) -> anyhow::Result<Option<Arc<Registry>>> {
+    let Some(path) = config
+        .pointer("/discovery/registry")
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let registry = Registry::load_path(std::path::Path::new(path))
+        .with_context(|| format!("loading discovery.registry `{path}`"))?;
+    tracing::info!(
+        path,
+        packs = registry.packs.len(),
+        tools = registry.tools.len(),
+        descriptors = registry.tool_descriptors().len(),
+        crossmatrix = registry.crossmatrix().len(),
+        "registry-v3 loaded"
+    );
+    Ok(Some(Arc::new(registry)))
+}
+
 async fn build_hot_components(
     config: &Value,
     audit: &Arc<dyn praxec_core::audit::AuditSink>,
@@ -1404,6 +1459,10 @@ async fn build_hot_components(
     Arc<dyn praxec_core::ports::DefinitionStore>,
     Arc<dyn praxec_core::ports::ExecutorRegistry>,
     Arc<dyn DiscoveryIndex>,
+    // D6 — the registry the discovery index above was built with. Returned (not
+    // just consumed) because the selector's topology term must read the SAME one:
+    // the server holds it, and every reload swaps index and registry together.
+    Option<Arc<Registry>>,
     // The runtime-less `kind: workflow` executor handle. The caller MUST call
     // `set_runtime` on it once the `WorkflowRuntime` (built around this
     // registry) exists, or every `kind: workflow` transition will fail with
@@ -1426,14 +1485,24 @@ async fn build_hot_components(
     let executors = maybe_enable_sandbox(&effective_config, executors)?;
     let definitions: Arc<dyn praxec_core::ports::DefinitionStore> =
         Arc::new(ConfigDefinitionStore::from_config(&effective_config));
+    // D6 — loaded here (not at startup only) so a reload picks up an edited
+    // registry, and a registry that stops loading REJECTS the reload instead of
+    // silently emptying the tool catalog.
+    let registry = load_registry(&effective_config)?;
     // The one seam that decides semantic-vs-lexical, shared by startup and every
     // hot-reload — so a reload re-embeds instead of silently dropping to lexical
     // (and a degrade, when the embedder is unusable, is audited, not swallowed).
     // Still fails fast (CMP-031) on an unknown `discovery.include` token rather
-    // than shipping a silently partial index.
-    let discovery =
-        praxec_core::discovery::build_discovery_index(&effective_config, embedder, audit).await?;
-    Ok((definitions, executors, discovery, workflow_handle))
+    // than shipping a silently partial index. D6: it also indexes the registry's
+    // tool descriptors, so `praxec.query {kind: "tool"}` is answerable.
+    let discovery = praxec_core::discovery::build_discovery_index(
+        &effective_config,
+        registry.as_deref(),
+        embedder,
+        audit,
+    )
+    .await?;
+    Ok((definitions, executors, discovery, registry, workflow_handle))
 }
 
 /// SPEC §8.4 — when `praxec.authoring.write_enabled` is set, overlay an
@@ -3351,7 +3420,7 @@ mod tests {
         let embedder: Arc<dyn praxec_core::embeddings::EmbeddingProvider> =
             Arc::new(SpeedAxisEmbedder);
 
-        let (_defs, _execs, discovery, _handle) =
+        let (_defs, _execs, discovery, _registry, _handle) =
             build_hot_components(&cache_flow_config(), &audit, &embedder)
                 .await
                 .expect("components build");
@@ -3371,7 +3440,7 @@ mod tests {
         let embedder: Arc<dyn praxec_core::embeddings::EmbeddingProvider> =
             Arc::new(praxec_core::embeddings::NoopEmbedder);
 
-        let (_defs, _execs, discovery, _handle) =
+        let (_defs, _execs, discovery, _registry, _handle) =
             build_hot_components(&cache_flow_config(), &audit, &embedder)
                 .await
                 .expect("components build");
@@ -3394,6 +3463,7 @@ mod tests {
     async fn reload_gated_swaps_in_an_index_built_from_the_new_config() {
         use praxec_core::hot_reload::{
             SwappableDefinitionStore, SwappableDiscoveryIndex, SwappableExecutorRegistry,
+            SwappableRegistry,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -3414,13 +3484,17 @@ mod tests {
         let audit: Arc<dyn praxec_core::audit::AuditSink> = Arc::new(audit_sink.clone());
         let embedder: Arc<dyn praxec_core::embeddings::EmbeddingProvider> =
             Arc::new(praxec_core::embeddings::NoopEmbedder);
-        let (defs, execs, discovery, handle) = build_hot_components(&config, &audit, &embedder)
-            .await
-            .expect("components build");
+        let (defs, execs, discovery, registry, handle) =
+            build_hot_components(&config, &audit, &embedder)
+                .await
+                .expect("components build");
         handle.set_runtime((*runtime).clone());
         let swappable_defs = Arc::new(SwappableDefinitionStore::new(defs));
         let swappable_execs = Arc::new(SwappableExecutorRegistry::new(execs));
         let swappable_discovery = Arc::new(SwappableDiscoveryIndex::new(discovery));
+        // This config declares no `discovery.registry` — `None`, which is exactly
+        // what the pre-D6 reload path carried.
+        let swappable_registry = Arc::new(SwappableRegistry::new(registry));
 
         // The operator adds a workflow and reloads.
         let mut edited = cache_flow_config();
@@ -3436,6 +3510,7 @@ mod tests {
             &swappable_defs,
             &swappable_execs,
             &swappable_discovery,
+            &swappable_registry,
             &cfg_path,
             &audit,
             &runtime,

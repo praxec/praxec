@@ -187,6 +187,36 @@ fn registry_suggestion_boosts_and_annotates_linked_tools() {
     assert_eq!(ranked[1].topology.component, 0.0);
 }
 
+/// D6 — the topology term must CHANGE the answer, not merely decorate it.
+/// The unlinked candidate wins the id tie-break, so with no registry it ranks
+/// first; loading the registry must flip the order in the direction the
+/// crossmatrix implies (the ecosystem-composed workflow rises).
+#[test]
+fn topology_flips_the_order_versus_no_registry() {
+    let hits = vec![hit("aaa.unlinked", 3.0), hit("cognitive/flow.derisk", 3.0)];
+
+    let without: Vec<String> = rank_candidates(&hits, None)
+        .iter()
+        .map(|r| r.id.clone())
+        .collect();
+    assert_eq!(
+        without,
+        ["aaa.unlinked", "cognitive/flow.derisk"],
+        "no registry: equal scores, id tie-break — the pre-D6 answer"
+    );
+
+    let reg = registry();
+    let with: Vec<String> = rank_candidates(&hits, Some(&reg))
+        .iter()
+        .map(|r| r.id.clone())
+        .collect();
+    assert_eq!(
+        with,
+        ["cognitive/flow.derisk", "aaa.unlinked"],
+        "a registry-composed workflow outranks an otherwise-equal unlinked one"
+    );
+}
+
 #[test]
 fn crossmatrix_dependency_edge_also_links() {
     // `cognitive/flow.inspect-repo` is linked only via a `dependency`

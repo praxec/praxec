@@ -672,7 +672,7 @@ async fn embedder_unavailable_still_returns_lexical_results() {
     let audit: Arc<dyn AuditSink> = Arc::new(sink.clone());
     let dead: Arc<dyn EmbeddingProvider> = Arc::new(DeadEmbedder);
 
-    let index = build_discovery_index(&pack_config(), &dead, &audit)
+    let index = build_discovery_index(&pack_config(), None, &dead, &audit)
         .await
         .expect("a dead embedder must never fail the index build");
 
@@ -696,7 +696,7 @@ async fn no_embedder_configured_is_unchanged_lexical_behaviour() {
     let audit: Arc<dyn AuditSink> = Arc::new(MemoryAuditSink::new());
     let noop: Arc<dyn EmbeddingProvider> = Arc::new(NoopEmbedder);
 
-    let index = build_discovery_index(&pack_config(), &noop, &audit)
+    let index = build_discovery_index(&pack_config(), None, &noop, &audit)
         .await
         .unwrap();
 
