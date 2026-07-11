@@ -1,0 +1,33 @@
+name: gitflow guard
+
+# Enforces the branch flow: feature -> dev -> main.
+# `main` is the release branch; it may only advance by merging `dev`.
+# This job fails any pull request into `main` whose source branch is not `dev`,
+# so a stray feature branch cannot merge straight to `main`.
+#
+# Note: for `pull_request`, the workflow file is taken from the PR head branch,
+# so this guard is effective as soon as it lands on `dev` (which is the only
+# legal head for a `main` PR anyway).
+
+on:
+    pull_request:
+        branches: [main]
+
+permissions:
+    contents: read
+
+jobs:
+    main-from-dev-only:
+        name: main only accepts merges from dev
+        runs-on: ubuntu-latest
+        steps:
+            - name: Verify PR source is dev
+              env:
+                  HEAD_REF: ${{ github.event.pull_request.head.ref }}
+              run: |
+                  if [ "$HEAD_REF" != "dev" ]; then
+                      echo "::error::PRs into 'main' must come from 'dev' (got '$HEAD_REF')."
+                      echo "gitflow: feature -> dev -> main. Merge your work into 'dev' first, then open dev -> main."
+                      exit 1
+                  fi
+                  echo "OK: PR head is 'dev'."
