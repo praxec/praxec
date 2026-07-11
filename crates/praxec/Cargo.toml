@@ -36,6 +36,8 @@ rig = { package = "rig-core", version = "0.38" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+# F13 — the typed `GRANT_REQUIRES_OPERATOR` origin-gate error on `connections grant`.
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

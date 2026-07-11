@@ -35,16 +35,20 @@ covered by a stability commitment.
   a callable tool through the gateway, dispatching per kind by reusing the
   existing mcp/cli/rest transports. Fail-fasts (never auto-grants) when the
   required connection is absent or ungranted.
-- **Registry v3 (`praxec.packs/v3`)** — a compatible superset of the v2 pack
-  registry: each tool may carry a descriptor (so the registry finally spans
-  cli + rest, not just mcp), plus per-tool `suggested_workflows` and a top-level
-  `crossmatrix` (tool × workflow) topology. Typed loader in
-  `praxec-core::registry_v3` with `workflows_for_tool` / `tools_for_workflow`.
-- **Evidence + topology-aware selector** — deterministic candidate ranking
-  (`rank_candidates`) combining lexical relevance, item1 intent-evidence, and
-  registry topology, with an explainable `why` line carrying the exact
-  arithmetic. The compiled-tool-determinism middle of
-  human-intent × tool-determinism × model-generation.
+- **Registry v3 (`praxec.packs/v3`) — schema + loader foundation.** A compatible
+  superset of the v2 pack registry: each tool may carry a descriptor (so the
+  registry can span cli + rest, not just mcp), plus per-tool `suggested_workflows`
+  and a top-level `crossmatrix` (tool × workflow) topology. Ships as the typed
+  loader (`praxec-core::registry_v3`, `workflows_for_tool` / `tools_for_workflow`).
+  **Foundation only in 0.0.17** — the runtime wiring that loads a v3 registry and
+  feeds its topology into discovery ranking lands in **v0.0.18** (the optimization
+  flywheel; see `docs/roadmap-v0.0.18-optimization-flywheel.md`).
+- **Evidence-aware selector.** Deterministic candidate ranking (`rank_candidates`,
+  wired into `praxec.query` discovery search) combining lexical relevance with
+  item1 intent-evidence, carrying an explainable `why` line. The compiled-tool-
+  determinism middle of human-intent × tool-determinism × model-generation. The
+  registry-**topology** term is present but neutral until a registry is wired into
+  the runtime (v0.0.18).
 - **`px connections add` / `px connections grant`** — a governed connection
   write path. `add` writes a connection **staged/ungranted**; `grant` is the
   separate, explicit, auditable trust act (emits `connections.granted`).
@@ -57,6 +61,37 @@ covered by a stability commitment.
   with `UNGRANTED_PACK_CONNECTION` until the operator grants them. A
   CLI-staged connection (`px connections add`) is treated identically until
   granted, so no code path can silently obtain a trusted connection.
+
+### Fixed — v0.0.17 dogfood hardening
+
+Found by dogfooding the release *before* tagging (see
+`docs/v0.0.17-functional-validation.md`):
+
+- **Credential path — the reasoning-agent hang trigger.** `providers.env` is now
+  resolved from the XDG config dir (`~/.config/praxec/`) first, so keys stored
+  beside the gateway config are auto-loaded; previously only `~/.praxec/` was
+  consulted → no credentials → agent model calls fast-failed and multi-step
+  auto-drive appeared to hang.
+- **Silent-drop of unloadable pack YAML.** A definition file in a remapped/
+  unscanned tier directory now emits `UNSCANNED_DEFINITION_DIR` at load + `check`
+  instead of vanishing with no feedback.
+- **Pack freshness.** The staleness recheck now watches `repos:` definition files,
+  so a pack edit triggers the same gated reload as a config edit.
+- **Validated connection promotion.** A granted staged connection body is
+  validated against the gateway connection shape before going live
+  (`INVALID_STAGED_CONNECTION`).
+- **`connections grant` requires operator origin** — a non-interactive caller must
+  pass `--yes`; a human at a TTY is unaffected (the audit records how origin was
+  proven).
+
+### Deferred to v0.0.18 (foundation shipped, wiring pending)
+
+- Tool-descriptor **`auth`** block: **removed** from the 0.0.17 surface (it was
+  parsed but never enforced — advertising unenforced auth is a footgun). Returns
+  in v0.0.18 as *enforce-then-declare*.
+- Tool-descriptor **`provision`** block: schema/foundation only in 0.0.17.
+- **Registry topology** in discovery ranking + semantic-search embeddings — the
+  optimization flywheel (`docs/roadmap-v0.0.18-optimization-flywheel.md`).
 
 ### Added — observability (0.0.16)
 
