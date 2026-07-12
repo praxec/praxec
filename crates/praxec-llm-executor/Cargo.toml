@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 praxec-core = { workspace = true }
 anyhow = { workspace = true }
+async-stream = "0.3"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }

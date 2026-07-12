@@ -271,6 +271,25 @@ impl Bus {
             .map_err(|_| BusError::UnknownRequest(request_id))
     }
 
+    /// Consumer side: **abandon** a parked interaction this channel cannot
+    /// answer — e.g. a headless run reached a `human_decision` gate ([`answer`]
+    /// returned [`BusError::NonHumanResolver`]) and no human will ever drain it.
+    /// Removes the pending entry; dropping its reply `oneshot` makes the parked
+    /// [`Bus::request_interaction`] resolve to the default (declined) reply, so
+    /// the orchestrator unparks and terminates cleanly instead of waiting
+    /// forever at 0 CPU (the zombie-mission failure mode).
+    ///
+    /// This is deliberately NOT [`Bus::answer`]: it resolves nothing on the
+    /// interaction's merits and never impersonates a human (P16-safe). It is the
+    /// bounded escape hatch for an *unanswerable* park, not a way around the
+    /// human-decision gate. Idempotent: returns `true` if an entry was removed,
+    /// `false` if it was already answered/abandoned.
+    ///
+    /// [`answer`]: Bus::answer
+    pub fn abandon(&self, request_id: RequestId) -> bool {
+        self.pending().remove(&request_id).is_some()
+    }
+
     /// Count of parked (unanswered) interactions — a consumer's inbox depth.
     pub fn pending_count(&self) -> usize {
         self.pending().len()
@@ -690,5 +709,53 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_bus_has_no_pending_requests() {
         assert_eq!(Bus::new().pending_count(), 0);
+    }
+
+    // ── abandon (bounded escape for an unanswerable headless park) ───────────
+
+    #[tokio::test]
+    async fn abandon_unparks_the_waiting_request_as_declined() {
+        // The zombie fix: a parked interaction that will never be answered must
+        // be unparkable so its orchestrator resumes instead of hanging forever.
+        let (bus, handle, event) = parked_as(InteractionKind::Approve).await;
+        let removed = bus.abandon(request_id_of(&event));
+        assert!(
+            removed,
+            "abandon should report it removed the pending entry"
+        );
+        // The parked `request_interaction` future resolves (does NOT hang) to the
+        // default reply — declined, never impersonating a human approval.
+        let reply = handle.await.expect("parked task should resolve, not hang");
+        assert!(
+            !reply.approved,
+            "an abandoned gate must resolve as declined"
+        );
+        assert_eq!(bus.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn abandon_unparks_a_gate_a_non_human_could_not_resolve() {
+        // The exact headless-zombie scenario: an agent/policy tries to answer a
+        // human_decision gate (rejected, stays parked), then the consumer
+        // abandons it so the mission terminates cleanly.
+        let (bus, handle, event) = parked_as(InteractionKind::Approve).await;
+        let rejected = bus.answer(request_id_of(&event), InteractionReply::default(), &agent());
+        assert!(matches!(rejected, Err(BusError::NonHumanResolver { .. })));
+        assert_eq!(bus.pending_count(), 1, "still parked after the rejection");
+
+        assert!(bus.abandon(request_id_of(&event)));
+        let reply = handle.await.expect("parked task should resolve, not hang");
+        assert!(!reply.approved);
+        assert_eq!(bus.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn abandon_is_idempotent_and_reports_unknown_requests() {
+        let (bus, handle, event) = parked_as(InteractionKind::Approve).await;
+        assert!(bus.abandon(request_id_of(&event)));
+        // A second abandon (or an unknown id) is a harmless no-op → false.
+        assert!(!bus.abandon(request_id_of(&event)));
+        assert!(!bus.abandon(9_999_999));
+        let _ = handle.await;
     }
 }

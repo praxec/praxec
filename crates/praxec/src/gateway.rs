@@ -66,8 +66,10 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log_format);
 
-    // Load `~/.praxec/providers.env` into the process env (env still wins over
-    // the file). The `px` binary already does this; the gateway binary did not,
+    // Load the provider-keys file (XDG `~/.config/praxec/providers.env`, legacy
+    // `~/.praxec/providers.env` as fallback — see `provider_keys::resolve_path`)
+    // into the process env (env still wins over the file). The `px` binary
+    // already does this; the gateway binary did not,
     // so `serve` never picked up provider keys and every `kind: agent` /
     // affinity-resolved `kind: llm` step failed for want of a key. Called here —
     // synchronously, before the first `.await` — so no spawned task can race on
@@ -640,19 +642,32 @@ fn drive_outcome_to_result(
         DriveOutcome::Declined => anyhow::bail!(
             "orchestrate {mission_id}: a HITL gate was declined by the headless policy."
         ),
+        DriveOutcome::TimedOut { detail } => anyhow::bail!(
+            "orchestrate {mission_id}: the mission no-progress watchdog fired — {detail}. \
+             The driver stopped rather than wedge; re-run, or inspect the step's model/tool."
+        ),
         DriveOutcome::MaxSteps => anyhow::bail!(
             "orchestrate {mission_id}: hit the {max_steps}-step bound without resolving."
         ),
         DriveOutcome::Error(e) => {
             anyhow::bail!("orchestrate {mission_id}: drive error — {e}")
         }
-        DriveOutcome::ChooserFailed { source } => anyhow::bail!(
-            "orchestrate {mission_id}: the agentic driver's model call FAILED — {source}.\n\
-             This is not a dead-end flow: the orchestrator could not run its decision model \
-             (common causes: no provider API key, a 401/auth error, an unresolvable model \
-             binding, or a network failure). Check `gateway.models_yaml`, your provider keys \
-             (~/.praxec/providers.env), and connectivity."
-        ),
+        DriveOutcome::ChooserFailed { source } => {
+            // Report the ACTUAL resolved provider-keys path (XDG-first, matching
+            // `set-provider-keys` + preflight) — not the stale legacy
+            // `~/.praxec/providers.env`, which misdirects a user who ran
+            // `set-provider-keys` (it writes the XDG path).
+            let keys_hint = praxec_core::provider_keys::resolve_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "~/.config/praxec/providers.env".to_string());
+            anyhow::bail!(
+                "orchestrate {mission_id}: the agentic driver's model call FAILED — {source}.\n\
+                 This is not a dead-end flow: the orchestrator could not run its decision model \
+                 (common causes: no provider API key, a 401/auth error, an unresolvable model \
+                 binding, or a network failure). Check `gateway.models_yaml`, your provider keys \
+                 ({keys_hint}), and connectivity."
+            )
+        }
     }
 }
 
@@ -1117,6 +1132,21 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         path = %config_path.display(),
         "starting praxec stdio server"
     );
+
+    // CR6 — reap orphaned runs. An instance a prior process left mid-`running`
+    // (its driver/CLI died) is a durable zombie: no live owner will advance it,
+    // yet it isn't terminal. On a fresh boot there are no in-process drivers, so
+    // cancel the orphaned running instances now (human / lock / subworkflow
+    // waits are deliberately left untouched — they legitimately persist). Best
+    // effort: a reap failure must never block the server from coming up.
+    match runtime.reap_orphaned_runs().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            reaped = n,
+            "reaped orphaned running workflow(s) left by a prior process"
+        ),
+        Err(e) => tracing::warn!(error = %e, "orphan-reap sweep failed; continuing startup"),
+    }
 
     // P6b — the staleness tracker behind the lazy recheck: the config file
     // set's mtimes as captured at boot. Every reload path (in-band, SIGHUP,

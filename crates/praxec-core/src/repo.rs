@@ -142,10 +142,17 @@ const PREFIXABLE_BLOCKS: &[&str] = &["workflows", "skills", "scripts", "connecti
 /// - YAML parse failure on any layout-dir file
 /// - duplicate prefixed id within this repo (V21)
 /// - unsupported top-level block in a layout-dir file
+///
+/// The layout-dir file errors are ACCUMULATED: a single load reports every
+/// invalid file at once (not just the first), so an author fixes them in one
+/// pass. It remains fail-whole — any invalid file fails the load — never
+/// fail-open (a bad file is never silently dropped into a partial config).
 pub fn load_repo(repo_path: &Path) -> anyhow::Result<(RepoManifest, Value)> {
     let manifest = load_manifest(repo_path)?;
     let ns = &manifest.namespace;
     let mut aggregate = Value::Object(Map::new());
+    // Every invalid file across all layout tiers, so one load reports them all.
+    let mut errors: Vec<String> = Vec::new();
 
     for layout_dir in [
         &manifest.layout.capabilities,
@@ -168,12 +175,32 @@ pub fn load_repo(repo_path: &Path) -> anyhow::Result<(RepoManifest, Value)> {
         // Deterministic order so duplicate-id errors are reproducible.
         entries.sort();
         for file_path in entries {
-            let text = std::fs::read_to_string(&file_path)
-                .with_context(|| format!("reading repo file {}", file_path.display()))?;
-            let value: Value = serde_yaml::from_str(&text)
-                .with_context(|| format!("parsing YAML {}", file_path.display()))?;
-            merge_repo_file(&mut aggregate, value, ns, &file_path)?;
+            // Collect per-file failures instead of aborting on the FIRST one, so
+            // the operator sees EVERY file to fix in a single pass rather than
+            // fix-one-restart-repeat while authoring. This is NOT fail-open: any
+            // failure below still makes the whole load fail (`bail!` after the
+            // scan), so a bad file is never silently dropped into a partial
+            // config — it just no longer masks its siblings.
+            let outcome = (|| -> anyhow::Result<()> {
+                let text = std::fs::read_to_string(&file_path)
+                    .with_context(|| format!("reading repo file {}", file_path.display()))?;
+                let value: Value = serde_yaml::from_str(&text)
+                    .with_context(|| format!("parsing YAML {}", file_path.display()))?;
+                merge_repo_file(&mut aggregate, value, ns, &file_path)
+            })();
+            if let Err(e) = outcome {
+                errors.push(format!("{e:#}"));
+            }
         }
+    }
+    // Fail-WHOLE, but LOUD and complete: one message naming every invalid file.
+    if !errors.is_empty() {
+        bail!(
+            "repo `{}` has {} invalid file(s) — fix all of them before it can load:\n  - {}",
+            manifest.name,
+            errors.len(),
+            errors.join("\n  - ")
+        );
     }
     // Surface the silent-drop footgun: definition files placed in a DEFAULT tier
     // directory that this manifest has REMAPPED elsewhere are never scanned. Warn
@@ -735,6 +762,40 @@ workflows:
         let err = load_repo(td.path()).expect_err("unsupported block should error");
         let msg = format!("{:#}", err);
         assert!(msg.contains("bogus_top_level"), "msg: {msg}");
+    }
+
+    #[test]
+    fn load_repo_reports_all_invalid_files_not_just_the_first() {
+        // Two independently-broken files: a YAML parse error and an unsupported
+        // top-level block. BOTH must appear in one error (fail-whole, but
+        // complete) so an author fixes them in a single pass — not
+        // fix-one-restart-repeat. It stays fail-whole: the load still errors.
+        let td = TempDir::new().unwrap();
+        write_manifest(td.path(), &minimal_manifest("swe"));
+        write_file(
+            td.path(),
+            "capabilities/aaa_broken_yaml.yaml",
+            "list: [1, 2, 3\n", // unterminated flow sequence → parse error
+        );
+        write_file(
+            td.path(),
+            "capabilities/bbb_bogus_block.yaml",
+            "bogus_top_level:\n  foo: bar\n",
+        );
+        let err = load_repo(td.path()).expect_err("invalid files must fail the load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("2 invalid file(s)"),
+            "should count both: {msg}"
+        );
+        assert!(
+            msg.contains("aaa_broken_yaml.yaml"),
+            "should name the parse-error file: {msg}"
+        );
+        assert!(
+            msg.contains("bogus_top_level"),
+            "should name the bad-block file's error: {msg}"
+        );
     }
 
     #[test]

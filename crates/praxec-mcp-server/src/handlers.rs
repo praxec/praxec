@@ -1148,6 +1148,25 @@ impl PraxecServer {
         let is_cancel = parsed.intent.as_deref() == Some("cancel_pending_subject")
             && parsed.unknown_subject.is_some();
 
+        // T24 — cancel a RUNNING WORKFLOW (distinct from the lexicon
+        // `cancel_pending_subject` above). Wire shape:
+        // `{ "intent": "cancel", "workflowId": "wf_…", "summary"?: "<reason>" }`.
+        // This is the operator's server-side reap: a run whose CLI/driver died
+        // leaves a durable `running` instance in the store; without a working
+        // cancel verb it orphans a zombie (killing the CLI does not cancel
+        // server-side). Exclusive shape: it carries a `workflowId` but no
+        // `transition` (so it can't be a submit) and a distinct intent.
+        let is_cancel_workflow = parsed.intent.as_deref() == Some("cancel")
+            && parsed.workflow_id.is_some()
+            && parsed.transition.is_none();
+        if is_cancel_workflow {
+            let workflow_id = parsed.workflow_id.clone().expect("checked above");
+            let reason = parsed.summary.clone().unwrap_or_else(|| {
+                format!("cancelled via praxec.command by {}", principal.subject)
+            });
+            return self.handle_cancel_workflow(&workflow_id, &reason).await;
+        }
+
         match (is_start, is_submit, is_define, is_cancel) {
             (true, false, false, false) => {
                 // Start: reshape CommandArgs → StartArgs wire shape.
@@ -1181,6 +1200,29 @@ impl PraxecServer {
             }
             _ => Ok(ambiguous_intent_command()),
         }
+    }
+
+    /// T24 — cancel a running workflow (see the `is_cancel_workflow` shape in
+    /// [`dispatch_command`]). Delegates to [`WorkflowRuntime::cancel`]: sets
+    /// `cancelled_at` + `cancelled_reason`, bumps the version, and emits a
+    /// `workflow.cancelled` audit event; subsequent `submit`s return
+    /// `WORKFLOW_CANCELLED` and `get` surfaces `status: "cancelled"`.
+    /// Idempotent (re-cancelling is a no-op). A missing workflow surfaces the
+    /// store's not-found error.
+    ///
+    /// [`dispatch_command`]: Self::dispatch_command
+    /// [`WorkflowRuntime::cancel`]: praxec_core::runtime::WorkflowRuntime::cancel
+    async fn handle_cancel_workflow(
+        &self,
+        workflow_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<Value> {
+        self.runtime.cancel(workflow_id, reason).await?;
+        Ok(json!({
+            "workflowId": workflow_id,
+            "status": "cancelled",
+            "reason": reason,
+        }))
     }
 
     /// Shim: extract `<term>` from `subject: "lexicon:<term>"` and delegate

@@ -86,6 +86,11 @@ impl WorkflowStore for InMemoryWorkflowStore {
             .collect())
     }
 
+    async fn list_all(&self) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let g = self.inner.lock().expect("LOCK_POISONED: workflow store");
+        Ok(g.values().cloned().collect())
+    }
+
     async fn save_if_version(
         &self,
         instance: WorkflowInstance,

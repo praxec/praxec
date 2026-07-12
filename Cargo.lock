@@ -4724,6 +4724,7 @@ name = "praxec-llm-executor"
 version = "0.0.18"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "chrono",
  "futures",

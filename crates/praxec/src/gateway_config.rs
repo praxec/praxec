@@ -150,8 +150,10 @@ pub(crate) enum Command {
     /// cancel) against the config's store and print the JSON response. State
     /// persists across calls when `store.kind: sqlite`. Argument is the same
     /// JSON the `praxec.command` MCP tool takes, e.g.
-    /// `'{"definitionId":"hello_flow"}'` or
-    /// `'{"workflowId":"wf_...","expectedVersion":1,"transition":"begin"}'`.
+    /// `'{"definitionId":"hello_flow"}'`,
+    /// `'{"workflowId":"wf_...","expectedVersion":1,"transition":"begin"}'`, or
+    /// `'{"intent":"cancel","workflowId":"wf_..."}'` (cancel a running workflow —
+    /// the server-side reap for a run whose driver/CLI died).
     Command {
         /// Path to the gateway YAML config (the store the workflow lives in).
         #[arg(short, long)]
