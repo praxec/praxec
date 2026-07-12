@@ -44,6 +44,9 @@ pub fn classify_run(outcome: &DriveOutcome, final_state: &MissionState) -> RunVe
         // A chooser/runner fault (missing key, 401, model-resolution, network)
         // is an engine-level error, not a livelock/wedge — surface it as one.
         DriveOutcome::ChooserFailed { source } => RunVerdict::EngineError(source.clone()),
+        // The mission no-progress watchdog fired on a wedged step — a stall the
+        // driver refused to hang on. Classify it as a wedge (no forward motion).
+        DriveOutcome::TimedOut { .. } => RunVerdict::Wedge,
         DriveOutcome::GaveUp => {
             if final_state.resolved() || final_state.human_turn() {
                 RunVerdict::Pass

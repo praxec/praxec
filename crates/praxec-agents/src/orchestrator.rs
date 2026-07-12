@@ -496,6 +496,9 @@ pub enum DriveOutcome {
     GaveUp,
     /// Hit the step bound without resolving.
     MaxSteps,
+    /// A single decision step blew the mission-level no-progress wall-clock
+    /// backstop ([`MISSION_STEP_TIMEOUT`]) — the driver refused to wedge on it.
+    TimedOut { detail: String },
     /// A §32 call errored.
     Error(String),
     /// The chooser itself FAILED — its agent runner errored (missing API key,
@@ -505,10 +508,61 @@ pub enum DriveOutcome {
     ChooserFailed { source: String },
 }
 
+/// How often [`drive_mission`] pulses a "still working" heartbeat to the bus
+/// while awaiting a single (possibly slow) agent decision — so a client tailing
+/// the mission can tell a slow reasoning call from a hung one (the observability
+/// gap where a blocking call looks identical to a wedge).
+const MISSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Mission-level no-progress backstop on a SINGLE autonomous decision step. The
+/// agent runner already bounds its own call (session timeout + stall watchdog),
+/// so in practice that fires first; this only trips if a step somehow exceeds
+/// even that — guaranteeing the driver can never wedge on one step. Generous by
+/// design: larger than a normal decision's own timeout, it catches a genuine
+/// hang, not slowness.
+const MISSION_STEP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Await a single agent decision while (a) pulsing a heartbeat to the bus every
+/// [`MISSION_HEARTBEAT_INTERVAL`] so a slow call is visibly *alive* to the
+/// client, and (b) enforcing [`MISSION_STEP_TIMEOUT`] as the mission-level
+/// no-progress backstop. `Ok(inner)` carries the chooser's own result;
+/// `Err(elapsed)` means the step blew the wall-clock bound.
+async fn choose_with_heartbeat(
+    chooser: &dyn TransitionChooser,
+    state: &MissionState,
+    bus: &Bus,
+    mission_id: &str,
+) -> Result<Result<Option<String>, String>, Duration> {
+    let started = tokio::time::Instant::now();
+    let choose_fut = chooser.choose(state);
+    tokio::pin!(choose_fut);
+    let mut ticker = tokio::time::interval(MISSION_HEARTBEAT_INTERVAL);
+    ticker.tick().await; // the first interval tick is immediate — consume it
+    loop {
+        tokio::select! {
+            // Prefer completing the decision over emitting a heartbeat.
+            biased;
+            result = &mut choose_fut => return Ok(result),
+            _ = ticker.tick() => {
+                let elapsed = started.elapsed();
+                if elapsed >= MISSION_STEP_TIMEOUT {
+                    return Err(elapsed);
+                }
+                bus.publish(MissionEvent::Status {
+                    mission_id: mission_id.to_string(),
+                    status: format!("working — deciding next move ({}s)", elapsed.as_secs()),
+                });
+            }
+        }
+    }
+}
+
 /// Drive a mission to resolution (ADR-0009 c). Each step: read state → publish
 /// status → if resolved, stop → if it's the human's turn, **park** on the bus and
 /// resume on the reply → else the orchestrator chooses and we submit. Bounded by
-/// `max_steps`; the outcomes are the real stop condition.
+/// `max_steps`; the outcomes are the real stop condition. A single autonomous
+/// decision is additionally heartbeat-pulsed and bounded by a mission-level
+/// no-progress backstop (see [`choose_with_heartbeat`]).
 pub async fn drive_mission(
     gateway: &dyn MissionGateway,
     chooser: &dyn TransitionChooser,
@@ -588,12 +642,23 @@ pub async fn drive_mission(
             // leave the instance running.
             return DriveOutcome::GaveUp;
         }
-        let transition = match chooser.choose(&state).await {
-            Ok(Some(t)) => t,
-            Ok(None) => return DriveOutcome::GaveUp,
+        let transition = match choose_with_heartbeat(chooser, &state, bus, mission_id).await {
+            Ok(Ok(Some(t))) => t,
+            Ok(Ok(None)) => return DriveOutcome::GaveUp,
             // The chooser's runner errored — surface the REAL fault (honest
             // error) instead of masquerading it as a give-up.
-            Err(source) => return DriveOutcome::ChooserFailed { source },
+            Ok(Err(source)) => return DriveOutcome::ChooserFailed { source },
+            // The mission-level no-progress backstop tripped: the driver refuses
+            // to wedge on a single step even if the runner's own bound didn't fire.
+            Err(elapsed) => {
+                return DriveOutcome::TimedOut {
+                    detail: format!(
+                        "a decision step ran {}s with no result (backstop {}s)",
+                        elapsed.as_secs(),
+                        MISSION_STEP_TIMEOUT.as_secs()
+                    ),
+                };
+            }
         };
         bus.publish(MissionEvent::Chunk {
             mission_id: mission_id.to_string(),
@@ -752,6 +817,71 @@ mod tests {
 
     fn running_then(states: Vec<MissionState>) -> ScriptedGateway {
         ScriptedGateway::new(states)
+    }
+
+    /// A chooser that takes `delay` to decide — stands in for a slow (but not
+    /// hung) reasoning call, so a test can drive the heartbeat + no-progress
+    /// backstop under a paused clock.
+    struct SlowChooser {
+        delay: Duration,
+    }
+    #[async_trait]
+    impl TransitionChooser for SlowChooser {
+        async fn choose(&self, state: &MissionState) -> Result<Option<String>, String> {
+            tokio::time::sleep(self.delay).await;
+            Ok(state.agent_actions().first().map(|a| a.transition.clone()))
+        }
+    }
+
+    // ── mission heartbeat + no-progress watchdog (CR4 / CR5) ─────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_decision_step_trips_the_no_progress_watchdog() {
+        // A decision that never returns must not wedge the driver: the
+        // mission-level backstop fires and drive_mission ends as TimedOut.
+        let gw = LoopGateway;
+        let chooser = SlowChooser {
+            delay: MISSION_STEP_TIMEOUT + Duration::from_secs(120),
+        };
+        let bus = Bus::new();
+        let outcome = drive_mission(&gw, &chooser, &bus, "m1", 10).await;
+        assert!(
+            matches!(outcome, DriveOutcome::TimedOut { .. }),
+            "a wedged step must trip the watchdog; got {outcome:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_decision_pulses_a_heartbeat_to_the_bus() {
+        // A slow-but-live decision must emit "still working" heartbeats so a
+        // client can tell it apart from a hang.
+        let gw = running_then(vec![
+            ms("running", &[("go", "agent")]),
+            ms("succeeded", &[]),
+        ]);
+        // Spans more than one heartbeat interval, well under the backstop.
+        let chooser = SlowChooser {
+            delay: MISSION_HEARTBEAT_INTERVAL * 2 + Duration::from_secs(5),
+        };
+        let bus = Bus::new();
+        let mut rx = bus.subscribe();
+        let outcome = drive_mission(&gw, &chooser, &bus, "m1", 10).await;
+        assert!(
+            matches!(outcome, DriveOutcome::Resolved { .. }),
+            "the mission should resolve; got {outcome:?}"
+        );
+        let mut heartbeats = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let MissionEvent::Status { status, .. } = ev {
+                if status.starts_with("working — deciding") {
+                    heartbeats += 1;
+                }
+            }
+        }
+        assert!(
+            heartbeats >= 1,
+            "a slow decision must pulse at least one heartbeat"
+        );
     }
 
     // ── MissionState::resolved ───────────────────────────────────────────────

@@ -266,6 +266,21 @@ impl WorkflowStore for SqliteWorkflowStore {
         })
         .await?
     }
+
+    async fn list_all(&self) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<WorkflowInstance>> {
+            let conn = conn.lock().expect("LOCK_POISONED: sqlite connection");
+            let mut stmt = conn.prepare("SELECT instance FROM workflows")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            let mut all = Vec::new();
+            for json in rows {
+                all.push(serde_json::from_str::<WorkflowInstance>(&json?)?);
+            }
+            Ok(all)
+        })
+        .await?
+    }
 }
 
 #[cfg(test)]

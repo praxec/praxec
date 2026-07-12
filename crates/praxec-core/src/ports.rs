@@ -79,6 +79,15 @@ pub trait WorkflowStore: Send + Sync {
     /// downtime would stay `waiting` forever). Every backend MUST scan and
     /// answer truthfully.
     async fn list_waiting_on_subworkflow(&self) -> anyhow::Result<Vec<WorkflowInstance>>;
+
+    /// List **every** persisted instance. Used at startup to reap orphaned runs
+    /// (`WorkflowRuntime::reap_orphaned_runs`): an instance left `running` by a
+    /// driver/CLI that died is a durable zombie until cancelled. REQUIRED — no
+    /// lenient default, matching the other list methods: a backend silently
+    /// returning an empty list would disable orphan reaping without any signal.
+    /// The runtime does the (definition-aware) terminal/waiting filtering, so
+    /// the store simply returns all instances.
+    async fn list_all(&self) -> anyhow::Result<Vec<WorkflowInstance>>;
 }
 
 #[async_trait]
@@ -336,6 +345,9 @@ mod tests {
             Ok(Vec::new())
         }
         async fn list_waiting_on_subworkflow(&self) -> anyhow::Result<Vec<WorkflowInstance>> {
+            Ok(Vec::new())
+        }
+        async fn list_all(&self) -> anyhow::Result<Vec<WorkflowInstance>> {
             Ok(Vec::new())
         }
     }

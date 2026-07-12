@@ -642,6 +642,10 @@ fn drive_outcome_to_result(
         DriveOutcome::Declined => anyhow::bail!(
             "orchestrate {mission_id}: a HITL gate was declined by the headless policy."
         ),
+        DriveOutcome::TimedOut { detail } => anyhow::bail!(
+            "orchestrate {mission_id}: the mission no-progress watchdog fired — {detail}. \
+             The driver stopped rather than wedge; re-run, or inspect the step's model/tool."
+        ),
         DriveOutcome::MaxSteps => anyhow::bail!(
             "orchestrate {mission_id}: hit the {max_steps}-step bound without resolving."
         ),
@@ -1128,6 +1132,21 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         path = %config_path.display(),
         "starting praxec stdio server"
     );
+
+    // CR6 — reap orphaned runs. An instance a prior process left mid-`running`
+    // (its driver/CLI died) is a durable zombie: no live owner will advance it,
+    // yet it isn't terminal. On a fresh boot there are no in-process drivers, so
+    // cancel the orphaned running instances now (human / lock / subworkflow
+    // waits are deliberately left untouched — they legitimately persist). Best
+    // effort: a reap failure must never block the server from coming up.
+    match runtime.reap_orphaned_runs().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            reaped = n,
+            "reaped orphaned running workflow(s) left by a prior process"
+        ),
+        Err(e) => tracing::warn!(error = %e, "orphan-reap sweep failed; continuing startup"),
+    }
 
     // P6b — the staleness tracker behind the lazy recheck: the config file
     // set's mtimes as captured at boot. Every reload path (in-band, SIGHUP,
