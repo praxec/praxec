@@ -82,6 +82,44 @@ the selector policy below its evidence threshold, behavior is identical to 0.0.1
   searchable through live discovery. A configured-but-unloadable registry fails
   fast rather than booting registry-less.
 
+### Fixed — orchestrate / auto_drive multi-step hang
+
+An investigation into a "multi-step reasoning `auto_drive` hangs at 0 CPU"
+report found the headline lead ("timeout after 60 ms") to be a **cosmetic
+mislabel**, not a functional bug — but it surfaced several real, distinct hangs.
+The prior model-chain circuit breaker (30-min cooldown + half-open re-probe),
+chain-walk escalation, and `host.tools()` setup timeout were already correct; the
+gaps were elsewhere:
+
+- **The stall watchdog is live again on the model call.** The provider factory
+  drained rig's whole turn into a `Vec` *before* returning the stream, so the
+  runner's per-event stall watchdog only ever polled an already-materialized
+  buffer — the real model wait (including a hang at first token) happened outside
+  it, bounded only by the 600s session wall. The factory now streams **lazily**
+  (an `async_stream` generator), so a hung/silent reasoning call is caught at the
+  `stall_timeout` and escalates, exactly as advertised.
+- **Headless HITL gates no longer park forever.** A headless run that reached a
+  `human_decision` gate parked on an unbounded `oneshot` the policy could never
+  answer (P16 refuses a non-human resolver) — the driver sat at 0 CPU
+  indefinitely, orphaning parent + child instances. The headless consumer now
+  **abandons** an unanswerable gate (resolving it as declined, never a forged
+  approval) so the mission terminates cleanly, and it survives a lagging event
+  channel instead of silently dying and stranding every future park.
+- **Per-call timeout on tool invocations.** A hung MCP tool server inside
+  `host.call` was bounded only by the session wall. Each call now has a generous
+  per-call ceiling; a timeout is a **non-fatal** tool error (the model sees it and
+  can recover) rather than a silent 0-CPU block.
+- **A working, server-side `cancel` verb.** `praxec.command
+  { "intent": "cancel", "workflowId": "…" }` now cancels a running workflow (the
+  `Runtime::cancel` primitive existed but was wired to no verb) — the operator's
+  reap for an instance whose driver/CLI died. The CLI exposes it through the same
+  passthrough (`px command '{"intent":"cancel","workflowId":"…"}'`).
+- **Honest error labels.** `ExecutorError::Timeout` is milliseconds everywhere
+  (matching every other construction site); two sites fed `.as_secs()`, printing a
+  real 60-second timeout as "timeout after 60 ms" (the report's red herring). The
+  `orchestrate` credentials-path hint now reports the actual resolved
+  `providers.env` path (XDG-first) instead of the stale legacy `~/.praxec` one.
+
 ## [0.0.17] — 2026-07-10 — tool-source ecosystem & governed connections
 
 > **This release bundles every 0.0.16 improvement.** There is no separate 0.0.16

@@ -296,6 +296,64 @@ async fn query_workflow_id_alone_dispatches_to_get() {
     );
 }
 
+/// `intent: "cancel" + workflowId` → cancel a RUNNING workflow (T24), distinct
+/// from the lexicon `cancel_pending_subject`. This is the server-side reap a
+/// killed CLI needs; without it a dead driver orphans a durable `running`
+/// instance (a zombie).
+#[tokio::test]
+async fn command_intent_cancel_cancels_a_running_workflow() {
+    let server = test_server().await;
+    let start = server
+        .dispatch_command(
+            json!({ "definitionId": "test_wf", "input": {} }),
+            Principal::anonymous(),
+        )
+        .await
+        .expect("start ok");
+    let workflow_id = start["workflow"]["id"]
+        .as_str()
+        .expect("workflow.id present")
+        .to_string();
+
+    let resp = server
+        .dispatch_command(
+            json!({ "intent": "cancel", "workflowId": workflow_id, "summary": "operator abort" }),
+            Principal::anonymous(),
+        )
+        .await
+        .expect("cancel returns Ok");
+    assert_eq!(resp["status"].as_str(), Some("cancelled"), "got: {resp}");
+    assert_eq!(resp["workflowId"].as_str(), Some(workflow_id.as_str()));
+    assert_eq!(resp["reason"].as_str(), Some("operator abort"));
+
+    // The instance is now cancelled — a `get` reflects it (mapped to cancelled).
+    let got = server
+        .dispatch_query(json!({ "workflowId": workflow_id }), Principal::anonymous())
+        .await
+        .expect("get ok");
+    assert!(
+        got.to_string().contains("cancel"),
+        "get should reflect the cancellation; got: {got}"
+    );
+}
+
+/// Cancelling a workflow that doesn't exist errors cleanly (surfaces the store's
+/// not-found), rather than panicking or silently succeeding.
+#[tokio::test]
+async fn command_intent_cancel_on_unknown_workflow_errors() {
+    let server = test_server().await;
+    let res = server
+        .dispatch_command(
+            json!({ "intent": "cancel", "workflowId": "wf_does_not_exist" }),
+            Principal::anonymous(),
+        )
+        .await;
+    assert!(
+        res.is_err(),
+        "cancelling a missing workflow should error, not panic or no-op"
+    );
+}
+
 /// Ambiguous args (too many dispatch-relevant fields) → AMBIGUOUS_INTENT structured response.
 #[tokio::test]
 async fn query_ambiguous_args_returns_ambiguous_intent_error() {

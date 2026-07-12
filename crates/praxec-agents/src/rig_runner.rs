@@ -68,6 +68,16 @@ pub const DEFAULT_MAX_HISTORY_BYTES: usize = 1024 * 1024;
 
 pub const TOOL_SETUP_TIMEOUT: Duration = Duration::from_secs(60); // Bounding tool setup to prevent hung server stalls
 
+/// Per-call ceiling on a single MCP tool invocation. A hung tool server (no
+/// response, ever) would otherwise sit at 0 CPU inside `host.call().await` — a
+/// path the model-stream stall watchdog does NOT cover — and burn the whole
+/// session wall. On expiry the call is treated as a **non-fatal tool error**:
+/// the model sees an `ERROR: … timed out` string as that tool's output and can
+/// recover (try another tool / finish), while the overall run stays bounded by
+/// the session wall. Generous by design (a real tool that runs a build/test can
+/// legitimately take minutes); it catches an indefinite hang, not slowness.
+pub const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// The audit `event_type` of the in-run liveness pulse — see [`HeartbeatEmitter`].
 pub const AGENT_HEARTBEAT_EVENT: &str = "agent.heartbeat";
 
@@ -431,7 +441,10 @@ impl RigSessionRunner {
             // than running the agent without a tool it was told it has.
             let listed = tokio::time::timeout(TOOL_SETUP_TIMEOUT, host.tools(&session.tools))
                 .await
-                .map_err(|_| ExecutorError::Timeout(TOOL_SETUP_TIMEOUT.as_secs()))??;
+                // `ExecutorError::Timeout` is milliseconds (its Display is "… ms");
+                // feed ms, not `.as_secs()`, so a 60s setup timeout doesn't print
+                // as "timeout after 60 ms" (the mislabel that seeded a bug report).
+                .map_err(|_| ExecutorError::Timeout(TOOL_SETUP_TIMEOUT.as_millis() as u64))??;
             for (mut def, conn) in listed {
                 let real = def.name.clone();
                 let exposed = sanitize_tool_name(&real, &tool_conn);
@@ -546,10 +559,22 @@ impl RigSessionRunner {
                 crate::tool_budget::read_spill(env.spill, &c.arguments).await
             } else {
                 let raw = match (env.tool_conn.get(&c.name), self.tool_host.as_ref()) {
-                    (Some((conn, real)), Some(host)) => host
-                        .call(conn, real, &c.arguments)
+                    (Some((conn, real)), Some(host)) => {
+                        match tokio::time::timeout(
+                            TOOL_CALL_TIMEOUT,
+                            host.call(conn, real, &c.arguments),
+                        )
                         .await
-                        .unwrap_or_else(|e| format!("ERROR: {e}")),
+                        {
+                            Ok(r) => r.unwrap_or_else(|e| format!("ERROR: {e}")),
+                            Err(_) => format!(
+                                "ERROR: tool '{}' timed out after {}s (no response \
+                                 from its MCP server); treat it as unavailable",
+                                c.name,
+                                TOOL_CALL_TIMEOUT.as_secs()
+                            ),
+                        }
+                    }
                     // `tool_conn` non-empty implies a host; keep the arm typed.
                     (Some(_), None) => "ERROR: no ToolHost wired".to_string(),
                     (None, _) => format!("ERROR: unknown tool '{}'", c.name),
@@ -863,10 +888,25 @@ impl RigSessionRunner {
                     crate::tool_budget::read_spill(env.spill, &c.arguments).await
                 } else {
                     let raw = match env.tool_conn.get(&c.name) {
-                        Some((conn, real)) => host
-                            .call(conn, real, &c.arguments)
+                        Some((conn, real)) => {
+                            match tokio::time::timeout(
+                                TOOL_CALL_TIMEOUT,
+                                host.call(conn, real, &c.arguments),
+                            )
                             .await
-                            .unwrap_or_else(|e| format!("ERROR: {e}")),
+                            {
+                                Ok(r) => r.unwrap_or_else(|e| format!("ERROR: {e}")),
+                                // Non-fatal: the model sees the timeout as this
+                                // tool's output and can proceed/finish; the run
+                                // stays bounded by the session wall.
+                                Err(_) => format!(
+                                    "ERROR: tool '{}' timed out after {}s (no response \
+                                     from its MCP server); treat it as unavailable",
+                                    c.name,
+                                    TOOL_CALL_TIMEOUT.as_secs()
+                                ),
+                            }
+                        }
                         None => format!("ERROR: unknown tool '{}'", c.name),
                     };
                     // Guard the context window: an unbounded tool result would
@@ -1203,7 +1243,8 @@ async fn drain_turn(
                     "\n[stalled] no stream event for {}s — escalating\n",
                     stall_timeout.as_secs()
                 ));
-                return Err(ExecutorError::Timeout(stall_timeout.as_secs()));
+                // ms, not `.as_secs()` — the field is milliseconds (Display "… ms").
+                return Err(ExecutorError::Timeout(stall_timeout.as_millis() as u64));
             }
             match tokio::time::timeout(remaining.min(HEARTBEAT_INTERVAL), stream.next()).await {
                 Ok(Some(item)) => break 'wait item,

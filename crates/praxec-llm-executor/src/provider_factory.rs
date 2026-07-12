@@ -7,13 +7,19 @@
 //! that returns canned [`StreamEvent`] streams.
 //!
 //! rig has no dynamic provider client, so the factory matches the vendor to build
-//! the right typed client (the cockpit pattern). Streaming is FINAL-ONLY for the
-//! executor, so the factory drains rig's stream into a `Vec<StreamEvent>` (incl.
-//! the final token-usage aggregate) and hands back an iterator — the executor's
-//! `drain_stream` then assembles the `DrainedResponse`.
+//! the right typed client (the cockpit pattern). The factory maps rig's stream to
+//! the executor's provider-agnostic [`StreamEvent`]s **lazily** — each event is
+//! forwarded as it arrives (via an `async_stream` generator), not pre-collected.
+//! Laziness is load-bearing: the agent runner's per-event stall watchdog can only
+//! bound inter-event silence if the underlying model wait actually happens while
+//! the consumer polls `.next()`. An earlier version drained the whole turn into a
+//! `Vec` before returning, which moved every token (and any first-token hang) to
+//! *before* the watchdog saw the stream — so a hung reasoning call sat at 0 CPU
+//! until the whole-session wall, and the advertised stall timeout never fired.
+//! The trailing token-usage aggregate + `Done` are emitted after the stream ends.
 
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::{BoxStream, Stream, StreamExt};
 use praxec_core::error::{ExecutorError, LlmErrorCode};
 use praxec_core::providers::ProviderId;
 use rig::client::{CompletionClient, ProviderClient};
@@ -87,8 +93,11 @@ impl ProviderFactory for DefaultProviderFactory {
             tool_choice,
         } = turn;
 
-        // Each arm builds the provider's typed client + agent; `collect_rig` is
-        // generic over the resulting model so the drain is written once.
+        // Each arm builds the provider's typed client + agent; `stream_rig` is
+        // generic over the resulting model so the lazy drain is written once. The
+        // client-construction error surfaces synchronously (before any stream is
+        // returned); a mid-turn connect/stream error is folded into the stream as
+        // an `Err` item (matching the prior behavior the runner already handles).
         macro_rules! run {
             ($client:expr_2021) => {{
                 let client = $client.map_err(provider_factory_err)?;
@@ -96,34 +105,42 @@ impl ProviderFactory for DefaultProviderFactory {
                 if let Some(s) = system.as_deref() {
                     b = b.preamble(s);
                 }
-                collect_rig(b.build(), prompt, history, tools, reasoning, tool_choice).await
+                Box::pin(stream_rig(
+                    b.build(),
+                    prompt,
+                    history,
+                    tools,
+                    reasoning,
+                    tool_choice,
+                )) as BoxStream<'static, Result<StreamEvent, String>>
             }};
         }
 
-        let events = match ProviderId::from_slug(vendor) {
-            Some(ProviderId::Anthropic) => run!(anthropic::Client::from_env()),
-            // A base-URL override → an OpenAI-*compatible* endpoint (proxy / self-
-            // hosted / mock), which speaks **Chat Completions**, not the Responses
-            // API that api.openai.com uses. No override → the default Responses
-            // client (which still honors rig's native `OPENAI_BASE_URL`).
-            Some(ProviderId::Openai) => match openai_base_override() {
-                Some(base) => run!(openai_completions_client(&base)),
-                None => run!(openai::Client::from_env()),
-            },
-            Some(ProviderId::Gemini) => run!(gemini::Client::from_env()),
-            Some(ProviderId::Openrouter) => run!(openrouter::Client::from_env()),
-            Some(ProviderId::Ollama) => run!(ollama::Client::from_env()),
-            _ => {
-                return Err(ExecutorError::Llm(
-                    LlmErrorCode::ProviderError,
-                    format!(
-                        "LLM executor: provider '{vendor}' is not wired; supported: \
+        let stream: BoxStream<'static, Result<StreamEvent, String>> =
+            match ProviderId::from_slug(vendor) {
+                Some(ProviderId::Anthropic) => run!(anthropic::Client::from_env()),
+                // A base-URL override → an OpenAI-*compatible* endpoint (proxy / self-
+                // hosted / mock), which speaks **Chat Completions**, not the Responses
+                // API that api.openai.com uses. No override → the default Responses
+                // client (which still honors rig's native `OPENAI_BASE_URL`).
+                Some(ProviderId::Openai) => match openai_base_override() {
+                    Some(base) => run!(openai_completions_client(&base)),
+                    None => run!(openai::Client::from_env()),
+                },
+                Some(ProviderId::Gemini) => run!(gemini::Client::from_env()),
+                Some(ProviderId::Openrouter) => run!(openrouter::Client::from_env()),
+                Some(ProviderId::Ollama) => run!(ollama::Client::from_env()),
+                _ => {
+                    return Err(ExecutorError::Llm(
+                        LlmErrorCode::ProviderError,
+                        format!(
+                            "LLM executor: provider '{vendor}' is not wired; supported: \
                          anthropic, openai, gemini, openrouter, ollama"
-                    ),
-                ));
-            }
-        };
-        Ok(Box::pin(stream::iter(events)))
+                        ),
+                    ));
+                }
+            };
+        Ok(stream)
     }
 }
 
@@ -159,78 +176,86 @@ fn openai_completions_client(
         .map_err(Into::into)
 }
 
-/// Drive a rig agent's stream for one turn, collecting it (incl. the final
-/// token-usage aggregate) into the executor's provider-agnostic events.
-async fn collect_rig<M>(
+/// Drive a rig agent's stream for one turn **lazily**: map each rig event to a
+/// provider-agnostic [`StreamEvent`] as it arrives, yielding it to the consumer
+/// immediately. The connect (`stream_completion`/`stream`) awaits happen inside
+/// the generator too, so the *whole* model wait — connection and first-token —
+/// occurs while the runner polls `.next()` and is therefore bounded by its
+/// per-event stall watchdog (a hung call surfaces as a Timeout the chain-walk
+/// escalates, rather than dead-airing to the whole-session wall). The trailing
+/// token-usage aggregate + `Done` are emitted after the underlying stream ends.
+/// A connect/stream error is folded in as an `Err` item — the same shape the old
+/// eager path produced and the runner already tolerates.
+fn stream_rig<M>(
     agent: rig::agent::Agent<M>,
     prompt: Message,
     history: Vec<Message>,
     tools: Vec<ToolDefinition>,
     reasoning: Option<Value>,
     tool_choice: Option<rig::message::ToolChoice>,
-) -> Vec<Result<StreamEvent, String>>
+) -> impl Stream<Item = Result<StreamEvent, String>> + Send
 where
-    M: CompletionModel,
+    M: CompletionModel + 'static,
 {
-    let mut out: Vec<Result<StreamEvent, String>> = Vec::new();
-    let builder = match agent.stream_completion(prompt, history).await {
-        Ok(b) => b,
-        Err(e) => {
-            out.push(Err(format!("couldn't start the turn: {e}")));
-            return out;
-        }
-    };
-    let mut builder = builder.tools(tools);
-    if let Some(p) = reasoning {
-        builder = builder.additional_params(p);
-    }
-    if let Some(tc) = tool_choice {
-        builder = builder.tool_choice(tc);
-    }
-    let mut stream = match builder.stream().await {
-        Ok(s) => s,
-        Err(e) => {
-            out.push(Err(format!("couldn't reach the model: {e}")));
-            return out;
-        }
-    };
-
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(StreamedAssistantContent::Text(t)) => {
-                out.push(Ok(StreamEvent::Text { chunk: t.text }))
+    async_stream::stream! {
+        let builder = match agent.stream_completion(prompt, history).await {
+            Ok(b) => b,
+            Err(e) => {
+                yield Err(format!("couldn't start the turn: {e}"));
+                return;
             }
-            Ok(StreamedAssistantContent::Reasoning(r)) => {
-                let text = r.display_text();
-                if !text.is_empty() {
-                    out.push(Ok(StreamEvent::Reasoning { chunk: text }));
+        };
+        let mut builder = builder.tools(tools);
+        if let Some(p) = reasoning {
+            builder = builder.additional_params(p);
+        }
+        if let Some(tc) = tool_choice {
+            builder = builder.tool_choice(tc);
+        }
+        let mut stream = match builder.stream().await {
+            Ok(s) => s,
+            Err(e) => {
+                yield Err(format!("couldn't reach the model: {e}"));
+                return;
+            }
+        };
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(StreamedAssistantContent::Text(t)) => {
+                    yield Ok(StreamEvent::Text { chunk: t.text });
+                }
+                Ok(StreamedAssistantContent::Reasoning(r)) => {
+                    let text = r.display_text();
+                    if !text.is_empty() {
+                        yield Ok(StreamEvent::Reasoning { chunk: text });
+                    }
+                }
+                Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
+                    yield Ok(StreamEvent::ToolCall(ToolCallRequest {
+                        id: tool_call.id,
+                        name: tool_call.function.name,
+                        arguments: tool_call.function.arguments.to_string(),
+                    }));
+                }
+                Ok(_) => {} // tool-call deltas, etc. — not surfaced
+                Err(e) => {
+                    yield Err(format!("stream error: {e}"));
+                    return;
                 }
             }
-            Ok(StreamedAssistantContent::ToolCall { tool_call, .. }) => {
-                out.push(Ok(StreamEvent::ToolCall(ToolCallRequest {
-                    id: tool_call.id,
-                    name: tool_call.function.name,
-                    arguments: tool_call.function.arguments.to_string(),
-                })));
-            }
-            Ok(_) => {} // tool-call deltas, etc. — not surfaced
-            Err(e) => {
-                out.push(Err(format!("stream error: {e}")));
-                return out;
-            }
         }
-    }
 
-    // The final aggregate carries token usage (set as the stream drains).
-    if let Some(u) = stream.response.token_usage() {
-        out.push(Ok(StreamEvent::Usage(TokenUsage {
-            input_tokens: u.input_tokens,
-            output_tokens: u.output_tokens,
-            reasoning_tokens: None,
-        })));
+        // The final aggregate carries token usage (set as the stream drains).
+        if let Some(u) = stream.response.token_usage() {
+            yield Ok(StreamEvent::Usage(TokenUsage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                reasoning_tokens: None,
+            }));
+        }
+        yield Ok(StreamEvent::Done { stop_reason: None });
     }
-    out.push(Ok(StreamEvent::Done { stop_reason: None }));
-    out
 }
 
 fn provider_factory_err(err: impl std::fmt::Display) -> ExecutorError {

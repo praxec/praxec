@@ -17,7 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use praxec_core::bus::{Bus, InteractionKind, InteractionReply, MissionEvent};
+use praxec_core::bus::{Bus, BusError, InteractionKind, InteractionReply, MissionEvent};
 
 use crate::session::{AgentRunOutcome, AgentSession, AgentSessionRunner};
 
@@ -339,7 +339,19 @@ pub async fn run_headless_consumer(
         roles: Vec::new(),
         permissions: Vec::new(),
     };
-    while let Ok(event) = events.recv().await {
+    loop {
+        let event = match events.recv().await {
+            Ok(e) => e,
+            // A lagging consumer that dropped out of the loop would strand every
+            // FUTURE park forever (nothing left to answer them). Resilience: log
+            // the missed span and keep consuming.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!("[mission] event consumer lagged — skipped {n} event(s)");
+                continue;
+            }
+            // Bus torn down — no more events will arrive.
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        };
         match event {
             MissionEvent::Interaction {
                 request_id,
@@ -350,6 +362,17 @@ pub async fn run_headless_consumer(
                 Ok(()) => eprintln!(
                     "[mission] HITL interaction ({kind:?}): {prompt} — auto-answered per policy"
                 ),
+                // A `human_decision` gate a headless policy cannot resolve (P16):
+                // no human will ever drain it in this run. ABANDON it so the
+                // orchestrator unparks (declined) and the mission terminates,
+                // instead of hanging forever at 0 CPU (the zombie failure mode).
+                Err(BusError::NonHumanResolver { .. }) => {
+                    bus.abandon(request_id);
+                    eprintln!(
+                        "[mission] HITL interaction ({kind:?}): {prompt} — no human in a \
+                         headless run; abandoned (declined) so the mission can finish"
+                    );
+                }
                 Err(e) => eprintln!("[mission] HITL interaction ({kind:?}): {prompt} — {e}"),
             },
             MissionEvent::Status {
@@ -1135,10 +1158,14 @@ mod tests {
     // ── headless consumer ────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn headless_policy_cannot_resolve_a_human_decision() {
-        // P16 — the policy is not a proven human, so the bus refuses its reply
-        // on an Approve gate: the interaction stays PARKED (it accumulates for
-        // a later human drain) instead of being auto-resolved.
+    async fn headless_policy_abandons_an_unanswerable_human_decision() {
+        // P16 — the policy is not a proven human, so it CANNOT approve an Approve
+        // gate (the bus refuses a non-human resolver). The OLD behavior left it
+        // parked "for a later human drain", but in a headless run no human ever
+        // comes: the driver blocks on the reply forever at 0 CPU (the reported
+        // zombie). Now the consumer ABANDONS the unanswerable gate so the parked
+        // `request_interaction` resolves (declined) and the mission terminates
+        // cleanly — WITHOUT ever impersonating a human approval.
         let bus = Bus::new();
         let events = bus.subscribe();
         let _c = tokio::spawn(run_headless_consumer(
@@ -1146,19 +1173,21 @@ mod tests {
             bus.clone(),
             HeadlessPolicy::AutoApprove,
         ));
-        let parked = {
-            let bus = bus.clone();
-            tokio::spawn(async move {
-                bus.request_interaction("m1", InteractionKind::Approve, "?")
-                    .await
-            })
-        };
-        let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), parked).await;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            bus.request_interaction("m1", InteractionKind::Approve, "?"),
+        )
+        .await
+        .expect("the gate must be unparked (abandoned), not hang forever");
         assert!(
-            outcome.is_err(),
-            "a human_decision must stay parked under a headless policy, not auto-resolve"
+            !reply.approved,
+            "an unanswerable gate resolves as declined, never a forged approval"
         );
-        assert_eq!(bus.pending_count(), 1);
+        assert_eq!(
+            bus.pending_count(),
+            0,
+            "the gate is abandoned, not left parked as a zombie"
+        );
     }
 
     #[tokio::test]

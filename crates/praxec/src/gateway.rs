@@ -66,8 +66,10 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log_format);
 
-    // Load `~/.praxec/providers.env` into the process env (env still wins over
-    // the file). The `px` binary already does this; the gateway binary did not,
+    // Load the provider-keys file (XDG `~/.config/praxec/providers.env`, legacy
+    // `~/.praxec/providers.env` as fallback — see `provider_keys::resolve_path`)
+    // into the process env (env still wins over the file). The `px` binary
+    // already does this; the gateway binary did not,
     // so `serve` never picked up provider keys and every `kind: agent` /
     // affinity-resolved `kind: llm` step failed for want of a key. Called here —
     // synchronously, before the first `.await` — so no spawned task can race on
@@ -646,13 +648,22 @@ fn drive_outcome_to_result(
         DriveOutcome::Error(e) => {
             anyhow::bail!("orchestrate {mission_id}: drive error — {e}")
         }
-        DriveOutcome::ChooserFailed { source } => anyhow::bail!(
-            "orchestrate {mission_id}: the agentic driver's model call FAILED — {source}.\n\
-             This is not a dead-end flow: the orchestrator could not run its decision model \
-             (common causes: no provider API key, a 401/auth error, an unresolvable model \
-             binding, or a network failure). Check `gateway.models_yaml`, your provider keys \
-             (~/.praxec/providers.env), and connectivity."
-        ),
+        DriveOutcome::ChooserFailed { source } => {
+            // Report the ACTUAL resolved provider-keys path (XDG-first, matching
+            // `set-provider-keys` + preflight) — not the stale legacy
+            // `~/.praxec/providers.env`, which misdirects a user who ran
+            // `set-provider-keys` (it writes the XDG path).
+            let keys_hint = praxec_core::provider_keys::resolve_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "~/.config/praxec/providers.env".to_string());
+            anyhow::bail!(
+                "orchestrate {mission_id}: the agentic driver's model call FAILED — {source}.\n\
+                 This is not a dead-end flow: the orchestrator could not run its decision model \
+                 (common causes: no provider API key, a 401/auth error, an unresolvable model \
+                 binding, or a network failure). Check `gateway.models_yaml`, your provider keys \
+                 ({keys_hint}), and connectivity."
+            )
+        }
     }
 }
 
