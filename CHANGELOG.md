@@ -120,6 +120,35 @@ gaps were elsewhere:
   `orchestrate` credentials-path hint now reports the actual resolved
   `providers.env` path (XDG-first) instead of the stale legacy `~/.praxec` one.
 
+### Fixed — orchestrate observability & recovery (defense in depth)
+
+- **Mission heartbeat + no-progress watchdog.** A single autonomous decision now
+  pulses a "still working (Ns)" heartbeat to the mission bus every 15s, so a
+  client can tell a slow reasoning call from a hung one, and is bounded by a
+  mission-level backstop — a wedged step ends the drive as `TimedOut` instead of
+  looping. (The per-step agent timeout still normally fires first; this is the
+  layer above it.)
+- **Startup orphan reap.** An instance a driver/CLI left mid-`running` (its
+  process died) is a durable zombie no live owner will advance. On a fresh boot
+  there are no in-process drivers, so `serve` now cancels the orphaned *running*
+  instances at startup (auditable, via the same cancel path). It deliberately
+  never touches work that legitimately persists across restarts: terminal or
+  cancelled instances, human gates (a person may return), and engine-waits that
+  self-resume (lock / subworkflow / agent-await) — classified against each
+  instance's own definition snapshot.
+- **Repo load reports every invalid file at once.** A malformed flow/cap file in
+  a repo aborted the load at the *first* bad file, so an author fixed one,
+  restarted, and hit the next. The loader now accumulates and names *every*
+  invalid file in one error. It stays fail-whole — an invalid file never loads a
+  partial config (no fail-open) — it just no longer masks its siblings.
+
+Note: a "force the fallback model to be non-reasoning" item from the report was
+deliberately **not** taken. Its premise (praxec can't handle reasoning models)
+was already false and is doubly so after the stall-watchdog fix — reasoning
+models are first-class. Resilience against a flaky model comes from correct
+response handling + real timeouts + chain-walk escalation + the circuit breaker,
+never from restricting which model classes the system may use.
+
 ## [0.0.17] — 2026-07-10 — tool-source ecosystem & governed connections
 
 > **This release bundles every 0.0.16 improvement.** There is no separate 0.0.16
