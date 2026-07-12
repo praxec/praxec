@@ -61,6 +61,7 @@ fn build_discovery_with_one_skill() -> Arc<InMemoryDiscoveryIndex> {
         verb: Some("review".to_string()),
         body: Some("Lead with the reader's problem.".to_string()),
         source: Some("config".to_string()),
+        structural_fingerprint: None,
     }]))
 }
 

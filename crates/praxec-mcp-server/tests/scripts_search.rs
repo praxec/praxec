@@ -56,6 +56,7 @@ fn script_item(subject: &str, verb: &str, source: &str) -> DiscoveryItem {
         verb: Some(verb.into()),
         body: Some("script body the test must never see".into()),
         source: Some(source.into()),
+        structural_fingerprint: None,
     }
 }
 
@@ -247,6 +248,7 @@ async fn scripts_search_excludes_guidance_items() {
         verb: Some("review".into()),
         body: Some("should NOT leak through scripts.search".into()),
         source: Some("config".into()),
+        structural_fingerprint: None,
     });
     let discovery = Arc::new(InMemoryDiscoveryIndex::new(items));
     let server = PraxecServer::new(build_runtime())

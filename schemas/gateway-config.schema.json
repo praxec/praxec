@@ -1394,6 +1394,10 @@
           ],
           "default": "memory"
         },
+        "registry": {
+          "type": "string",
+          "description": "Path to a `praxec.packs/v3` (or v2) registry document — the pack/tool catalog (`packs.yaml`, ADR-0013 + design-0.0.17 §D4b). When set, the gateway loads it at startup and on every config reload: its tool descriptors join the discovery index (searchable via `praxec.query {kind: \"tool\"}`) and its crossmatrix feeds the selector's topology term. Absent: no tool catalog, no topology term. A configured registry that fails to load is a fail-fast boot error (and rejects a reload), never a silent registry-less start."
+        },
         "include": {
           "type": "array",
           "items": {

@@ -7,14 +7,26 @@
 //! never read as 0%), the cost tie-breaker among evidence-clearing
 //! candidates, totality (annotation never drops a candidate), and
 //! determinism (same inputs ⇒ same order + same `why`).
+//!
+//! Every case here runs under the **production tuning** (`tuned()`), and every
+//! fixture's evidence sits below `intent.policy_min_runs` — so this whole file
+//! doubles as the D7 no-regression suite: the shipped default configuration
+//! must still produce exactly these pre-D7 scores and `why` lines. The D7
+//! policy's own cases live in `selector_policy.rs`.
 
 use praxec_core::discovery::{
-    DiscoveryItem, DiscoveryKind, EvidenceSignal, SearchHit, rank_candidates,
+    DiscoveryItem, DiscoveryKind, EvidenceSignal, SearchHit, SelectorPolicy, rank_candidates,
 };
 use praxec_core::intent_index::IntentEvidence;
 use praxec_core::registry_v3::Registry;
 
 // ── fixtures ──────────────────────────────────────────────────────────────
+
+/// The policy as an operator actually gets it — straight from the shipped
+/// tuning, so these cases assert the *default install's* ranking.
+fn tuned() -> SelectorPolicy {
+    SelectorPolicy::from_tuning()
+}
 
 /// A minimal v3 registry whose crossmatrix links two tools to
 /// `cognitive/flow.derisk` and one to `cognitive/flow.inspect-repo`.
@@ -57,6 +69,7 @@ fn item(id: &str, kind: DiscoveryKind) -> DiscoveryItem {
         verb: None,
         body: None,
         source: None,
+        structural_fingerprint: None,
     }
 }
 
@@ -90,7 +103,7 @@ fn relevance_only_preserves_lexical_order() {
         hit("flow.high", 4.0),
         hit("flow.mid", 2.0),
     ];
-    let ranked = rank_candidates(&hits, None);
+    let ranked = rank_candidates(&hits, None, &tuned());
     let ids: Vec<&str> = ranked.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, ["flow.high", "flow.mid", "flow.low"]);
     // The best hit normalizes to 1.0; components are exposed.
@@ -113,7 +126,7 @@ fn proven_template_lifts_above_higher_lexical_but_unproven() {
         hit("flow.unproven", 5.0),
         hit_with_evidence("flow.proven", 4.0, 6, 1.0, Some(0.02)),
     ];
-    let ranked = rank_candidates(&hits, None);
+    let ranked = rank_candidates(&hits, None, &tuned());
     assert_eq!(ranked[0].id, "flow.proven");
     assert_eq!(ranked[1].id, "flow.unproven");
     assert_eq!(
@@ -135,7 +148,7 @@ fn absent_evidence_is_neutral_not_penalizing() {
         hit("flow.no-evidence", 3.0),
         hit_with_evidence("flow.proven-good", 3.0, 5, 0.9, None),
     ];
-    let ranked = rank_candidates(&hits, None);
+    let ranked = rank_candidates(&hits, None, &tuned());
     let ids: Vec<&str> = ranked.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -160,7 +173,7 @@ fn cheaper_evidence_breaks_ties_among_equally_proven() {
         hit_with_evidence("flow.pricey", 3.0, 4, 1.0, Some(0.50)),
         hit_with_evidence("flow.cheap", 3.0, 4, 1.0, Some(0.01)),
     ];
-    let ranked = rank_candidates(&hits, None);
+    let ranked = rank_candidates(&hits, None, &tuned());
     let ids: Vec<&str> = ranked.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, ["flow.cheap", "flow.pricey", "flow.unpriced"]);
 }
@@ -174,7 +187,7 @@ fn registry_suggestion_boosts_and_annotates_linked_tools() {
     // rank above the unlinked candidate and expose the linked tool ids.
     let reg = registry();
     let hits = vec![hit("flow.unlinked", 3.0), hit("cognitive/flow.derisk", 3.0)];
-    let ranked = rank_candidates(&hits, Some(&reg));
+    let ranked = rank_candidates(&hits, Some(&reg), &tuned());
     assert_eq!(ranked[0].id, "cognitive/flow.derisk");
     assert_eq!(ranked[0].topology.linked_tools, ["cpm-planner", "log-mcp"]);
     assert!(ranked[0].topology.component > 0.0);
@@ -187,13 +200,43 @@ fn registry_suggestion_boosts_and_annotates_linked_tools() {
     assert_eq!(ranked[1].topology.component, 0.0);
 }
 
+/// D6 — the topology term must CHANGE the answer, not merely decorate it.
+/// The unlinked candidate wins the id tie-break, so with no registry it ranks
+/// first; loading the registry must flip the order in the direction the
+/// crossmatrix implies (the ecosystem-composed workflow rises).
+#[test]
+fn topology_flips_the_order_versus_no_registry() {
+    let hits = vec![hit("aaa.unlinked", 3.0), hit("cognitive/flow.derisk", 3.0)];
+
+    let without: Vec<String> = rank_candidates(&hits, None, &tuned())
+        .iter()
+        .map(|r| r.id.clone())
+        .collect();
+    assert_eq!(
+        without,
+        ["aaa.unlinked", "cognitive/flow.derisk"],
+        "no registry: equal scores, id tie-break — the pre-D6 answer"
+    );
+
+    let reg = registry();
+    let with: Vec<String> = rank_candidates(&hits, Some(&reg), &tuned())
+        .iter()
+        .map(|r| r.id.clone())
+        .collect();
+    assert_eq!(
+        with,
+        ["cognitive/flow.derisk", "aaa.unlinked"],
+        "a registry-composed workflow outranks an otherwise-equal unlinked one"
+    );
+}
+
 #[test]
 fn crossmatrix_dependency_edge_also_links() {
     // `cognitive/flow.inspect-repo` is linked only via a `dependency`
     // crossmatrix row — both edge roles count as topology.
     let reg = registry();
     let hits = vec![hit("cognitive/flow.inspect-repo", 3.0)];
-    let ranked = rank_candidates(&hits, Some(&reg));
+    let ranked = rank_candidates(&hits, Some(&reg), &tuned());
     assert_eq!(ranked[0].topology.linked_tools, ["ripgrep"]);
 }
 
@@ -211,7 +254,7 @@ fn non_workflow_candidates_get_no_topology_and_are_never_dropped() {
         },
         hit("flow.other", 3.0),
     ];
-    let ranked = rank_candidates(&hits, Some(&reg));
+    let ranked = rank_candidates(&hits, Some(&reg), &tuned());
     assert_eq!(
         ranked.len(),
         hits.len(),
@@ -236,8 +279,8 @@ fn ranking_is_deterministic_same_order_same_why() {
         hit("flow.plain", 5.0),
         hit("cognitive/flow.inspect-repo", 2.0),
     ];
-    let first = rank_candidates(&hits, Some(&reg));
-    let second = rank_candidates(&hits, Some(&reg));
+    let first = rank_candidates(&hits, Some(&reg), &tuned());
+    let second = rank_candidates(&hits, Some(&reg), &tuned());
     assert_eq!(first, second, "same inputs ⇒ same order, scores, and why");
     // Every ranked item explains its own arithmetic.
     for r in &first {
@@ -259,7 +302,7 @@ fn score_is_the_documented_weighted_sum() {
         hit_with_evidence("flow.proven", 4.0, 6, 0.83, Some(0.02)),
         hit("flow.plain", 5.0),
     ];
-    for r in rank_candidates(&hits, Some(&reg)) {
+    for r in rank_candidates(&hits, Some(&reg), &tuned()) {
         let expected = RELEVANCE_WEIGHT * r.relevance
             + EVIDENCE_WEIGHT * r.evidence.component()
             + TOPOLOGY_WEIGHT * r.topology.component;
@@ -272,7 +315,7 @@ fn zero_score_batch_ranks_by_id_without_panicking() {
     // A want-nothing batch (all-zero lexical scores) must not divide by the
     // zero max; ordering falls back to the deterministic id tie-break.
     let hits = vec![hit("flow.b", 0.0), hit("flow.a", 0.0)];
-    let ranked = rank_candidates(&hits, None);
+    let ranked = rank_candidates(&hits, None, &tuned());
     let ids: Vec<&str> = ranked.iter().map(|r| r.id.as_str()).collect();
     assert_eq!(ids, ["flow.a", "flow.b"]);
     assert_eq!(ranked[0].relevance, 0.0);

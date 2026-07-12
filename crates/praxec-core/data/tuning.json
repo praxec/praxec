@@ -25,7 +25,8 @@
     "material_savings_pct": 0.25
   },
   "intent": {
-    "min_runs": 5
+    "min_runs": 5,
+    "policy_min_runs": 10
   },
   "reasoning": {
     "anthropic_budget_tokens": {

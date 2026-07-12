@@ -32,6 +32,7 @@
 //!   escape, mirroring [`crate::tool_descriptor::ToolKind`].
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,17 @@ static REGISTRY_V3_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(||
 /// mirrors [`ToolDescriptorError`].
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
+    /// The configured registry file is unreadable (missing, wrong path,
+    /// permissions). A registry the operator *named* and praxec cannot read is
+    /// an operator error, never a shrug: the caller fails fast rather than
+    /// booting registry-less and silently losing the topology it was
+    /// configured with.
+    #[error("REGISTRY_READ: cannot read registry file `{path}`: {source}")]
+    Read {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     /// The bytes are not YAML/JSON.
     #[error("REGISTRY_PARSE: {0}")]
     Yaml(#[from] serde_yaml::Error),
@@ -365,6 +377,18 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Load a registry from a file on disk (the `packs.yaml` an operator points
+    /// `discovery.registry` at): read → [`load_str`](Self::load_str). Same
+    /// fail-fast contract — an unreadable, unparseable, or invalid file yields a
+    /// typed [`RegistryError`], never a `None`-shaped shrug.
+    pub fn load_path(path: &Path) -> Result<Self, RegistryError> {
+        let text = std::fs::read_to_string(path).map_err(|source| RegistryError::Read {
+            path: path.display().to_string(),
+            source,
+        })?;
+        Self::load_str(&text)
+    }
+
     /// Load a registry from YAML (or JSON — YAML is a superset) text:
     /// parse → [`load_value`](Self::load_value). Fail-fast: the first
     /// failing stage returns a typed [`RegistryError`]; there is no
@@ -514,6 +538,21 @@ impl Registry {
     /// The crossmatrix rows — the `topology_refs` the selector reads.
     pub fn crossmatrix(&self) -> &[CrossmatrixRow] {
         &self.crossmatrix
+    }
+
+    /// The D1 descriptors this registry carries — the tool catalog the discovery
+    /// index indexes (`DiscoveryKind::Tool`), owned so the indexer can stamp
+    /// each one's `embedding` slot.
+    ///
+    /// v2-only tools carry no descriptor and are therefore absent: a bare
+    /// provider-catalog row has no operations, no reach, no typed I/O — nothing
+    /// a caller could *do* with the search hit. Indexing it would surface a tool
+    /// that leads nowhere, which is worse than not surfacing it.
+    pub fn tool_descriptors(&self) -> Vec<ToolDescriptor> {
+        self.tools
+            .iter()
+            .filter_map(|tool| tool.descriptor.clone())
+            .collect()
     }
 
     /// Every workflow definitionId associated with a tool: its effective

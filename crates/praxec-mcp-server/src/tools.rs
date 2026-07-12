@@ -20,6 +20,7 @@ pub(crate) fn parse_kind(s: &str) -> Option<DiscoveryKind> {
         "capability" => Some(DiscoveryKind::Capability),
         "connection" => Some(DiscoveryKind::Connection),
         "agent" => Some(DiscoveryKind::Agent),
+        "tool" => Some(DiscoveryKind::Tool),
         _ => None,
     }
 }

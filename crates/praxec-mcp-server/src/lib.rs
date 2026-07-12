@@ -85,6 +85,11 @@ pub type StalenessHook = std::sync::Arc<
 pub struct PraxecServer {
     pub(crate) runtime: WorkflowRuntime,
     pub(crate) discovery: Arc<dyn DiscoveryIndex>,
+    /// D6 — the loaded `praxec.packs/v3` registry, hot-swappable with the
+    /// discovery index it also feeds. `handle_search` reads it for the selector's
+    /// topology term. Default: an EMPTY swappable (no registry configured), which
+    /// ranks with a uniform zero topology term — the pre-D6 behavior, unchanged.
+    pub(crate) registry: Arc<praxec_core::hot_reload::SwappableRegistry>,
     server_name: String,
     server_version: String,
     /// SPEC §5.9 — optional store that records `gateway.describe` calls per
@@ -186,6 +191,7 @@ impl PraxecServer {
         Self {
             runtime,
             discovery: Arc::new(InMemoryDiscoveryIndex::default()),
+            registry: Arc::new(praxec_core::hot_reload::SwappableRegistry::new(None)),
             server_name: "praxec".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             ack_store: None,
@@ -286,6 +292,19 @@ impl PraxecServer {
 
     pub fn with_discovery(mut self, discovery: Arc<dyn DiscoveryIndex>) -> Self {
         self.discovery = discovery;
+        self
+    }
+
+    /// D6 — wire the hot-swappable `praxec.packs/v3` registry the gateway loaded
+    /// from `discovery.registry`. The SAME handle the reload path swaps, so the
+    /// selector's topology term never drifts from the tool catalog in the index.
+    /// Omit it (CLI/tests/no registry configured) and ranking has no topology
+    /// term — the pre-D6 behavior.
+    pub fn with_registry(
+        mut self,
+        registry: Arc<praxec_core::hot_reload::SwappableRegistry>,
+    ) -> Self {
+        self.registry = registry;
         self
     }
 

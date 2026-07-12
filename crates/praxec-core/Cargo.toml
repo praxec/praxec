@@ -68,6 +68,10 @@ harness = false
 [dev-dependencies]
 rstest = { workspace = true }
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
+# `test-util` for `#[tokio::test(start_paused = true)]`: the discovery-rebuild
+# budget is a wall-clock timeout, and a stalled-embedder test must prove it
+# expires without the suite actually waiting out the budget.
+tokio = { workspace = true, features = ["test-util"] }
 rand = "0.10"
 serde_yaml = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -15,6 +15,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::embeddings::EMBEDDING_COSINE_THRESHOLD;
+use crate::tool_descriptor::ToolDescriptor;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryKind {
@@ -35,6 +38,13 @@ pub enum DiscoveryKind {
     /// config) that orchestrates a workflow. Discoverable + launchable like a
     /// skill or script; the lookup id is the agent's declared name.
     Agent,
+    /// v0.0.18 D4 — a catalogued tool source: an MCP server, a REST API, or a
+    /// CLI, described by a [`ToolDescriptor`]. Surface (b) of semantic
+    /// discovery: tools live in the SAME index as workflows and are ranked by
+    /// the same hybrid score, so a caller finds the tool that does the job
+    /// without already knowing its name. The lookup id is the descriptor's
+    /// `name`.
+    Tool,
 }
 
 impl DiscoveryKind {
@@ -46,6 +56,7 @@ impl DiscoveryKind {
             DiscoveryKind::Guidance => "guidance",
             DiscoveryKind::Script => "script",
             DiscoveryKind::Agent => "agent",
+            DiscoveryKind::Tool => "tool",
         }
     }
 }
@@ -347,6 +358,18 @@ pub struct DiscoveryItem {
     /// non-guidance items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Workflows only (v0.0.18 mechanism #2): the canonical fingerprint of this
+    /// flow's control-flow graph, written at catalog time by
+    /// [`index_from_config`] via
+    /// [`structural_fingerprint::fingerprint`](crate::structural_fingerprint::fingerprint).
+    /// It rides the search response, so praxec-meta can compare / cluster / dedup
+    /// flows by their real graph without re-reading every YAML.
+    ///
+    /// `None` for every non-workflow item — a tool, a skill or a connection has
+    /// no state machine, and a fabricated fingerprint there would be a lie the
+    /// dedup pass would act on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_fingerprint: Option<String>,
 }
 
 /// The tag prefix that carries a flow's `process` / `taskClass` into the
@@ -364,6 +387,66 @@ impl DiscoveryItem {
             .iter()
             .find_map(|t| t.strip_prefix(PROCESS_TAG_PREFIX))
             .filter(|s| !s.is_empty())
+    }
+
+    /// Surface (b) of semantic discovery — project a [`ToolDescriptor`] (mcp /
+    /// rest / cli) into the SAME catalog the workflows live in, so one query
+    /// ranks tools and workflows together through one scorer.
+    ///
+    /// The projection is lossless *for search*: every string the descriptor
+    /// carries that could answer a query — name, description, tags, aliases, and
+    /// each operation's id and verb — lands in a field [`item_embed_text`] and
+    /// the lexical scorer already read. No parallel tool index, no second
+    /// scoring path, nothing new to keep in sync.
+    pub fn from_tool_descriptor(descriptor: &ToolDescriptor) -> Self {
+        // Operation ids and verbs are the tool's real vocabulary ("search-issues",
+        // "audit") — the words a caller who does not know the tool's *name* would
+        // actually reach for.
+        let mut text: Vec<&str> = Vec::with_capacity(1 + 2 * descriptor.operations.len());
+        text.push(descriptor.kind.as_token());
+        for op in &descriptor.operations {
+            text.push(op.id.as_str());
+            if let Some(verb) = op.verb {
+                text.push(verb.as_token());
+            }
+        }
+
+        // A tool is not *started*; it is reached through a workflow whose step
+        // dispatches into it. The only honest next step is therefore the workflows
+        // the descriptor itself nominates — and no link at all when it nominates
+        // none, rather than a link that would 404.
+        let links = descriptor
+            .suggested_workflows
+            .iter()
+            .map(|workflow| DiscoveryLink {
+                rel: "start_suggested_workflow".into(),
+                title: Some(format!("Start workflow '{workflow}'")),
+                description: Some(format!(
+                    "Workflow '{workflow}' is composed from tool '{}'.",
+                    descriptor.name
+                )),
+                method: "praxec.command".into(),
+                args: json!({ "definitionId": workflow, "input": {} }),
+                input_schema: None,
+            })
+            .collect();
+
+        DiscoveryItem {
+            id: descriptor.name.clone(),
+            kind: DiscoveryKind::Tool,
+            title: descriptor.name.clone(),
+            description: descriptor.description.clone(),
+            tags: descriptor.tags.clone(),
+            examples: vec![],
+            aliases: descriptor.aliases.clone(),
+            text: text.join(" "),
+            links,
+            verb: None,
+            body: None,
+            // Provenance, same meaning as a guidance fragment's `source`.
+            source: descriptor.source_repo.clone(),
+            structural_fingerprint: None,
+        }
     }
 }
 
@@ -598,14 +681,50 @@ pub fn item_embed_text(item: &DiscoveryItem) -> String {
     .join(" ")
 }
 
+/// Weight of the lexical half of a hybrid score. Its complement,
+/// [`SEMANTIC_WEIGHT`], is the cosine half.
+///
+/// **Why an even split, and why it is not a tuning knob.** Lexical is normalised
+/// against the best lexical hit in the candidate set, so the strongest keyword
+/// match always earns the full lexical half — and a zero-lexical item, whatever
+/// its cosine, can therefore never overtake it. Exact-keyword precision is
+/// preserved *by construction*, not by tuning. The other half is what lets
+/// meaning re-order items that merely **collide** on a word: praxec issue #43,
+/// where `cpm schedule critical path status` surfaced the shell script
+/// `inspect.git.status` on the word "status" alone — lexically a fair hit,
+/// semantically nowhere. Half the score is enough to say so.
+///
+/// A finer split would be fitted to today's catalog and would need re-fitting on
+/// tomorrow's; without a labelled relevance set there is nothing to fit it
+/// against. The coarse split is the defensible one, so it is a `const` with a
+/// reason rather than a config knob nobody can set correctly.
+pub const LEXICAL_WEIGHT: f32 = 0.5;
+
+/// Weight of the semantic (cosine) half of a hybrid score. See [`LEXICAL_WEIGHT`].
+pub const SEMANTIC_WEIGHT: f32 = 1.0 - LEXICAL_WEIGHT;
+
+/// The hybrid relevance of one candidate: its lexical score (already normalised
+/// to `0..=1` against the best lexical hit in the candidate set) blended with its
+/// query↔item cosine.
+///
+/// Monotone non-decreasing in **both** components — raising either can only raise
+/// the score — which is what makes a ranking explainable: an item placed higher
+/// either matched more words or meant more nearly the same thing.
+pub fn hybrid_score(lexical_normalized: f32, cosine: f32) -> f32 {
+    // A negative cosine ("actively unrelated") contributes nothing; it does not
+    // *subtract* from a lexical hit the item genuinely earned. Clamping keeps the
+    // function monotone and the score inside `0..=1`.
+    LEXICAL_WEIGHT * lexical_normalized + SEMANTIC_WEIGHT * cosine.clamp(0.0, 1.0)
+}
+
 /// A semantic discovery index — the **opt-in add-on** activated only when a user
 /// has registered (and pays for) an embedding model. It precomputes one
 /// embedding per item at build time and ranks search by a hybrid of the lexical
-/// score and query↔item cosine similarity, so natural-language intent surfaces
-/// the right items even without keyword overlap. With no embedding model
-/// configured the runtime stays on the free lexical [`InMemoryDiscoveryIndex`];
-/// if a query can't be embedded at request time, this falls back to pure
-/// lexical.
+/// score and query↔item cosine similarity ([`hybrid_score`]), so natural-language
+/// intent surfaces the right items even without keyword overlap. With no embedding
+/// model configured the runtime stays on the free lexical
+/// [`InMemoryDiscoveryIndex`]; if a query can't be embedded at request time, this
+/// falls back to pure lexical.
 pub struct SemanticDiscoveryIndex {
     items: Arc<Vec<DiscoveryItem>>,
     /// Parallel to `items`; `None` for items whose embedding failed at build
@@ -650,6 +769,54 @@ impl SemanticDiscoveryIndex {
             embeddings: Arc::new(embeddings),
             embedder,
         })
+    }
+
+    /// Build over the config's items **and** a tool catalog (surface b), then
+    /// stamp each descriptor's [`embedding`] slot with the vector it was indexed
+    /// by.
+    ///
+    /// The tools go into the same `items` vector, so they are embedded by the
+    /// same pass and ranked by the same [`hybrid_score`] — there is no tool-only
+    /// index to keep in step.
+    ///
+    /// The stamp is a **record, never a cache**: the index always embeds fresh,
+    /// because a vector carried over from a previous build goes stale the moment
+    /// its description is edited (the D3 re-embed-on-reload invariant). What the
+    /// slot buys is that a catalog which is exported, re-served, or inspected
+    /// carries the vectors it was actually ranked by, instead of them living only
+    /// inside a private array. A tool whose embed failed keeps an EMPTY slot —
+    /// never a stale or fabricated vector — and stays lexically searchable, the
+    /// documented per-item degrade.
+    ///
+    /// [`embedding`]: ToolDescriptor::embedding
+    pub async fn build_with_tools(
+        mut items: Vec<DiscoveryItem>,
+        tools: &mut [ToolDescriptor],
+        embedder: Arc<dyn crate::embeddings::EmbeddingProvider>,
+    ) -> anyhow::Result<Self> {
+        let first_tool = items.len();
+        items.extend(tools.iter().map(DiscoveryItem::from_tool_descriptor));
+
+        let index = Self::build(items, embedder).await?;
+
+        // `build` keeps `embeddings` parallel to `items`, and the tools were
+        // appended contiguously — so the offset arithmetic is exact, not a lookup.
+        for (offset, tool) in tools.iter_mut().enumerate() {
+            match &index.embeddings[first_tool + offset] {
+                Some(vector) => tool.set_embedding(vector),
+                None => tool.embedding = None,
+            }
+        }
+        Ok(index)
+    }
+
+    /// How many items carry a live embedding. Zero over a non-empty index means
+    /// every embed failed and the index ranks purely lexically — it *presents* as
+    /// semantic while behaving as lexical, so the builder
+    /// ([`crate::discovery::build_discovery_index`]) checks this and degrades
+    /// explicitly rather than shipping the illusion.
+    pub fn embedded_count(&self) -> usize {
+        self.embeddings.iter().filter(|e| e.is_some()).count()
     }
 
     fn kind_ok(item: &DiscoveryItem, kind: Option<DiscoveryKind>) -> bool {
@@ -701,14 +868,31 @@ impl DiscoveryIndex for SemanticDiscoveryIndex {
                 let score = if want_all {
                     1.0
                 } else if semantic_on {
-                    let lex_norm = if lex_max > 0.0 { lex / lex_max } else { 0.0 };
-                    // If this item has no embedding (failed at build time), fall
-                    // back to lexical-only for it.
+                    // An item whose embed failed at build time has no vector to
+                    // compare. It competes on its lexical merit alone and forfeits
+                    // the semantic half — pessimistic on purpose: a vector we do
+                    // not have is not evidence of relevance, and an item we cannot
+                    // semantically confirm must not outrank one we can. This is the
+                    // documented per-item degrade to lexical.
                     let cos = self.embeddings[i]
                         .as_ref()
                         .map(|ev| crate::embeddings::cosine_similarity(&qvec, ev))
                         .unwrap_or(0.0);
-                    0.5 * lex_norm + 0.5 * cos
+
+                    // Found purely by MEANING (no keyword overlap at all): admit
+                    // only on a strong agreement — EMBEDDING_COSINE_THRESHOLD, the
+                    // same bar Tier-3 lexicon matching already answers to. Real
+                    // embedders return a positive cosine for *any* two texts, so
+                    // without a floor every query would return `limit` items of
+                    // steadily-decreasing relevance instead of the few that answer
+                    // it. Items with any lexical signal are admitted exactly as
+                    // before; this gate governs only the zero-lexical path.
+                    if lex <= 0.0 && cos < EMBEDDING_COSINE_THRESHOLD {
+                        return None;
+                    }
+
+                    let lex_norm = if lex_max > 0.0 { lex / lex_max } else { 0.0 };
+                    hybrid_score(lex_norm, cos)
                 } else {
                     lex
                 };
@@ -856,6 +1040,9 @@ mod semantic_tests {
                 .any(|w| t.contains(w)) as i32 as f32;
             Ok(vec![speed, auth])
         }
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Ok(())
+        }
         fn dimensions(&self) -> usize {
             2
         }
@@ -871,6 +1058,9 @@ mod semantic_tests {
     impl EmbeddingProvider for FailingEmbedder {
         async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
             Err(EmbeddingError::BackendFailed("backend down".into()))
+        }
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Err(EmbeddingError::HealthCheckFailed("backend down".into()))
         }
         fn dimensions(&self) -> usize {
             2
@@ -891,6 +1081,10 @@ mod semantic_tests {
             } else {
                 Ok(vec![1.0, 0.0])
             }
+        }
+        /// Healthy overall — only the one poisoned item fails.
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Ok(())
         }
         fn dimensions(&self) -> usize {
             2
@@ -950,6 +1144,7 @@ mod semantic_tests {
             verb: None,
             body: None,
             source: None,
+            structural_fingerprint: None,
         }
     }
 
