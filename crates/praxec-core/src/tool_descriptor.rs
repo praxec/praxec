@@ -303,10 +303,32 @@ pub struct ToolDescriptor {
     /// Workflow definitionIds (namespace-qualified) that compose this tool.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suggested_workflows: Vec<String>,
-    /// Reserved v0.0.18 forward-compat slot (tool-description embeddings).
+    /// The vector this tool was last indexed by — surface (b) of semantic
+    /// discovery (v0.0.18 D4). Written at index time by
+    /// [`SemanticDiscoveryIndex::build_with_tools`], read back by
+    /// [`embedding_vec`](Self::embedding_vec).
+    ///
+    /// `f64` because JSON has one number type and the schema slot is
+    /// `number[]`; the index compares in `f32` (what
+    /// [`cosine_similarity`](crate::embeddings::cosine_similarity) takes).
+    /// Absent on a descriptor that has never been indexed, or whose embed
+    /// failed — never fabricated.
+    ///
+    /// [`SemanticDiscoveryIndex::build_with_tools`]: crate::discovery::SemanticDiscoveryIndex::build_with_tools
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding: Option<Vec<f64>>,
-    /// Reserved v0.0.18 forward-compat slot (structural dedup fingerprint).
+    /// Reserved forward-compat slot (structural dedup fingerprint).
+    ///
+    /// Still `None` after v0.0.18 D5, deliberately: the structural fingerprint is
+    /// the hash of a *workflow's control-flow graph*
+    /// ([`structural_fingerprint::fingerprint`](crate::structural_fingerprint::fingerprint)),
+    /// and a [`ToolDescriptor`] is a `cli` / `mcp` / `rest` tool — it has no
+    /// states and no transitions. Writing a graph hash here would be a
+    /// fabrication the dedup pass would then act on. The populated slot lives on
+    /// the workflow's catalog entry
+    /// ([`DiscoveryItem::structural_fingerprint`](crate::discovery::DiscoveryItem::structural_fingerprint)).
+    /// If tool-vs-tool dedup ever earns its place, this is where its own
+    /// (different) fingerprint would go.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structural_fingerprint: Option<String>,
 }
@@ -427,6 +449,38 @@ impl ToolDescriptor {
             }
         }
         Ok(())
+    }
+
+    /// The [`embedding`](Self::embedding) slot as the index scores it: the
+    /// stored `f64` wire values narrowed to the `f32`
+    /// [`cosine_similarity`](crate::embeddings::cosine_similarity) compares.
+    ///
+    /// An empty stored vector reads back as `None`: a zero-length vector makes
+    /// every cosine comparison 0.0, which would silently disable semantic
+    /// matching for this tool while *looking* indexed.
+    pub fn embedding_vec(&self) -> Option<Vec<f32>> {
+        self.embedding
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .map(|v| v.iter().map(|&x| x as f32).collect())
+    }
+
+    /// Record the vector this descriptor was indexed by. Called at index time
+    /// by [`SemanticDiscoveryIndex::build_with_tools`] so a catalog that is
+    /// exported, re-served, or inspected carries the vectors it was ranked by
+    /// instead of them living only inside a private index array.
+    ///
+    /// An empty vector *clears* the slot rather than storing `[]` — see
+    /// [`embedding_vec`](Self::embedding_vec) for why a zero-length vector is
+    /// worse than no vector.
+    ///
+    /// [`SemanticDiscoveryIndex::build_with_tools`]: crate::discovery::SemanticDiscoveryIndex::build_with_tools
+    pub fn set_embedding(&mut self, vector: &[f32]) {
+        self.embedding = if vector.is_empty() {
+            None
+        } else {
+            Some(vector.iter().map(|&x| f64::from(x)).collect())
+        };
     }
 
     /// The bare grant token the operator must add to `grant_connections:` on

@@ -353,6 +353,55 @@ impl WorkflowRuntime {
         Ok(())
     }
 
+    /// Reap orphaned runs at startup. An instance a driver/CLI left in a
+    /// `running` position — the process died mid-step — is a durable zombie: no
+    /// live owner will ever advance it, yet it isn't terminal. On a fresh
+    /// process start there are no in-process drivers, so a non-terminal instance
+    /// that is genuinely *running* (an executor/agent owns the next move) has no
+    /// owner and is an orphan. This cancels those (idempotently, via
+    /// [`cancel`](Self::cancel), so each reap emits `workflow.cancelled` and is
+    /// auditable). Returns the number reaped.
+    ///
+    /// SAFETY — it deliberately leaves alone anything that legitimately persists
+    /// across restarts, so it can never destroy recoverable work: cancelled or
+    /// terminal instances; a human gate (`actor: human` — awaiting a person who
+    /// may return days later); and engine-waits that self-resume on restart
+    /// (`_lock_wait` / `_subworkflow_wait` / `_agent_await`). Only a
+    /// `running`-classified instance is reaped, mirroring the `get`-time status
+    /// derivation (a `waiting` mission is never touched).
+    pub async fn reap_orphaned_runs(&self) -> anyhow::Result<usize> {
+        let all = self.store.list_all().await?;
+        let mut reaped = 0usize;
+        for inst in all {
+            if inst.cancelled_at.is_some() {
+                continue; // already resolved as cancelled
+            }
+            // The definition snapshot travels with the instance — classify
+            // against it, never the (possibly reloaded) live config.
+            let def = &inst.definition;
+            if is_terminal(def, &inst.state) {
+                continue; // succeeded / failed — resolved, nothing to reap
+            }
+            // Legitimately WAITING → never reap (mirrors the `get` derivation).
+            let state_def = def.pointer(&format!("/states/{}", pointer_escape(&inst.state)));
+            let awaiting_human = state_def
+                .and_then(|s| s.get("actor"))
+                .and_then(Value::as_str)
+                == Some("human");
+            let engine_wait = inst.context.get("_lock_wait").is_some()
+                || inst.context.get("_subworkflow_wait").is_some()
+                || inst.context.get("_agent_await").is_some();
+            if awaiting_human || engine_wait {
+                continue;
+            }
+            // Non-terminal, non-waiting, no live driver at startup: an orphan.
+            self.cancel(&inst.id, "orphaned run reaped at startup (no live driver)")
+                .await?;
+            reaped += 1;
+        }
+        Ok(reaped)
+    }
+
     /// SPEC §5.8 non-critical-path audit pattern (FMECA FM-8 mitigation,
     /// audit-resolution plan C.1). Records `event` to the audit sink; on
     /// sink failure, emits an `audit.write_failed` self-event so the loss
@@ -1123,3 +1172,127 @@ impl WorkflowRuntime {
 // ---------------------------------------------------------------------------
 // Guidance string templating (SPEC v2 §5.2)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod reap_tests {
+    use super::*;
+    use crate::audit::{AuditSink, MemoryAuditSink};
+    use crate::guards::DefaultGuardEvaluator;
+    use crate::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    struct EmptyRegistry;
+    impl ExecutorRegistry for EmptyRegistry {
+        fn get(&self, _kind: &str) -> Option<Arc<dyn Executor>> {
+            None
+        }
+    }
+
+    fn inst(id: &str, definition: serde_json::Value, state: &str) -> WorkflowInstance {
+        WorkflowInstance {
+            id: id.into(),
+            definition_id: "demo".into(),
+            definition_version: "1.0.0".into(),
+            definition,
+            state: state.into(),
+            version: 0,
+            input: json!({}),
+            context: json!({}),
+            started_at: chrono::Utc::now(),
+            trace_id: None,
+            run_id: None,
+            cancelled_at: None,
+            cancelled_reason: None,
+            depth: 0,
+            parent: None,
+        }
+    }
+
+    fn runtime(store: Arc<InMemoryWorkflowStore>) -> WorkflowRuntime {
+        // reap classifies against each instance's OWN definition snapshot, so the
+        // definition store here can be empty.
+        let defs = Arc::new(ConfigDefinitionStore::from_config(&json!({
+            "version": "1.0.0", "workflows": {}
+        })));
+        WorkflowRuntime::new(
+            defs,
+            store,
+            Arc::new(EmptyRegistry),
+            Arc::new(DefaultGuardEvaluator::new()),
+            Arc::new(MemoryAuditSink::new()) as Arc<dyn AuditSink>,
+        )
+    }
+
+    fn running_def() -> serde_json::Value {
+        json!({
+            "initialState": "working",
+            "states": {
+                "working": { "transitions": { "go": { "target": "done", "actor": "agent" } } },
+                "done": { "terminal": true }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn reap_cancels_only_orphaned_running_instances() {
+        let store = Arc::new(InMemoryWorkflowStore::new());
+
+        // (1) orphaned RUNNING (an agent owns the next move) → reaped.
+        store
+            .create(inst("wf_running", running_def(), "working"))
+            .await
+            .unwrap();
+
+        // (2) parked at a human gate → left alone (a person may return later).
+        let human = json!({
+            "initialState": "gate",
+            "states": {
+                "gate": { "actor": "human", "transitions": { "ok": { "target": "done" } } },
+                "done": { "terminal": true }
+            }
+        });
+        store.create(inst("wf_human", human, "gate")).await.unwrap();
+
+        // (3) suspended on a repo lock → self-resumes on release, left alone.
+        let mut locked = inst("wf_lock", running_def(), "working");
+        locked.context = json!({ "_lock_wait": { "files": ["a"] } });
+        store.create(locked).await.unwrap();
+
+        // (4) terminal → resolved, left alone.
+        store
+            .create(inst("wf_done", running_def(), "done"))
+            .await
+            .unwrap();
+
+        // (5) already cancelled → left alone (idempotent).
+        let mut cancelled = inst("wf_cancelled", running_def(), "working");
+        cancelled.cancelled_at = Some(chrono::Utc::now());
+        store.create(cancelled).await.unwrap();
+
+        let rt = runtime(store.clone());
+        let reaped = rt.reap_orphaned_runs().await.unwrap();
+        assert_eq!(reaped, 1, "only the orphaned running instance is reaped");
+
+        assert!(
+            store
+                .load("wf_running")
+                .await
+                .unwrap()
+                .cancelled_at
+                .is_some(),
+            "the orphaned running instance must be cancelled"
+        );
+        assert!(store.load("wf_human").await.unwrap().cancelled_at.is_none());
+        assert!(store.load("wf_lock").await.unwrap().cancelled_at.is_none());
+        assert!(store.load("wf_done").await.unwrap().cancelled_at.is_none());
+        assert!(
+            store
+                .load("wf_cancelled")
+                .await
+                .unwrap()
+                .cancelled_at
+                .is_some()
+        );
+    }
+}

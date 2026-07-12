@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::discovery::{DiscoveryIndex, DiscoveryItem, DiscoveryKind, SearchHit, SearchRequest};
 use crate::ports::{DefinitionStore, Executor, ExecutorRegistry};
+use crate::registry_v3::Registry;
 
 // ---------------------------------------------------------------------------
 // P6b — lazy TTL-based config-staleness recheck.
@@ -260,6 +261,46 @@ impl DiscoveryIndex for SwappableDiscoveryIndex {
     }
 }
 
+/// D6 — the loaded `praxec.packs/v3` [`Registry`], hot-swappable alongside the
+/// discovery index.
+///
+/// It is swappable for the same reason the index is: the registry feeds BOTH the
+/// index's tool catalog and the selector's topology term, and those two are read
+/// from the same config. Pinning the topology at startup while the index rebuilt
+/// on every reload would recreate the D3 defect one layer up — a reloaded gateway
+/// ranking against a registry it no longer serves.
+///
+/// `None` is the configured-no-registry state, not an error: ranking then carries
+/// a uniform zero topology term (exactly today's behavior) and the catalog holds
+/// no tools.
+pub struct SwappableRegistry {
+    inner: RwLock<Option<Arc<Registry>>>,
+}
+
+impl SwappableRegistry {
+    pub fn new(initial: Option<Arc<Registry>>) -> Self {
+        Self {
+            inner: RwLock::new(initial),
+        }
+    }
+
+    /// The registry in force right now. Cloned out (rather than borrowed) so a
+    /// reload can swap while a search is mid-rank.
+    pub fn current(&self) -> Option<Arc<Registry>> {
+        self.inner
+            .read()
+            .expect("LOCK_POISONED: swappable registry")
+            .clone()
+    }
+
+    pub fn swap(&self, new: Option<Arc<Registry>>) {
+        *self
+            .inner
+            .write()
+            .expect("LOCK_POISONED: swappable registry") = new;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +327,75 @@ mod tests {
 
         assert!(swappable.load("wf_a").await.is_err());
         assert!(swappable.load("wf_b").await.is_ok());
+    }
+
+    /// D3-T5 — a reload swaps the discovery index under live searches. Every
+    /// concurrent reader must see EITHER the whole old index or the whole new
+    /// one, never a half-swapped mix (which would read as "the workflow I just
+    /// added is missing" / "the one I removed is still here"). This is why the
+    /// reload path swaps a single `Arc<dyn DiscoveryIndex>` rather than mutating
+    /// an index in place.
+    #[tokio::test]
+    async fn swap_discovery_index_is_atomic_under_concurrent_search() {
+        use crate::discovery::{
+            DiscoveryItem, DiscoveryKind, InMemoryDiscoveryIndex, SearchRequest,
+        };
+
+        fn index(ids: &[&str]) -> Arc<dyn DiscoveryIndex> {
+            Arc::new(InMemoryDiscoveryIndex::new(
+                ids.iter()
+                    .map(|id| DiscoveryItem {
+                        id: (*id).into(),
+                        kind: DiscoveryKind::Workflow,
+                        title: (*id).into(),
+                        description: "flow".into(),
+                        tags: vec![],
+                        examples: vec![],
+                        aliases: vec![],
+                        text: String::new(),
+                        links: vec![],
+                        verb: None,
+                        body: None,
+                        source: None,
+                        structural_fingerprint: None,
+                    })
+                    .collect(),
+            ))
+        }
+
+        let swappable = Arc::new(SwappableDiscoveryIndex::new(index(&["old_a", "old_b"])));
+
+        let searcher = {
+            let swappable = swappable.clone();
+            tokio::spawn(async move {
+                for _ in 0..500 {
+                    let hits = swappable
+                        .search(SearchRequest {
+                            query: "flow".into(),
+                            kind: None,
+                            limit: 10,
+                        })
+                        .await
+                        .expect("search never fails mid-swap");
+                    let ids: Vec<&str> = hits.iter().map(|h| h.item.id.as_str()).collect();
+                    // Coherent generations only: never one old id beside one new.
+                    assert!(
+                        ids == ["old_a", "old_b"] || ids == ["new_a", "new_b", "new_c"],
+                        "torn index observed: {ids:?}"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        for _ in 0..50 {
+            swappable.swap(index(&["new_a", "new_b", "new_c"]));
+            tokio::task::yield_now().await;
+            swappable.swap(index(&["old_a", "old_b"]));
+            tokio::task::yield_now().await;
+        }
+
+        searcher.await.expect("no torn read");
     }
 
     // -- P6b staleness decisions (pure; time + mtimes injected) --------------

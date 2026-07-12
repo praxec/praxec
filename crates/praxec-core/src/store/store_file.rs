@@ -258,4 +258,35 @@ impl WorkflowStore for FileWorkflowStore {
         }
         Ok(waiting)
     }
+
+    async fn list_all(&self) -> anyhow::Result<Vec<WorkflowInstance>> {
+        let mut entries = match tokio::fs::read_dir(&self.root).await {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow!("scanning {}: {e}", self.root.display())),
+        };
+        let mut all = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e,
+                        "list_all: skipping unreadable instance file");
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<WorkflowInstance>(&bytes) {
+                Ok(inst) => all.push(inst),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e,
+                        "list_all: skipping unparseable instance file");
+                }
+            }
+        }
+        Ok(all)
+    }
 }

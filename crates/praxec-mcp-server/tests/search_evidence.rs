@@ -52,6 +52,7 @@ fn workflow_item(id: &str, task_class: Option<&str>) -> DiscoveryItem {
         verb: None,
         body: None,
         source: None,
+        structural_fingerprint: None,
     }
 }
 

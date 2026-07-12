@@ -1,9 +1,11 @@
 //! Provider API key file backend.
 //!
-//! Writes a flat dotenv file at `~/.praxec/providers.env`
-//! (override via `$PRAXEC_PROVIDER_KEYS_FILE`) with mode 0600 inside
-//! a 0700 parent dir. Loaded into env at startup, existing env vars
-//! taking precedence (CI overrides file).
+//! Writes a flat dotenv file at `~/.config/praxec/providers.env` (the XDG
+//! config dir, alongside the gateway config; legacy `~/.praxec/providers.env`
+//! is still read as a fallback — see [`resolve_path`]), override via
+//! `$PRAXEC_PROVIDER_KEYS_FILE`, with mode 0600 inside a 0700 parent dir.
+//! Loaded into env at startup, existing env vars taking precedence (CI
+//! overrides file).
 //!
 //! File-backed (not OS keyring) so agent sub-processes spawned by
 //! `walk` / `headless` can read the keys without UI prompts and so

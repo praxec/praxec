@@ -1723,6 +1723,9 @@ mod tests {
         async fn list_waiting_on_subworkflow(&self) -> anyhow::Result<Vec<WorkflowInstance>> {
             self.inner.list_waiting_on_subworkflow().await
         }
+        async fn list_all(&self) -> anyhow::Result<Vec<WorkflowInstance>> {
+            self.inner.list_all().await
+        }
         async fn find_by_run_id(&self, run_id: &str) -> anyhow::Result<Option<String>> {
             self.inner.find_by_run_id(run_id).await
         }

@@ -17,7 +17,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use praxec_core::bus::{Bus, InteractionKind, InteractionReply, MissionEvent};
+use praxec_core::bus::{Bus, BusError, InteractionKind, InteractionReply, MissionEvent};
 
 use crate::session::{AgentRunOutcome, AgentSession, AgentSessionRunner};
 
@@ -339,7 +339,19 @@ pub async fn run_headless_consumer(
         roles: Vec::new(),
         permissions: Vec::new(),
     };
-    while let Ok(event) = events.recv().await {
+    loop {
+        let event = match events.recv().await {
+            Ok(e) => e,
+            // A lagging consumer that dropped out of the loop would strand every
+            // FUTURE park forever (nothing left to answer them). Resilience: log
+            // the missed span and keep consuming.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                eprintln!("[mission] event consumer lagged — skipped {n} event(s)");
+                continue;
+            }
+            // Bus torn down — no more events will arrive.
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        };
         match event {
             MissionEvent::Interaction {
                 request_id,
@@ -350,6 +362,17 @@ pub async fn run_headless_consumer(
                 Ok(()) => eprintln!(
                     "[mission] HITL interaction ({kind:?}): {prompt} — auto-answered per policy"
                 ),
+                // A `human_decision` gate a headless policy cannot resolve (P16):
+                // no human will ever drain it in this run. ABANDON it so the
+                // orchestrator unparks (declined) and the mission terminates,
+                // instead of hanging forever at 0 CPU (the zombie failure mode).
+                Err(BusError::NonHumanResolver { .. }) => {
+                    bus.abandon(request_id);
+                    eprintln!(
+                        "[mission] HITL interaction ({kind:?}): {prompt} — no human in a \
+                         headless run; abandoned (declined) so the mission can finish"
+                    );
+                }
                 Err(e) => eprintln!("[mission] HITL interaction ({kind:?}): {prompt} — {e}"),
             },
             MissionEvent::Status {
@@ -473,6 +496,9 @@ pub enum DriveOutcome {
     GaveUp,
     /// Hit the step bound without resolving.
     MaxSteps,
+    /// A single decision step blew the mission-level no-progress wall-clock
+    /// backstop ([`MISSION_STEP_TIMEOUT`]) — the driver refused to wedge on it.
+    TimedOut { detail: String },
     /// A §32 call errored.
     Error(String),
     /// The chooser itself FAILED — its agent runner errored (missing API key,
@@ -482,10 +508,61 @@ pub enum DriveOutcome {
     ChooserFailed { source: String },
 }
 
+/// How often [`drive_mission`] pulses a "still working" heartbeat to the bus
+/// while awaiting a single (possibly slow) agent decision — so a client tailing
+/// the mission can tell a slow reasoning call from a hung one (the observability
+/// gap where a blocking call looks identical to a wedge).
+const MISSION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Mission-level no-progress backstop on a SINGLE autonomous decision step. The
+/// agent runner already bounds its own call (session timeout + stall watchdog),
+/// so in practice that fires first; this only trips if a step somehow exceeds
+/// even that — guaranteeing the driver can never wedge on one step. Generous by
+/// design: larger than a normal decision's own timeout, it catches a genuine
+/// hang, not slowness.
+const MISSION_STEP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Await a single agent decision while (a) pulsing a heartbeat to the bus every
+/// [`MISSION_HEARTBEAT_INTERVAL`] so a slow call is visibly *alive* to the
+/// client, and (b) enforcing [`MISSION_STEP_TIMEOUT`] as the mission-level
+/// no-progress backstop. `Ok(inner)` carries the chooser's own result;
+/// `Err(elapsed)` means the step blew the wall-clock bound.
+async fn choose_with_heartbeat(
+    chooser: &dyn TransitionChooser,
+    state: &MissionState,
+    bus: &Bus,
+    mission_id: &str,
+) -> Result<Result<Option<String>, String>, Duration> {
+    let started = tokio::time::Instant::now();
+    let choose_fut = chooser.choose(state);
+    tokio::pin!(choose_fut);
+    let mut ticker = tokio::time::interval(MISSION_HEARTBEAT_INTERVAL);
+    ticker.tick().await; // the first interval tick is immediate — consume it
+    loop {
+        tokio::select! {
+            // Prefer completing the decision over emitting a heartbeat.
+            biased;
+            result = &mut choose_fut => return Ok(result),
+            _ = ticker.tick() => {
+                let elapsed = started.elapsed();
+                if elapsed >= MISSION_STEP_TIMEOUT {
+                    return Err(elapsed);
+                }
+                bus.publish(MissionEvent::Status {
+                    mission_id: mission_id.to_string(),
+                    status: format!("working — deciding next move ({}s)", elapsed.as_secs()),
+                });
+            }
+        }
+    }
+}
+
 /// Drive a mission to resolution (ADR-0009 c). Each step: read state → publish
 /// status → if resolved, stop → if it's the human's turn, **park** on the bus and
 /// resume on the reply → else the orchestrator chooses and we submit. Bounded by
-/// `max_steps`; the outcomes are the real stop condition.
+/// `max_steps`; the outcomes are the real stop condition. A single autonomous
+/// decision is additionally heartbeat-pulsed and bounded by a mission-level
+/// no-progress backstop (see [`choose_with_heartbeat`]).
 pub async fn drive_mission(
     gateway: &dyn MissionGateway,
     chooser: &dyn TransitionChooser,
@@ -565,12 +642,23 @@ pub async fn drive_mission(
             // leave the instance running.
             return DriveOutcome::GaveUp;
         }
-        let transition = match chooser.choose(&state).await {
-            Ok(Some(t)) => t,
-            Ok(None) => return DriveOutcome::GaveUp,
+        let transition = match choose_with_heartbeat(chooser, &state, bus, mission_id).await {
+            Ok(Ok(Some(t))) => t,
+            Ok(Ok(None)) => return DriveOutcome::GaveUp,
             // The chooser's runner errored — surface the REAL fault (honest
             // error) instead of masquerading it as a give-up.
-            Err(source) => return DriveOutcome::ChooserFailed { source },
+            Ok(Err(source)) => return DriveOutcome::ChooserFailed { source },
+            // The mission-level no-progress backstop tripped: the driver refuses
+            // to wedge on a single step even if the runner's own bound didn't fire.
+            Err(elapsed) => {
+                return DriveOutcome::TimedOut {
+                    detail: format!(
+                        "a decision step ran {}s with no result (backstop {}s)",
+                        elapsed.as_secs(),
+                        MISSION_STEP_TIMEOUT.as_secs()
+                    ),
+                };
+            }
         };
         bus.publish(MissionEvent::Chunk {
             mission_id: mission_id.to_string(),
@@ -729,6 +817,71 @@ mod tests {
 
     fn running_then(states: Vec<MissionState>) -> ScriptedGateway {
         ScriptedGateway::new(states)
+    }
+
+    /// A chooser that takes `delay` to decide — stands in for a slow (but not
+    /// hung) reasoning call, so a test can drive the heartbeat + no-progress
+    /// backstop under a paused clock.
+    struct SlowChooser {
+        delay: Duration,
+    }
+    #[async_trait]
+    impl TransitionChooser for SlowChooser {
+        async fn choose(&self, state: &MissionState) -> Result<Option<String>, String> {
+            tokio::time::sleep(self.delay).await;
+            Ok(state.agent_actions().first().map(|a| a.transition.clone()))
+        }
+    }
+
+    // ── mission heartbeat + no-progress watchdog (CR4 / CR5) ─────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_decision_step_trips_the_no_progress_watchdog() {
+        // A decision that never returns must not wedge the driver: the
+        // mission-level backstop fires and drive_mission ends as TimedOut.
+        let gw = LoopGateway;
+        let chooser = SlowChooser {
+            delay: MISSION_STEP_TIMEOUT + Duration::from_secs(120),
+        };
+        let bus = Bus::new();
+        let outcome = drive_mission(&gw, &chooser, &bus, "m1", 10).await;
+        assert!(
+            matches!(outcome, DriveOutcome::TimedOut { .. }),
+            "a wedged step must trip the watchdog; got {outcome:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_decision_pulses_a_heartbeat_to_the_bus() {
+        // A slow-but-live decision must emit "still working" heartbeats so a
+        // client can tell it apart from a hang.
+        let gw = running_then(vec![
+            ms("running", &[("go", "agent")]),
+            ms("succeeded", &[]),
+        ]);
+        // Spans more than one heartbeat interval, well under the backstop.
+        let chooser = SlowChooser {
+            delay: MISSION_HEARTBEAT_INTERVAL * 2 + Duration::from_secs(5),
+        };
+        let bus = Bus::new();
+        let mut rx = bus.subscribe();
+        let outcome = drive_mission(&gw, &chooser, &bus, "m1", 10).await;
+        assert!(
+            matches!(outcome, DriveOutcome::Resolved { .. }),
+            "the mission should resolve; got {outcome:?}"
+        );
+        let mut heartbeats = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let MissionEvent::Status { status, .. } = ev {
+                if status.starts_with("working — deciding") {
+                    heartbeats += 1;
+                }
+            }
+        }
+        assert!(
+            heartbeats >= 1,
+            "a slow decision must pulse at least one heartbeat"
+        );
     }
 
     // ── MissionState::resolved ───────────────────────────────────────────────
@@ -1135,10 +1288,14 @@ mod tests {
     // ── headless consumer ────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn headless_policy_cannot_resolve_a_human_decision() {
-        // P16 — the policy is not a proven human, so the bus refuses its reply
-        // on an Approve gate: the interaction stays PARKED (it accumulates for
-        // a later human drain) instead of being auto-resolved.
+    async fn headless_policy_abandons_an_unanswerable_human_decision() {
+        // P16 — the policy is not a proven human, so it CANNOT approve an Approve
+        // gate (the bus refuses a non-human resolver). The OLD behavior left it
+        // parked "for a later human drain", but in a headless run no human ever
+        // comes: the driver blocks on the reply forever at 0 CPU (the reported
+        // zombie). Now the consumer ABANDONS the unanswerable gate so the parked
+        // `request_interaction` resolves (declined) and the mission terminates
+        // cleanly — WITHOUT ever impersonating a human approval.
         let bus = Bus::new();
         let events = bus.subscribe();
         let _c = tokio::spawn(run_headless_consumer(
@@ -1146,19 +1303,21 @@ mod tests {
             bus.clone(),
             HeadlessPolicy::AutoApprove,
         ));
-        let parked = {
-            let bus = bus.clone();
-            tokio::spawn(async move {
-                bus.request_interaction("m1", InteractionKind::Approve, "?")
-                    .await
-            })
-        };
-        let outcome = tokio::time::timeout(std::time::Duration::from_millis(200), parked).await;
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            bus.request_interaction("m1", InteractionKind::Approve, "?"),
+        )
+        .await
+        .expect("the gate must be unparked (abandoned), not hang forever");
         assert!(
-            outcome.is_err(),
-            "a human_decision must stay parked under a headless policy, not auto-resolve"
+            !reply.approved,
+            "an unanswerable gate resolves as declined, never a forged approval"
         );
-        assert_eq!(bus.pending_count(), 1);
+        assert_eq!(
+            bus.pending_count(),
+            0,
+            "the gate is abandoned, not left parked as a zombie"
+        );
     }
 
     #[tokio::test]

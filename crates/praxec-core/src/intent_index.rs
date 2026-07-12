@@ -531,6 +531,7 @@ mod tests {
                 verb: None,
                 body: None,
                 source: None,
+                structural_fingerprint: None,
             },
             evidence: None,
         }

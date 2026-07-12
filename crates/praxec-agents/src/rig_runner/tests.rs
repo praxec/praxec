@@ -1050,7 +1050,10 @@ async fn test_tool_setup_timeout() {
     let runner = RigSessionRunner::new(Arc::new(ScriptedFactory::new(vec![])))
         .with_tool_host(Arc::new(HangingToolHost));
     let result = runner.run(session).await;
-    assert!(matches!(result, Err(ExecutorError::Timeout(60))));
+    // `ExecutorError::Timeout` is milliseconds (Display "… ms"), matching every
+    // other construction site (reliability/pipeline/parallel/executor). A 60s
+    // setup timeout is 60_000 ms — previously this asserted the mislabeled `60`.
+    assert!(matches!(result, Err(ExecutorError::Timeout(60_000))));
 }
 
 /// A factory whose stream hangs forever without ever yielding an event —
@@ -1090,7 +1093,8 @@ async fn a_stalled_stream_is_caught_by_the_no_progress_watchdog_and_does_not_ret
     // Fires at the 30s stall window, not the 600s wall, and surfaces as a
     // Timeout (→ NetworkTimeout → chain-walk escalates to the next model).
     assert!(
-        matches!(result, Err(ExecutorError::Timeout(30))),
+        // ms, not seconds — the 30s stall window surfaces as Timeout(30_000).
+        matches!(result, Err(ExecutorError::Timeout(30_000))),
         "a stalled stream must time out at the 30s stall window, got {result:?}"
     );
     // Escalate, don't re-hang: the same-model retry path must NOT re-issue a
@@ -1099,6 +1103,78 @@ async fn a_stalled_stream_is_caught_by_the_no_progress_watchdog_and_does_not_ret
         factory.calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "a stalled model must escalate after one attempt, not retry in-session"
+    );
+}
+
+/// A hung MCP tool server must not wedge the run. `TOOL_CALL_TIMEOUT` bounds
+/// `host.call`, and a timeout is a NON-FATAL tool error: the model sees an
+/// "ERROR: … timed out" string as that tool's output and can still finish, so
+/// the run completes instead of sitting at 0 CPU inside the tool call until the
+/// whole-session wall. (Paused clock: the tool's 300s ceiling fires well inside
+/// the 600s session budget.)
+#[tokio::test(start_paused = true)]
+async fn a_hung_tool_call_times_out_non_fatally_and_the_run_finishes() {
+    struct HangingCallHost;
+    #[async_trait::async_trait]
+    impl ToolHost for HangingCallHost {
+        async fn tools(
+            &self,
+            connections: &[String],
+        ) -> Result<Vec<(ToolDefinition, String)>, ExecutorError> {
+            let conn = connections
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "conn".into());
+            Ok(vec![(
+                ToolDefinition {
+                    name: "lookup".into(),
+                    description: "look something up".into(),
+                    parameters: json!({ "type": "object" }),
+                },
+                conn,
+            )])
+        }
+        async fn call(&self, _c: &str, _n: &str, _a: &str) -> Result<String, String> {
+            // Hang well beyond TOOL_CALL_TIMEOUT — the "unreachable" MCP server.
+            sleep(Duration::from_secs(3600)).await;
+            unreachable!()
+        }
+    }
+
+    let factory = ScriptedFactory::new(vec![
+        // Turn 1: the model calls the (hanging) tool.
+        vec![
+            Ok(StreamEvent::ToolCall(ToolCallRequest {
+                id: "t1".into(),
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            })),
+            Ok(done()),
+        ],
+        // Turn 2: having seen the timed-out tool result, the model finishes.
+        vec![
+            Ok(final_answer(r#"{"status":"success","output":{"ok":true}}"#)),
+            Ok(done()),
+        ],
+    ]);
+    let mut s = session(vec!["conn".into()]);
+    // Larger than TOOL_CALL_TIMEOUT so the per-call ceiling — not the session
+    // wall — is what fires on the hung tool.
+    s.timeout = Duration::from_secs(600);
+    let report = RigSessionRunner::new(Arc::new(factory))
+        .with_tool_host(Arc::new(HangingCallHost))
+        .run(s)
+        .await
+        .expect("the run must finish, not hang");
+    assert!(
+        matches!(report.outcome, AgentRunOutcome::Completed(_)),
+        "a hung tool must be non-fatal and let the run complete; got {:?}",
+        report.outcome
+    );
+    assert!(
+        report.transcript.contains("timed out"),
+        "the timed-out tool must surface (non-fatally) in the transcript; got: {}",
+        report.transcript
     );
 }
 

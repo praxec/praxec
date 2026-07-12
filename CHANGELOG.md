@@ -17,6 +17,138 @@ covered by a stability commitment.
 > none were tagged at the time. Versions `0.0.1`–`0.0.5` are the earlier
 > development history, renumbered onto this line.
 
+## [0.0.18] — 2026-07-11 — the optimization flywheel
+
+Planned by dogfooding praxec's own planning surface
+(`cognitive/cap.plan.build-graph` → `cognitive/cap.coordinate.cpm-plan`) and
+built cohort-by-cohort against that dependency-ordered plan
+(`docs/plan-v0.0.18.md`, `docs/test-plan-v0.0.18.md`). The release makes the
+tool/workflow ecosystem *compounding*: discover → apply → gather evidence →
+improve. Everything here is **additive** — with no embedder, no v3 registry, and
+the selector policy below its evidence threshold, behavior is identical to 0.0.17.
+
+### Added — semantic discovery (mechanism 1)
+
+- **Dependable embedder.** `EmbeddingProvider` gains a mandatory `health_check()`
+  (a real round-trip, deliberately with no default impl, so an unprobed provider
+  cannot claim health). `HttpEmbedder` now builds its client with explicit connect
+  + request timeouts and a bounded retry for *transient* failures only — a timeout
+  is fatal, not retried, because retrying multiplies the very wait the budget
+  exists to cap. This closes the flaky-endpoint **hang** that got embeddings cut
+  from 0.0.17 (the client was previously built with no timeout at all).
+- **Re-embed on reload.** Startup and hot-reload now build the discovery index
+  through **one** seam (`discovery::build_discovery_index`). Previously reload
+  rebuilt a *lexical* index and swapped it in, silently and permanently
+  downgrading discovery from semantic to lexical on any config/pack reload. Any
+  embedder failure now degrades to lexical **loudly** (audit `discovery.index_degraded`),
+  never silently, and never stickily — the next reload with a healthy embedder
+  restores semantics.
+- **Hybrid semantic search over two surfaces.** Ranking blends lexical relevance
+  with embedding cosine similarity (`0.5·lex + 0.5·cos`), over both (a) workflow /
+  cap / skill descriptions and (b) tool / mcp / rest descriptors (`kind: "tool"`).
+  The weighting preserves lexical precision by construction — a zero-lexical item
+  can never outbid an exact keyword match — while letting a semantically-relevant
+  item outrank a keyword *collision*. Fixes the observed case where
+  `cognitive/inspect.git.status` outranked planning workflows on a shared "status"
+  keyword, and where an existing capability was undiscoverable by meaning.
+
+### Added — structural fingerprints (mechanism 2)
+
+- **Canonical structural fingerprint + duplicate detection** over a workflow's
+  actual graph (states, transitions, executor topology), reusing the existing
+  `contract_hash` canonicalization. Declaration order and prose don't move the
+  hash; graph structure does. Exact-duplicate grouping + Jaccard near-duplicate
+  detection give praxec-meta a screening signal for dedup/cluster/merge, feeding
+  `flow.optimize-*`. The *learned* structural embedding is intentionally deferred
+  to corpus scale.
+
+### Added — evidence-driven selection (mechanism 3)
+
+- **Learned selector policy.** Accrued `{task_class, template} × success × cost`
+  evidence from the intent index now actively re-ranks toward the highest-value
+  composition — guarded by a per-pair **evidence-volume threshold**
+  (`intent.policy_min_runs`, default 10). Below it, ranking is bit-for-bit the
+  0.0.17 evidence-annotation blend (the cold-start guard: a policy on thin evidence
+  selects worse than none). Activation is explainable in the `why` line, and the
+  threshold is a tuning knob (set out of reach to disable — the kill switch).
+
+### Added — registry topology wiring
+
+- **Registry v3 is loaded and live.** The `praxec.packs/v3` loader (foundation-only
+  in 0.0.17) is now loaded at gateway startup from `discovery.registry`, threaded
+  into `rank_candidates`, and swapped atomically with the index on reload. The
+  crossmatrix tool × workflow topology term — previously present but dead in
+  production — now influences ranking, and the registry's tool descriptors become
+  searchable through live discovery. A configured-but-unloadable registry fails
+  fast rather than booting registry-less.
+
+### Fixed — orchestrate / auto_drive multi-step hang
+
+An investigation into a "multi-step reasoning `auto_drive` hangs at 0 CPU"
+report found the headline lead ("timeout after 60 ms") to be a **cosmetic
+mislabel**, not a functional bug — but it surfaced several real, distinct hangs.
+The prior model-chain circuit breaker (30-min cooldown + half-open re-probe),
+chain-walk escalation, and `host.tools()` setup timeout were already correct; the
+gaps were elsewhere:
+
+- **The stall watchdog is live again on the model call.** The provider factory
+  drained rig's whole turn into a `Vec` *before* returning the stream, so the
+  runner's per-event stall watchdog only ever polled an already-materialized
+  buffer — the real model wait (including a hang at first token) happened outside
+  it, bounded only by the 600s session wall. The factory now streams **lazily**
+  (an `async_stream` generator), so a hung/silent reasoning call is caught at the
+  `stall_timeout` and escalates, exactly as advertised.
+- **Headless HITL gates no longer park forever.** A headless run that reached a
+  `human_decision` gate parked on an unbounded `oneshot` the policy could never
+  answer (P16 refuses a non-human resolver) — the driver sat at 0 CPU
+  indefinitely, orphaning parent + child instances. The headless consumer now
+  **abandons** an unanswerable gate (resolving it as declined, never a forged
+  approval) so the mission terminates cleanly, and it survives a lagging event
+  channel instead of silently dying and stranding every future park.
+- **Per-call timeout on tool invocations.** A hung MCP tool server inside
+  `host.call` was bounded only by the session wall. Each call now has a generous
+  per-call ceiling; a timeout is a **non-fatal** tool error (the model sees it and
+  can recover) rather than a silent 0-CPU block.
+- **A working, server-side `cancel` verb.** `praxec.command
+  { "intent": "cancel", "workflowId": "…" }` now cancels a running workflow (the
+  `Runtime::cancel` primitive existed but was wired to no verb) — the operator's
+  reap for an instance whose driver/CLI died. The CLI exposes it through the same
+  passthrough (`px command '{"intent":"cancel","workflowId":"…"}'`).
+- **Honest error labels.** `ExecutorError::Timeout` is milliseconds everywhere
+  (matching every other construction site); two sites fed `.as_secs()`, printing a
+  real 60-second timeout as "timeout after 60 ms" (the report's red herring). The
+  `orchestrate` credentials-path hint now reports the actual resolved
+  `providers.env` path (XDG-first) instead of the stale legacy `~/.praxec` one.
+
+### Fixed — orchestrate observability & recovery (defense in depth)
+
+- **Mission heartbeat + no-progress watchdog.** A single autonomous decision now
+  pulses a "still working (Ns)" heartbeat to the mission bus every 15s, so a
+  client can tell a slow reasoning call from a hung one, and is bounded by a
+  mission-level backstop — a wedged step ends the drive as `TimedOut` instead of
+  looping. (The per-step agent timeout still normally fires first; this is the
+  layer above it.)
+- **Startup orphan reap.** An instance a driver/CLI left mid-`running` (its
+  process died) is a durable zombie no live owner will advance. On a fresh boot
+  there are no in-process drivers, so `serve` now cancels the orphaned *running*
+  instances at startup (auditable, via the same cancel path). It deliberately
+  never touches work that legitimately persists across restarts: terminal or
+  cancelled instances, human gates (a person may return), and engine-waits that
+  self-resume (lock / subworkflow / agent-await) — classified against each
+  instance's own definition snapshot.
+- **Repo load reports every invalid file at once.** A malformed flow/cap file in
+  a repo aborted the load at the *first* bad file, so an author fixed one,
+  restarted, and hit the next. The loader now accumulates and names *every*
+  invalid file in one error. It stays fail-whole — an invalid file never loads a
+  partial config (no fail-open) — it just no longer masks its siblings.
+
+Note: a "force the fallback model to be non-reasoning" item from the report was
+deliberately **not** taken. Its premise (praxec can't handle reasoning models)
+was already false and is doubly so after the stall-watchdog fix — reasoning
+models are first-class. Resilience against a flaky model comes from correct
+response handling + real timeouts + chain-walk escalation + the circuit breaker,
+never from restricting which model classes the system may use.
+
 ## [0.0.17] — 2026-07-10 — tool-source ecosystem & governed connections
 
 > **This release bundles every 0.0.16 improvement.** There is no separate 0.0.16

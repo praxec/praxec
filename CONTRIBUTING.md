@@ -17,6 +17,28 @@ your time and ours land in the same place.
 - **Verification coverage (what's tested vs. what isn't):**
   see the "Verification coverage" section in [`docs/reference/stability.md`](docs/reference/stability.md).
 
+## Branching model
+
+We use a gitflow-style flow, enforced by branch rulesets and CI:
+
+```
+feature/*  ->  dev  ->  main
+```
+
+- **`feature/*` (or `fix/*`)** — where you do your work. Branch off `dev`.
+  Commit in logical groups; a single deliverable is one branch, not a
+  stack of PRs.
+- **`dev`** — the integration branch and the repo default. Feature work
+  merges here via PR. This is where things come together before release.
+- **`main`** — the release branch. It only ever advances by merging
+  `dev`. A CI guard (`main only accepts merges from dev`) rejects any PR
+  into `main` whose source branch isn't `dev`.
+
+Both `dev` and `main` are protected: **direct pushes are blocked, every
+change goes through a pull request, and CI (`build + test + lint`) must be
+green before merge — for everyone, including maintainers.** There is no
+admin bypass, so plan on the PR round-trip even for small changes.
+
 ## Before you open a PR
 
 1. **Open an issue first** for anything larger than a bug fix or doc

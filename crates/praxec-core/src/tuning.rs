@@ -124,6 +124,19 @@ pub struct IntentTuning {
     /// selection. Mirrors `DeescalationTuning::min_runs`.
     #[serde(default = "default_intent_min_runs")]
     pub min_runs: usize,
+
+    /// D7 — the evidence-volume threshold at which the *learned selector policy*
+    /// (`crate::discovery::SelectorPolicy`) takes over ranking for a
+    /// `(task_class, template)` pair. Below it, ranking is exactly the
+    /// evidence-annotation blend that shipped in 0.0.17 — the cold-start guard:
+    /// a policy acting on thin evidence selects worse than no policy at all.
+    ///
+    /// Strictly above `min_runs` by default (10 vs 5) because the two bars buy
+    /// different things: `min_runs` is the bar to *show* a track record to a
+    /// caller, `policy_min_runs` is the bar to *act* on it. Acting demands more.
+    /// Set it arbitrarily high to disable the policy entirely (the kill switch).
+    #[serde(default = "default_intent_policy_min_runs")]
+    pub policy_min_runs: usize,
 }
 
 /// How our reasoning-effort levels map to each provider's native knob — values
@@ -246,9 +259,13 @@ fn default_deescalation_tuning() -> DeescalationTuning {
 fn default_intent_min_runs() -> usize {
     5
 }
+fn default_intent_policy_min_runs() -> usize {
+    10
+}
 fn default_intent_tuning() -> IntentTuning {
     IntentTuning {
         min_runs: default_intent_min_runs(),
+        policy_min_runs: default_intent_policy_min_runs(),
     }
 }
 fn default_reasoning_tuning() -> ReasoningTuning {
@@ -371,6 +388,10 @@ mod tests {
         assert_eq!(t.requests_per_day_levels, vec![100, 1_000, 10_000, 100_000]);
         assert_eq!(t.deescalation.min_runs, 5);
         assert_eq!(t.intent.min_runs, 5);
+        // D7 — the policy acts, so it demands a stricter bar than the
+        // annotation that merely informs.
+        assert_eq!(t.intent.policy_min_runs, 10);
+        assert!(t.intent.policy_min_runs > t.intent.min_runs);
         assert_eq!(reasoning_multiplier("high"), 8.0);
         // Unknown level → medium fallback.
         assert_eq!(reasoning_multiplier("wat"), 4.0);
@@ -396,6 +417,17 @@ mod tests {
         // The de-escalation + intent loops default in too.
         assert_eq!(t.deescalation.min_runs, 5);
         assert_eq!(t.intent.min_runs, 5);
+        assert_eq!(t.intent.policy_min_runs, 10);
+    }
+
+    #[test]
+    fn intent_policy_threshold_is_tunable_without_touching_min_runs() {
+        // D7's one knob: raise the activation bar (or set it out of reach as a
+        // kill switch) from the tuning file, leaving the annotation bar alone.
+        let t: RecommendationTuning =
+            serde_json::from_str(r#"{ "intent": { "policy_min_runs": 999999 } }"#).unwrap();
+        assert_eq!(t.intent.policy_min_runs, 999_999);
+        assert_eq!(t.intent.min_runs, 5, "the annotation bar is untouched");
     }
 
     #[test]

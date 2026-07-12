@@ -150,8 +150,10 @@ pub(crate) enum Command {
     /// cancel) against the config's store and print the JSON response. State
     /// persists across calls when `store.kind: sqlite`. Argument is the same
     /// JSON the `praxec.command` MCP tool takes, e.g.
-    /// `'{"definitionId":"hello_flow"}'` or
-    /// `'{"workflowId":"wf_...","expectedVersion":1,"transition":"begin"}'`.
+    /// `'{"definitionId":"hello_flow"}'`,
+    /// `'{"workflowId":"wf_...","expectedVersion":1,"transition":"begin"}'`, or
+    /// `'{"intent":"cancel","workflowId":"wf_..."}'` (cancel a running workflow —
+    /// the server-side reap for a run whose driver/CLI died).
     Command {
         /// Path to the gateway YAML config (the store the workflow lives in).
         #[arg(short, long)]
@@ -475,6 +477,9 @@ pub(crate) struct OneshotServer {
     pub(crate) swappable_defs: Arc<praxec_core::hot_reload::SwappableDefinitionStore>,
     pub(crate) swappable_executors: Arc<praxec_core::hot_reload::SwappableExecutorRegistry>,
     pub(crate) swappable_discovery: Arc<praxec_core::hot_reload::SwappableDiscoveryIndex>,
+    /// D6 — the loaded `praxec.packs/v3` registry (`None` when unconfigured).
+    /// Swapped by `reload_gated` in lockstep with the discovery index it fed.
+    pub(crate) swappable_registry: Arc<praxec_core::hot_reload::SwappableRegistry>,
 }
 
 /// Apply every registrar to `base`, folding each result into the next, so the

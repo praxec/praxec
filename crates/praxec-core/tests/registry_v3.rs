@@ -235,6 +235,62 @@ fn v3_crossmatrix_reads_both_directions() {
     assert!(registry.tools_for_workflow("no/flow.such").is_empty());
 }
 
+// ── D6: the on-disk load path the gateway's `discovery.registry` uses ─────
+
+#[test]
+fn load_path_reads_a_registry_file_from_disk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("packs.yaml");
+    std::fs::write(&path, V3_REGISTRY).expect("write registry");
+
+    let registry = Registry::load_path(&path).expect("registry file loads");
+    assert_eq!(registry, Registry::load_str(V3_REGISTRY).unwrap());
+}
+
+#[test]
+fn load_path_on_a_missing_file_fails_fast_with_a_named_error() {
+    // The gateway must never boot registry-less because the file it was POINTED
+    // AT is not there — a typo'd path is an operator error, and the error names
+    // both the code and the path.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("nope.yaml");
+
+    let err = Registry::load_path(&missing).expect_err("a missing registry file must not load");
+    assert!(matches!(err, RegistryError::Read { .. }), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("REGISTRY_READ"), "{msg}");
+    assert!(msg.contains("nope.yaml"), "{msg}");
+}
+
+#[test]
+fn load_path_on_a_malformed_registry_fails_fast_with_the_typed_error() {
+    // Present but broken: still fail-fast — and with the SAME typed error the
+    // in-memory loader gives, so the diagnosis does not depend on the door used.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("packs.yaml");
+    std::fs::write(&path, "schema: praxec.packs/v9\ntools: []\n").expect("write registry");
+
+    let err = Registry::load_path(&path).expect_err("an unknown schema marker must not load");
+    assert!(matches!(err, RegistryError::UnknownSchema { .. }), "{err}");
+    assert!(err.to_string().contains("REGISTRY_UNKNOWN_SCHEMA"), "{err}");
+}
+
+#[test]
+fn tool_descriptors_projects_the_v3_catalog_and_skips_v2_only_tools() {
+    // D6 — the tool catalog the discovery index indexes. v3 tools with a
+    // descriptor are in; a v2 provider-catalog row (no descriptor, nothing to
+    // invoke) is deliberately out.
+    let v3 = Registry::load_str(V3_REGISTRY).expect("v3 registry loads");
+    let names: Vec<String> = v3.tool_descriptors().into_iter().map(|d| d.name).collect();
+    assert_eq!(names, ["cpm-planner", "ripgrep", "httpbin"]);
+
+    let v2 = Registry::load_str(V2_REGISTRY).expect("v2 registry loads");
+    assert!(
+        v2.tool_descriptors().is_empty(),
+        "a v2 catalog carries no D1 descriptors — nothing to index as a tool"
+    );
+}
+
 #[test]
 fn v3_registry_round_trips_through_serialization() {
     let registry = Registry::load_str(V3_REGISTRY).expect("v3 registry loads");

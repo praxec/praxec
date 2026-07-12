@@ -46,6 +46,10 @@ impl EmbeddingProvider for FixedVectorEmbedder {
         Ok(self.vector.clone())
     }
 
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        Ok(())
+    }
+
     fn dimensions(&self) -> usize {
         self.vector.len()
     }
@@ -62,6 +66,12 @@ struct FailingEmbedder;
 impl EmbeddingProvider for FailingEmbedder {
     async fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
         Err(EmbeddingError::BackendFailed(
+            "injected test failure".to_string(),
+        ))
+    }
+
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        Err(EmbeddingError::HealthCheckFailed(
             "injected test failure".to_string(),
         ))
     }
@@ -1586,6 +1596,9 @@ async fn alias_add_with_embedder_reembeds_entry() {
             let n = self.call_count.fetch_add(1, Ordering::SeqCst);
             // Each call returns a distinct vector so we can tell them apart.
             Ok(vec![n as f32, 0.0, 0.0])
+        }
+        async fn health_check(&self) -> Result<(), EmbeddingError> {
+            Ok(())
         }
         fn dimensions(&self) -> usize {
             3

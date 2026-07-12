@@ -88,12 +88,25 @@ impl PraxecServer {
         self.attach_intent_evidence(&mut hits).await;
 
         // Selector (D6) — re-rank the annotated hits by the deterministic
-        // relevance + evidence (+ topology) blend and surface the explainable
+        // relevance + evidence + topology blend and surface the explainable
         // `why`, instead of returning raw lexical order. `rank_candidates` is
         // total (one entry per hit) and stable, so every hit maps and the order
-        // is fully determined. `registry: None` for now → relevance+evidence
-        // blend; the topology term activates once a registry is wired here.
-        let ranked = praxec_core::discovery::rank_candidates(&hits, None);
+        // is fully determined. The registry is the one the gateway loaded from
+        // `discovery.registry` (and re-loads on every reload); `None` when the
+        // operator configured none, which zeroes the topology term uniformly and
+        // leaves the relevance+evidence blend exactly as it was.
+        //
+        // D7 — and the learned selector policy, whose activation bar comes from
+        // the operator's tuning (`intent.policy_min_runs`), exactly as the
+        // annotator above takes `intent.min_runs`. A template with too little
+        // accrued evidence falls through to the blend above, unchanged: on a
+        // fresh install nothing here re-ranks anything.
+        let registry = self.registry.current();
+        let ranked = praxec_core::discovery::rank_candidates(
+            &hits,
+            registry.as_deref(),
+            &praxec_core::discovery::SelectorPolicy::from_tuning(),
+        );
         let hit_by_id: std::collections::HashMap<&str, &praxec_core::discovery::SearchHit> =
             hits.iter().map(|h| (h.item.id.as_str(), h)).collect();
         let items: Vec<Value> = ranked
@@ -1135,6 +1148,25 @@ impl PraxecServer {
         let is_cancel = parsed.intent.as_deref() == Some("cancel_pending_subject")
             && parsed.unknown_subject.is_some();
 
+        // T24 — cancel a RUNNING WORKFLOW (distinct from the lexicon
+        // `cancel_pending_subject` above). Wire shape:
+        // `{ "intent": "cancel", "workflowId": "wf_…", "summary"?: "<reason>" }`.
+        // This is the operator's server-side reap: a run whose CLI/driver died
+        // leaves a durable `running` instance in the store; without a working
+        // cancel verb it orphans a zombie (killing the CLI does not cancel
+        // server-side). Exclusive shape: it carries a `workflowId` but no
+        // `transition` (so it can't be a submit) and a distinct intent.
+        let is_cancel_workflow = parsed.intent.as_deref() == Some("cancel")
+            && parsed.workflow_id.is_some()
+            && parsed.transition.is_none();
+        if is_cancel_workflow {
+            let workflow_id = parsed.workflow_id.clone().expect("checked above");
+            let reason = parsed.summary.clone().unwrap_or_else(|| {
+                format!("cancelled via praxec.command by {}", principal.subject)
+            });
+            return self.handle_cancel_workflow(&workflow_id, &reason).await;
+        }
+
         match (is_start, is_submit, is_define, is_cancel) {
             (true, false, false, false) => {
                 // Start: reshape CommandArgs → StartArgs wire shape.
@@ -1168,6 +1200,29 @@ impl PraxecServer {
             }
             _ => Ok(ambiguous_intent_command()),
         }
+    }
+
+    /// T24 — cancel a running workflow (see the `is_cancel_workflow` shape in
+    /// [`dispatch_command`]). Delegates to [`WorkflowRuntime::cancel`]: sets
+    /// `cancelled_at` + `cancelled_reason`, bumps the version, and emits a
+    /// `workflow.cancelled` audit event; subsequent `submit`s return
+    /// `WORKFLOW_CANCELLED` and `get` surfaces `status: "cancelled"`.
+    /// Idempotent (re-cancelling is a no-op). A missing workflow surfaces the
+    /// store's not-found error.
+    ///
+    /// [`dispatch_command`]: Self::dispatch_command
+    /// [`WorkflowRuntime::cancel`]: praxec_core::runtime::WorkflowRuntime::cancel
+    async fn handle_cancel_workflow(
+        &self,
+        workflow_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<Value> {
+        self.runtime.cancel(workflow_id, reason).await?;
+        Ok(json!({
+            "workflowId": workflow_id,
+            "status": "cancelled",
+            "reason": reason,
+        }))
     }
 
     /// Shim: extract `<term>` from `subject: "lexicon:<term>"` and delegate

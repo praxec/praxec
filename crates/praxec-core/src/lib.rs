@@ -68,6 +68,7 @@ pub mod sandbox;
 pub mod skills;
 pub mod slot;
 pub mod store;
+pub mod structural_fingerprint;
 pub mod templating;
 pub mod tier;
 pub mod tool_descriptor;
@@ -82,8 +83,8 @@ pub use audit::{
 pub use capability::{Capability, CapabilityRegistry, CapabilitySource};
 pub use discovery::{
     DiscoveryIndex, DiscoveryItem, DiscoveryKind, DiscoveryLink, EvidenceSignal,
-    InMemoryDiscoveryIndex, RankedCandidate, SearchHit, SearchRequest, TopologySignal,
-    rank_candidates,
+    InMemoryDiscoveryIndex, PolicySignal, RankedCandidate, SearchHit, SearchRequest,
+    SelectorPolicy, TopologySignal, rank_candidates,
 };
 pub use error::{ErrorClass, ExecutorError, RuntimeError};
 pub use fs::{Filesystem, InMemoryFilesystem, RealFilesystem};
