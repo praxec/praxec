@@ -15,7 +15,7 @@ use praxec_core::store::{
 use serde_json::{Value, json};
 
 use crate::analysis::output_map::{
-    OutputSource, analyze_output, insert_nested, output_field_paths,
+    OutputSource, analyze_output, insert_nested, output_field_paths, whole_output_slots,
 };
 use crate::analysis::plan::{OutputPlan, add_capability_outputs, derive_plan};
 use crate::analysis::reads::{satisfying_context, violating_context};
@@ -122,13 +122,23 @@ fn def_wide_plan(resolved: &Value, def_id: &str) -> OutputPlan {
             if let Some(ts) = state.get("transitions").and_then(|t| t.as_object()) {
                 for (tname, tobj) in ts {
                     for (slot, full_path) in output_field_paths(tobj) {
+                        // Prefer the slot's DECLARED OUTPUT schema over its
+                        // blackboard `type:`. The blackboard type is the coarse
+                        // one — a verify slot is declared `{type: object}` there
+                        // but `{$ref: praxec://hop#/$defs/verifyOut}` in
+                        // snippet.outputs. A dummy built from the blackboard type
+                        // is a bare `{}`: type-correct, contract-invalid. It would
+                        // then OVERWRITE the seeded value on the way to terminal
+                        // and fail the output contract the runtime enforces there.
                         let val = def
-                            .get("blackboard")
-                            .and_then(|b| b.get(&slot))
+                            .pointer("/snippet/outputs")
+                            .or_else(|| def.pointer("/outputs"))
+                            .and_then(|o| o.get(&slot))
+                            .or_else(|| def.get("blackboard").and_then(|b| b.get(&slot)))
                             .map(crate::analysis::dummy::dummy_for_schema)
                             .unwrap_or_else(|| json!("fuzz"));
                         let parts: Vec<&str> = full_path.split('.').collect();
-                        let entry = plan.entry(tname.clone()).or_default();
+                        let entry = crate::analysis::plan::output_obj(&mut plan, tname.as_str());
                         insert_nested(entry, &parts, val);
                     }
                 }
@@ -136,7 +146,98 @@ fn def_wide_plan(resolved: &Value, def_id: &str) -> OutputPlan {
         }
     }
 
+    // Whole-output mappings LAST — a `kind: mcp` leaf's result IS the slot's
+    // value, with no field to nest it under, and a bare `{}` is what made
+    // `corpus_search`'s array-typed doc_evidence look like a contract violation.
+    //
+    // ONLY for a transition whose output comes ENTIRELY from the whole result.
+    // A transition routinely maps both ways at once —
+    //   output: { ready: "$.output.ready", report: "$.output" }
+    //   output: { d0_id: "$.output.deliverables.0.id", cohort: "$.output" }
+    // — and there the whole output IS the object the fields were planned into.
+    // Replacing it with a fresh dummy would erase those fields, breaking the
+    // downstream guards they exist to satisfy and dead-ending the chain. Leave
+    // the field-planned object alone; it already serves both mappings.
+    if let Some(states) = def.get("states").and_then(|s| s.as_object()) {
+        for state in states.values() {
+            if let Some(ts) = state.get("transitions").and_then(|t| t.as_object()) {
+                for (tname, tobj) in ts {
+                    if !output_field_paths(tobj).is_empty() {
+                        continue;
+                    }
+                    for slot in whole_output_slots(tobj) {
+                        let Some(schema) = def
+                            .pointer("/snippet/outputs")
+                            .or_else(|| def.pointer("/outputs"))
+                            .and_then(|o| o.get(&slot))
+                            .or_else(|| def.get("blackboard").and_then(|b| b.get(&slot)))
+                        else {
+                            continue;
+                        };
+                        let already_valid = plan.get(tname).is_some_and(|planned| {
+                            praxec_core::hop::validate_against_schema(schema, planned, &slot)
+                                .is_ok()
+                        });
+                        if !already_valid {
+                            plan.insert(
+                                tname.clone(),
+                                crate::analysis::dummy::dummy_for_schema(schema),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     plan
+}
+
+/// Seed the definition's DECLARED outputs (a capability's `snippet.outputs`, a
+/// nestable flow's top-level `outputs:`) into an isolated probe's synthetic
+/// context, whenever the probe hasn't already put a CONTRACT-VALID value there.
+///
+/// The per-transition prober fabricates a context, drops the workflow into ONE
+/// state, fires ONE edge, and lets the deterministic chain run wherever it goes
+/// — which is frequently straight to a terminal. But it seeds only the slots the
+/// probed transition *reads*, and it types those from the `blackboard:` block —
+/// which flows often don't declare at all, so the slot lands as the literal
+/// `"fuzz"`. Any declared output written by a state the probe skipped is missing
+/// outright. The runtime enforces the output contract at terminal (SPEC §5.3)
+/// and would rightly fail it, reporting a violation the DEFINITION does not
+/// have: an artifact of a fabricated history, not a defect.
+///
+/// So make the fabricated history plausible — a mid-flow context is one in which
+/// the states that "already ran" already wrote contract-valid outputs.
+///
+/// A value the probe DID choose deliberately (a guard-satisfying literal, e.g.
+/// `status == 'pass'`) is kept — but only if it satisfies the declared schema.
+/// If it doesn't, it can only be the untyped `"fuzz"` fallback, and keeping it
+/// would just re-create the false failure. Validity is judged with the same
+/// registry-aware compiler the runtime enforces the contract with, so this can't
+/// drift from the check it exists to keep honest.
+fn seed_declared_outputs(ctx: &mut Value, def: &Value) {
+    let Some(schemas) = def
+        .pointer("/snippet/outputs")
+        .or_else(|| def.pointer("/outputs"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let Some(map) = ctx.as_object_mut() else {
+        return;
+    };
+    for (name, schema) in schemas {
+        let keep = map
+            .get(name)
+            .is_some_and(|v| praxec_core::hop::validate_against_schema(schema, v, name).is_ok());
+        if !keep {
+            map.insert(
+                name.clone(),
+                crate::analysis::dummy::dummy_for_schema(schema),
+            );
+        }
+    }
 }
 
 /// Build a human principal (carries the "human" role the runtime checks for
@@ -281,7 +382,8 @@ pub async fn fuzz_transitions(
             })
         };
 
-        let sat_ctx = satisfying_context(tobj, &blackboard);
+        let mut sat_ctx = satisfying_context(tobj, &blackboard);
+        seed_declared_outputs(&mut sat_ctx, def);
         let executors: Arc<dyn ExecutorRegistry> =
             Arc::new(SmartMockRegistry::new(def_plan.clone()));
         let (rt, store, ack_store) = build_runtime(resolved, executors);
@@ -370,45 +472,47 @@ pub async fn fuzz_transitions(
         // ── Violating submit ──────────────────────────────────────────────────
         // Only run when a parseable violating context exists (i.e., there's an
         // expr guard we can flip).
-        let (viol_ok, viol_detail) = if let Some(viol_ctx) = violating_context(tobj, &blackboard) {
-            let executors2: Arc<dyn ExecutorRegistry> =
-                Arc::new(SmartMockRegistry::new(def_plan.clone()));
-            let (rt2, store2, ack_store2) = build_runtime(resolved, executors2);
+        let (viol_ok, viol_detail) =
+            if let Some(mut viol_ctx) = violating_context(tobj, &blackboard) {
+                seed_declared_outputs(&mut viol_ctx, def);
+                let executors2: Arc<dyn ExecutorRegistry> =
+                    Arc::new(SmartMockRegistry::new(def_plan.clone()));
+                let (rt2, store2, ack_store2) = build_runtime(resolved, executors2);
 
-            // For the violating path, do NOT pre-record guidance acks — we want
-            // to test that the guard blocks when not acknowledged. (The expr guard
-            // is what we're flipping; guidance_acknowledged stays as-is on the
-            // violating path.)
-            let viol_result = submit_isolated(
-                &rt2,
-                &store2,
-                &snapshot,
-                definition_id,
-                state,
-                viol_ctx,
-                workflow_input.clone(),
-                transition,
-                principal,
-                arguments_for(tobj),
-            )
-            .await?;
-            let _ = ack_store2; // suppress unused warning
+                // For the violating path, do NOT pre-record guidance acks — we want
+                // to test that the guard blocks when not acknowledged. (The expr guard
+                // is what we're flipping; guidance_acknowledged stays as-is on the
+                // violating path.)
+                let viol_result = submit_isolated(
+                    &rt2,
+                    &store2,
+                    &snapshot,
+                    definition_id,
+                    state,
+                    viol_ctx,
+                    workflow_input.clone(),
+                    transition,
+                    principal,
+                    arguments_for(tobj),
+                )
+                .await?;
+                let _ = ack_store2; // suppress unused warning
 
-            match viol_result {
-                SubmitResult::Rejected { .. } => (true, String::new()),
-                SubmitResult::Fired { to_state, .. } => (
-                    false,
-                    format!("guard did not reject a violating context (fired to '{to_state}')"),
-                ),
-                SubmitResult::Errored { code } => {
-                    // An error on the violating path is not a guard bypass;
-                    // treat as ok (the transition didn't fire).
-                    (true, format!("errored on violating (ok): {code}"))
+                match viol_result {
+                    SubmitResult::Rejected { .. } => (true, String::new()),
+                    SubmitResult::Fired { to_state, .. } => (
+                        false,
+                        format!("guard did not reject a violating context (fired to '{to_state}')"),
+                    ),
+                    SubmitResult::Errored { code } => {
+                        // An error on the violating path is not a guard bypass;
+                        // treat as ok (the transition didn't fire).
+                        (true, format!("errored on violating (ok): {code}"))
+                    }
                 }
-            }
-        } else {
-            (true, String::new())
-        };
+            } else {
+                (true, String::new())
+            };
 
         let ok = sat_ok && viol_ok;
         let detail = [sat_detail, viol_detail]

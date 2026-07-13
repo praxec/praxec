@@ -37,6 +37,23 @@ pub fn analyze_output(transition: &Value) -> Vec<(String, OutputSource)> {
         .collect()
 }
 
+/// Returns every context slot fed by the WHOLE executor result (`slot: "$.output"`).
+///
+/// This is the shape every `kind: mcp` leaf uses — the tool's result IS the
+/// value. It is not a `Field`: there is no sub-path to plan, the mock's entire
+/// output must be the slot's value. Callers that only understand `Field` will
+/// emit `{}` here, which fails any slot declared as an array/string/number.
+pub fn whole_output_slots(transition: &Value) -> Vec<String> {
+    let Some(output_obj) = transition.get("output").and_then(|v| v.as_object()) else {
+        return vec![];
+    };
+    output_obj
+        .iter()
+        .filter(|(_, val)| val.as_str() == Some("$.output"))
+        .map(|(slot, _)| slot.clone())
+        .collect()
+}
+
 /// Returns `(contextSlot, fullPathAfterOutput)` for every `slot: "$.output.<path>"` entry.
 ///
 /// Unlike [`analyze_output`], this preserves the FULL dotted path after `$.output.`, so
