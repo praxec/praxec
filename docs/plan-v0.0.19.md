@@ -7,7 +7,7 @@
 >
 > Outcome: V25/V26/V27 close the silent-scope class on both read and write sides;
 > each has a mutation operator that must kill it (live-pack mutation report 100%
-> across all twelve operators). V27 caught a real bug on first run (`plan_final:
+> across all fourteen operators). V27/V29 each caught a real bug on first run (`plan_final:
 > $.input.plan` dropping the operator's approved plan) plus two latent null-writes
 > in praxec's own test fixtures.
 
@@ -107,13 +107,18 @@ gate), or fail-fast at eval like `$.context.*` already does for an unset slot
 (`UnsetSlotError`). Lean fail-fast per doctrine, but it's a behavior change worth
 a deliberate call. Small; do it alongside H1.
 
-### H5 — FMECA sweep for silent-null / fail-open operand paths  ✅ DONE (→ V27)
+### H5 — FMECA sweep for silent-null / fail-open operand paths  ✅ DONE (→ V27, V28, V29 + executor fail-fast)
 
-H1 found one. The systematic version: audit every operand/path resolver
-(`guards.rs`, `mapping.rs`, `resolve_output_operand`) for `unwrap_or(Null)` /
-`unwrap_or_default()` on a *reference* that should have resolved, and classify
-each prevent → detect → fail-fast. Bounded, high-signal, matches the 0.0.12
-prod-readiness pass's method.
+Swept both the core AND executor crates. Every coalescing site is now closed —
+nothing left as a follow-on:
+- **write side** → V27 (`output:`/`onEnter.output:`/`prefill:`).
+- **use.inputs** → V28.
+- **executor `args:`/`map:`/`query:`/`body:`** → V29, plus runtime fail-fast in
+  `arg_render` (script/cli), `rest.rs` (query + body), and the legacy
+  sub-workflow `input:` path. `mcp.rs`/`parallel.rs` already fail-fast.
+- Confirmed bug found + fixed: `arg_render` documented `$.input.x` but shipped it
+  to the shell as a literal; 13 pack caps carried it. `$.input.*` is a bound scope
+  nowhere — canonical is `$.workflow.input.*`.
 
 ## Non-goals for 0.0.19
 
