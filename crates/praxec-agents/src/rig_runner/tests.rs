@@ -1703,3 +1703,138 @@ async fn without_a_sink_the_slow_call_still_completes_with_no_emission() {
     let report = runner.run(s).await.unwrap();
     assert!(matches!(report.outcome, AgentRunOutcome::Completed(_)));
 }
+
+// ── (CR#1) the sign-off ceremony ──────────────────────────────────────────
+
+/// The reasoning-model AGENT_NO_RESULT signature, in its UNSALVAGEABLE form:
+/// this model streams thinking text every turn and never calls a tool — not
+/// even when the runner restricts the turn to `final_answer` only (the existing
+/// `force_final` steer, which can only *offer* the tool because thinking-mode
+/// providers 400 on a forced `tool_choice`). It complies ONLY when the call is
+/// actually COMPELLED (`tool_choice = Required`), which is legal exactly because
+/// the ceremony turn disables reasoning.
+///
+/// Records (tool_choice, reasoning_was_set) per turn so the test can prove the
+/// ceremony turn is BOTH forced AND reasoning-disabled — the two are a package:
+/// force without reasoning-off is the 400 that made this unfixable before.
+struct ThinkingStallFactory {
+    seen: Mutex<Vec<(Option<rig::message::ToolChoice>, bool)>>,
+}
+#[async_trait]
+impl ProviderFactory for ThinkingStallFactory {
+    async fn stream(
+        &self,
+        _model: &str,
+        turn: TurnRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, String>>, ExecutorError> {
+        let forced = matches!(turn.tool_choice, Some(rig::message::ToolChoice::Required));
+        self.seen
+            .lock()
+            .unwrap()
+            .push((turn.tool_choice.clone(), turn.reasoning.is_some()));
+        let events = if forced {
+            // Compelled → it finally signs off the work it already did.
+            vec![
+                Ok(final_answer(
+                    r#"{"status":"success","output":{"patch":"applied"}}"#,
+                )),
+                Ok(done()),
+            ]
+        } else {
+            // Thinking out loud, forever. No final_answer, no tool call.
+            vec![
+                Ok(StreamEvent::Text {
+                    chunk: "Let me reconsider the approach...".into(),
+                }),
+                Ok(StreamEvent::Done { stop_reason: None }),
+            ]
+        };
+        Ok(Box::pin(stream::iter(events)))
+    }
+}
+
+/// THE CR#1 CEREMONY TEST. Before the fix this run was `AGENT_NO_RESULT`: the
+/// model did the work but never performed the sign-off ceremony, so a correct
+/// result was thrown away and the fix-loop chain-walked to the next model
+/// (silent churn, no state transition). Now the exhausted loop makes ONE final
+/// reasoning-disabled, tool-forced turn and the SAME model records its answer.
+#[tokio::test]
+async fn a_reasoning_model_that_never_calls_final_answer_is_forced_to_sign_off() {
+    let factory = Arc::new(ThinkingStallFactory {
+        seen: Mutex::new(vec![]),
+    });
+    let report = RigSessionRunner::new(factory.clone())
+        .run(session(vec![]))
+        .await
+        .unwrap();
+
+    match report.outcome {
+        AgentRunOutcome::Completed(r) => assert_eq!(
+            r.output["patch"], "applied",
+            "the work the model actually did must be recorded, not discarded"
+        ),
+        other => panic!("expected the sign-off ceremony to capture a result, got {other:?}"),
+    }
+
+    let seen = factory.seen.lock().unwrap().clone();
+    let (choice, reasoning_set) = seen.last().expect("at least one turn");
+    assert!(
+        matches!(choice, Some(rig::message::ToolChoice::Required)),
+        "the ceremony turn must COMPEL the call — merely offering `final_answer` \
+         is the steer that this model class already ignores"
+    );
+    assert!(
+        !reasoning_set,
+        "the ceremony turn must disable reasoning — a forced tool_choice on a \
+         thinking-mode request is a hard 400, which is precisely why the in-loop \
+         steer could never force the call"
+    );
+    // And every in-loop turn stayed unforced (thinking-safe).
+    assert!(
+        seen[..seen.len() - 1]
+            .iter()
+            .all(|(c, _)| !matches!(c, Some(rig::message::ToolChoice::Required))),
+        "no in-loop turn may force tool_choice — that would 400 the thinking models"
+    );
+}
+
+/// Graceful degradation (the no-regression guarantee): a model that thinks
+/// UNCONDITIONALLY rejects the forced `tool_choice` with a provider error even
+/// on the reasoning-disabled ceremony turn. The run must land on exactly the
+/// pre-fix outcome — `AGENT_NO_RESULT` — never a panic and never a fabricated
+/// success. The ceremony can only ever ADD a result, never invent one.
+struct ThinkAlwaysFactory;
+#[async_trait]
+impl ProviderFactory for ThinkAlwaysFactory {
+    async fn stream(
+        &self,
+        _model: &str,
+        turn: TurnRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, String>>, ExecutorError> {
+        if matches!(turn.tool_choice, Some(rig::message::ToolChoice::Required)) {
+            // The 400 that thinking-mode providers raise on a forced tool_choice.
+            return Err(ExecutorError::Permanent(
+                "tool_choice does not support being set to required in thinking mode".into(),
+            ));
+        }
+        Ok(Box::pin(stream::iter(vec![
+            Ok(StreamEvent::Text {
+                chunk: "thinking...".into(),
+            }),
+            Ok(StreamEvent::Done { stop_reason: None }),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn a_think_always_model_that_rejects_the_forced_sign_off_still_ends_as_no_result() {
+    let report = RigSessionRunner::new(Arc::new(ThinkAlwaysFactory))
+        .run(session(vec![]))
+        .await
+        .unwrap();
+    assert!(
+        matches!(report.outcome, AgentRunOutcome::NoResult),
+        "a failed ceremony must degrade to exactly the pre-fix outcome, got {:?}",
+        report.outcome
+    );
+}
