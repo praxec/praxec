@@ -4,7 +4,7 @@
 //! `Vec<(label, mutant)>` — one mutant per applicable injection site. The label
 //! is human-readable and uniquely identifies the site (used in reports).
 //!
-//! Twelve operators are provided:
+//! Fourteen operators are provided:
 //!
 //! | Operator                  | Kind       | Expected kill? | Detector           |
 //! |---------------------------|------------|----------------|--------------------|
@@ -18,6 +18,8 @@
 //! | weaken_output_source      | Contract   | KILLED         | V26 (scalar-null)  |
 //! | retarget_guard_scope      | Scope      | KILLED         | V25 (guard scope)  |
 //! | retarget_output_scope     | Scope      | KILLED         | V27 (write scope)  |
+//! | retarget_use_input_scope  | Scope      | KILLED         | V28 (use-input)    |
+//! | retarget_executor_arg_scope | Scope    | KILLED         | V29 (executor arg) |
 //! | delete_guard              | Semantic   | KILLED         | violating-ctx probe|
 //! | flip_guard_op             | Semantic   | KILLED         | violating-ctx probe|
 //!
@@ -741,6 +743,91 @@ pub fn drop_initial_context_seed(config: &Value) -> Vec<(String, Value)> {
     mutants
 }
 
+/// SCOPE — for each `use.inputs` value binding `$.workflow.input.<x>`, rewrite it
+/// to the bare `$.input.<x>` spelling `resolve_one` does NOT resolve. Killed by
+/// V28. (The compose-boundary read twin of the guard/output operators.)
+pub fn retarget_use_input_scope(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+    for (wf_id, state_name, t_name, t_def) in each_transition(config) {
+        let Some(inputs) = t_def
+            .pointer("/executor/use/inputs")
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (name, value) in inputs {
+            let Some(src) = value.as_str() else { continue };
+            if !src.starts_with("$.workflow.input.") {
+                continue;
+            }
+            let broken = src.replace("$.workflow.input.", "$.input.");
+            let label = format!("retarget_use_input_scope/{wf_id}/{state_name}/{t_name}/{name}");
+            let (wf_id_c, sn_c, tn_c, name_c) = (
+                wf_id.clone(),
+                state_name.clone(),
+                t_name.clone(),
+                name.clone(),
+            );
+            let mutant = mutate(config, |v| {
+                let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut) else {
+                    return;
+                };
+                if let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c)
+                    && let Some(inp) = td
+                        .get_mut("executor")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|e| e.get_mut("use"))
+                        .and_then(Value::as_object_mut)
+                        .and_then(|u| u.get_mut("inputs"))
+                        .and_then(Value::as_object_mut)
+                {
+                    inp.insert(name_c.clone(), Value::String(broken.clone()));
+                }
+            });
+            mutants.push((label, mutant));
+        }
+    }
+    mutants
+}
+
+/// SCOPE — for each executor `args:` entry binding `$.workflow.input.<x>`, rewrite
+/// it to the bare `$.input.<x>` spelling that reaches the shell as a literal.
+/// Killed by V29.
+pub fn retarget_executor_arg_scope(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+    for (wf_id, state_name, t_name, t_def) in each_transition(config) {
+        let Some(args) = t_def.pointer("/executor/args").and_then(Value::as_array) else {
+            continue;
+        };
+        for (i, arg) in args.iter().enumerate() {
+            let Some(src) = arg.as_str() else { continue };
+            if !src.starts_with("$.workflow.input.") {
+                continue;
+            }
+            let broken = src.replace("$.workflow.input.", "$.input.");
+            let label = format!("retarget_executor_arg_scope/{wf_id}/{state_name}/{t_name}/{i}");
+            let (wf_id_c, sn_c, tn_c) = (wf_id.clone(), state_name.clone(), t_name.clone());
+            let mutant = mutate(config, |v| {
+                let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut) else {
+                    return;
+                };
+                if let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c)
+                    && let Some(a) = td
+                        .get_mut("executor")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|e| e.get_mut("args"))
+                        .and_then(Value::as_array_mut)
+                        .and_then(|a| a.get_mut(i))
+                {
+                    *a = Value::String(broken.clone());
+                }
+            });
+            mutants.push((label, mutant));
+        }
+    }
+    mutants
+}
+
 /// SCOPE — for each `output:` mapping that writes a `$.workflow.input.<x>` value,
 /// rewrite it to the bare `$.input.<x>` spelling the write resolver does NOT
 /// resolve.
@@ -1086,6 +1173,8 @@ pub async fn mutation_score(resolved: &Value) -> anyhow::Result<MutationReport> 
         ("weaken_output_source", weaken_output_source),
         ("retarget_guard_scope", retarget_guard_scope),
         ("retarget_output_scope", retarget_output_scope),
+        ("retarget_use_input_scope", retarget_use_input_scope),
+        ("retarget_executor_arg_scope", retarget_executor_arg_scope),
         ("delete_guard", delete_guard),
         ("flip_guard_op", flip_guard_op),
     ];
@@ -1483,6 +1572,60 @@ mod tests {
                 .iter()
                 .any(|d| d.message().contains("UNRESOLVABLE_WRITE_SCOPE")),
             "the mutant must be killed by V27"
+        );
+    }
+
+    #[test]
+    fn retarget_use_input_scope_is_killed_by_v28() {
+        let cfg = json!({ "workflows": {
+            "cap.thing": { "verb": "review", "initialState": "s",
+                "snippet": { "inputs": { "x": { "type": "string" } }, "outputs": {} },
+                "states": { "s": { "transitions": { "go": {
+                    "target": "d", "actor": "deterministic", "executor": { "kind": "noop" } } } },
+                    "d": { "terminal": true } } },
+            "flow.h": { "initialState": "a", "states": {
+                "a": { "transitions": { "call": {
+                    "target": "d", "actor": "deterministic",
+                    "executor": { "kind": "workflow", "definitionId": "cap.thing",
+                        "use": { "inputs": { "x": "$.workflow.input.src" }, "outputs": {} } } } } },
+                "d": { "terminal": true } } }
+        }});
+        let mutants = retarget_use_input_scope(&cfg);
+        assert_eq!(mutants.len(), 1, "one use.inputs binding to retarget");
+        assert!(
+            praxec_core::validate::validate_workflows(&mutants[0].1)
+                .iter()
+                .any(|d| d.message().contains("UNRESOLVABLE_USE_INPUT_SCOPE")),
+            "must be killed by V28"
+        );
+    }
+
+    #[test]
+    fn retarget_executor_arg_scope_is_killed_by_v29() {
+        let cfg = json!({ "workflows": { "wf": {
+            "initialState": "s",
+            "states": {
+                "s": { "transitions": { "go": {
+                    "target": "d", "actor": "deterministic",
+                    "executor": { "kind": "script", "subject": "x",
+                                  "args": ["$.workflow.input.path"] } } } },
+                "d": { "terminal": true }
+            }
+        }}});
+        let mutants = retarget_executor_arg_scope(&cfg);
+        assert_eq!(mutants.len(), 1, "one executor arg to retarget");
+        assert_eq!(
+            mutants[0]
+                .1
+                .pointer("/workflows/wf/states/s/transitions/go/executor/args/0")
+                .and_then(Value::as_str),
+            Some("$.input.path")
+        );
+        assert!(
+            praxec_core::validate::validate_workflows(&mutants[0].1)
+                .iter()
+                .any(|d| d.message().contains("UNRESOLVABLE_EXECUTOR_ARG_SCOPE")),
+            "must be killed by V29"
         );
     }
 

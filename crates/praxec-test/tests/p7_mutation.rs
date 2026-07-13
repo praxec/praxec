@@ -253,6 +253,8 @@ async fn p7_cog_arch_mutation_report() {
             "weaken_output_source" => "← V26 scalar-null",
             "retarget_guard_scope" => "← V25 guard scope",
             "retarget_output_scope" => "← V27 write scope",
+            "retarget_use_input_scope" => "← V28 use-input",
+            "retarget_executor_arg_scope" => "← V29 executor-arg",
             // Once documented blind spots. The per-transition fuzz submits a
             // deliberately VIOLATING context to every edge and asserts the guard
             // rejects it, so a deleted/flipped guard is now caught, not survived.

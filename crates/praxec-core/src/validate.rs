@@ -269,6 +269,11 @@ fn validate_one_workflow(
     // writes that Null to the blackboard. Reject those shapes at load so a
     // typo'd operator can't masquerade as a real (null) value at runtime.
     validate_output_operator_shapes(id, def, out);
+    // SPEC §5.3, V29 — executor `args:`/`map:`/`query:`/`body:` path strings must
+    // name a resolvable scope; an unrecognized one (`$.input.x`) reaches the
+    // shell/tool/endpoint as a literal or a null. The prevent layer for the
+    // executor-side coalescing the runtime now fails fast on.
+    validate_executor_arg_scopes(id, def, out);
     // Spec A §7.1 — the fan-in composition check for `kind: parallel` steps.
     // Proves at LOAD that the reduce (aggregator) consumes only what the map
     // produces: every field the reduce requires must be satisfiable from the
@@ -1781,6 +1786,30 @@ fn validate_use_block_shape(id: &str, location: &str, use_val: &Value, out: &mut
             )));
         }
     }
+    // V28 — UNRESOLVABLE_USE_INPUT_SCOPE. A `use.inputs` value is resolved at
+    // spawn time by `use_binding::resolve_one` → `read_in_scopes(.., None)`, which
+    // knows only `$.context.*`, `$.arguments.*`, `$.workflow.input.*` (no
+    // executor output exists yet, so `$.output.*` and `$` are absent too). An
+    // unrecognized `$.`-rooted scope coalesces to null and silently seeds the
+    // child with it. Reject at load — the read-side twin of V25/V27, on the
+    // compose boundary.
+    if let Some(inputs) = obj.get("inputs").and_then(Value::as_object) {
+        for (name, value) in inputs {
+            for operand in write_operand_strings(value) {
+                if crate::guards::is_rooted_operand(operand)
+                    && !is_resolvable_use_input_scope(operand)
+                {
+                    out.push(Diagnostic::Error(format!(
+                        "UNRESOLVABLE_USE_INPUT_SCOPE: workflow '{id}' {location} \
+                         use.inputs[{name}] operand '{operand}' names no resolvable scope — at \
+                         spawn time only `$.context.*`, `$.arguments.*`, and `$.workflow.input.*` \
+                         resolve (no executor output exists yet); anything else coalesces to null. \
+                         (SPEC §6.1, V28)"
+                    )));
+                }
+            }
+        }
+    }
     // V12 (shape half): every use.outputs value must be a string naming a
     // capability output, every key must match `$.context.<simple-name>`.
     if let Some(outputs) = obj.get("outputs").and_then(Value::as_object) {
@@ -1802,6 +1831,93 @@ fn validate_use_block_shape(id: &str, location: &str, use_val: &Value, out: &mut
             }
         }
     }
+}
+
+/// SPEC §5.3, V29 — UNRESOLVABLE_EXECUTOR_ARG_SCOPE.
+///
+/// Executor `args:` (script/cli), `map:` (mcp), and `query:` / `body:` (rest) are
+/// resolved by `read_in_scopes(.., None)` — the same {context, arguments,
+/// workflow.input} set as `use.inputs`, with no executor output at bind time. An
+/// unrecognized `$.`-rooted scope (`$.input.gateway_config_path`) either reaches
+/// the shell/tool/endpoint as its literal token or seeds a null. The runtime now
+/// fails fast on it; this is the load-time prevent that catches it at
+/// `praxec check`, the read-side companion to V27's write side.
+fn validate_executor_arg_scopes(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
+    let Some(states) = def.get("states").and_then(Value::as_object) else {
+        return;
+    };
+    for (state_name, state_def) in states {
+        let Some(transitions) = state_def.pointer("/transitions").and_then(Value::as_object) else {
+            continue;
+        };
+        for (t_name, t_def) in transitions {
+            let Some(exec) = t_def.get("executor") else {
+                continue;
+            };
+            let loc = |field: &str| format!("state '{state_name}' transition '{t_name}' {field}");
+            // script/cli `args:` — array of path strings.
+            if let Some(args) = exec.get("args").and_then(Value::as_array) {
+                for a in args {
+                    check_arg_scope(id, &loc("args"), a, out);
+                }
+            }
+            // mcp `map:` / rest `query:` — object of path strings.
+            for field in ["map", "query"] {
+                if let Some(obj) = exec.get(field).and_then(Value::as_object) {
+                    for v in obj.values() {
+                        check_arg_scope(id, &loc(field), v, out);
+                    }
+                }
+            }
+            // rest `body:` — an arbitrary template tree; recurse into every string.
+            if let Some(body) = exec.get("body") {
+                check_arg_scope_tree(id, &loc("body"), body, out);
+            }
+        }
+    }
+}
+
+/// Flag a single executor-arg value if it is a `$.`-rooted string naming no
+/// resolvable executor-arg scope.
+fn check_arg_scope(id: &str, loc: &str, value: &Value, out: &mut Vec<Diagnostic>) {
+    let Some(s) = value.as_str() else { return };
+    if crate::guards::is_rooted_operand(s) && !is_resolvable_use_input_scope(s) {
+        out.push(Diagnostic::Error(format!(
+            "UNRESOLVABLE_EXECUTOR_ARG_SCOPE: workflow '{id}' {loc}: operand '{s}' names no \
+             resolvable scope — executor args resolve against `$.context.*`, `$.arguments.*`, and \
+             `$.workflow.input.*` only (note: `$.input.*` is NOT `$.workflow.input.*`). It would \
+             reach the tool as a literal or a null (SPEC §5.3, V29)"
+        )));
+    }
+}
+
+/// Recurse an rest-`body:` template tree, checking every leaf string.
+fn check_arg_scope_tree(id: &str, loc: &str, value: &Value, out: &mut Vec<Diagnostic>) {
+    match value {
+        Value::String(_) => check_arg_scope(id, loc, value, out),
+        Value::Array(arr) => {
+            for v in arr {
+                check_arg_scope_tree(id, loc, v, out);
+            }
+        }
+        Value::Object(obj) => {
+            for v in obj.values() {
+                check_arg_scope_tree(id, loc, v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The scopes `use_binding::resolve_one` resolves a `use.inputs` value against:
+/// `$.context.*`, `$.arguments.*`, `$.workflow.input.*`. NOT `$.output`/`$` —
+/// there is no executor output at spawn time. Deliberately a strict subset of
+/// [`crate::mapping::is_resolvable_write_scope`]; a V28 test pins the difference.
+fn is_resolvable_use_input_scope(s: &str) -> bool {
+    let s = s.trim();
+    s.starts_with("$.context.")
+        || s.starts_with("$.arguments.")
+        || s.starts_with("$.workflow.input.")
 }
 
 /// Mirror of `crate::config::host_path_tail` — accept iff the path matches
@@ -3603,6 +3719,116 @@ mod tests {
         })));
         assert_eq!(d.len(), 1, "{d:?}");
         assert!(d[0].contains("$.contxt.counter"), "{}", d[0]);
+    }
+
+    // ── V28 — UNRESOLVABLE_USE_INPUT_SCOPE ───────────────────────────────────
+
+    fn use_input_workflow(inputs: Value) -> Value {
+        json!({ "workflows": {
+            "cap.thing": { "verb": "review", "initialState": "s",
+                "snippet": { "inputs": { "x": { "type": "string" } }, "outputs": {} },
+                "states": { "s": { "transitions": { "go": {
+                    "target": "done", "actor": "deterministic", "executor": { "kind": "noop" } } } },
+                    "done": { "terminal": true } } },
+            "flow.host": { "initialState": "a",
+                "states": {
+                    "a": { "transitions": { "call": {
+                        "target": "done", "actor": "deterministic",
+                        "executor": { "kind": "workflow", "definitionId": "cap.thing",
+                            "use": { "inputs": inputs, "outputs": {} } } } } },
+                    "done": { "terminal": true } } }
+        }})
+    }
+
+    fn v28_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("UNRESOLVABLE_USE_INPUT_SCOPE"))
+            .collect()
+    }
+
+    #[test]
+    fn v28_rejects_a_use_input_from_an_unresolvable_scope() {
+        // `$.output.*` in use.inputs — no executor output exists at spawn time.
+        let d = v28_errors(&use_input_workflow(json!({ "x": "$.output.foo" })));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("$.output.foo"), "{}", d[0]);
+    }
+
+    #[test]
+    fn v28_accepts_the_spawn_time_scopes() {
+        for scope in ["$.context.x", "$.arguments.y", "$.workflow.input.z"] {
+            let d = v28_errors(&use_input_workflow(json!({ "x": scope })));
+            assert!(d.is_empty(), "{scope} should be accepted: {d:?}");
+        }
+    }
+
+    // ── V29 — UNRESOLVABLE_EXECUTOR_ARG_SCOPE ────────────────────────────────
+
+    fn v29_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("UNRESOLVABLE_EXECUTOR_ARG_SCOPE"))
+            .collect()
+    }
+
+    fn script_arg_workflow(args: Value) -> Value {
+        json!({ "workflows": { "wf": {
+            "initialState": "s",
+            "states": {
+                "s": { "transitions": { "go": {
+                    "target": "done", "actor": "deterministic",
+                    "executor": { "kind": "script", "subject": "x", "args": args } } } },
+                "done": { "terminal": true }
+            }
+        }}})
+    }
+
+    #[test]
+    fn v29_rejects_an_arg_from_the_bare_input_scope() {
+        // The real bug: `$.input.x` in a script arg (not `$.workflow.input.x`).
+        let d = v29_errors(&script_arg_workflow(json!(["$.input.gateway_config_path"])));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("$.input.gateway_config_path"), "{}", d[0]);
+    }
+
+    #[test]
+    fn v29_accepts_valid_arg_scopes_and_literals() {
+        let d = v29_errors(&script_arg_workflow(json!([
+            "$.workflow.input.x",
+            "$.context.y",
+            "$.arguments.z",
+            "--a-literal-flag"
+        ])));
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn v29_checks_mcp_map_and_rest_body() {
+        let cfg = json!({ "workflows": { "wf": {
+            "initialState": "s",
+            "states": {
+                "s": { "transitions": {
+                    "m": { "target": "done", "actor": "deterministic",
+                           "executor": { "kind": "mcp", "connection": "c", "tool": "t",
+                                         "map": { "p": "$.input.bad" } } },
+                    "b": { "target": "done", "actor": "deterministic",
+                           "executor": { "kind": "rest", "connection": "c",
+                                         "body": { "nested": { "f": "$.input.also_bad" } } } }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        let d = v29_errors(&cfg);
+        assert_eq!(
+            d.len(),
+            2,
+            "both the map and the nested body operand: {d:?}"
+        );
     }
 
     #[test]

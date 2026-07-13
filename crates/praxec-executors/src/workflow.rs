@@ -257,7 +257,7 @@ impl Executor for WorkflowExecutor {
                             .get("input")
                             .cloned()
                             .unwrap_or_else(|| json!({}));
-                        resolve_input(&input, &request.workflow.context, &request.arguments)
+                        resolve_input(&input, &request.workflow.context, &request.arguments)?
                     }
                 };
 
@@ -647,28 +647,33 @@ async fn emit_cap_terminated(
         .unwrap_or_else(|e| tracing::warn!(error = %e, "audit emit failed; event dropped"));
 }
 
-fn resolve_input(input: &Value, context: &Value, arguments: &Value) -> Value {
+fn resolve_input(
+    input: &Value,
+    context: &Value,
+    arguments: &Value,
+) -> Result<Value, ExecutorError> {
     match input {
         Value::String(s) if s.starts_with("$.") => {
+            // CMP-006 (executors): a legacy `$.` sub-workflow input that fails to
+            // resolve used to seed the child with null (with a warn). That silently
+            // hands the child a wrong (null) input. Fail fast — a `$.`-rooted input
+            // that doesn't resolve is an authoring bug, not a null seed.
             praxec_core::mapping::read_in_scopes(s, arguments, context, &json!({}), None)
-                .unwrap_or_else(|| {
-                    // CMP-006 (executors): a legacy `$.` sub-workflow input that
-                    // fails to resolve seeds the child with null. That's a likely
-                    // authoring typo, so warn rather than let it vanish silently.
-                    tracing::warn!(
-                        reference = %s,
-                        "legacy sub-workflow input reference did not resolve; seeding child input with null"
-                    );
-                    Value::Null
+                .ok_or_else(|| {
+                    ExecutorError::Permanent(format!(
+                        "SUBWORKFLOW_INPUT_UNRESOLVED: legacy `input:` reference '{s}' did not \
+                         resolve against the available scopes (arguments / context). Refusing to \
+                         seed the child with null."
+                    ))
                 })
         }
         Value::Object(map) => {
             let mut resolved = serde_json::Map::new();
             for (k, v) in map {
-                resolved.insert(k.clone(), resolve_input(v, context, arguments));
+                resolved.insert(k.clone(), resolve_input(v, context, arguments)?);
             }
-            Value::Object(resolved)
+            Ok(Value::Object(resolved))
         }
-        other => other.clone(),
+        other => Ok(other.clone()),
     }
 }

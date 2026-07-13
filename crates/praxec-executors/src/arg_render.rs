@@ -1,10 +1,14 @@
 //! Shared argument templating for the `cli` and `script` executors.
 //!
 //! Both kinds materialize their argv from a config array, where each entry is
-//! either a literal string or a `$.context.x` / `$.arguments.x` / `$.input.x`
-//! path that resolves against the request's blackboard / args / input scopes.
-//! The two executors had byte-identical copies of this helper; this is the
-//! single source of truth.
+//! either a literal string or a `$.context.x` / `$.arguments.x` /
+//! `$.workflow.input.x` path that resolves against the request's blackboard /
+//! args / input scopes. The two executors had byte-identical copies of this
+//! helper; this is the single source of truth.
+//!
+//! NOTE: the resolvable scope in an arg is `$.workflow.input.*`, NOT bare
+//! `$.input.*` — `$.input.*` names no arg scope and used to slip through to the
+//! shell as its literal token. See `is_scope_path`.
 
 use praxec_core::error::ExecutorError;
 use praxec_core::mapping::read_in_scopes;
@@ -49,16 +53,18 @@ pub(crate) fn render_arg(value: &Value, request: &ExecuteRequest) -> Result<Stri
     Ok(raw.to_string())
 }
 
-/// True iff `raw` matches a `$.<scope>.…` path grammar for one of the scopes
-/// arg-rendering actually provides (arguments / context / workflow.input).
-/// `$.output.*` is intentionally excluded: cli/script arg rendering passes no
-/// executor-output scope, so an `$.output` reference here was never resolvable
-/// and is treated as a plain literal (out of FALLBACK-01 scope — keep it
-/// surgical to `$.context` / `$.arguments` / `$.workflow.input`).
+/// True iff `raw` LOOKS like a `$.`-rooted path expression (as opposed to a plain
+/// literal flag). Any such token that failed to resolve is a FALLBACK-01 error,
+/// not a silent literal pass-through.
+///
+/// This is deliberately broad — ANY `$.`-rooted token, not just the three
+/// resolvable arg scopes. The narrow version silently passed an unresolvable but
+/// path-SHAPED token (`$.input.gateway_config_path`, an `$.output.*` used where no
+/// executor output exists, a typo'd `$.contxt.x`) straight to the shell as its
+/// literal text. A token an author wrote as `$.<something>` is always a path
+/// attempt; if it didn't resolve, that's a bug to surface, never a flag to run.
 fn is_scope_path(raw: &str) -> bool {
-    raw.starts_with("$.arguments.")
-        || raw.starts_with("$.context.")
-        || raw.starts_with("$.workflow.input.")
+    raw.starts_with("$.") || raw == "$"
 }
 
 #[cfg(test)]
@@ -139,5 +145,29 @@ mod tests {
         let r = req(json!({}), json!({}));
         let out = render_arg(&json!(42), &r).expect("number literal");
         assert_eq!(out, "42");
+    }
+
+    #[test]
+    fn bare_dollar_input_is_an_error_not_a_literal() {
+        // `$.input.x` is NOT a resolvable arg scope (the scope is
+        // `$.workflow.input.x`). It used to slip through to the shell as its
+        // literal token; now it fails fast.
+        let mut r = req(json!({}), json!({}));
+        r.workflow.input = json!({ "x": "val" });
+        let err = render_arg(&json!("$.input.x"), &r).expect_err("must error");
+        assert!(
+            matches!(&err, ExecutorError::Permanent(m) if m.contains("$.input.x")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn workflow_input_path_resolves() {
+        let mut r = req(json!({}), json!({}));
+        r.workflow.input = json!({ "x": "val" });
+        assert_eq!(
+            render_arg(&json!("$.workflow.input.x"), &r).expect("resolves"),
+            "val"
+        );
     }
 }
