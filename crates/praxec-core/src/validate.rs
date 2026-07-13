@@ -2417,6 +2417,44 @@ fn check_mapping_object(
                  (FALLBACK-05)."
             )));
         }
+        // V27 — UNRESOLVABLE_WRITE_SCOPE. Every `$.`-rooted string operand (the
+        // value itself, or an operand inside an arithmetic operator array) must
+        // name a scope `read_in_scopes` resolves. An unrecognized scope
+        // (a typo'd `$.outpt.plan`, a `$.input.x`) coalesces to null and silently
+        // writes it — the write-side twin of the guard's UNRESOLVABLE_GUARD_SCOPE.
+        for operand in write_operand_strings(spec) {
+            if crate::guards::is_rooted_operand(operand)
+                && !crate::mapping::is_resolvable_write_scope(operand)
+            {
+                out.push(Diagnostic::Error(format!(
+                    "UNRESOLVABLE_WRITE_SCOPE: workflow '{id}' state '{state_name}' {where_} key \
+                     '{key}': operand '{operand}' names no resolvable scope — it would coalesce to \
+                     null and silently write it. Use `$.context.*`, `$.output[.*]`, \
+                     `$.arguments.*`, `$.workflow.input.*`, or `$` (SPEC §5.3, V27)"
+                )));
+            }
+        }
+    }
+}
+
+/// The `$.`-rooted string operands a write-mapping value carries: the value
+/// itself when it is a bare path string, or the string operands inside a
+/// single-key arithmetic operator array (`{ add: ["$.context.n", 1] }`). Literals
+/// and nested non-operator objects carry none.
+fn write_operand_strings(spec: &Value) -> Vec<&str> {
+    match spec {
+        Value::String(s) => vec![s.as_str()],
+        Value::Object(obj) if obj.len() == 1 => {
+            let (op, args) = obj.iter().next().expect("len()==1");
+            match op.as_str() {
+                "add" | "subtract" | "multiply" | "divide" | "concat" => args
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -3502,6 +3540,69 @@ mod tests {
             v26_warnings(&scalar_output_cap(true, false)).is_empty(),
             "marking the source required clears V26"
         );
+    }
+
+    // ── V27 — UNRESOLVABLE_WRITE_SCOPE ───────────────────────────────────────
+
+    fn output_mapping_workflow(output: Value) -> Value {
+        json!({ "workflows": { "wf": {
+            "initialState": "start",
+            "states": {
+                "start": { "transitions": { "go": {
+                    "target": "done", "actor": "deterministic",
+                    "executor": { "kind": "noop" },
+                    "output": output
+                }}},
+                "done": { "terminal": true }
+            }
+        }}})
+    }
+
+    fn v27_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("UNRESOLVABLE_WRITE_SCOPE"))
+            .collect()
+    }
+
+    #[test]
+    fn v27_rejects_an_output_writing_from_an_unresolvable_scope() {
+        // `$.input.plan` — the write-side twin of the guard bug, caught in the
+        // SAME cap the guard fix touched.
+        let d = v27_errors(&output_mapping_workflow(
+            json!({ "plan_final": "$.input.plan" }),
+        ));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("$.input.plan"), "{}", d[0]);
+    }
+
+    #[test]
+    fn v27_accepts_every_valid_write_scope() {
+        let d = v27_errors(&output_mapping_workflow(json!({
+            "a": "$.context.x",
+            "b": "$.output.y",
+            "c": "$.arguments.z",
+            "d": "$.workflow.input.w",
+            "e": "$",
+            "lit": "a literal string",
+            "num": 42
+        })));
+        assert!(
+            d.is_empty(),
+            "no valid write scope should be flagged: {d:?}"
+        );
+    }
+
+    #[test]
+    fn v27_checks_arithmetic_operator_operands() {
+        // A typo'd scope inside `{ add: [...] }` silently becomes 0 at runtime.
+        let d = v27_errors(&output_mapping_workflow(json!({
+            "n": { "add": ["$.contxt.counter", 1] }
+        })));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("$.contxt.counter"), "{}", d[0]);
     }
 
     #[test]

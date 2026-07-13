@@ -49,7 +49,7 @@ fn undeclared_output_slot_warns() {
                         "transitions": {
                             "done": {
                                 "target": "finish",
-                                "output": { "typo": "$.result.value" }
+                                "output": { "typo": "$.output.value" }
                             }
                         }
                     },
@@ -85,7 +85,7 @@ fn undeclared_output_slot_warns_object_form() {
                         "transitions": {
                             "done": {
                                 "target": "finish",
-                                "output": { "typo": "$.result.value" }
+                                "output": { "typo": "$.output.value" }
                             }
                         }
                     },
@@ -202,7 +202,7 @@ fn declared_blackboard_accepted() {
                         "transitions": {
                             "done": {
                                 "target": "finish",
-                                "output": { "lintPassed": "$.result.value" }
+                                "output": { "lintPassed": "$.output.value" }
                             }
                         }
                     },
@@ -233,7 +233,7 @@ fn no_blackboard_declared_no_warning() {
                         "transitions": {
                             "done": {
                                 "target": "finish",
-                                "output": { "anyKey": "$.result.value" }
+                                "output": { "anyKey": "$.output.value" }
                             }
                         }
                     },
@@ -502,7 +502,7 @@ fn guard_reading_slot_with_reachable_writer_clean() {
                         "transitions": {
                             "done": {
                                 "target": "gate",
-                                "output": { "lintPassed": "$.result.value" }
+                                "output": { "lintPassed": "$.output.value" }
                             }
                         }
                     },
@@ -674,7 +674,7 @@ fn ontimeout_target_inherits_writers_from_any_reachable_state() {
                         "transitions": {
                             "done": {
                                 "target": "deploy",
-                                "output": { "lintPassed": "$.result.value" }
+                                "output": { "lintPassed": "$.output.value" }
                             }
                         }
                     },

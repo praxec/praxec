@@ -4,7 +4,7 @@
 //! `Vec<(label, mutant)>` — one mutant per applicable injection site. The label
 //! is human-readable and uniquely identifies the site (used in reports).
 //!
-//! Eleven operators are provided:
+//! Twelve operators are provided:
 //!
 //! | Operator                  | Kind       | Expected kill? | Detector           |
 //! |---------------------------|------------|----------------|--------------------|
@@ -17,6 +17,7 @@
 //! | drop_initial_context_seed | Contract   | KILLED         | V24 (must-write)   |
 //! | weaken_output_source      | Contract   | KILLED         | V26 (scalar-null)  |
 //! | retarget_guard_scope      | Scope      | KILLED         | V25 (guard scope)  |
+//! | retarget_output_scope     | Scope      | KILLED         | V27 (write scope)  |
 //! | delete_guard              | Semantic   | KILLED         | violating-ctx probe|
 //! | flip_guard_op             | Semantic   | KILLED         | violating-ctx probe|
 //!
@@ -740,6 +741,49 @@ pub fn drop_initial_context_seed(config: &Value) -> Vec<(String, Value)> {
     mutants
 }
 
+/// SCOPE — for each `output:` mapping that writes a `$.workflow.input.<x>` value,
+/// rewrite it to the bare `$.input.<x>` spelling the write resolver does NOT
+/// resolve.
+///
+/// The write-side twin of [`retarget_guard_scope`]. `$.input.*` coalesces to
+/// `null` in `resolve_value` and silently writes it — the bug V27
+/// (`UNRESOLVABLE_WRITE_SCOPE`) exists to catch. Before V27 it survived silently.
+pub fn retarget_output_scope(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+
+    for (wf_id, state_name, t_name, t_def) in each_transition(config) {
+        let Some(output) = t_def.get("output").and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, spec) in output {
+            let Some(src) = spec.as_str() else { continue };
+            if !src.starts_with("$.workflow.input.") {
+                continue;
+            }
+            let broken = src.replace("$.workflow.input.", "$.input.");
+            let label = format!("retarget_output_scope/{wf_id}/{state_name}/{t_name}/{key}");
+            let (wf_id_c, sn_c, tn_c, key_c) = (
+                wf_id.clone(),
+                state_name.clone(),
+                t_name.clone(),
+                key.clone(),
+            );
+            let mutant = mutate(config, |v| {
+                let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut) else {
+                    return;
+                };
+                if let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c)
+                    && let Some(o) = td.get_mut("output").and_then(Value::as_object_mut)
+                {
+                    o.insert(key_c.clone(), Value::String(broken.clone()));
+                }
+            });
+            mutants.push((label, mutant));
+        }
+    }
+    mutants
+}
+
 /// SCOPE — for each `expr` guard reading `$.workflow.input.<x>`, rewrite it to the
 /// bare `$.input.<x>` spelling the guard evaluator does NOT resolve.
 ///
@@ -1041,6 +1085,7 @@ pub async fn mutation_score(resolved: &Value) -> anyhow::Result<MutationReport> 
         ("drop_initial_context_seed", drop_initial_context_seed),
         ("weaken_output_source", weaken_output_source),
         ("retarget_guard_scope", retarget_guard_scope),
+        ("retarget_output_scope", retarget_output_scope),
         ("delete_guard", delete_guard),
         ("flip_guard_op", flip_guard_op),
     ];
@@ -1404,6 +1449,40 @@ mod tests {
                 .iter()
                 .any(|d| d.message().contains("UNRESOLVABLE_GUARD_SCOPE")),
             "the mutant must be killed by V25"
+        );
+    }
+
+    #[test]
+    fn retarget_output_scope_breaks_input_writes_and_is_killed_by_v27() {
+        let cfg = json!({ "workflows": { "wf": {
+            "initialState": "start",
+            "states": {
+                "start": { "transitions": {
+                    "go": { "target": "done", "actor": "deterministic", "executor": { "kind": "noop" },
+                            "output": { "plan_final": "$.workflow.input.plan" } }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        let mutants = retarget_output_scope(&cfg);
+        assert_eq!(
+            mutants.len(),
+            1,
+            "one input-scoped output write to retarget"
+        );
+        let (_l, mutant) = &mutants[0];
+        assert_eq!(
+            mutant
+                .pointer("/workflows/wf/states/start/transitions/go/output/plan_final")
+                .and_then(Value::as_str),
+            Some("$.input.plan"),
+            "rewritten to the dead spelling"
+        );
+        assert!(
+            praxec_core::validate::validate_workflows(mutant)
+                .iter()
+                .any(|d| d.message().contains("UNRESOLVABLE_WRITE_SCOPE")),
+            "the mutant must be killed by V27"
         );
     }
 
