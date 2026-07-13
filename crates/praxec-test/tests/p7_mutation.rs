@@ -250,6 +250,7 @@ async fn p7_cog_arch_mutation_report() {
                 "← structural / validate"
             }
             "drop_output_write" | "drop_initial_context_seed" => "← V24 must-write",
+            "weaken_output_source" => "← V26 scalar-null",
             "retarget_guard_scope" => "← V25 guard scope",
             // Once documented blind spots. The per-transition fuzz submits a
             // deliberately VIOLATING context to every edge and asserts the guard

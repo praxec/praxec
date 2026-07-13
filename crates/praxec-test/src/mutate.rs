@@ -4,7 +4,7 @@
 //! `Vec<(label, mutant)>` — one mutant per applicable injection site. The label
 //! is human-readable and uniquely identifies the site (used in reports).
 //!
-//! Nine operators are provided:
+//! Eleven operators are provided:
 //!
 //! | Operator                  | Kind       | Expected kill? | Detector           |
 //! |---------------------------|------------|----------------|--------------------|
@@ -15,6 +15,7 @@
 //! | literal_type_break        | Type       | KILLED         | runtime type check |
 //! | drop_output_write         | Contract   | KILLED         | V24 (must-write)   |
 //! | drop_initial_context_seed | Contract   | KILLED         | V24 (must-write)   |
+//! | weaken_output_source      | Contract   | KILLED         | V26 (scalar-null)  |
 //! | retarget_guard_scope      | Scope      | KILLED         | V25 (guard scope)  |
 //! | delete_guard              | Semantic   | KILLED         | violating-ctx probe|
 //! | flip_guard_op             | Semantic   | KILLED         | violating-ctx probe|
@@ -48,6 +49,8 @@
 //! path separator, so `pointer_mut("/workflows/cognitive/cap...")` silently
 //! mis-navigates. All mutations use direct `Map::get_mut` calls on the
 //! `workflows` object to avoid this.
+
+use std::collections::HashSet;
 
 use serde_json::{Map, Value, json};
 
@@ -572,6 +575,124 @@ pub fn drop_output_write(config: &Value) -> Vec<(String, Value)> {
     mutants
 }
 
+/// CONTRACT — remove the `required`/`default` that keeps a scalar output's source
+/// argument non-null.
+///
+/// The operator that proves V26. A declared scalar output sourced from an agent
+/// argument is safe only while that argument is `required` or has a `default`.
+/// Strip that safety and the output can land null at terminal — the exact
+/// "written-but-nullable" class V26 warns on. It must be caught; before V26 it
+/// survived silently, which is the whole reason to model it.
+pub fn weaken_output_source(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+    let Some(wfs) = config.pointer("/workflows").and_then(Value::as_object) else {
+        return mutants;
+    };
+
+    for (wf_id, wf_def) in wfs {
+        // Declared SCALAR outputs of this workflow.
+        let Some(declared) = wf_def
+            .pointer("/snippet/outputs")
+            .or_else(|| wf_def.pointer("/outputs"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let scalar: HashSet<&str> = declared
+            .iter()
+            .filter(|(_, s)| {
+                matches!(
+                    s.get("type").and_then(Value::as_str),
+                    Some("string" | "integer" | "number" | "boolean")
+                )
+            })
+            .map(|(n, _)| n.as_str())
+            .collect();
+        if scalar.is_empty() {
+            continue;
+        }
+        let Some(states) = wf_def.pointer("/states").and_then(Value::as_object) else {
+            continue;
+        };
+
+        for (state_name, state_def) in states {
+            let Some(transitions) = state_def.pointer("/transitions").and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for (t_name, t_def) in transitions {
+                let Some(output) = t_def.pointer("/output").and_then(Value::as_object) else {
+                    continue;
+                };
+                for (out_slot, src) in output {
+                    if !scalar.contains(out_slot.as_str()) {
+                        continue;
+                    }
+                    let Some(field) = src
+                        .as_str()
+                        .and_then(|s| s.strip_prefix("$.arguments."))
+                        .filter(|f| !f.contains('.'))
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    // Only a currently-SAFE source is worth weakening (an
+                    // already-optional one would just re-warn what V26 caught).
+                    let is_required = t_def
+                        .pointer("/inputSchema/required")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().any(|v| v.as_str() == Some(field.as_str())))
+                        .unwrap_or(false);
+                    let has_default = t_def
+                        .pointer(&format!("/inputSchema/properties/{field}/default"))
+                        .is_some();
+                    if !is_required && !has_default {
+                        continue;
+                    }
+
+                    let label =
+                        format!("weaken_output_source/{wf_id}/{state_name}/{t_name}/{field}");
+                    let (wf_id_c, sn_c, tn_c, field_c) = (
+                        wf_id.clone(),
+                        state_name.clone(),
+                        t_name.clone(),
+                        field.clone(),
+                    );
+                    let mutant = mutate(config, |v| {
+                        let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut)
+                        else {
+                            return;
+                        };
+                        let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c) else {
+                            return;
+                        };
+                        let Some(schema) = td.get_mut("inputSchema").and_then(Value::as_object_mut)
+                        else {
+                            return;
+                        };
+                        // Drop the field from `required`...
+                        if let Some(req) = schema.get_mut("required").and_then(Value::as_array_mut)
+                        {
+                            req.retain(|v| v.as_str() != Some(field_c.as_str()));
+                        }
+                        // ...and remove any `default`.
+                        if let Some(prop) = schema
+                            .get_mut("properties")
+                            .and_then(Value::as_object_mut)
+                            .and_then(|p| p.get_mut(&field_c))
+                            .and_then(Value::as_object_mut)
+                        {
+                            prop.remove("default");
+                        }
+                    });
+                    mutants.push((label, mutant));
+                }
+            }
+        }
+    }
+    mutants
+}
+
 /// CONTRACT — for each declared output seeded in `initialContext`, remove the
 /// seed.
 ///
@@ -918,6 +1039,7 @@ pub async fn mutation_score(resolved: &Value) -> anyhow::Result<MutationReport> 
         ("literal_type_break", literal_type_break),
         ("drop_output_write", drop_output_write),
         ("drop_initial_context_seed", drop_initial_context_seed),
+        ("weaken_output_source", weaken_output_source),
         ("retarget_guard_scope", retarget_guard_scope),
         ("delete_guard", delete_guard),
         ("flip_guard_op", flip_guard_op),
@@ -1213,6 +1335,43 @@ mod tests {
                 "delete_guard mutant should have no guards"
             );
         }
+    }
+
+    #[test]
+    fn weaken_output_source_strips_safety_and_is_killed_by_v26() {
+        // A scalar output sourced from a currently-SAFE (defaulted) argument.
+        let cfg = json!({ "workflows": { "cap.review.thing": {
+            "verb": "review",
+            "initialState": "s",
+            "snippet": { "inputs": {}, "outputs": { "summary": { "type": "string" } } },
+            "states": {
+                "s": { "transitions": { "submit": {
+                    "target": "done", "actor": "agent",
+                    "inputSchema": { "type": "object", "required": [],
+                        "properties": { "summary": { "type": "string", "default": "" } } },
+                    "executor": { "kind": "noop" },
+                    "output": { "summary": "$.arguments.summary" }
+                }}},
+                "done": { "terminal": true }
+            }
+        }}});
+        let mutants = weaken_output_source(&cfg);
+        assert_eq!(mutants.len(), 1, "one safe scalar source to weaken");
+        let (_l, mutant) = &mutants[0];
+        // The default is gone.
+        assert!(
+            mutant
+                .pointer("/workflows/cap.review.thing/states/s/transitions/submit/inputSchema/properties/summary/default")
+                .is_none(),
+            "default must be stripped"
+        );
+        // ...and V26 catches it.
+        assert!(
+            praxec_core::validate::validate_workflows(mutant)
+                .iter()
+                .any(|d| d.message().contains("SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE")),
+            "the mutant must be killed by V26"
+        );
     }
 
     #[test]

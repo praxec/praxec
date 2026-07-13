@@ -240,6 +240,9 @@ fn validate_one_workflow(
     // SPEC §5.3, V24 — every declared output must be written on EVERY path to
     // EVERY terminal. The compile-time half of the terminal output contract.
     validate_declared_outputs_are_written(id, def, out);
+    // SPEC §5.3, V26 — a declared SCALAR output written from an OPTIONAL argument
+    // can land null at terminal (the repair rung can't coerce a scalar). Warn.
+    validate_scalar_outputs_have_non_nullable_sources(id, def, out);
     // SPEC §6.1, V12 — every `kind: workflow` executor inside this
     // workflow's transitions must conform to the use-binding contract.
     validate_use_bindings(id, def, out);
@@ -1611,6 +1614,123 @@ pub fn for_each_executor_site(def: &Value, mut f: impl FnMut(&ExecutorSite)) {
             }
         }
     }
+}
+
+/// SPEC §5.3, V26 — SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE (warning).
+///
+/// V24 proves a declared output is *written* on every path. This catches the
+/// subtler sibling: an output that IS written, but from a source that can be
+/// `null`. The deterministic-repair rung coerces a missing `array`/`object` to
+/// `[]`/`{}` before the terminal check — but it CANNOT repair a scalar. So a
+/// declared `summary: {type: string}` mapped from `$.arguments.summary`, where
+/// `summary` is an OPTIONAL agent input (not `required`, no `default`), lands
+/// `null` at terminal whenever the agent omits it, and fails the contract.
+///
+/// This is why the fuzz's per-edge probe supplies ALL arguments, not just
+/// required ones — and it's the exact shape the pack survey found in
+/// `cap.review.completeness`, `cap.review.analysis`, and
+/// `cap.implement.resolve-conflicts`.
+///
+/// A warning, not an error: the runtime terminal check is the hard gate; this is
+/// the authoring nudge. Scope: a declared scalar output whose transition-level
+/// `output:` mapping sources it from `$.arguments.<field>`, where that field is
+/// present in the transition's `inputSchema.properties` but is neither `required`
+/// nor carries a `default`. (Array/object outputs are repairable; nullable-union
+/// scalar declarations already permit null and are exempt.)
+fn validate_scalar_outputs_have_non_nullable_sources(
+    id: &str,
+    def: &Value,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(declared) = def
+        .pointer("/snippet/outputs")
+        .or_else(|| def.pointer("/outputs"))
+        .and_then(Value::as_object)
+        .filter(|o| !o.is_empty())
+    else {
+        return;
+    };
+    // Only scalar, non-nullable declared outputs are at risk.
+    let scalar_outputs: HashSet<&str> = declared
+        .iter()
+        .filter(|(_, schema)| is_non_nullable_scalar_schema(schema))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if scalar_outputs.is_empty() {
+        return;
+    }
+
+    let Some(states) = def.pointer("/states").and_then(Value::as_object) else {
+        return;
+    };
+    for (state_name, state_def) in states {
+        let Some(transitions) = state_def.pointer("/transitions").and_then(Value::as_object) else {
+            continue;
+        };
+        for (t_name, t_def) in transitions {
+            let Some(output) = t_def.pointer("/output").and_then(Value::as_object) else {
+                continue;
+            };
+            for (out_slot, source) in output {
+                if !scalar_outputs.contains(out_slot.as_str()) {
+                    continue;
+                }
+                // Source must be `$.arguments.<field>` (a single top-level field).
+                let Some(field) = source
+                    .as_str()
+                    .and_then(|s| s.strip_prefix("$.arguments."))
+                    .filter(|f| !f.contains('.'))
+                else {
+                    continue;
+                };
+                if argument_is_optional(t_def, field) {
+                    out.push(Diagnostic::Warning(format!(
+                        "SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE: workflow '{id}': declared scalar \
+                         output '{out_slot}' is written by transition '{t_name}' in state \
+                         '{state_name}' from '$.arguments.{field}', but '{field}' is an OPTIONAL \
+                         input (not in `required`, no `default`). If the agent omits it the output \
+                         is null at terminal and fails the contract (a scalar can't be repaired). \
+                         Mark '{field}' required, give it a default, or make the output nullable \
+                         (SPEC §5.3, V26)"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// A schema declaring exactly one scalar type (string/integer/number/boolean),
+/// with no `null` in a type union — i.e. a value that CANNOT legally be null and
+/// CANNOT be deterministically repaired. `$ref` schemas and object/array types
+/// are excluded (a `$ref` may resolve to anything; array/object are repairable).
+fn is_non_nullable_scalar_schema(schema: &Value) -> bool {
+    matches!(
+        schema.get("type").and_then(Value::as_str),
+        Some("string" | "integer" | "number" | "boolean")
+    )
+}
+
+/// Is `field` an OPTIONAL property of the transition's `inputSchema` — declared,
+/// but absent from `required` and carrying no `default`?
+fn argument_is_optional(t_def: &Value, field: &str) -> bool {
+    let Some(schema) = t_def.pointer("/inputSchema") else {
+        return false;
+    };
+    let declared = schema
+        .pointer(&format!("/properties/{}", pointer_escape(field)))
+        .is_some();
+    if !declared {
+        return false; // not an inputSchema field at all — out of V26's scope
+    }
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().any(|v| v.as_str() == Some(field)))
+        .unwrap_or(false);
+    let has_default = schema
+        .pointer(&format!("/properties/{}/default", pointer_escape(field)))
+        .is_some();
+    !required && !has_default
 }
 
 fn validate_use_bindings(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
@@ -3317,6 +3437,94 @@ mod tests {
             d.iter()
                 .any(|d| d.is_error() && d.message().contains("UNRESOLVABLE_GUARD_SCOPE")),
             "{d:?}"
+        );
+    }
+
+    // ── V26 — SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE ─────────────────────────────
+
+    /// A cap declaring a scalar output written from an optional arg, or (when
+    /// `required`) not. `cap.review.analysis` shape.
+    fn scalar_output_cap(required: bool, with_default: bool) -> Value {
+        let mut summary_prop = json!({ "type": "string" });
+        if with_default {
+            summary_prop["default"] = json!("");
+        }
+        let required_list = if required {
+            json!(["findings", "summary"])
+        } else {
+            json!(["findings"])
+        };
+        json!({ "workflows": { "cap.review.thing": {
+            "verb": "review",
+            "initialState": "analyzing",
+            "snippet": { "inputs": {}, "outputs": { "summary": { "type": "string" } } },
+            "states": {
+                "analyzing": { "transitions": { "submit": {
+                    "target": "done", "actor": "agent",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": required_list,
+                        "properties": {
+                            "findings": { "type": "array", "default": [] },
+                            "summary": summary_prop
+                        }
+                    },
+                    "executor": { "kind": "noop" },
+                    "output": { "summary": "$.arguments.summary" }
+                }}},
+                "done": { "terminal": true }
+            }
+        }}})
+    }
+
+    fn v26_warnings(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE"))
+            .collect()
+    }
+
+    #[test]
+    fn v26_warns_on_a_scalar_output_from_an_optional_argument() {
+        let w = v26_warnings(&scalar_output_cap(false, false));
+        assert_eq!(w.len(), 1, "expected one V26 warning: {w:?}");
+        assert!(w[0].contains("summary"), "{}", w[0]);
+    }
+
+    #[test]
+    fn v26_is_satisfied_by_a_default_or_by_required() {
+        assert!(
+            v26_warnings(&scalar_output_cap(false, true)).is_empty(),
+            "a default on the source clears V26"
+        );
+        assert!(
+            v26_warnings(&scalar_output_cap(true, false)).is_empty(),
+            "marking the source required clears V26"
+        );
+    }
+
+    #[test]
+    fn v26_ignores_array_and_object_outputs() {
+        // An object output is repairable ({}), so it is out of scope.
+        let config = json!({ "workflows": { "cap.x.thing": {
+            "verb": "review",
+            "initialState": "s",
+            "snippet": { "inputs": {}, "outputs": { "report": { "type": "object" } } },
+            "states": {
+                "s": { "transitions": { "go": {
+                    "target": "done", "actor": "agent",
+                    "inputSchema": { "type": "object", "required": [],
+                                     "properties": { "report": { "type": "object" } } },
+                    "executor": { "kind": "noop" },
+                    "output": { "report": "$.arguments.report" }
+                }}},
+                "done": { "terminal": true }
+            }
+        }}});
+        assert!(
+            v26_warnings(&config).is_empty(),
+            "object output is repairable"
         );
     }
 
