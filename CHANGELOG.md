@@ -66,6 +66,49 @@ event the compose path emits, because it is the same defect. The
 deterministic-repair rung runs first, exactly as it does under `use:`, so the
 terminal check is never harsher than the compose check it mirrors.
 
+### Added — V24 `UNWRITTEN_DECLARED_OUTPUT` (the compile-time half)
+
+The terminal check above cannot catch every unwritten output, and that is not a
+flaw in it: the deterministic-repair rung coerces a missing `array`/`object` to
+`[]`/`{}` *before* validating, because a composing host repairs too and the
+terminal check must never be harsher than the compose check it mirrors. So a
+never-written `report: {type: object}` goes green at runtime and the caller reads
+an empty report instead of an error. Only a static analysis sees that the slot has
+no writer at all.
+
+V24 proves from the state graph that every declared output is written on **every**
+path to **every** terminal — a MUST dataflow over the declared-output lattice,
+computed as a *greatest* fixpoint so a retry cycle cannot launder an unwritten slot
+into a written one. It caught a broken fixture in praxec's own corpus on first run.
+
+### Fixed — the mutation score was measuring nothing
+
+`praxec-test`'s mutation harness credited a kill for *any* diagnostic or fuzz
+failure, absolutely. Run that against a real corpus with a single pre-existing
+complaint and every mutant is "killed" by a defect that was already there. The tell
+was the two semantic operators — which exist to document what the tool *cannot*
+catch — also reporting 100%.
+
+Kills are now credited only for a complaint the mutant **caused**: every gate is
+diffed against what it already said about the unmutated config. Two new CONTRACT
+operators (`drop_output_write`, `drop_initial_context_seed`) delete a declared
+output's only writer — the class that shipped the bug above, and which no operator
+previously modeled, which is precisely why nothing warned us. A gate you never
+attack is a gate you are only assuming works.
+
+### Fixed — the fuzz mock could not produce the contracts it was mocking
+
+Three bugs, all the same shape, each making `praxec fuzz` report failures the
+definitions were not guilty of. The dummy synthesizer had no `$ref` arm, so every
+slot capability in the pack (they all spell their contract as
+`$ref: praxec://hop#/$defs/verifyOut`) got `null` and looked like a contract
+violation. The output plan could only hold an *object*, so a `kind: mcp` leaf whose
+result is legitimately an array (`corpus_search`) could only ever emit `{}`. And
+the isolated prober fabricated a mid-flow context that skipped the states it was
+pretending had already run. On the live pack: **152 → 116** fuzz failures, with
+zero coming from the new terminal check. A bare `CHAIN_FAILED` now also carries its
+error class and message, which is how all three were diagnosed.
+
 > **Note on versioning.** This is a pre-1.0, greenfield project on the `0.0.x`
 > line: nothing is API-stable, and any release may change anything (breaking
 > changes are cut over cleanly, by design). The `0.0.6`–`0.0.13` sequence below
