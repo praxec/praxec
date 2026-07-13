@@ -247,9 +247,13 @@ async fn p7_cog_arch_mutation_report() {
     for r in &report.per_operator {
         let note = match r.operator.as_str() {
             "orphan_state" | "dangle_target" | "deadend" | "det_cycle" | "literal_type_break" => {
-                "← GUARANTEED CATCH"
+                "← structural / validate"
             }
-            "delete_guard" | "flip_guard_op" => "← DOCUMENTED BLIND SPOT",
+            "drop_output_write" | "drop_initial_context_seed" => "← V24 must-write",
+            // Once documented blind spots. The per-transition fuzz submits a
+            // deliberately VIOLATING context to every edge and asserts the guard
+            // rejects it, so a deleted/flipped guard is now caught, not survived.
+            "delete_guard" | "flip_guard_op" => "← violating-context probe",
             _ => "",
         };
         println!(

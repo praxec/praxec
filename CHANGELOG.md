@@ -109,6 +109,45 @@ pretending had already run. On the live pack: **152 → 116** fuzz failures, wit
 zero coming from the new terminal check. A bare `CHAIN_FAILED` now also carries its
 error class and message, which is how all three were diagnosed.
 
+### Fixed — `praxec fuzz` is now fully green on the pack (116 → 0 hard failures)
+
+The remaining 116 per-transition failures were all the mock failing to reconstruct
+the state a real prior chain would have produced — not defects in the definitions.
+Each was a distinct fidelity gap, now closed:
+
+- **Nested guard reads.** A guard on `$.context.out.status` was seeded only at
+  `out` (a `{}` dummy), leaving `.status` unset → `GUARD_UNSET_SLOT`. The seeder
+  now writes at the full dotted path, and the mock output plan plants a
+  guard-satisfying value *inside* the field it writes.
+- **Definition-wide context.** An isolated probe fires one edge and lets the chain
+  run, but seeded only the probed edge's reads — so any downstream guard hit an
+  unseeded slot. The probe now starts from a context covering every slot the
+  definition reads, typed from the guards that compare it.
+- **Slot-vs-slot and input guards.** `iter >= iter_cap` (neither side a literal)
+  and `$.workflow.input.stack == 'rust'` (input-scoped) were invisible to the
+  satisfier; both are now seeded — the input per-edge, since siblings gate the same
+  slot on exclusive values.
+- **The violating-context probe.** It set a bool to "violate" a guard, but a bool
+  does not violate `status != 'pass'`, so the transition fired and the fuzz cried
+  "guard did not reject". It now computes a value that genuinely fails the clause,
+  and skips the check when it cannot guarantee one.
+- **`$ref` / nested / `minProperties` arguments.** A `hop_slot` transition's
+  `inputSchema` is a bare `{$ref: verifyIn}`; the arguments builder now resolves the
+  ref, includes optional properties (so an output mapped from an optional argument
+  isn't null), and honors `minProperties`.
+
+Left green the honest way: this surfaced one **real** pack bug —
+`cap.gate.human-approve-plan` guarded on `$.input.mode`, a scope the guard
+evaluator resolves to `null` (it recognizes `$.workflow.input.*`, not bare
+`$.input.*`), so both its transitions were dead. Fixed in the pack. The 44
+remaining smoke wedges on agent-heavy flows stay advisory — a mock chooser cannot
+make an agent's decisions, which is what `--live --model` is for.
+
+With a clean fuzz baseline, the mutation score is now meaningful rather than
+inflated: 100% across all nine operators (1434 mutants), and the two guard
+operators are genuinely *killed* by the violating-context probe — they were never
+really blind spots, only older than the harness.
+
 > **Note on versioning.** This is a pre-1.0, greenfield project on the `0.0.x`
 > line: nothing is API-stable, and any release may change anything (breaking
 > changes are cut over cleanly, by design). The `0.0.6`–`0.0.13` sequence below

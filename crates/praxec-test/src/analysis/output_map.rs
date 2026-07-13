@@ -104,6 +104,23 @@ pub fn insert_nested(obj: &mut serde_json::Map<String, Value>, parts: &[&str], v
     // we leave it as-is to avoid clobbering it.
 }
 
+/// Remove the leaf at a nested `parts` path, so a subsequent [`insert_nested`]
+/// (which won't clobber) writes a fresh value. Intermediate objects are left in
+/// place. A no-op when the path is absent.
+pub fn remove_nested(obj: &mut serde_json::Map<String, Value>, parts: &[&str]) {
+    match parts {
+        [] => {}
+        [leaf] => {
+            obj.remove(*leaf);
+        }
+        [head, tail @ ..] => {
+            if let Some(sub) = obj.get_mut(*head).and_then(Value::as_object_mut) {
+                remove_nested(sub, tail);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
