@@ -10,6 +10,62 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+Fixes from dogfooding 0.0.18 against a real .NET/React/C# repo. Both changes
+target the same class of defect: the engine was *silent* where it should have
+been *loud*.
+
+### Fixed — the multi-turn fix-loop stall on reasoning models
+
+A reasoning model on a real fix-loop would do the work, emit the diff as text,
+and never call the `final_answer` tool. The turn budget exhausted, the step
+reported `AGENT_NO_RESULT`, that classified as `Capability` (escalatable), and
+the chain-walk quietly retried the whole thing on the next model — three 600s
+walls, ~30 minutes, no verdict, and nobody told. Two independent defects were
+conflated there; both are fixed.
+
+- **Sign-off ceremony.** On turn exhaustion the runner now takes one more turn on
+  the *same* model with reasoning disabled and `tool_choice: Required`, purely to
+  capture the sign-off. Thinking-mode models reject a forced `tool_choice` with a
+  hard 400 — which is why the in-loop `force_final` steer can only ever *offer*
+  `final_answer` — but turning reasoning off makes the force legal. The model that
+  did the work signs off on it. This is robust handling of the ceremony, not a
+  capability restriction: reasoning models stay fully in play. Every miss path
+  (transport error, still no tool call, non-conforming output) degrades to exactly
+  the previous `Exhausted`/`AGENT_NO_RESULT`, so a model that still refuses ends
+  where it ended before.
+- **Hard per-step budget.** The chain-walk had no wall-clock bound: each model in
+  the chain got its own `max_seconds`, so an all-`NoResult` walk burned N × 600s in
+  silence. An agent step now carries a budget (`step_budget_seconds`, default
+  **900s**); each attempt's wall is clamped to what remains, and escalation stops
+  once too little is left to try again, surfacing a new terminal
+  `AGENT_STEP_BUDGET_EXHAUSTED`. That code deliberately does **not** classify as
+  `Capability`, so it routes to a human instead of feeding the churn it exists to
+  stop.
+
+### Fixed — a capability's output contract is now enforced on a direct run
+
+A capability's declared `snippet.outputs` was validated **only** on the compose
+path, against the host's `use.outputs` projection. A direct top-level run
+validated nothing. So an author could run a cap on its own, see green, and only
+discover the contract violation once someone wrapped it in a `use:` block —
+which is how a perfectly good `verify` verdict got discarded downstream over a
+single stray provenance key.
+
+A definition now owes its declared outputs at its **own** terminal state, whether
+or not anything composed it. The check is expressed as the existing compose check
+evaluated under a synthesized *full identity binding* — it reuses
+`repair_outputs_against_snippet` and `validate_outputs_against_snippet` verbatim
+rather than reimplementing them, so the two paths cannot drift, and a full binding
+is the strictest host any composer could be. That buys the property worth having:
+
+> **a green direct run implies a green composed run.**
+
+A violation fails the run as `cap_output_schema_violation` with recovery links and
+a `cap.output.schema_violation` audit event naming the offending slot — the same
+event the compose path emits, because it is the same defect. The
+deterministic-repair rung runs first, exactly as it does under `use:`, so the
+terminal check is never harsher than the compose check it mirrors.
+
 > **Note on versioning.** This is a pre-1.0, greenfield project on the `0.0.x`
 > line: nothing is API-stable, and any release may change anything (breaking
 > changes are cut over cleanly, by design). The `0.0.6`–`0.0.13` sequence below
