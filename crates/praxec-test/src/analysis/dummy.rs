@@ -91,6 +91,7 @@ pub fn dummy_for_schema(schema: &Value) -> Value {
                     }
                 }
             }
+            pad_min_properties(&mut m, schema);
             Value::Object(m)
         }
         _ => Value::Null,
@@ -114,6 +115,73 @@ pub fn dummy_all_properties(schema: &Value) -> Value {
         m.insert(name.clone(), dummy_for_schema(psch));
     }
     Value::Object(m)
+}
+
+/// Pad an object dummy with filler keys until it meets `minProperties`.
+///
+/// A schema like `blast_radius: {type: object, minProperties: 1}` declares NO
+/// `properties`, so the dummy is `{}` — which fails `minProperties: 1`. The
+/// filler is arbitrary (the schema constrains only the COUNT), so any distinct
+/// keys satisfy it.
+fn pad_min_properties(m: &mut serde_json::Map<String, Value>, schema: &Value) {
+    let min = schema
+        .get("minProperties")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let mut i = 0;
+    while m.len() < min {
+        m.insert(format!("_fuzz_{i}"), Value::String("fuzz".to_owned()));
+        i += 1;
+    }
+}
+
+/// A dummy that satisfies `schema` AND includes every OPTIONAL property, all the
+/// way down — for transition `arguments` and workflow `input`.
+///
+/// The distinction from [`dummy_for_schema`] (which emits only *required* object
+/// properties) is deliberate and load-bearing in two directions:
+///
+/// - A `hop_slot` transition's `inputSchema` is a bare `{$ref: verifyIn}` with no
+///   `properties`; this resolves the ref first, so the emitted arguments satisfy
+///   the referenced contract instead of being an empty `{}`.
+/// - A declared OUTPUT is often mapped from an OPTIONAL argument
+///   (`summary: "$.arguments.summary"`). Emitting only required args would leave
+///   that output null and fail the terminal contract — a per-edge probe must test
+///   the edge as an agent that supplies everything, not one that omits optionals.
+pub fn dummy_arguments(schema: &Value) -> Value {
+    if let Some(target) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(resolve_hop_ref)
+    {
+        return dummy_arguments(target);
+    }
+    match schema.get("type").and_then(|t| t.as_str()) {
+        Some("object") => {
+            let mut m = serde_json::Map::new();
+            if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+                for (name, psch) in props {
+                    m.insert(name.clone(), dummy_arguments(psch));
+                }
+            }
+            pad_min_properties(&mut m, schema);
+            Value::Object(m)
+        }
+        Some("array") => {
+            // At least `minItems` (default 1 so a downstream `.0` read resolves).
+            let min = schema
+                .get("minItems")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .max(1) as usize;
+            let item = schema
+                .get("items")
+                .map(dummy_arguments)
+                .unwrap_or(Value::Null);
+            Value::Array(std::iter::repeat_n(item, min).collect())
+        }
+        _ => dummy_for_schema(schema),
+    }
 }
 
 #[cfg(test)]
@@ -216,6 +284,70 @@ mod tests {
         assert_eq!(
             dummy_for_schema(&json!({ "$ref": "https://example.com/other#/x" })),
             Value::Null
+        );
+    }
+
+    #[test]
+    fn object_pads_to_min_properties() {
+        // `{type: object, minProperties: 1}` with no declared properties: a bare
+        // `{}` fails the constraint, so it must be padded. (The `blast_radius`
+        // shape in cap.plan.build-graph's inputSchema.)
+        let v = dummy_for_schema(&json!({ "type": "object", "minProperties": 1 }));
+        assert!(
+            v.as_object().is_some_and(|o| !o.is_empty()),
+            "must have at least one property: {v}"
+        );
+    }
+
+    #[test]
+    fn dummy_arguments_resolves_a_ref_and_includes_optional_fields() {
+        // A hop_slot inputSchema is a bare `{$ref: verifyIn}` — no `properties`.
+        let args = dummy_arguments(&json!({ "$ref": "praxec://hop#/$defs/verifyIn" }));
+        assert_eq!(
+            praxec_core::hop::validate_against_schema(
+                &json!({ "$ref": "praxec://hop#/$defs/verifyIn" }),
+                &args,
+                "verifyIn",
+            ),
+            Ok(()),
+            "arguments must satisfy verifyIn, got: {args}"
+        );
+
+        // Optional properties are included (unlike dummy_for_schema) so an output
+        // mapped from an optional argument does not land null.
+        let schema = json!({
+            "type": "object",
+            "required": ["a"],
+            "properties": { "a": { "type": "string" }, "b": { "type": "string" } }
+        });
+        let args = dummy_arguments(&schema);
+        assert!(args.get("a").is_some());
+        assert!(
+            args.get("b").is_some(),
+            "optional property must be present for the arguments probe: {args}"
+        );
+    }
+
+    #[test]
+    fn dummy_arguments_builds_a_deep_required_object() {
+        // cap.plan.build-graph shape: nested required object + array minItems.
+        let schema = json!({
+            "type": "object",
+            "required": ["graph"],
+            "properties": { "graph": {
+                "type": "object",
+                "required": ["deliverables"],
+                "properties": { "deliverables": {
+                    "type": "array", "minItems": 1,
+                    "items": { "type": "object", "required": ["id"],
+                               "properties": { "id": { "type": "string" } } }
+                }}
+            }}
+        });
+        let args = dummy_arguments(&schema);
+        assert!(
+            args["graph"]["deliverables"][0]["id"].is_string(),
+            "deep required path must be filled: {args}"
         );
     }
 

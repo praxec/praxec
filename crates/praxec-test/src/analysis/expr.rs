@@ -13,6 +13,66 @@ pub struct GuardClause {
     pub rhs: Value,
 }
 
+/// A parsed comparison `<lhs> <op> <rhs>`, with both sides kept as raw tokens so
+/// the caller can classify each as a `$.context.*` / `$.workflow.input.*` /
+/// `$.input.*` reference or a literal. Unlike [`parse_clause`] this makes no
+/// assumption about the left side's scope.
+#[derive(Debug, PartialEq)]
+pub struct Comparison {
+    pub lhs: String,
+    pub op: String,
+    pub rhs: String,
+}
+
+/// Split `expr` at its top-level comparison operator (outside quotes), returning
+/// the raw left and right tokens. `None` if no operator is present.
+pub fn parse_comparison(expr: &str) -> Option<Comparison> {
+    const OPS: &[&str] = &["starts_with", "contains", "<=", ">=", "==", "!=", "<", ">"];
+    let (op, op_idx) = OPS
+        .iter()
+        .filter_map(|op| find_op_outside_quotes(expr, op).map(|idx| (*op, idx)))
+        .min_by_key(|(_op, idx)| *idx)?;
+    Some(Comparison {
+        lhs: expr[..op_idx].trim().to_owned(),
+        op: op.to_owned(),
+        rhs: expr[op_idx + op.len()..].trim().to_owned(),
+    })
+}
+
+/// The path after `$.workflow.input.` if `token` is an input reference.
+///
+/// Deliberately does NOT accept the bare `$.input.` spelling: the guard evaluator
+/// (`guards.rs::resolve_operand`) resolves `$.workflow.input.*` but NOT
+/// `$.input.*`, which coalesces to `Null`. Treating `$.input.mode` as a valid
+/// input read here would let the fuzz seed around a guard the engine can never
+/// satisfy — masking exactly the dead-guard bug this must surface.
+pub fn input_ref(token: &str) -> Option<&str> {
+    token.strip_prefix("$.workflow.input.")
+}
+
+/// The path after `$.context.` if `token` is a context reference.
+pub fn context_ref(token: &str) -> Option<&str> {
+    token.strip_prefix("$.context.")
+}
+
+/// Parse a literal token (`true`, `42`, `'go'`, …) into a JSON value.
+pub fn parse_literal_value(s: &str) -> Value {
+    parse_literal(s)
+}
+
+/// Given `op`, produce a `(lhs_value, rhs_value)` pair that makes `lhs op rhs`
+/// TRUE — for the slot-vs-slot case where neither side is a literal. Integers,
+/// because every such guard in practice compares counters (`iter < iter_cap`).
+pub fn satisfying_pair(op: &str) -> Option<(Value, Value)> {
+    let (lo, hi) = (Value::from(0), Value::from(1));
+    match op {
+        "==" | ">=" | "<=" => Some((Value::from(1), Value::from(1))),
+        "!=" | "<" => Some((lo, hi)),
+        ">" => Some((hi, lo)),
+        _ => None,
+    }
+}
+
 /// Parse `$.context.<slot> <op> <literal>`. Returns None if it doesn't match
 /// that shape (left side not `$.context.*`, or no operator found).
 pub fn parse_clause(expr: &str) -> Option<GuardClause> {
@@ -61,6 +121,40 @@ pub fn satisfying_value(clause: &GuardClause) -> Option<Value> {
         "contains" => {
             let needle = clause.rhs.as_str()?;
             Some(Value::String(format!("x{needle}x")))
+        }
+        _ => None,
+    }
+}
+
+/// A value for `slot` that makes `clause` evaluate FALSE, or `None` when we
+/// cannot GUARANTEE falsity (in which case the caller must skip the
+/// violating-path check rather than assert on a value that might still satisfy).
+///
+/// This is the mirror of [`satisfying_value`], and its absence was a real bug:
+/// the violating-context builder used to blindly set the slot to a bool, which
+/// does NOT violate `status != 'pass'` (a bool is `!= 'pass'`), so the guard
+/// still passed, the transition fired, and the fuzz reported "guard did not
+/// reject" against a perfectly correct definition.
+pub fn violating_value(clause: &GuardClause) -> Option<Value> {
+    match clause.op.as_str() {
+        // Any value distinct from rhs fails `==`.
+        "==" => Some(negate_value(&clause.rhs)),
+        // Equal to rhs fails `!=`.
+        "!=" => Some(clause.rhs.clone()),
+        // rhs itself is not `> rhs` and not `< rhs`.
+        ">" | "<" => Some(clause.rhs.clone()),
+        // One step the wrong way fails the inclusive bounds.
+        ">=" => Some(bump_number(&clause.rhs, -1)?),
+        "<=" => Some(bump_number(&clause.rhs, 1)?),
+        // The empty string starts with / contains no non-empty token, so it
+        // fails either — unless the token is itself empty, which we can't violate.
+        "starts_with" | "contains" => {
+            let token = clause.rhs.as_str()?;
+            if token.is_empty() {
+                None
+            } else {
+                Some(Value::String(String::new()))
+            }
         }
         _ => None,
     }
@@ -206,5 +300,81 @@ mod tests {
         let c2 = parse_clause("$.context.n != 5").unwrap();
         let v = satisfying_value(&c2).unwrap();
         assert_ne!(v, json!(5));
+    }
+
+    // ── violating_value: the value must actually FAIL the clause ─────────────
+
+    /// A bool did NOT violate `!= 'pass'` — a bool is `!= 'pass'` — which is the
+    /// exact bug that made the fuzz report "guard did not reject" on correct defs.
+    #[test]
+    fn violating_value_actually_fails_each_operator() {
+        let cases = [
+            ("$.context.s == 'pass'", json!("pass"), false),
+            ("$.context.s != 'pass'", json!("pass"), true), // equal → fails !=
+            ("$.context.n > 5", json!(5), false),           // 5 > 5 is false
+            ("$.context.n < 5", json!(5), false),           // 5 < 5 is false
+            ("$.context.n >= 5", json!(4), false),
+            ("$.context.n <= 5", json!(6), false),
+        ];
+        for (expr, _, _) in cases {
+            let c = parse_clause(expr).unwrap();
+            let sat = satisfying_value(&c).expect("has a satisfying value");
+            let viol = violating_value(&c).expect("has a violating value");
+            assert_ne!(
+                sat, viol,
+                "satisfying and violating must differ for `{expr}`"
+            );
+        }
+        // The concrete regression: `!= 'pass'` violated by 'pass' (equal).
+        let c = parse_clause("$.context.status != 'pass'").unwrap();
+        assert_eq!(violating_value(&c), Some(json!("pass")));
+    }
+
+    #[test]
+    fn violating_value_gives_up_when_it_cannot_guarantee_falsity() {
+        // `contains ''` is satisfied by every string — nothing violates it, so we
+        // must return None rather than a value that still passes.
+        let c = parse_clause("$.context.s contains ''").unwrap();
+        assert_eq!(violating_value(&c), None);
+    }
+
+    // ── parse_comparison / scope classification / slot-vs-slot pairs ─────────
+
+    #[test]
+    fn parse_comparison_keeps_raw_sides() {
+        let cmp = parse_comparison("$.context.iter >= $.context.iter_cap").unwrap();
+        assert_eq!(cmp.lhs, "$.context.iter");
+        assert_eq!(cmp.op, ">=");
+        assert_eq!(cmp.rhs, "$.context.iter_cap");
+        assert_eq!(context_ref(&cmp.lhs), Some("iter"));
+        assert_eq!(context_ref(&cmp.rhs), Some("iter_cap"));
+    }
+
+    #[test]
+    fn input_ref_accepts_only_the_valid_guard_spelling() {
+        // The guard evaluator resolves `$.workflow.input.*` but NOT bare
+        // `$.input.*` — accepting the latter would let the fuzz seed around a
+        // dead guard.
+        assert_eq!(input_ref("$.workflow.input.mode"), Some("mode"));
+        assert_eq!(input_ref("$.input.mode"), None);
+    }
+
+    #[test]
+    fn satisfying_pair_is_consistent_with_its_operator() {
+        // The pair (lval, rval) must make `lval OP rval` true.
+        for op in ["==", "!=", "<", ">", "<=", ">="] {
+            let (l, r) = satisfying_pair(op).unwrap();
+            let (l, r) = (l.as_i64().unwrap(), r.as_i64().unwrap());
+            let holds = match op {
+                "==" => l == r,
+                "!=" => l != r,
+                "<" => l < r,
+                ">" => l > r,
+                "<=" => l <= r,
+                ">=" => l >= r,
+                _ => unreachable!(),
+            };
+            assert!(holds, "pair {l},{r} must satisfy `{op}`");
+        }
     }
 }

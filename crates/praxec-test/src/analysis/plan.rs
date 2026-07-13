@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::analysis::dummy::dummy_for_schema;
 use crate::analysis::expr::{GuardClause, parse_clause, satisfying_value};
-use crate::analysis::output_map::{OutputSource, analyze_output};
+use crate::analysis::output_map::{OutputSource, analyze_output, insert_nested, remove_nested};
 
 /// transitionName -> the executor output the mock emits for it.
 ///
@@ -100,13 +100,44 @@ pub fn derive_plan(definition: &Value) -> OutputPlan {
                     continue;
                 };
                 // For each downstream clause that reads this slot, compute a satisfying value.
+                //
+                // A guard routinely reads INTO the slot — `$.context.codegen.ok`,
+                // `$.context.verify.status` — while the transition writes the slot
+                // WHOLE (`codegen: "$.output.json"`). Matching only on an exact
+                // slot name misses every one of those, so the mock emitted a bare
+                // `{}` for the object, the guard found no `.ok`, and the runtime
+                // failed it with GUARD_UNSET_SLOT: a defect of the mock, reported
+                // against the definition.
+                //
+                // So match on the clause's TOP segment and plant the satisfying
+                // value at the sub-path INSIDE the emitted field.
                 for clause in clauses {
-                    if &clause.slot == slot {
-                        if let Some(v) = satisfying_value(clause) {
-                            // Last-writer-wins on conflicting clauses is acceptable for P1.
-                            output_obj(&mut plan, t_name).insert(field.clone(), v);
-                        }
+                    let (top, rest) = match clause.slot.split_once('.') {
+                        Some((t, r)) => (t, Some(r)),
+                        None => (clause.slot.as_str(), None),
+                    };
+                    if top != slot.as_str() {
+                        continue;
                     }
+                    let Some(v) = satisfying_value(clause) else {
+                        continue;
+                    };
+                    // Nest at `field` + the guard's sub-path. `field` itself may be
+                    // dotted (`build_passed: "$.output.json.passed"` → field
+                    // "json.passed"): inserting it as a LITERAL key would leave the
+                    // runtime resolving `$.output.json.passed` to the dummy instead,
+                    // so a bool build_passed reads as the string "fuzz" and every
+                    // exhaustive gate branch fails ("no viable deterministic
+                    // transition"). Split BOTH into path segments.
+                    let mut parts: Vec<&str> = field.split('.').collect();
+                    if let Some(sub) = rest {
+                        parts.extend(sub.split('.'));
+                    }
+                    // Last-writer-wins on conflicting clauses is acceptable for P1.
+                    // `insert_nested` won't clobber, so remove any prior leaf first.
+                    let entry = output_obj(&mut plan, t_name);
+                    remove_nested(entry, &parts);
+                    insert_nested(entry, &parts, v);
                 }
             }
         }
