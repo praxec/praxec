@@ -4,20 +4,41 @@
 //! `Vec<(label, mutant)>` — one mutant per applicable injection site. The label
 //! is human-readable and uniquely identifies the site (used in reports).
 //!
-//! Seven operators are provided:
+//! Nine operators are provided:
 //!
-//! | Operator              | Kind      | Expected kill? |
-//! |-----------------------|-----------|----------------|
-//! | orphan_state          | Structural | KILLED          |
-//! | dangle_target         | Structural | KILLED          |
-//! | deadend               | Structural | KILLED          |
-//! | det_cycle             | Structural | KILLED          |
-//! | literal_type_break    | Type       | KILLED          |
-//! | delete_guard          | Semantic   | SURVIVES        |
-//! | flip_guard_op         | Semantic   | SURVIVES        |
+//! | Operator                  | Kind       | Expected kill? | Detector           |
+//! |---------------------------|------------|----------------|--------------------|
+//! | orphan_state              | Structural | KILLED         | reachability       |
+//! | dangle_target             | Structural | KILLED         | validate           |
+//! | deadend                   | Structural | KILLED         | validate           |
+//! | det_cycle                 | Structural | KILLED         | loop detection     |
+//! | literal_type_break        | Type       | KILLED         | runtime type check |
+//! | drop_output_write         | Contract   | KILLED         | V24 (must-write)   |
+//! | drop_initial_context_seed | Contract   | KILLED         | V24 (must-write)   |
+//! | delete_guard              | Semantic   | KILLED         | violating-ctx probe|
+//! | flip_guard_op             | Semantic   | KILLED         | violating-ctx probe|
 //!
-//! The harness collects per-operator kill rates: structural/type operators
-//! document the tool's guarantees; semantic operators document its honest limits.
+//! The harness collects per-operator kill rates, which is how the tool's actual
+//! guarantees stay distinguishable from its assumed ones.
+//!
+//! The two SEMANTIC operators were originally documented as blind spots — "the
+//! tool cannot know correct guard intent". That is no longer true, and the
+//! measurement is what said so: the per-transition fuzz submits a deliberately
+//! VIOLATING context to every edge and asserts the guard rejects it, so deleting
+//! a guard (or flipping its operator) makes that probe fire and is caught. The
+//! prose was just older than the harness.
+//!
+//! ## Why the CONTRACT operators exist
+//!
+//! They were added after a defect class shipped that no operator modeled: a
+//! definition reaching a terminal owing a declared output it never wrote. The
+//! caller binds the slot and reads `null` — or, for an `array`/`object` slot, the
+//! deterministic-repair rung hands it `[]`/`{}` and the run goes GREEN with an
+//! empty result. Nothing in the harness generated that mutant, so nothing
+//! measured that the tool was blind to it.
+//!
+//! That is the whole argument for mutation testing here: a gate you never attack
+//! is a gate you are only ASSUMING works.
 //!
 //! ## Implementation note — workflow IDs with slashes
 //!
@@ -483,6 +504,120 @@ fn wrong_typed_literal(declared_type: &str) -> Value {
     }
 }
 
+/// CONTRACT — for each transition that writes a DECLARED output (a capability's
+/// `snippet.outputs`, a nestable flow's top-level `outputs:`), delete that one
+/// write.
+///
+/// This is the operator the harness was missing, and its absence is why nothing
+/// warned us about the defect class that shipped: a definition that reaches a
+/// terminal owing an output it never wrote. A caller binding the slot reads
+/// `null` — or worse, for an `array`/`object` slot, the deterministic-repair rung
+/// hands it `[]`/`{}` and the run goes GREEN with an empty result.
+///
+/// Killed by V24 (`UNWRITTEN_DECLARED_OUTPUT`) at load time. Before V24 existed,
+/// the scalar cases were killed at runtime by the terminal check and the
+/// array/object cases SURVIVED — silently. The kill rate on this operator is the
+/// number that says whether that hole is still open.
+pub fn drop_output_write(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+    let Some(wfs) = config.pointer("/workflows").and_then(Value::as_object) else {
+        return mutants;
+    };
+
+    for (wf_id, wf_def) in wfs {
+        let Some(declared) = wf_def
+            .pointer("/snippet/outputs")
+            .or_else(|| wf_def.pointer("/outputs"))
+            .and_then(Value::as_object)
+            .filter(|o| !o.is_empty())
+        else {
+            continue;
+        };
+        let Some(states) = wf_def.pointer("/states").and_then(Value::as_object) else {
+            continue;
+        };
+
+        for (state_name, state_def) in states {
+            let Some(transitions) = state_def.pointer("/transitions").and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for (t_name, t_def) in transitions {
+                let Some(output) = t_def.pointer("/output").and_then(Value::as_object) else {
+                    continue;
+                };
+                for slot in output.keys().filter(|k| declared.contains_key(*k)) {
+                    let label = format!("drop_output_write/{wf_id}/{state_name}/{t_name}/{slot}");
+                    let wf_id_c = wf_id.clone();
+                    let sn_c = state_name.clone();
+                    let tn_c = t_name.clone();
+                    let slot_c = slot.clone();
+                    let mutant = mutate(config, |v| {
+                        let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut)
+                        else {
+                            return;
+                        };
+                        if let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c)
+                            && let Some(o) = td.get_mut("output").and_then(Value::as_object_mut)
+                        {
+                            o.remove(&slot_c);
+                        }
+                    });
+                    mutants.push((label, mutant));
+                }
+            }
+        }
+    }
+    mutants
+}
+
+/// CONTRACT — for each declared output seeded in `initialContext`, remove the
+/// seed.
+///
+/// The mirror of [`drop_output_write`]: seeding is the OTHER way a definition
+/// discharges its contract on a path that has no writer (it is the one-line fix
+/// V24 asks for). Deleting the seed must therefore re-open the same hole — if it
+/// doesn't, the seed was load-bearing for nothing and the rule isn't actually
+/// checking what it claims.
+pub fn drop_initial_context_seed(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+    let Some(wfs) = config.pointer("/workflows").and_then(Value::as_object) else {
+        return mutants;
+    };
+
+    for (wf_id, wf_def) in wfs {
+        let Some(declared) = wf_def
+            .pointer("/snippet/outputs")
+            .or_else(|| wf_def.pointer("/outputs"))
+            .and_then(Value::as_object)
+            .filter(|o| !o.is_empty())
+        else {
+            continue;
+        };
+        let Some(seeds) = wf_def.pointer("/initialContext").and_then(Value::as_object) else {
+            continue;
+        };
+
+        for slot in seeds.keys().filter(|k| declared.contains_key(*k)) {
+            let label = format!("drop_initial_context_seed/{wf_id}/{slot}");
+            let wf_id_c = wf_id.clone();
+            let slot_c = slot.clone();
+            let mutant = mutate(config, |v| {
+                let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut) else {
+                    return;
+                };
+                if let Some(wf) = wfs_mut.get_mut(&wf_id_c).and_then(Value::as_object_mut)
+                    && let Some(ic) = wf.get_mut("initialContext").and_then(Value::as_object_mut)
+                {
+                    ic.remove(&slot_c);
+                }
+            });
+            mutants.push((label, mutant));
+        }
+    }
+    mutants
+}
+
 /// SEMANTIC — for each guarded transition, remove all its guards.
 ///
 /// Known blind spot: the tool cannot tell whether a guard is intentional without
@@ -645,14 +780,89 @@ impl MutationReport {
 
 // ── Harness ───────────────────────────────────────────────────────────────────
 
-/// Run all seven mutation operators over a resolved config `Value`.
+/// What the gates already say about the UNMUTATED config.
 ///
-/// Each mutant is assessed three ways:
-/// 1. `config::resolve(mutant)` — a load/resolve error = KILLED.
-/// 2. `validate_workflows()` — any Error diagnostic = KILLED.
-/// 3. `fuzz_coverage(temp_path)` — `has_failures()` = KILLED.
+/// A mutant may only be credited as KILLED for a complaint it actually CAUSED.
+/// Without this, the score is a lie: run the harness against any real corpus with
+/// a single pre-existing warning (the live cognitive-architectures pack has four,
+/// plus 116 known fuzz findings) and EVERY mutant is "killed" by a defect that was
+/// already there — including the two SEMANTIC operators that exist precisely to
+/// document what the tool CANNOT catch. A 100% score with the blind spots also at
+/// 100% is the tell.
+struct Baseline {
+    diagnostics: std::collections::HashSet<String>,
+    fuzz_findings: std::collections::HashSet<String>,
+}
+
+impl Baseline {
+    async fn capture(resolved: &Value) -> Self {
+        let diagnostics = praxec_core::validate::validate_workflows(resolved)
+            .into_iter()
+            .map(|d| d.message().to_string())
+            .collect();
+        let fuzz_findings = fuzz_findings_of(resolved).await.unwrap_or_default();
+        Self {
+            diagnostics,
+            fuzz_findings,
+        }
+    }
+}
+
+/// Every fuzz complaint about a config, as a stable set of keys — so a mutant's
+/// findings can be diffed against the baseline's instead of collapsed into a
+/// single "did anything fail?" bit.
+async fn fuzz_findings_of(resolved: &Value) -> anyhow::Result<std::collections::HashSet<String>> {
+    let tmp_path = write_temp_config(resolved)?;
+    let result = crate::fuzz_coverage(&tmp_path).await;
+    let _ = std::fs::remove_file(&tmp_path);
+    let cov = result?;
+
+    let mut findings = std::collections::HashSet::new();
+    for d in &cov.defs {
+        for orphan in &d.orphan_states {
+            findings.insert(format!("{}|orphan|{orphan}", d.definition_id));
+        }
+        for loop_state in &d.det_loops {
+            findings.insert(format!("{}|loop|{loop_state}", d.definition_id));
+        }
+        for v in d.verdicts.iter().filter(|v| !v.ok) {
+            findings.insert(format!(
+                "{}|edge|{}.{}|{}",
+                d.definition_id, v.state, v.transition, v.detail
+            ));
+        }
+    }
+    Ok(findings)
+}
+
+/// Serialize a resolved config to a temp file. JSON is valid YAML, so the normal
+/// loader parses it.
+fn write_temp_config(resolved: &Value) -> anyhow::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let mut path = std::env::temp_dir();
+    let tid = std::thread::current().id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let uniq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.push(format!("praxec_mutant_{tid:?}_{nanos}_{uniq}.json"));
+    let mut f = std::fs::File::create(&path)?;
+    f.write_all(&serde_json::to_vec(resolved)?)?;
+    Ok(path)
+}
+
+static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Run every mutation operator over a resolved config `Value`.
 ///
-/// A mutant that passes all three checks SURVIVES.
+/// A mutant is KILLED when it makes a gate say something NEW relative to the
+/// unmutated baseline:
+/// 1. `config::resolve(mutant)` errors (and the baseline resolved), or
+/// 2. `validate_workflows()` emits a diagnostic the baseline did not, or
+/// 3. `fuzz_coverage()` reports a finding the baseline did not.
+///
+/// A mutant that changes nothing any gate says SURVIVES — the tool is blind to it.
 pub async fn mutation_score(resolved: &Value) -> anyhow::Result<MutationReport> {
     type MutationOperator = (&'static str, fn(&Value) -> Vec<(String, Value)>);
     let operators: Vec<MutationOperator> = vec![
@@ -661,10 +871,13 @@ pub async fn mutation_score(resolved: &Value) -> anyhow::Result<MutationReport> 
         ("deadend", deadend),
         ("det_cycle", det_cycle),
         ("literal_type_break", literal_type_break),
+        ("drop_output_write", drop_output_write),
+        ("drop_initial_context_seed", drop_initial_context_seed),
         ("delete_guard", delete_guard),
         ("flip_guard_op", flip_guard_op),
     ];
 
+    let baseline = Baseline::capture(resolved).await;
     let mut per_operator = Vec::new();
 
     for (op_name, op_fn) in &operators {
@@ -674,7 +887,7 @@ pub async fn mutation_score(resolved: &Value) -> anyhow::Result<MutationReport> 
         let mut sample_survivor: Option<String> = None;
 
         for (label, mutant) in &mutants {
-            let is_killed = assess_mutant(mutant).await;
+            let is_killed = assess_mutant(mutant, &baseline).await;
             if is_killed {
                 killed += 1;
             } else if sample_survivor.is_none() {
@@ -706,54 +919,39 @@ pub async fn mutation_score(resolved: &Value) -> anyhow::Result<MutationReport> 
     })
 }
 
-/// Assess a single mutant: returns `true` if KILLED, `false` if SURVIVED.
+/// Assess a single mutant against the baseline: `true` if KILLED, `false` if it
+/// SURVIVED.
 ///
-/// Kill conditions (any one suffices):
-/// - `config::resolve()` errors (config structurally invalid).
-/// - `validate_workflows()` returns at least one Error-level diagnostic.
-/// - `fuzz_coverage()` on a temp file returns `has_failures() == true`.
-async fn assess_mutant(mutant: &Value) -> bool {
-    // Gate 1: resolve (idempotent on already-resolved docs; catches dangling targets, etc.)
+/// A mutant is killed only by a complaint it CAUSED. Every gate is diffed against
+/// what it already said about the unmutated config:
+/// - `config::resolve()` errors (the baseline resolved, or there'd be no report),
+/// - `validate_workflows()` emits a diagnostic not in the baseline,
+/// - `fuzz_coverage()` reports a finding not in the baseline.
+async fn assess_mutant(mutant: &Value, baseline: &Baseline) -> bool {
+    // Gate 1: resolve (catches dangling targets and the like).
     let re_resolved = match praxec_core::config::resolve(mutant.clone()) {
         Err(_) => return true, // KILLED at resolve
         Ok(v) => v,
     };
 
-    // Gate 2: validate_workflows (structural checks: orphans, dead-ends, loops, etc.)
-    // Both errors AND warnings are treated as kills — we're running on known-good
-    // configs (no pre-existing diagnostics), so any diagnostic on a mutant is new.
-    let diagnostics = praxec_core::validate::validate_workflows(&re_resolved);
-    if !diagnostics.is_empty() {
-        return true; // KILLED by validator (error or warning)
+    // Gate 2: a NEW diagnostic. Warnings count — a mutant that provokes a warning
+    // the clean config never produced has been noticed, which is the whole
+    // question. But it must be new: a corpus with pre-existing diagnostics would
+    // otherwise "kill" every mutant, including the ones the tool is blind to.
+    let new_diagnostic = praxec_core::validate::validate_workflows(&re_resolved)
+        .into_iter()
+        .any(|d| !baseline.diagnostics.contains(d.message()));
+    if new_diagnostic {
+        return true;
     }
 
-    // Gate 3: fuzz_coverage via a temp JSON file.
-    // JSON is valid YAML, so load_yaml (called by load_resolved_with_repos) parses it.
-    let tmp_path = {
-        use std::io::Write;
-        let mut path = std::env::temp_dir();
-        // Use thread ID + subsec nanos for a unique name to avoid collisions in parallel tests.
-        let tid = std::thread::current().id();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        path.push(format!("praxec_mutant_{tid:?}_{nanos}.json"));
-        let mut f = match std::fs::File::create(&path) {
-            Ok(f) => f,
-            Err(_) => return false,
-        };
-        let json_bytes = serde_json::to_vec(&re_resolved).unwrap_or_default();
-        let _ = f.write_all(&json_bytes);
-        path
-    };
-
-    let result = crate::fuzz_coverage(&tmp_path).await;
-    let _ = std::fs::remove_file(&tmp_path);
-
-    match result {
-        Ok(cov) => cov.has_failures(),
-        Err(_) => true, // load error = KILLED
+    // Gate 3: a NEW fuzz finding.
+    match fuzz_findings_of(&re_resolved).await {
+        Ok(findings) => findings
+            .difference(&baseline.fuzz_findings)
+            .next()
+            .is_some(),
+        Err(_) => true, // the mutant broke the loader outright
     }
 }
 
@@ -763,6 +961,52 @@ async fn assess_mutant(mutant: &Value) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// THE test that keeps the score honest: an UNMUTATED config must SURVIVE its
+    /// own baseline.
+    ///
+    /// If baseline capture silently fails (or is never subtracted), a corpus with
+    /// any pre-existing complaint "kills" every mutant it is handed — including
+    /// the identity one — and the mutation score reads 100% while measuring
+    /// nothing at all. That is not hypothetical: it is exactly what the harness
+    /// did before, and the tell was the two SEMANTIC operators, which exist to
+    /// document what the tool CANNOT catch, also reporting 100%.
+    ///
+    /// The config below carries a deliberate pre-existing defect (`dead` is a
+    /// non-terminal state with no way out). A mutant that introduces nothing new
+    /// must still come back SURVIVED.
+    #[tokio::test]
+    async fn an_unmutated_config_survives_its_own_baseline() {
+        let config = json!({
+            "version": "1.0.0",
+            "workflows": { "wf": {
+                "version": "1.0.0",
+                "initialState": "start",
+                "states": {
+                    "start": { "transitions": {
+                        "go":   { "target": "done", "actor": "agent", "executor": { "kind": "noop" } },
+                        "trap": { "target": "dead", "actor": "agent", "executor": { "kind": "noop" } }
+                    }},
+                    // Pre-existing defect: reachable, non-terminal, no way out.
+                    "dead": { "transitions": {} },
+                    "done": { "terminal": true, "transitions": {} }
+                }
+            }}
+        });
+
+        let baseline = Baseline::capture(&config).await;
+        assert!(
+            !baseline.diagnostics.is_empty() || !baseline.fuzz_findings.is_empty(),
+            "fixture must actually have a pre-existing complaint, or this test proves nothing"
+        );
+
+        assert!(
+            !assess_mutant(&config, &baseline).await,
+            "the identity mutant changed NOTHING, so it must SURVIVE. Killing it means the \
+             kill criterion is absolute rather than baseline-relative, and every score the \
+             harness reports on a real corpus is meaningless."
+        );
+    }
 
     fn simple_config() -> Value {
         // A minimal resolved config: start →(go)→ review →(approve, guarded)→ done

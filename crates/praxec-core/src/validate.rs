@@ -237,6 +237,9 @@ fn validate_one_workflow(
         }
         Tier::Other => {}
     }
+    // SPEC §5.3, V24 — every declared output must be written on EVERY path to
+    // EVERY terminal. The compile-time half of the terminal output contract.
+    validate_declared_outputs_are_written(id, def, out);
     // SPEC §6.1, V12 — every `kind: workflow` executor inside this
     // workflow's transitions must conform to the use-binding contract.
     validate_use_bindings(id, def, out);
@@ -1323,6 +1326,198 @@ fn validate_snippet(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
     }
 }
 
+/// SPEC §5.3, V24 — UNWRITTEN_DECLARED_OUTPUT.
+///
+/// The runtime enforces a definition's declared outputs at its own terminal
+/// (`runtime_chain::enforce_declared_outputs`). This is the compile-time half:
+/// prove, from the state graph alone, that every declared output is written on
+/// EVERY path to EVERY terminal — so an author learns at `praxec check` rather
+/// than on the one run that happens to take the escalation branch.
+///
+/// It exists because the runtime check cannot catch all of these. The
+/// deterministic-repair rung coerces a missing `array`/`object` output to
+/// `[]`/`{}` before validating (it must — a composing host repairs too, and the
+/// terminal check must not be harsher than the compose check it mirrors). So a
+/// never-written `report: {type: object}` silently becomes `{}` at runtime and
+/// the caller reads an empty report instead of an error. Only a static
+/// must-write analysis sees that the slot has no writer at all.
+///
+/// The analysis is a standard MUST dataflow over the state graph, restricted to
+/// the declared-output slots (the only lattice we care about):
+///
+/// ```text
+///   MUST[initial] = D ∩ (initialContext ∪ writes(onEnter[initial]))
+///   MUST[s]       = ( ⋂ over incoming (u --t--> s) of  MUST[u] ∪ writes(t) )
+///                     ∪ writes(onEnter[s])
+/// ```
+///
+/// Greatest fixpoint (seed every non-initial state with the full set D and
+/// shrink), which is what makes it correct across cycles — a retry loop must not
+/// be able to launder an unwritten slot into a written one.
+///
+/// `writes(t)` is the transition's `output:` keys. By the time validation runs,
+/// `expand_use_bindings` has already synthesized the `output:` block for a
+/// `use:`-bound `kind: workflow` call, so a composed capability's outputs are
+/// counted like any other write. `onEnter` merges an `output:` block of its own
+/// (runtime_chain::run_on_enter) and counts as a write on ENTRY to its state.
+///
+/// Unreachable states are excluded: an orphan terminal is V-something else's
+/// problem, and reporting it here would just be noise on top of that diagnostic.
+fn validate_declared_outputs_are_written(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
+    // A capability declares its invokable outputs under `snippet.outputs`; a
+    // nestable flow declares them at the top level. Same harvest rule
+    // `expand_use_bindings` uses to embed `_snippetOutputs`.
+    let Some(declared) = def
+        .pointer("/snippet/outputs")
+        .or_else(|| def.pointer("/outputs"))
+        .and_then(Value::as_object)
+        .filter(|o| !o.is_empty())
+    else {
+        return;
+    };
+    let all: HashSet<&str> = declared.keys().map(String::as_str).collect();
+
+    let Some(states) = def.pointer("/states").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(initial) = def.get("initialState").and_then(Value::as_str) else {
+        return;
+    };
+    if !states.contains_key(initial) {
+        return; // a bogus initialState is another rule's diagnostic
+    }
+
+    // Slots written on ENTRY to a state (its `onEnter.output` keys).
+    fn on_enter_writes(state: &Value) -> HashSet<&str> {
+        state
+            .pointer("/onEnter/output")
+            .and_then(Value::as_object)
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    // Edges: target <- [(source, writes(transition))]
+    let mut incoming: HashMap<&str, Vec<(&str, HashSet<&str>)>> = HashMap::new();
+    let mut reachable: HashSet<&str> = HashSet::new();
+    let mut queue = vec![initial];
+    reachable.insert(initial);
+    while let Some(cur) = queue.pop() {
+        let Some(transitions) = states
+            .get(cur)
+            .and_then(|s| s.pointer("/transitions"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for t_def in transitions.values() {
+            let Some(target) = t_def.get("target").and_then(Value::as_str) else {
+                continue;
+            };
+            if !states.contains_key(target) {
+                continue; // dangling target — V-something else
+            }
+            let writes: HashSet<&str> = t_def
+                .pointer("/output")
+                .and_then(Value::as_object)
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            incoming.entry(target).or_default().push((cur, writes));
+            if reachable.insert(target) {
+                queue.push(target);
+            }
+        }
+    }
+
+    // Greatest fixpoint: seed non-initial states with EVERYTHING, then shrink.
+    let seed_initial: HashSet<&str> = def
+        .pointer("/initialContext")
+        .and_then(Value::as_object)
+        .map(|o| o.keys().map(String::as_str).collect::<HashSet<&str>>())
+        .unwrap_or_default()
+        .union(&on_enter_writes(&states[initial]))
+        .copied()
+        .filter(|s| all.contains(s))
+        .collect();
+
+    let mut must: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for &s in &reachable {
+        if s == initial {
+            must.insert(s, seed_initial.clone());
+        } else {
+            must.insert(s, all.clone());
+        }
+    }
+
+    // Iterate to stability. Each pass can only shrink a set, and the sets are
+    // bounded by `all`, so this terminates in at most |reachable| * |all| passes.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &s in &reachable {
+            if s == initial {
+                continue;
+            }
+            let Some(preds) = incoming.get(s) else {
+                continue;
+            };
+            let mut next: Option<HashSet<&str>> = None;
+            for (pred, writes) in preds {
+                if !reachable.contains(pred) {
+                    continue;
+                }
+                let along: HashSet<&str> = must[pred]
+                    .union(&writes.iter().copied().filter(|w| all.contains(w)).collect())
+                    .copied()
+                    .collect();
+                next = Some(match next {
+                    None => along,
+                    Some(acc) => acc.intersection(&along).copied().collect(),
+                });
+            }
+            let mut next = next.unwrap_or_default();
+            // Entering the state writes its onEnter outputs, on every path.
+            for w in on_enter_writes(&states[s]) {
+                if all.contains(w) {
+                    next.insert(w);
+                }
+            }
+            if next != must[s] {
+                must.insert(s, next);
+                changed = true;
+            }
+        }
+    }
+
+    // Every reachable terminal must owe nothing.
+    let mut terminals: Vec<&str> = reachable
+        .iter()
+        .copied()
+        .filter(|s| {
+            states[*s]
+                .get("terminal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .collect();
+    terminals.sort_unstable();
+
+    for terminal in terminals {
+        let mut missing: Vec<&str> = all.difference(&must[terminal]).copied().collect();
+        if missing.is_empty() {
+            continue;
+        }
+        missing.sort_unstable();
+        out.push(Diagnostic::Error(format!(
+            "UNWRITTEN_DECLARED_OUTPUT: workflow '{id}' declares output(s) [{}] that are NOT \
+             written on every path to terminal state '{terminal}' — a caller binding one reads \
+             null, and for an `array`/`object` slot the repair rung silently hands it `[]`/`{{}}` \
+             instead of failing. Either write it on every path, or seed it in `initialContext:` \
+             (SPEC §5.3, V24)",
+            missing.join(", ")
+        )));
+    }
+}
+
 /// SPEC §6.1, V12 — walk every transition; for any `kind: workflow`
 /// executor targeting a `cap.*` definition, require a `use:` block;
 /// validate its shape. Also enforces the `host_path → cap_output_name`
@@ -2358,6 +2553,225 @@ mod tests {
         });
         let d = validate_workflows(&config);
         assert!(d.is_empty(), "expected no diagnostics, got: {d:?}");
+    }
+
+    // ── V24 UNWRITTEN_DECLARED_OUTPUT ────────────────────────────────────────
+    //
+    // Modeled on the real defects the runtime terminal check surfaced in the
+    // cognitive-architectures pack, so the static rule is pinned to the bugs it
+    // exists to catch — not to a toy.
+
+    fn v24_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| matches!(d, Diagnostic::Error(_)))
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("UNWRITTEN_DECLARED_OUTPUT"))
+            .collect()
+    }
+
+    /// The `cap.implement.build-loop` shape: an output written only on the happy
+    /// path, with an escalation branch that reaches the SAME terminal without it.
+    fn build_loop_shaped(seed_tests_added: bool) -> Value {
+        let mut wf = json!({
+            "verb": "implement",
+            "initialState": "coding",
+            "snippet": {
+                "inputs": {},
+                "outputs": {
+                    "result":      { "type": "object" },
+                    "tests_added": { "type": "integer" }
+                }
+            },
+            "states": {
+                "coding": { "transitions": {
+                    "green": {
+                        "target": "done", "actor": "deterministic",
+                        "executor": { "kind": "noop" },
+                        "output": { "result": "$.output.result", "tests_added": "$.output.n" }
+                    },
+                    // The escalation branch: reaches `done` via `needs_human`,
+                    // never traversing the transition that writes tests_added.
+                    "escalate": {
+                        "target": "needs_human", "actor": "deterministic",
+                        "executor": { "kind": "noop" }
+                    }
+                }},
+                "needs_human": { "transitions": {
+                    "review": {
+                        "target": "done", "actor": "human",
+                        "executor": { "kind": "noop" },
+                        "output": { "result": "$.arguments.result" }
+                    }
+                }},
+                "done": { "terminal": true }
+            }
+        });
+        if seed_tests_added {
+            wf["initialContext"] = json!({ "tests_added": 0 });
+        }
+        json!({ "workflows": { "cap.implement.loop": wf } })
+    }
+
+    #[test]
+    fn v24_rejects_a_declared_output_missing_on_one_path_to_terminal() {
+        let errors = v24_errors(&build_loop_shaped(false));
+        assert_eq!(
+            errors.len(),
+            1,
+            "the escalation path reaches `done` without ever writing tests_added: {errors:?}"
+        );
+        assert!(
+            errors[0].contains("tests_added"),
+            "must name the unwritten slot: {}",
+            errors[0]
+        );
+        assert!(
+            !errors[0].contains("result"),
+            "`result` IS written on every path — naming it would be a false positive: {}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn v24_accepts_the_same_workflow_once_the_slot_is_seeded() {
+        // The one-line fix the rule is asking for.
+        assert!(
+            v24_errors(&build_loop_shaped(true)).is_empty(),
+            "seeding tests_added in initialContext satisfies it on every path"
+        );
+    }
+
+    /// The whole point of the STATIC rule: the runtime check cannot catch this
+    /// one. A never-written `array`/`object` output is silently repaired to
+    /// `[]`/`{}` by the deterministic-repair rung, so the run goes green and the
+    /// caller reads an empty report. Only must-write analysis sees there is no
+    /// writer at all. (The `flow.pressure-test.use-cases` defect, exactly.)
+    #[test]
+    fn v24_catches_the_unwritten_object_output_the_repair_rung_would_paper_over() {
+        let config = json!({ "workflows": { "flow.pressure-test": {
+            "initialState": "proposing",
+            "outputs": { "report": { "type": "object" } },
+            "states": {
+                "proposing": { "transitions": {
+                    "falsify": {
+                        "target": "done", "actor": "deterministic",
+                        "executor": { "kind": "noop" },
+                        "output": { "report": "$.output.report" }
+                    },
+                    // Human rejects before anything is falsified → `failed`
+                    // terminal, and `report` was never written.
+                    "reject": {
+                        "target": "failed", "actor": "deterministic",
+                        "executor": { "kind": "noop" }
+                    }
+                }},
+                "done":   { "terminal": true },
+                "failed": { "terminal": true }
+            }
+        }}});
+        let errors = v24_errors(&config);
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one terminal to owe: {errors:?}"
+        );
+        assert!(
+            errors[0].contains("failed") && errors[0].contains("report"),
+            "must name the offending terminal AND slot: {}",
+            errors[0]
+        );
+    }
+
+    /// A retry loop must not be able to launder an unwritten slot into a written
+    /// one. This is why the analysis is a GREATEST fixpoint (seed with everything
+    /// and shrink) rather than a least one — a naive least-fixpoint walk would
+    /// reach `gate` a second time through the cycle, see `verdict` "already
+    /// written", and conclude the terminal is safe.
+    #[test]
+    fn v24_is_not_fooled_by_a_retry_cycle() {
+        let config = json!({ "workflows": { "cap.verify.thing": {
+            "verb": "verify",
+            "initialState": "gate",
+            "snippet": { "inputs": {}, "outputs": { "verdict": { "type": "string" } } },
+            "states": {
+                "gate": { "transitions": {
+                    // Straight to terminal without ever writing `verdict`.
+                    "give_up": {
+                        "target": "done", "actor": "deterministic",
+                        "executor": { "kind": "noop" }
+                    },
+                    "retry": {
+                        "target": "working", "actor": "deterministic",
+                        "executor": { "kind": "noop" }
+                    }
+                }},
+                "working": { "transitions": {
+                    // Writes verdict, then loops BACK to the gate.
+                    "run": {
+                        "target": "gate", "actor": "deterministic",
+                        "executor": { "kind": "noop" },
+                        "output": { "verdict": "$.output.verdict" }
+                    }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        let errors = v24_errors(&config);
+        assert_eq!(
+            errors.len(),
+            1,
+            "the give_up edge fires on the FIRST visit to `gate`, before `working` ever \
+             ran — the cycle must not launder that away: {errors:?}"
+        );
+        assert!(errors[0].contains("verdict"), "{}", errors[0]);
+    }
+
+    #[test]
+    fn v24_counts_an_on_enter_output_as_a_write() {
+        let config = json!({ "workflows": { "cap.record.thing": {
+            "verb": "record",
+            "initialState": "ready",
+            "snippet": { "inputs": {}, "outputs": { "stamp": { "type": "string" } } },
+            "states": {
+                "ready": { "transitions": {
+                    "go": { "target": "done", "actor": "deterministic", "executor": { "kind": "noop" } }
+                }},
+                "done": {
+                    "terminal": true,
+                    // onEnter merges its own `output:` block into context
+                    // (runtime_chain::run_on_enter), so it IS a writer.
+                    "onEnter": {
+                        "executor": { "kind": "noop" },
+                        "output": { "stamp": "$.output.stamp" }
+                    }
+                }
+            }
+        }}});
+        assert!(
+            v24_errors(&config).is_empty(),
+            "an onEnter output on the terminal writes the slot on every path into it"
+        );
+    }
+
+    #[test]
+    fn v24_ignores_a_definition_that_declares_no_outputs() {
+        let config = json!({ "workflows": { "cap.record.thing": {
+            "verb": "record",
+            "initialState": "ready",
+            "snippet": { "inputs": {}, "outputs": {} },
+            "states": {
+                "ready": { "transitions": {
+                    "go": { "target": "done", "actor": "deterministic", "executor": { "kind": "noop" } }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        assert!(
+            v24_errors(&config).is_empty(),
+            "no declared contract, nothing to owe — most caps are this shape and a rule \
+             that fired on them would be a brownout, not a guard"
+        );
     }
 
     // ADR-0008 — outcomes + terminal `outcome` validation.

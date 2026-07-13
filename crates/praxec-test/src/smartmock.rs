@@ -2,27 +2,27 @@
 //! (so guard-gated flows traverse). Falls back to `{}` when no plan exists.
 //! Optionally injects failures via a [`FailureInjector`].
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{Map, Value, json};
+use serde_json::json;
 
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{ExecuteRequest, ExecuteResult};
 use praxec_core::ports::{Executor, ExecutorRegistry};
 
+use crate::analysis::plan::OutputPlan;
 use crate::inject::FailureInjector;
 
 #[derive(Clone)]
 pub struct SmartMockRegistry {
-    plan: Arc<HashMap<String, Map<String, Value>>>,
+    plan: Arc<OutputPlan>,
     injector: Option<Arc<FailureInjector>>,
 }
 
 impl SmartMockRegistry {
     /// No failure injection — Task 4's unit test uses this.
-    pub fn new(plan: HashMap<String, Map<String, Value>>) -> Self {
+    pub fn new(plan: OutputPlan) -> Self {
         Self {
             plan: Arc::new(plan),
             injector: None,
@@ -30,7 +30,7 @@ impl SmartMockRegistry {
     }
 
     /// With failure injection: `rate` is 0–100 (percent of calls that fail).
-    pub fn with_injection(plan: HashMap<String, Map<String, Value>>, seed: u64, rate: u8) -> Self {
+    pub fn with_injection(plan: OutputPlan, seed: u64, rate: u8) -> Self {
         Self {
             plan: Arc::new(plan),
             injector: Some(Arc::new(FailureInjector::new(seed, rate))),
@@ -39,7 +39,7 @@ impl SmartMockRegistry {
 }
 
 struct SmartMockExecutor {
-    plan: Arc<HashMap<String, Map<String, Value>>>,
+    plan: Arc<OutputPlan>,
     injector: Option<Arc<FailureInjector>>,
 }
 
@@ -64,11 +64,9 @@ impl Executor for SmartMockExecutor {
             return Err(ExecutorError::Permanent("fuzz-injected failure".into()));
         }
         let key = request.transition.clone().unwrap_or_default();
-        let output = self
-            .plan
-            .get(&key)
-            .map(|m| Value::Object(m.clone()))
-            .unwrap_or_else(|| json!({}));
+        // The planned output is a whole JSON value, not a field map — a
+        // `kind: mcp` leaf's result may legitimately be an array or a scalar.
+        let output = self.plan.get(&key).cloned().unwrap_or_else(|| json!({}));
         Ok(ExecuteResult {
             output,
             evidence: vec![],
@@ -84,6 +82,7 @@ impl Executor for SmartMockExecutor {
 mod tests {
     use super::*;
     use praxec_core::model::WorkflowInstance;
+    use serde_json::Value;
 
     fn instance_stub() -> WorkflowInstance {
         WorkflowInstance {
@@ -118,10 +117,8 @@ mod tests {
 
     #[tokio::test]
     async fn emits_planned_output_for_transition() {
-        let mut plan = HashMap::new();
-        let mut fields = Map::new();
-        fields.insert("approved".into(), json!(true));
-        plan.insert("go".into(), fields);
+        let mut plan = OutputPlan::new();
+        plan.insert("go".into(), json!({ "approved": true }));
 
         let reg = SmartMockRegistry::new(plan);
         let ex = reg.get("noop").unwrap();
@@ -133,5 +130,21 @@ mod tests {
         // unknown transition → empty
         let r2 = ex.execute(make_request(Some("other"))).await.unwrap();
         assert_eq!(r2.output, json!({}));
+    }
+
+    /// A `kind: mcp` leaf's result IS the slot's value, and it is frequently not
+    /// an object — `corpus_search` returns a bare array of passages. The mock has
+    /// to be able to emit that, or every array-typed whole-output slot looks like
+    /// a contract violation the definition didn't commit.
+    #[tokio::test]
+    async fn emits_a_non_object_planned_output() {
+        let mut plan = OutputPlan::new();
+        plan.insert("retrieve".into(), json!([{ "path": "a.md", "score": 1 }]));
+
+        let reg = SmartMockRegistry::new(plan);
+        let ex = reg.get("mcp").unwrap();
+
+        let r = ex.execute(make_request(Some("retrieve"))).await.unwrap();
+        assert_eq!(r.output, json!([{ "path": "a.md", "score": 1 }]));
     }
 }

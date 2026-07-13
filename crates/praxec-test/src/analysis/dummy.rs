@@ -1,10 +1,48 @@
 //! Synthesize a type-appropriate dummy value from a JSON Schema fragment, for
 //! satisfying a capability's declared `snippet.outputs`.
 
+use std::sync::LazyLock;
+
 use serde_json::{Value, json};
+
+use praxec_core::hop::HOP_SCHEMA;
+
+/// The shipped HOP vocabulary's `$defs`, parsed once.
+///
+/// A slot capability spells its output contract as a `$ref` into this
+/// vocabulary — `{ "$ref": "praxec://hop#/$defs/verifyOut" }` — so a synthesizer
+/// that cannot follow the ref cannot produce a valid verdict for ANY slot cap in
+/// the pack. It would emit `null` (no `type:` key to match on) and every
+/// mock-driven verify would look like a contract violation.
+static HOP_DEFS: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::from_str::<Value>(HOP_SCHEMA)
+        .ok()
+        .and_then(|doc| doc.get("$defs").cloned())
+        .unwrap_or(Value::Null)
+});
+
+/// Resolve a HOP `$ref` to the schema it names — both the config-side alias
+/// (`praxec://hop#/$defs/<def>`) and the document-internal form
+/// (`#/$defs/<def>`), since a resolved def's own properties `$ref` each other
+/// (e.g. `verifyOut.status` → `#/$defs/gateStatus`).
+fn resolve_hop_ref(reference: &str) -> Option<&'static Value> {
+    let name = reference
+        .strip_prefix("praxec://hop#/$defs/")
+        .or_else(|| reference.strip_prefix("#/$defs/"))?;
+    HOP_DEFS.get(name)
+}
 
 /// A minimal valid value for the given JSON Schema fragment.
 pub fn dummy_for_schema(schema: &Value) -> Value {
+    // Follow a HOP `$ref` before anything else — the ref IS the schema.
+    if let Some(target) = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .and_then(resolve_hop_ref)
+    {
+        return dummy_for_schema(target);
+    }
+
     // enum wins (first value)
     if let Some(first) = schema
         .get("enum")
@@ -141,6 +179,44 @@ mod tests {
     #[test]
     fn unknown_is_null() {
         assert_eq!(dummy_for_schema(&json!({})), Value::Null);
+    }
+
+    /// Every slot capability in the pack spells its contract as a `$ref` into
+    /// the shipped HOP vocabulary. A synthesizer that can't follow the ref emits
+    /// `null` for all of them — so a mock-driven verify looks like a contract
+    /// violation, and the fuzz reports a failure the definition doesn't have.
+    #[test]
+    fn a_hop_ref_resolves_to_a_contract_valid_dummy() {
+        let verdict = dummy_for_schema(&json!({ "$ref": "praxec://hop#/$defs/verifyOut" }));
+
+        // The value must actually satisfy verifyOut — checked through the same
+        // registry-aware validator the runtime enforces the contract with, so
+        // this test can't drift from the check it exists to keep honest.
+        assert_eq!(
+            praxec_core::hop::validate_against_schema(
+                &json!({ "$ref": "praxec://hop#/$defs/verifyOut" }),
+                &verdict,
+                "verifyOut",
+            ),
+            Ok(()),
+            "synthesized dummy must satisfy verifyOut, got: {verdict}"
+        );
+
+        // And the nested refs resolved too, not just the top level.
+        assert!(
+            verdict["provenance"]["stack"].is_string(),
+            "nested $ref (provenance -> stackProvenance) must resolve: {verdict}"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_ref_still_degrades_to_null() {
+        // Not a HOP ref — no registry to consult, so the old behavior stands
+        // rather than panicking or inventing a value.
+        assert_eq!(
+            dummy_for_schema(&json!({ "$ref": "https://example.com/other#/x" })),
+            Value::Null
+        );
     }
 
     #[test]

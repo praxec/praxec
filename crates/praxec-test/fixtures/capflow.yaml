@@ -36,6 +36,19 @@ workflows:
       outputs:
         severity: { type: string, enum: [S1, S2] }
     states:
+      # This state used to be `terminal: true` with no transitions — a cap that
+      # DECLARED `severity` and had no way on earth to write it. The fuzz never
+      # noticed because it mocks `kind: workflow`, so the cap never actually ran;
+      # V24 (UNWRITTEN_DECLARED_OUTPUT) caught it the moment it existed. Give the
+      # cap a real transition that discharges its own contract.
       only:
+        transitions:
+          classify:
+            target: done
+            actor: deterministic
+            executor: { kind: noop }
+            output:
+              severity: "$.output.severity"
+      done:
         terminal: true
         transitions: {}

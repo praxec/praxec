@@ -52,6 +52,17 @@ pub struct AgentExecutorConfig {
     /// making progress).
     #[serde(default)]
     pub stall_seconds: Option<u64>,
+    /// (CR#1) Wall-clock ceiling on the *whole* model chain-walk for a single
+    /// step, in seconds. Without it, an all-`AGENT_NO_RESULT` walk gives every
+    /// model in the chain its own full `max_seconds` wall (N×600s of silent
+    /// churn with no forward progress). This bounds the entire escalation: each
+    /// model's effective wall is shrunk to the budget REMAINING, and once the
+    /// budget is spent the walk stops and returns a terminal, human-routable
+    /// `AGENT_STEP_BUDGET_EXHAUSTED` instead of escalating into yet another
+    /// full-wall attempt. Enforceable → an accepted knob; defaults to
+    /// [`DEFAULT_STEP_BUDGET_SECONDS`].
+    #[serde(default)]
+    pub step_budget_seconds: Option<u64>,
     /// Reasoning-effort hint passed through to the Aether session.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
