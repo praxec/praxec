@@ -10,9 +10,45 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
-Fixes from dogfooding 0.0.18 against a real .NET/React/C# repo. Both changes
-target the same class of defect: the engine was *silent* where it should have
-been *loud*.
+### Hardening — close the silent/fail-open scope gaps (V25–V27)
+
+The theme is one lesson driven home three ways: **a scope the resolver quietly
+coalesces to `null` is a bug it hides.** The 0.0.18 dogfooding found a guard that
+read `$.input.mode` — a scope the evaluator resolves to `null`, making the guard
+permanently false and wedging the cap. That was one instance of a class, and
+v0.0.19 closes the class, on both sides of the read/write boundary, with a
+mutation operator behind each rule so it stays honest.
+
+- **V25 `UNRESOLVABLE_GUARD_SCOPE`.** A load-time error on any guard `expr`
+  operand that is `$.`-rooted but names no resolvable scope (`$.context.*`,
+  `$.arguments.*`, `$.workflow.input.*`, `$.workflow.{id,state,version}`). The
+  resolvable set lives in one predicate the evaluator and the validator both
+  consult — a poka-yoke test keeps them from drifting. The evaluator also now
+  **fails fast** on such an operand instead of coalescing to `null`.
+- **V26 `SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE`.** A warning: V24 proves an output is
+  *written*; V26 catches one *written from a source that can be null*. The
+  repair rung coerces a missing array/object to `[]`/`{}`, but it cannot repair a
+  scalar — so a declared `summary: {type: string}` sourced from an optional
+  argument lands `null` at terminal when the agent omits it. Found exactly three
+  in the pack (survey-confirmed), each fixed with a `default`.
+- **V27 `UNRESOLVABLE_WRITE_SCOPE`.** The write-side twin of V25, from an FMECA
+  sweep of the resolver code. `output:` / `onEnter.output:` / `prefill:` mappings
+  had **no** scope validator — an unrecognized `$.`-rooted path (a typo, an
+  `$.input.x`) silently wrote `null`. V27 caught a real bug on first run: the same
+  human-approve cap wrote `plan_final: "$.input.plan"`, dropping the operator's
+  approved plan on the auto path. It also flagged two of praxec's own test
+  fixtures that had been silently writing null.
+
+Each rule ships with a mutation operator (`retarget_guard_scope`,
+`weaken_output_source`, `retarget_output_scope`) that must be killed by it — the
+mutation report on the live pack is 100% across all twelve operators (1434+
+mutants), so the rules are attacked, not assumed. Remaining coalescing sites the
+sweep found (`use.inputs` non-context scopes; `join.expression` operands) are
+narrower and tracked for a follow-on.
+
+### Fixes from dogfooding 0.0.18 against a real .NET/React/C# repo
+
+The engine was *silent* where it should have been *loud*.
 
 ### Fixed — the multi-turn fix-loop stall on reasoning models
 
