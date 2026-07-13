@@ -1101,6 +1101,24 @@ fn check_guard_kind_recursive(
                      parseable binary comparison (e.g. `$.context.x == \"y\"`); it would silently \
                      evaluate to false at runtime"
                 )));
+            } else if let Some((lhs, rhs)) = crate::guards::expr_operands(raw_expr) {
+                // V25 — UNRESOLVABLE_GUARD_SCOPE. Every `$.`-rooted operand must
+                // name a scope the evaluator resolves; anything else coalesces to
+                // `null` and makes the guard permanently false (the `$.input.mode`
+                // dead-guard bug). Reject at load so the author never ships it.
+                for operand in [lhs, rhs] {
+                    if crate::guards::is_rooted_operand(operand)
+                        && !crate::guards::is_resolvable_guard_scope(operand)
+                    {
+                        out.push(Diagnostic::Error(format!(
+                            "UNRESOLVABLE_GUARD_SCOPE: workflow '{id}': transition '{t_name}' in \
+                             state '{state_name}' has an 'expr' guard whose operand '{operand}' \
+                             names no resolvable scope — it would coalesce to null and make the \
+                             guard always-false. Use `$.context.*`, `$.arguments.*`, \
+                             `$.workflow.input.*`, or `$.workflow.{{id,state,version}}`"
+                        )));
+                    }
+                }
             }
         }
         _ => {}
@@ -3257,6 +3275,48 @@ mod tests {
         assert!(
             d.iter()
                 .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND"))
+        );
+    }
+
+    // ── V25 — UNRESOLVABLE_GUARD_SCOPE ───────────────────────────────────────
+
+    #[test]
+    fn v25_rejects_a_guard_reading_an_unresolvable_scope() {
+        // `$.input.mode` is the real bug: the evaluator resolves
+        // `$.workflow.input.*`, not bare `$.input.*`, so this coalesces to null
+        // and the guard is permanently false.
+        let d = validate_workflows(&guarded_workflow(
+            json!({ "kind": "expr", "expr": "$.input.mode == 'auto'" }),
+        ));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("UNRESOLVABLE_GUARD_SCOPE")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn v25_accepts_the_canonical_input_spelling() {
+        let d = validate_workflows(&guarded_workflow(
+            json!({ "kind": "expr", "expr": "$.workflow.input.mode == 'auto'" }),
+        ));
+        assert!(
+            !d.iter()
+                .any(|d| d.message().contains("UNRESOLVABLE_GUARD_SCOPE")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn v25_checks_the_right_hand_operand_too() {
+        // Slot-vs-slot with a bogus RHS scope.
+        let d = validate_workflows(&guarded_workflow(json!({
+            "kind": "expr", "expr": "$.context.iter < $.input.iter_cap"
+        })));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("UNRESOLVABLE_GUARD_SCOPE")),
+            "{d:?}"
         );
     }
 

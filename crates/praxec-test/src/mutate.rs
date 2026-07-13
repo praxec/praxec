@@ -15,6 +15,7 @@
 //! | literal_type_break        | Type       | KILLED         | runtime type check |
 //! | drop_output_write         | Contract   | KILLED         | V24 (must-write)   |
 //! | drop_initial_context_seed | Contract   | KILLED         | V24 (must-write)   |
+//! | retarget_guard_scope      | Scope      | KILLED         | V25 (guard scope)  |
 //! | delete_guard              | Semantic   | KILLED         | violating-ctx probe|
 //! | flip_guard_op             | Semantic   | KILLED         | violating-ctx probe|
 //!
@@ -618,6 +619,50 @@ pub fn drop_initial_context_seed(config: &Value) -> Vec<(String, Value)> {
     mutants
 }
 
+/// SCOPE — for each `expr` guard reading `$.workflow.input.<x>`, rewrite it to the
+/// bare `$.input.<x>` spelling the guard evaluator does NOT resolve.
+///
+/// This is the mutant that proves V25 works. `$.input.*` coalesces to `null` at
+/// eval, so the guard becomes permanently false — the exact dead-guard bug that
+/// shipped in `cap.gate.human-approve-plan`. V25 (`UNRESOLVABLE_GUARD_SCOPE`) must
+/// kill it at load; before V25 it survived silently.
+pub fn retarget_guard_scope(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+
+    for (wf_id, state_name, t_name, t_def) in each_transition(config) {
+        let Some(guards) = t_def.get("guards").and_then(Value::as_array) else {
+            continue;
+        };
+        for (gi, guard) in guards.iter().enumerate() {
+            if guard.get("kind").and_then(Value::as_str) != Some("expr") {
+                continue;
+            }
+            let Some(expr) = guard.get("expr").and_then(Value::as_str) else {
+                continue;
+            };
+            if !expr.contains("$.workflow.input.") {
+                continue;
+            }
+            let broken = expr.replace("$.workflow.input.", "$.input.");
+            let label = format!("retarget_guard_scope/{wf_id}/{state_name}/{t_name}/guard[{gi}]");
+            let (wf_id_c, sn_c, tn_c) = (wf_id.clone(), state_name.clone(), t_name.clone());
+            let mutant = mutate(config, |v| {
+                let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut) else {
+                    return;
+                };
+                if let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c)
+                    && let Some(gs) = td.get_mut("guards").and_then(Value::as_array_mut)
+                    && let Some(g) = gs.get_mut(gi).and_then(Value::as_object_mut)
+                {
+                    g.insert("expr".into(), Value::String(broken.clone()));
+                }
+            });
+            mutants.push((label, mutant));
+        }
+    }
+    mutants
+}
+
 /// SEMANTIC — for each guarded transition, remove all its guards.
 ///
 /// Known blind spot: the tool cannot tell whether a guard is intentional without
@@ -873,6 +918,7 @@ pub async fn mutation_score(resolved: &Value) -> anyhow::Result<MutationReport> 
         ("literal_type_break", literal_type_break),
         ("drop_output_write", drop_output_write),
         ("drop_initial_context_seed", drop_initial_context_seed),
+        ("retarget_guard_scope", retarget_guard_scope),
         ("delete_guard", delete_guard),
         ("flip_guard_op", flip_guard_op),
     ];
@@ -1167,6 +1213,39 @@ mod tests {
                 "delete_guard mutant should have no guards"
             );
         }
+    }
+
+    #[test]
+    fn retarget_guard_scope_breaks_only_input_guards_and_is_killed_by_v25() {
+        let cfg = json!({ "workflows": { "wf": {
+            "initialState": "start",
+            "states": {
+                "start": { "transitions": {
+                    "go": { "target": "done", "actor": "deterministic", "executor": { "kind": "noop" },
+                            "guards": [ { "kind": "expr", "expr": "$.workflow.input.mode == 'auto'" } ] }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        let mutants = retarget_guard_scope(&cfg);
+        assert_eq!(mutants.len(), 1, "one input-scoped guard to retarget");
+        let (_label, mutant) = &mutants[0];
+        let expr = mutant
+            .pointer("/workflows/wf/states/start/transitions/go/guards/0/expr")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(
+            expr, "$.input.mode == 'auto'",
+            "rewritten to the dead spelling"
+        );
+
+        // The whole point: V25 must catch it.
+        assert!(
+            praxec_core::validate::validate_workflows(mutant)
+                .iter()
+                .any(|d| d.message().contains("UNRESOLVABLE_GUARD_SCOPE")),
+            "the mutant must be killed by V25"
+        );
     }
 
     #[test]
