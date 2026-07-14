@@ -10,6 +10,97 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+## [0.0.20] — 2026-07-14 — observability, HITL, and contract-clean gating
+
+A consumer-dogfooding release: driving 0.0.19 to mint and deliver real workflows
+(a C# authoring pack, a React feature) surfaced a cluster of blockers — the
+authoring pack couldn't survey its own tools, human gates were invisible to the
+MCP-driving agent, and a contract-dirty pack served a broken surface silently.
+This release closes all of them, adds the full MCP-native HITL story
+(elicitation push + relay), and makes a dirty pack **un-operable-but-repairable**
+by construction.
+
+### Fixed — the authoring pack could not survey its own tools (BLOCKER)
+
+`cap.research.tool-inventory` (step 1 of every authoring flow) asked an LLM agent
+to "survey the live gateway for reachable tools" — but the agent had no tool with
+which to enumerate the gateway, so it burned the full 900s step budget
+(`AGENT_STEP_BUDGET_EXHAUSTED`) and produced nothing, making the entire meta
+authoring pack unusable. Surveying the gateway's own registry is inherently
+deterministic: a new **`inventory` executor** reads the live `DiscoveryIndex`
+directly and emits the typed `{ mcp_tools, cli_scripts, skills, capabilities,
+connections, workflows, agents, counts }` inventory in one instant, governed
+step — no model, no budget, no hallucinated tools. The cap is now an
+`actor: deterministic` step that completes on `start` via the deterministic
+chain. Verified against the exact consumer repro.
+
+### Added — MCP-native human-in-the-loop
+
+A workflow that parks on a human gate (an `actor: human` approval or an agent's
+in-workflow question) is now visible and resolvable to the agent driving over
+MCP, four ways:
+
+- **Typed pull-list** — `praxec.query { approvals: true }` enumerates every
+  parked gate as a typed `PendingHumanGate`, and a `waiting` response carries the
+  gate inline as `pending_human` with a ready-to-fire `resolve` handle.
+- **Elicitation push** — when a `praxec.command` parks on a gate and the client
+  advertises the MCP `elicitation` capability (SEP-1319 / rmcp 1.8), praxec turns
+  the gate into an `elicitation/create` round-trip and **resumes the mission
+  in-band** on accept (under a human principal); a non-capable client keeps the
+  pull-list. The form is built from the resolving transition's declared
+  `inputSchema`.
+- **Sub-workflow gate surfacing** — a parent parked waiting on a `kind: workflow`
+  child that holds the gate used to show `links: []` (the actionable transition
+  lived on the child). The parent now surfaces the child's gate with
+  `onChildWorkflow: true` and a `resolve` handle targeting the child.
+- **Elicitation relay** — praxec is a middle node: a downstream `kind: mcp` tool
+  that itself prompts a human now has its `elicitation/create` **proxied through
+  praxec** up to praxec's own upstream client. Tool-agnostic by construction (it
+  forwards opaque params), so any eliciting MCP server reaches a human through
+  the gateway.
+
+### Added — V30 `USE_BINDING_CONTRACT_DRIFT` + contract-clean gating (poka-yoke)
+
+- **V30** joins the V25–V29 silent-scope series: a static, load-time check that
+  cross-validates every `kind: workflow` step's `use` block against the
+  referenced definition's declared `snippet` contract — a mapped input the child
+  doesn't declare, a required child input the host omits, or a `use.outputs` name
+  the child never produces are all hard errors (previously silent). It caught a
+  latent dead `filter` binding in the shipped meta pack.
+- **Contract-clean gating**: a pack with ANY contract error no longer serves a
+  broken functional surface. The gateway comes up in **repair-only mode** — it
+  refuses to `start` anything except the operator-declared repair surface
+  (`praxec.repair_surface` allowlist, or a per-workflow `repair: true` marker),
+  surfacing the precise diagnostics + callable repair links on every gated call
+  and on `home`. A clean reload reopens the full surface; a dirty reload drops
+  to repair-only (never exits). You cannot operate a dirty pack — only repair it.
+
+### Added — observability + operations
+
+- `praxec.query { observe: true }` now **tails the live** audit window (was
+  returning a stale window); `praxec health` and the MCP discovery `home` report
+  the running binary's **version**, so a consumer can detect a stale server.
+- **`praxec cleanup`** prunes residual rotated audit-log files (dry-run by
+  default, `--force` to delete; fail-safe — never touches undateable or recent
+  files).
+- **`praxec sync`** fast-forwards local git-backed pack repos to `origin/main`
+  (fail-safe: only a clean checkout on `main`), and startup warns when a local
+  pack repo is checked out off `main` — the stale-pack failure mode.
+
+### Companion pack + org changes
+
+- **praxec-meta** — `cap.research.tool-inventory` reshaped to the deterministic
+  `inventory` executor; the dead `filter` binding removed from
+  `flow.author-capability`/`flow.author-flow`.
+- **cognitive-architectures** — the delivery flow is now **stack-aware** (detects
+  Rust/TS/.NET and routes to `cap.verify.{rust,ts,dotnet}` instead of hardcoded
+  cargo; `cap.verify.ts` added), threads `repo_path` to the implement agent, and
+  guards against a failed/no-op implement reaching "complete" with honest
+  outcomes. A deterministic **path-grounding gate** blocks a plan with
+  hallucinated file paths from reaching signoff.
+- **/praxec org repos** standardized on **rmcp 1.8** (SEP-1319 elicitation) so
+  the relay proxies elicitation with uniform typed params.
+
 ## [0.0.19] — 2026-07-14 — the silent-scope hardening
 
 A dogfooding-driven consolidation release. Running 0.0.18 against a real

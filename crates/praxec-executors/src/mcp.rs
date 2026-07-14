@@ -7,8 +7,14 @@ use async_trait::async_trait;
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult};
 use praxec_core::ports::Executor;
-use rmcp::model::CallToolRequestParams;
-use rmcp::service::RunningService;
+use rmcp::ErrorData as McpError;
+use rmcp::handler::client::ClientHandler;
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, ClientInfo, CreateElicitationRequestParams,
+    CreateElicitationResult, ElicitationAction, ElicitationCapability, FormElicitationCapability,
+    Implementation,
+};
+use rmcp::service::{RequestContext, RunningService};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::{RoleClient, ServiceExt};
@@ -18,6 +24,80 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::idle::{ActivityClock, ActivityTracked, with_idle_timeout};
+
+/// #11 — the seam a downstream MCP server's `elicitation/create` is relayed
+/// through. praxec is a MIDDLE node: when a governed `kind: mcp` tool needs a
+/// human, that request must reach the human at praxec's OWN upstream client
+/// (the agent host), not die at praxec's downstream connection. Implemented by
+/// the MCP server over its captured upstream peer; `None` on paths with no
+/// upstream (a one-shot CLI call) → the relay declines rather than hangs.
+///
+/// Tool-agnostic BY CONSTRUCTION: it forwards an opaque
+/// [`CreateElicitationRequestParams`], so ANY eliciting downstream server
+/// proxies through — nothing here is specific to one tool.
+#[async_trait]
+pub trait UpstreamElicitor: Send + Sync {
+    async fn elicit(
+        &self,
+        params: CreateElicitationRequestParams,
+    ) -> Result<CreateElicitationResult, String>;
+}
+
+/// The rmcp client handler praxec presents to EVERY downstream MCP connection.
+/// It ADVERTISES the elicitation capability (so downstream servers know they may
+/// prompt a human through us) and RELAYS each `elicitation/create` up to the
+/// [`UpstreamElicitor`]. Replaces the former `()` no-op client, which advertised
+/// nothing and could not carry a human prompt across the gateway.
+#[derive(Clone)]
+pub struct RelayClientHandler {
+    upstream: Option<Arc<dyn UpstreamElicitor>>,
+}
+
+impl RelayClientHandler {
+    pub fn new(upstream: Option<Arc<dyn UpstreamElicitor>>) -> Self {
+        Self { upstream }
+    }
+}
+
+impl ClientHandler for RelayClientHandler {
+    fn get_info(&self) -> ClientInfo {
+        // These rmcp capability/info structs are `#[non_exhaustive]`, so build
+        // via Default + field assignment rather than a struct literal.
+        let mut elicitation = ElicitationCapability::default();
+        elicitation.form = Some(FormElicitationCapability {
+            schema_validation: Some(false),
+        });
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.elicitation = Some(elicitation);
+        let mut client_info = Implementation::default();
+        client_info.name = "praxec".into();
+        client_info.version = env!("CARGO_PKG_VERSION").into();
+        let mut info = ClientInfo::default();
+        info.capabilities = capabilities;
+        info.client_info = client_info;
+        info
+    }
+
+    async fn create_elicitation(
+        &self,
+        params: CreateElicitationRequestParams,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<CreateElicitationResult, McpError> {
+        match &self.upstream {
+            Some(upstream) => upstream.elicit(params).await.map_err(|e| {
+                McpError::internal_error(format!("elicitation relay to upstream failed: {e}"), None)
+            }),
+            // No upstream (e.g. one-shot CLI, no human peer): decline cleanly so
+            // the downstream tool fails fast instead of hanging on a prompt that
+            // can never be answered.
+            None => Ok(CreateElicitationResult {
+                action: ElicitationAction::Decline,
+                content: None,
+                meta: None,
+            }),
+        }
+    }
+}
 
 /// Per-connection idle (no-activity) ceiling on connect/`initialize` and each
 /// tool call when the connection does not set `idleTimeoutMs`. This is an
@@ -136,7 +216,7 @@ pub trait McpToolCaller: Send + Sync {
 /// child-process transport, the owned child handle (spawned with
 /// `kill_on_drop`, so dropping this entry reaps the server).
 struct Conn {
-    service: RunningService<RoleClient, ()>,
+    service: RunningService<RoleClient, RelayClientHandler>,
     clock: ActivityClock,
     idle: Duration,
     /// Kept alive for the connection's lifetime; `None` for the HTTP transport.
@@ -149,6 +229,9 @@ struct Conn {
 pub struct RmcpToolCaller {
     connections: McpConnections,
     cache: Mutex<HashMap<String, Arc<Conn>>>,
+    /// #11 — the upstream elicitation relay handed to every downstream client.
+    /// `None` → downstream elicitations are declined (no human peer to reach).
+    upstream: Option<Arc<dyn UpstreamElicitor>>,
 }
 
 impl RmcpToolCaller {
@@ -156,7 +239,15 @@ impl RmcpToolCaller {
         Self {
             connections,
             cache: Mutex::new(HashMap::new()),
+            upstream: None,
         }
+    }
+
+    /// #11 — wire the upstream elicitation relay: downstream servers that prompt
+    /// a human have their `elicitation/create` forwarded to `upstream`.
+    pub fn with_upstream(mut self, upstream: Arc<dyn UpstreamElicitor>) -> Self {
+        self.upstream = Some(upstream);
+        self
     }
 
     async fn client_for(&self, name: &str) -> Result<Arc<Conn>, ExecutorError> {
@@ -177,15 +268,17 @@ impl RmcpToolCaller {
         // when both are present (since URL implies a hosted server, not a
         // process to launch). Both bound connect/`initialize` by the idle
         // window so an unreachable or silent server can never hang establishment.
+        let handler = RelayClientHandler::new(self.upstream.clone());
         let (service, child): (
-            RunningService<RoleClient, ()>,
+            RunningService<RoleClient, RelayClientHandler>,
             Option<tokio::process::Child>,
         ) = if let Some(url) = &conn.url {
             let transport = StreamableHttpClientTransport::<reqwest::Client>::from_uri(url.clone());
             // HTTP has no child stdio to tap, so the clock isn't byte-bumped:
             // the idle window acts as a connect timeout here.
             clock.mark();
-            let client = with_idle_timeout(idle, &clock, ServiceExt::serve((), transport))
+            let client =
+                with_idle_timeout(idle, &clock, ServiceExt::serve(handler.clone(), transport))
                 .await
                 .map_err(|e| ExecutorError::Connection(format!("mcp http connect '{name}': {e}")))?
                 .map_err(|e| ExecutorError::Connection(format!("mcp http init '{name}': {e}")))?;
@@ -251,7 +344,7 @@ impl RmcpToolCaller {
             let transport =
                 AsyncRwTransport::new_client(ActivityTracked::new(stdout, clock.clone()), stdin);
             clock.mark();
-            let client = with_idle_timeout(idle, &clock, ServiceExt::serve((), transport))
+            let client = with_idle_timeout(idle, &clock, ServiceExt::serve(handler, transport))
                 .await
                 .map_err(|e| {
                     ExecutorError::Connection(format!("mcp connect '{name}': {e} (idle timeout)"))
@@ -348,6 +441,23 @@ impl McpExecutor {
     pub fn new(connections: McpConnections) -> Self {
         Self {
             caller: Arc::new(RmcpToolCaller::new(connections)),
+        }
+    }
+
+    /// #11 — production constructor that also wires the upstream elicitation
+    /// relay, so a downstream `kind: mcp` server that prompts a human reaches
+    /// one through praxec's own upstream client. `None` → no relay (declines).
+    pub fn new_with_upstream(
+        connections: McpConnections,
+        upstream: Option<Arc<dyn UpstreamElicitor>>,
+    ) -> Self {
+        let caller = RmcpToolCaller::new(connections);
+        let caller = match upstream {
+            Some(up) => caller.with_upstream(up),
+            None => caller,
+        };
+        Self {
+            caller: Arc::new(caller),
         }
     }
 
@@ -844,5 +954,122 @@ mod transport_happy_path_tests {
 
         let _ = client.cancel().await;
         server_task.abort();
+    }
+
+    // #11 — a GENERIC downstream server that, on ANY tool call, prompts the human
+    // via `elicitation/create`. It is not special-cased to any tool: it forwards
+    // whatever schema it likes and reports back the elicited action + content.
+    #[derive(Clone)]
+    struct ElicitingServer;
+    impl ServerHandler for ElicitingServer {
+        fn get_info(&self) -> ServerInfo {
+            let mut info = InitializeResult::default();
+            info.protocol_version = ProtocolVersion::default();
+            info.capabilities = ServerCapabilities::builder().enable_tools().build();
+            info
+        }
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResult, McpError> {
+            use rmcp::model::{CreateElicitationRequestParams, ElicitationSchema};
+            let schema = ElicitationSchema::builder()
+                .required_string("anything")
+                .build()
+                .unwrap();
+            let params = CreateElicitationRequestParams::FormElicitationParams {
+                meta: None,
+                message: "a generic downstream prompt".to_string(),
+                requested_schema: schema,
+            };
+            // Prompt the human THROUGH the connected client (praxec's relay).
+            let elicited = context
+                .peer
+                .create_elicitation(params)
+                .await
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            Ok(CallToolResult::structured(json!({
+                "action": format!("{:?}", elicited.action),
+                "content": elicited.content,
+            })))
+        }
+    }
+
+    // A stand-in upstream (praxec's own client) that auto-accepts with a value.
+    struct AcceptingUpstream;
+    #[async_trait::async_trait]
+    impl UpstreamElicitor for AcceptingUpstream {
+        async fn elicit(
+            &self,
+            params: rmcp::model::CreateElicitationRequestParams,
+        ) -> Result<rmcp::model::CreateElicitationResult, String> {
+            // Prove it received the downstream's opaque params (tool-agnostic).
+            let msg = match &params {
+                rmcp::model::CreateElicitationRequestParams::FormElicitationParams {
+                    message,
+                    ..
+                } => message.clone(),
+                _ => String::new(),
+            };
+            assert_eq!(msg, "a generic downstream prompt");
+            Ok(rmcp::model::CreateElicitationResult {
+                action: rmcp::model::ElicitationAction::Accept,
+                content: Some(json!({ "anything": "relayed-through-praxec" })),
+                meta: None,
+            })
+        }
+    }
+
+    /// #11 — an arbitrary downstream server's `elicitation/create` is proxied
+    /// THROUGH praxec's `RelayClientHandler` up to the upstream, and the upstream's
+    /// answer flows back down to the downstream tool. Nothing here is specific to
+    /// any one tool — the relay forwards opaque params.
+    #[tokio::test]
+    async fn relays_arbitrary_downstream_elicitation_up_to_the_upstream() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let (cr, cw) = tokio::io::split(client_io);
+        let (sr, sw) = tokio::io::split(server_io);
+
+        let server_task = tokio::spawn(async move {
+            let server = serve_server(ElicitingServer, AsyncRwTransport::new_server(sr, sw))
+                .await
+                .expect("server initialize");
+            let _ = server.waiting().await;
+        });
+
+        // The client IS praxec's relay handler, with an accepting upstream.
+        let handler = RelayClientHandler::new(Some(Arc::new(AcceptingUpstream)));
+        let client = ServiceExt::serve(handler, AsyncRwTransport::new_client(cr, cw))
+            .await
+            .expect("relay client initialize");
+
+        // Calling the downstream tool triggers its elicitation, which the relay
+        // forwards up and answers — the tool sees the accepted content.
+        let result = client
+            .peer()
+            .call_tool(CallToolRequestParams::new("anything".to_string()))
+            .await
+            .expect("call tool through the relay");
+        let structured = result.structured_content.expect("structured result");
+        assert_eq!(structured["action"], "Accept", "relayed accept: {structured}");
+        assert_eq!(
+            structured["content"]["anything"], "relayed-through-praxec",
+            "the upstream's answer must reach the downstream tool: {structured}"
+        );
+
+        let _ = client.cancel().await;
+        server_task.abort();
+    }
+
+    /// The relay ADVERTISES elicitation to every downstream server, so any of
+    /// them knows it may prompt a human through praxec.
+    #[test]
+    fn relay_client_advertises_elicitation() {
+        let info = RelayClientHandler::new(None).get_info();
+        assert!(
+            info.capabilities.elicitation.is_some(),
+            "praxec must advertise elicitation to downstream servers"
+        );
     }
 }

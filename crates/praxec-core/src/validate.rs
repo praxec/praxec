@@ -94,10 +94,29 @@ pub fn validate_workflows(config: &Value) -> Vec<Diagnostic> {
                 .map(|outputs| (id.clone(), outputs))
         })
         .collect();
+    // V30 — the input side of the compose contract. Every cap/flow is indexed
+    // (with `{}` when it declares no inputs) so a lookup by resolved
+    // `definitionId` distinguishes "child declares no inputs → a mapped input is
+    // extra" from "child not loaded → not V30's business" (V22 owns that).
+    // `definitionId` is already namespace-resolved by `expand_use_bindings`
+    // before this validation runs, so an exact-key lookup is correct.
+    let cap_snippet_inputs: HashMap<String, Value> = workflows
+        .iter()
+        .filter(|(id, _)| matches!(Tier::from_id(id), Tier::Cap | Tier::Flow))
+        .map(|(id, def)| {
+            let inputs = def
+                .pointer("/snippet/inputs")
+                .or_else(|| def.pointer("/inputs"))
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            (id.clone(), inputs)
+        })
+        .collect();
     let ctx = ValidationCtx {
         cap_contract_hashes: &cap_contract_hashes,
         cap_lifecycles: &cap_lifecycles,
         cap_snippet_outputs: &cap_snippet_outputs,
+        cap_snippet_inputs: &cap_snippet_inputs,
     };
 
     for (id, def) in workflows {
@@ -183,6 +202,9 @@ struct ValidationCtx<'a> {
     cap_contract_hashes: &'a HashMap<String, String>,
     cap_lifecycles: &'a HashMap<String, String>,
     cap_snippet_outputs: &'a HashMap<String, Value>,
+    /// V30 — declared inputs of every loaded cap/flow (`{}` when none),
+    /// keyed by resolved definition id. The input twin of `cap_snippet_outputs`.
+    cap_snippet_inputs: &'a HashMap<String, Value>,
 }
 
 fn validate_one_workflow(
@@ -245,7 +267,7 @@ fn validate_one_workflow(
     validate_scalar_outputs_have_non_nullable_sources(id, def, out);
     // SPEC §6.1, V12 — every `kind: workflow` executor inside this
     // workflow's transitions must conform to the use-binding contract.
-    validate_use_bindings(id, def, out);
+    validate_use_bindings(id, def, ctx, out);
     // SPEC §33 D6 — the `_llm.*` synthetic namespace is reserved for the
     // in-runtime LLM executor's cumulative-cap bookkeeping. User-declared
     // blackboard slots that begin with `_llm.` (or the legacy synthetic
@@ -1738,7 +1760,7 @@ fn argument_is_optional(t_def: &Value, field: &str) -> bool {
     !required && !has_default
 }
 
-fn validate_use_bindings(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
+fn validate_use_bindings(id: &str, def: &Value, ctx: &ValidationCtx<'_>, out: &mut Vec<Diagnostic>) {
     for_each_executor_site(def, |site| {
         let exec = site.executor;
         if exec.get("kind").and_then(Value::as_str) != Some("workflow") {
@@ -1761,8 +1783,108 @@ fn validate_use_bindings(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
         }
         if let Some(use_val) = exec.get("use") {
             validate_use_block_shape(id, &site.location, use_val, out);
+            if let Some(def_id) = target_def_id {
+                validate_use_contract(id, &site.location, def_id, use_val, ctx, out);
+            }
         }
     });
+}
+
+/// SPEC §6.1, V30 — USE_BINDING_CONTRACT_DRIFT.
+///
+/// Cross-check a `kind: workflow` step's `use` block against the referenced
+/// definition's DECLARED contract, in both directions:
+///
+/// 1. a mapped `use.inputs.<k>` the child never declares is a dead binding —
+///    the host thinks it's passing data the child silently drops;
+/// 2. a `required` child input the host omits spawns a child missing an input
+///    it needs;
+/// 3. a `use.outputs` name the child never produces reads back null.
+///
+/// All three silently mis-wire the compose boundary — the same silent-scope
+/// class as V25–V29, but ACROSS definitions, which is why nothing caught them
+/// before. Only fires when the child contract is known (a loaded cap/flow, its
+/// `definitionId` already namespace-resolved by `expand_use_bindings`); an
+/// unresolved target is V22's error, not this one, so V30 never false-positives
+/// on a ref it can't see.
+fn validate_use_contract(
+    id: &str,
+    location: &str,
+    def_id: &str,
+    use_val: &Value,
+    ctx: &ValidationCtx<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
+    // Unknown child ⇒ not V30's business (V22 owns unresolved refs).
+    let Some(child_inputs) = ctx
+        .cap_snippet_inputs
+        .get(def_id)
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let use_obj = use_val.as_object();
+    let host_inputs = use_obj
+        .and_then(|o| o.get("inputs"))
+        .and_then(Value::as_object);
+
+    // (1) Extra input: host maps an input the child does not declare.
+    if let Some(host_inputs) = host_inputs {
+        for k in host_inputs.keys() {
+            if !child_inputs.contains_key(k) {
+                out.push(Diagnostic::Error(format!(
+                    "USE_BINDING_CONTRACT_DRIFT: workflow '{id}' {location} maps `use.inputs.{k}` \
+                     but '{def_id}' declares no such input (declared: [{declared}]). Remove the \
+                     binding or rename it to match the referenced definition's contract \
+                     (SPEC §6.1, V30).",
+                    declared = key_list(child_inputs)
+                )));
+            }
+        }
+    }
+
+    // (2) Missing required: child requires an input the host does not map.
+    for (k, spec) in child_inputs {
+        let required = spec.get("required").and_then(Value::as_bool) == Some(true);
+        let provided = host_inputs.is_some_and(|hi| hi.contains_key(k));
+        if required && !provided {
+            out.push(Diagnostic::Error(format!(
+                "USE_BINDING_CONTRACT_DRIFT: workflow '{id}' {location} does not provide required \
+                 input `{k}` of '{def_id}' via `use.inputs`. Map it (or make the input optional in \
+                 '{def_id}') so the child is not spawned missing an input it needs (SPEC §6.1, V30)."
+            )));
+        }
+    }
+
+    // (3) Unknown output read: host reads an output the child does not produce.
+    if let Some(child_outputs) = ctx
+        .cap_snippet_outputs
+        .get(def_id)
+        .and_then(Value::as_object)
+    {
+        if let Some(host_outputs) = use_obj
+            .and_then(|o| o.get("outputs"))
+            .and_then(Value::as_object)
+        {
+            for cap_name in host_outputs.values().filter_map(Value::as_str) {
+                if !child_outputs.contains_key(cap_name) {
+                    out.push(Diagnostic::Error(format!(
+                        "USE_BINDING_CONTRACT_DRIFT: workflow '{id}' {location} reads output \
+                         `{cap_name}` via `use.outputs` but '{def_id}' declares no such output \
+                         (declared: [{declared}]); it would read back null (SPEC §6.1, V30).",
+                        declared = key_list(child_outputs)
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Comma-joined, sorted key names for a diagnostic's "declared: [...]" hint.
+fn key_list(obj: &serde_json::Map<String, Value>) -> String {
+    let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    keys.join(", ")
 }
 
 fn validate_use_block_shape(id: &str, location: &str, use_val: &Value, out: &mut Vec<Diagnostic>) {
@@ -4632,5 +4754,99 @@ mod tests {
             !d.iter().any(|x| x.message().contains("PARALLEL_REDUCE")),
             "a parallel step with no declared reduce contract must not be flagged, got: {d:?}"
         );
+    }
+
+    // --- V30 — USE_BINDING_CONTRACT_DRIFT -----------------------------------
+
+    fn v30_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("USE_BINDING_CONTRACT_DRIFT"))
+            .collect()
+    }
+
+    /// host + child pair: a flow whose `survey` step maps `use` into a cap.
+    fn host_and_child(use_block: Value, child_snippet: Value) -> Value {
+        json!({
+            "workflows": {
+                "cap.child.thing": {
+                    "verb": "research",
+                    "initialState": "ready",
+                    "snippet": child_snippet,
+                    "states": { "ready": { "transitions": {
+                        "go": { "target": "done", "actor": "deterministic", "executor": { "kind": "noop" } }
+                    }}, "done": { "terminal": true } }
+                },
+                "flow.host": {
+                    "initialState": "s",
+                    "states": { "s": { "transitions": {
+                        "call": {
+                            "target": "done", "actor": "deterministic",
+                            "executor": { "kind": "workflow", "definitionId": "cap.child.thing", "use": use_block }
+                        }
+                    }}, "done": { "terminal": true } }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn v30_flags_input_the_child_does_not_declare() {
+        let errs = v30_errors(&host_and_child(
+            json!({ "inputs": { "filter": "$.context.goal" } }),
+            json!({ "inputs": {}, "outputs": {} }),
+        ));
+        assert_eq!(errs.len(), 1, "got: {errs:?}");
+        assert!(errs[0].contains("use.inputs.filter"));
+        assert!(errs[0].contains("declares no such input"));
+    }
+
+    #[test]
+    fn v30_flags_missing_required_child_input() {
+        let errs = v30_errors(&host_and_child(
+            json!({ "inputs": {} }),
+            json!({ "inputs": { "goal": { "type": "string", "required": true } }, "outputs": {} }),
+        ));
+        assert_eq!(errs.len(), 1, "got: {errs:?}");
+        assert!(errs[0].contains("required input `goal`"));
+    }
+
+    #[test]
+    fn v30_flags_output_the_child_does_not_produce() {
+        let errs = v30_errors(&host_and_child(
+            json!({ "outputs": { "$.context.x": "nonexistent" } }),
+            json!({ "inputs": {}, "outputs": { "real": { "type": "string" } } }),
+        ));
+        assert_eq!(errs.len(), 1, "got: {errs:?}");
+        assert!(errs[0].contains("reads output `nonexistent`"));
+    }
+
+    #[test]
+    fn v30_accepts_a_contract_clean_binding() {
+        let errs = v30_errors(&host_and_child(
+            json!({ "inputs": { "goal": "$.context.goal" }, "outputs": { "$.context.r": "real" } }),
+            json!({
+                "inputs":  { "goal": { "type": "string", "required": true } },
+                "outputs": { "real": { "type": "string" } }
+            }),
+        ));
+        assert!(errs.is_empty(), "clean binding must not drift: {errs:?}");
+    }
+
+    #[test]
+    fn v30_skips_an_unresolved_child_ref() {
+        // Target not loaded → V22's error, never a V30 false positive.
+        let config = json!({
+            "workflows": { "flow.host": {
+                "initialState": "s",
+                "states": { "s": { "transitions": {
+                    "call": { "target": "done", "actor": "deterministic",
+                              "executor": { "kind": "workflow", "definitionId": "cap.absent",
+                                            "use": { "inputs": { "x": "$.context.y" } } } }
+                }}, "done": { "terminal": true } }
+            }}
+        });
+        assert!(v30_errors(&config).is_empty());
     }
 }

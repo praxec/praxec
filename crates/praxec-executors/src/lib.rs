@@ -14,6 +14,7 @@ pub mod human;
 pub mod idle;
 pub mod import;
 pub mod ingest;
+pub mod inventory;
 pub mod kind_doctor;
 pub mod mcp;
 pub mod noop;
@@ -33,7 +34,10 @@ pub use dry_run::DryRunExecutor;
 pub use human::HumanExecutor;
 pub use import::import_capabilities;
 pub use ingest::IngestExecutor;
-pub use mcp::{McpConnection, McpConnections, McpExecutor};
+pub use inventory::InventoryExecutor;
+pub use mcp::{
+    McpConnection, McpConnections, McpExecutor, RelayClientHandler, UpstreamElicitor,
+};
 pub use noop::NoopExecutor;
 pub use parallel::ParallelExecutor;
 pub use pipeline::PipelineExecutor;
@@ -74,6 +78,10 @@ pub const REGISTERED_EXECUTOR_KINDS: &[&str] = &[
     "structural_analysis",
     "ingest",
     "diff",
+    // `inventory` (like `agent`/`llm`) is added by the binary's overlay — it
+    // needs the live `DiscoveryIndex` handle, wired after the index is built —
+    // not the default registry. Listed here so `check` recognizes it.
+    "inventory",
     // D2 (v0.0.17) — surfaces a D1 tool descriptor's operations as callable,
     // delegating to the cli/mcp/rest executors above (no new transport).
     "tool_source",
@@ -115,6 +123,9 @@ pub const ALL_EXECUTOR_KINDS: &[&str] = &[
     "structural_analysis",
     "ingest",
     "diff",
+    // Overlaid by the binary with the live `DiscoveryIndex` (deterministic
+    // gateway self-survey; unblocks `cap.research.tool-inventory`).
+    "inventory",
     "tool_source",
 ];
 pub use registry::HashMapExecutorRegistry;

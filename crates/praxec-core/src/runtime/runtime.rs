@@ -292,6 +292,17 @@ impl WorkflowRuntime {
         &self.audit
     }
 
+    /// Every live mission currently parked awaiting a human — the store-derived
+    /// HITL queue the MCP-native `approvals` surface enumerates. Oldest-first
+    /// (clear the longest-waiting gate first). Each carries the transition +
+    /// `expected_version` a resolving `submit` needs.
+    pub async fn list_pending_human(
+        &self,
+    ) -> anyhow::Result<Vec<crate::hitl::PendingHumanGate>> {
+        let all = self.store.list_all().await?;
+        Ok(crate::hitl::pending_gates(&all))
+    }
+
     /// SPEC §30.10 — load a workflow instance by id without triggering
     /// timeout/cancellation checks. Used by handlers that need to inspect
     /// the instance's definition snapshot for lexicon embedding (describe,

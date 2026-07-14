@@ -215,3 +215,67 @@ async fn suspended_parent_resumes_when_child_terminates() {
          (saw {started} sub_workflow.started events)"
     );
 }
+
+/// #5 — a parent parked waiting on a child that holds a human gate must surface
+/// the CHILD's gate on the PARENT's response (the parent's own `links` are empty
+/// there), so a human staring at the parent sees the actionable transition
+/// instead of an inscrutable `links: []`.
+#[tokio::test]
+async fn parent_surfaces_the_childs_human_gate() {
+    use praxec_core::model::GetWorkflow;
+
+    let (runtime, _store, _audit) = build_runtime();
+    let start = runtime
+        .start(StartWorkflow {
+            definition_id: "parent".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            trace_id: None,
+            run_id: None,
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .expect("parent start");
+    let parent_id = start["workflow"]["id"].as_str().unwrap().to_string();
+    runtime
+        .submit(SubmitTransition {
+            workflow_id: parent_id.clone(),
+            expected_version: 0,
+            transition: "run_child".into(),
+            arguments: json!({}),
+            principal: Principal::anonymous(),
+            summary: None,
+            trace_id: None,
+            run_id: None,
+        })
+        .await
+        .expect("parent parks on the child");
+
+    // GET the parent while it is parked. Its own state has no human gate, but the
+    // child does — the response must surface it.
+    let resp = runtime
+        .get(GetWorkflow {
+            workflow_id: parent_id.clone(),
+            principal: Principal::anonymous(),
+            trace_id: None,
+            run_id: None,
+        })
+        .await
+        .expect("get parent");
+
+    let ph = &resp["pending_human"];
+    assert_eq!(
+        ph["onChildWorkflow"], true,
+        "parent must surface the child's gate: {resp:#}"
+    );
+    assert_eq!(ph["source"], "human_gate", "resp: {resp:#}");
+    // The resolve handle targets the CHILD (not the parent), with the child's
+    // human transition — the actionable step.
+    assert_eq!(ph["transition"], "approve", "resp: {resp:#}");
+    assert_ne!(
+        ph["resolve"]["args"]["workflowId"], json!(parent_id),
+        "resolve must target the child workflow, not the parent: {resp:#}"
+    );
+    assert_eq!(ph["resolve"]["requiresHuman"], true);
+}
