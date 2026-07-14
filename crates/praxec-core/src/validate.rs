@@ -237,6 +237,12 @@ fn validate_one_workflow(
         }
         Tier::Other => {}
     }
+    // SPEC §5.3, V24 — every declared output must be written on EVERY path to
+    // EVERY terminal. The compile-time half of the terminal output contract.
+    validate_declared_outputs_are_written(id, def, out);
+    // SPEC §5.3, V26 — a declared SCALAR output written from an OPTIONAL argument
+    // can land null at terminal (the repair rung can't coerce a scalar). Warn.
+    validate_scalar_outputs_have_non_nullable_sources(id, def, out);
     // SPEC §6.1, V12 — every `kind: workflow` executor inside this
     // workflow's transitions must conform to the use-binding contract.
     validate_use_bindings(id, def, out);
@@ -263,6 +269,11 @@ fn validate_one_workflow(
     // writes that Null to the blackboard. Reject those shapes at load so a
     // typo'd operator can't masquerade as a real (null) value at runtime.
     validate_output_operator_shapes(id, def, out);
+    // SPEC §5.3, V29 — executor `args:`/`map:`/`query:`/`body:` path strings must
+    // name a resolvable scope; an unrecognized one (`$.input.x`) reaches the
+    // shell/tool/endpoint as a literal or a null. The prevent layer for the
+    // executor-side coalescing the runtime now fails fast on.
+    validate_executor_arg_scopes(id, def, out);
     // Spec A §7.1 — the fan-in composition check for `kind: parallel` steps.
     // Proves at LOAD that the reduce (aggregator) consumes only what the map
     // produces: every field the reduce requires must be satisfiable from the
@@ -1098,6 +1109,24 @@ fn check_guard_kind_recursive(
                      parseable binary comparison (e.g. `$.context.x == \"y\"`); it would silently \
                      evaluate to false at runtime"
                 )));
+            } else if let Some((lhs, rhs)) = crate::guards::expr_operands(raw_expr) {
+                // V25 — UNRESOLVABLE_GUARD_SCOPE. Every `$.`-rooted operand must
+                // name a scope the evaluator resolves; anything else coalesces to
+                // `null` and makes the guard permanently false (the `$.input.mode`
+                // dead-guard bug). Reject at load so the author never ships it.
+                for operand in [lhs, rhs] {
+                    if crate::guards::is_rooted_operand(operand)
+                        && !crate::guards::is_resolvable_guard_scope(operand)
+                    {
+                        out.push(Diagnostic::Error(format!(
+                            "UNRESOLVABLE_GUARD_SCOPE: workflow '{id}': transition '{t_name}' in \
+                             state '{state_name}' has an 'expr' guard whose operand '{operand}' \
+                             names no resolvable scope — it would coalesce to null and make the \
+                             guard always-false. Use `$.context.*`, `$.arguments.*`, \
+                             `$.workflow.input.*`, or `$.workflow.{{id,state,version}}`"
+                        )));
+                    }
+                }
             }
         }
         _ => {}
@@ -1323,6 +1352,198 @@ fn validate_snippet(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
     }
 }
 
+/// SPEC §5.3, V24 — UNWRITTEN_DECLARED_OUTPUT.
+///
+/// The runtime enforces a definition's declared outputs at its own terminal
+/// (`runtime_chain::enforce_declared_outputs`). This is the compile-time half:
+/// prove, from the state graph alone, that every declared output is written on
+/// EVERY path to EVERY terminal — so an author learns at `praxec check` rather
+/// than on the one run that happens to take the escalation branch.
+///
+/// It exists because the runtime check cannot catch all of these. The
+/// deterministic-repair rung coerces a missing `array`/`object` output to
+/// `[]`/`{}` before validating (it must — a composing host repairs too, and the
+/// terminal check must not be harsher than the compose check it mirrors). So a
+/// never-written `report: {type: object}` silently becomes `{}` at runtime and
+/// the caller reads an empty report instead of an error. Only a static
+/// must-write analysis sees that the slot has no writer at all.
+///
+/// The analysis is a standard MUST dataflow over the state graph, restricted to
+/// the declared-output slots (the only lattice we care about):
+///
+/// ```text
+///   MUST[initial] = D ∩ (initialContext ∪ writes(onEnter[initial]))
+///   MUST[s]       = ( ⋂ over incoming (u --t--> s) of  MUST[u] ∪ writes(t) )
+///                     ∪ writes(onEnter[s])
+/// ```
+///
+/// Greatest fixpoint (seed every non-initial state with the full set D and
+/// shrink), which is what makes it correct across cycles — a retry loop must not
+/// be able to launder an unwritten slot into a written one.
+///
+/// `writes(t)` is the transition's `output:` keys. By the time validation runs,
+/// `expand_use_bindings` has already synthesized the `output:` block for a
+/// `use:`-bound `kind: workflow` call, so a composed capability's outputs are
+/// counted like any other write. `onEnter` merges an `output:` block of its own
+/// (runtime_chain::run_on_enter) and counts as a write on ENTRY to its state.
+///
+/// Unreachable states are excluded: an orphan terminal is V-something else's
+/// problem, and reporting it here would just be noise on top of that diagnostic.
+fn validate_declared_outputs_are_written(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
+    // A capability declares its invokable outputs under `snippet.outputs`; a
+    // nestable flow declares them at the top level. Same harvest rule
+    // `expand_use_bindings` uses to embed `_snippetOutputs`.
+    let Some(declared) = def
+        .pointer("/snippet/outputs")
+        .or_else(|| def.pointer("/outputs"))
+        .and_then(Value::as_object)
+        .filter(|o| !o.is_empty())
+    else {
+        return;
+    };
+    let all: HashSet<&str> = declared.keys().map(String::as_str).collect();
+
+    let Some(states) = def.pointer("/states").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(initial) = def.get("initialState").and_then(Value::as_str) else {
+        return;
+    };
+    if !states.contains_key(initial) {
+        return; // a bogus initialState is another rule's diagnostic
+    }
+
+    // Slots written on ENTRY to a state (its `onEnter.output` keys).
+    fn on_enter_writes(state: &Value) -> HashSet<&str> {
+        state
+            .pointer("/onEnter/output")
+            .and_then(Value::as_object)
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    // Edges: target <- [(source, writes(transition))]
+    let mut incoming: HashMap<&str, Vec<(&str, HashSet<&str>)>> = HashMap::new();
+    let mut reachable: HashSet<&str> = HashSet::new();
+    let mut queue = vec![initial];
+    reachable.insert(initial);
+    while let Some(cur) = queue.pop() {
+        let Some(transitions) = states
+            .get(cur)
+            .and_then(|s| s.pointer("/transitions"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for t_def in transitions.values() {
+            let Some(target) = t_def.get("target").and_then(Value::as_str) else {
+                continue;
+            };
+            if !states.contains_key(target) {
+                continue; // dangling target — V-something else
+            }
+            let writes: HashSet<&str> = t_def
+                .pointer("/output")
+                .and_then(Value::as_object)
+                .map(|o| o.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            incoming.entry(target).or_default().push((cur, writes));
+            if reachable.insert(target) {
+                queue.push(target);
+            }
+        }
+    }
+
+    // Greatest fixpoint: seed non-initial states with EVERYTHING, then shrink.
+    let seed_initial: HashSet<&str> = def
+        .pointer("/initialContext")
+        .and_then(Value::as_object)
+        .map(|o| o.keys().map(String::as_str).collect::<HashSet<&str>>())
+        .unwrap_or_default()
+        .union(&on_enter_writes(&states[initial]))
+        .copied()
+        .filter(|s| all.contains(s))
+        .collect();
+
+    let mut must: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for &s in &reachable {
+        if s == initial {
+            must.insert(s, seed_initial.clone());
+        } else {
+            must.insert(s, all.clone());
+        }
+    }
+
+    // Iterate to stability. Each pass can only shrink a set, and the sets are
+    // bounded by `all`, so this terminates in at most |reachable| * |all| passes.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &s in &reachable {
+            if s == initial {
+                continue;
+            }
+            let Some(preds) = incoming.get(s) else {
+                continue;
+            };
+            let mut next: Option<HashSet<&str>> = None;
+            for (pred, writes) in preds {
+                if !reachable.contains(pred) {
+                    continue;
+                }
+                let along: HashSet<&str> = must[pred]
+                    .union(&writes.iter().copied().filter(|w| all.contains(w)).collect())
+                    .copied()
+                    .collect();
+                next = Some(match next {
+                    None => along,
+                    Some(acc) => acc.intersection(&along).copied().collect(),
+                });
+            }
+            let mut next = next.unwrap_or_default();
+            // Entering the state writes its onEnter outputs, on every path.
+            for w in on_enter_writes(&states[s]) {
+                if all.contains(w) {
+                    next.insert(w);
+                }
+            }
+            if next != must[s] {
+                must.insert(s, next);
+                changed = true;
+            }
+        }
+    }
+
+    // Every reachable terminal must owe nothing.
+    let mut terminals: Vec<&str> = reachable
+        .iter()
+        .copied()
+        .filter(|s| {
+            states[*s]
+                .get("terminal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .collect();
+    terminals.sort_unstable();
+
+    for terminal in terminals {
+        let mut missing: Vec<&str> = all.difference(&must[terminal]).copied().collect();
+        if missing.is_empty() {
+            continue;
+        }
+        missing.sort_unstable();
+        out.push(Diagnostic::Error(format!(
+            "UNWRITTEN_DECLARED_OUTPUT: workflow '{id}' declares output(s) [{}] that are NOT \
+             written on every path to terminal state '{terminal}' — a caller binding one reads \
+             null, and for an `array`/`object` slot the repair rung silently hands it `[]`/`{{}}` \
+             instead of failing. Either write it on every path, or seed it in `initialContext:` \
+             (SPEC §5.3, V24)",
+            missing.join(", ")
+        )));
+    }
+}
+
 /// SPEC §6.1, V12 — walk every transition; for any `kind: workflow`
 /// executor targeting a `cap.*` definition, require a `use:` block;
 /// validate its shape. Also enforces the `host_path → cap_output_name`
@@ -1400,6 +1621,123 @@ pub fn for_each_executor_site(def: &Value, mut f: impl FnMut(&ExecutorSite)) {
     }
 }
 
+/// SPEC §5.3, V26 — SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE (warning).
+///
+/// V24 proves a declared output is *written* on every path. This catches the
+/// subtler sibling: an output that IS written, but from a source that can be
+/// `null`. The deterministic-repair rung coerces a missing `array`/`object` to
+/// `[]`/`{}` before the terminal check — but it CANNOT repair a scalar. So a
+/// declared `summary: {type: string}` mapped from `$.arguments.summary`, where
+/// `summary` is an OPTIONAL agent input (not `required`, no `default`), lands
+/// `null` at terminal whenever the agent omits it, and fails the contract.
+///
+/// This is why the fuzz's per-edge probe supplies ALL arguments, not just
+/// required ones — and it's the exact shape the pack survey found in
+/// `cap.review.completeness`, `cap.review.analysis`, and
+/// `cap.implement.resolve-conflicts`.
+///
+/// A warning, not an error: the runtime terminal check is the hard gate; this is
+/// the authoring nudge. Scope: a declared scalar output whose transition-level
+/// `output:` mapping sources it from `$.arguments.<field>`, where that field is
+/// present in the transition's `inputSchema.properties` but is neither `required`
+/// nor carries a `default`. (Array/object outputs are repairable; nullable-union
+/// scalar declarations already permit null and are exempt.)
+fn validate_scalar_outputs_have_non_nullable_sources(
+    id: &str,
+    def: &Value,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(declared) = def
+        .pointer("/snippet/outputs")
+        .or_else(|| def.pointer("/outputs"))
+        .and_then(Value::as_object)
+        .filter(|o| !o.is_empty())
+    else {
+        return;
+    };
+    // Only scalar, non-nullable declared outputs are at risk.
+    let scalar_outputs: HashSet<&str> = declared
+        .iter()
+        .filter(|(_, schema)| is_non_nullable_scalar_schema(schema))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if scalar_outputs.is_empty() {
+        return;
+    }
+
+    let Some(states) = def.pointer("/states").and_then(Value::as_object) else {
+        return;
+    };
+    for (state_name, state_def) in states {
+        let Some(transitions) = state_def.pointer("/transitions").and_then(Value::as_object) else {
+            continue;
+        };
+        for (t_name, t_def) in transitions {
+            let Some(output) = t_def.pointer("/output").and_then(Value::as_object) else {
+                continue;
+            };
+            for (out_slot, source) in output {
+                if !scalar_outputs.contains(out_slot.as_str()) {
+                    continue;
+                }
+                // Source must be `$.arguments.<field>` (a single top-level field).
+                let Some(field) = source
+                    .as_str()
+                    .and_then(|s| s.strip_prefix("$.arguments."))
+                    .filter(|f| !f.contains('.'))
+                else {
+                    continue;
+                };
+                if argument_is_optional(t_def, field) {
+                    out.push(Diagnostic::Warning(format!(
+                        "SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE: workflow '{id}': declared scalar \
+                         output '{out_slot}' is written by transition '{t_name}' in state \
+                         '{state_name}' from '$.arguments.{field}', but '{field}' is an OPTIONAL \
+                         input (not in `required`, no `default`). If the agent omits it the output \
+                         is null at terminal and fails the contract (a scalar can't be repaired). \
+                         Mark '{field}' required, give it a default, or make the output nullable \
+                         (SPEC §5.3, V26)"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// A schema declaring exactly one scalar type (string/integer/number/boolean),
+/// with no `null` in a type union — i.e. a value that CANNOT legally be null and
+/// CANNOT be deterministically repaired. `$ref` schemas and object/array types
+/// are excluded (a `$ref` may resolve to anything; array/object are repairable).
+fn is_non_nullable_scalar_schema(schema: &Value) -> bool {
+    matches!(
+        schema.get("type").and_then(Value::as_str),
+        Some("string" | "integer" | "number" | "boolean")
+    )
+}
+
+/// Is `field` an OPTIONAL property of the transition's `inputSchema` — declared,
+/// but absent from `required` and carrying no `default`?
+fn argument_is_optional(t_def: &Value, field: &str) -> bool {
+    let Some(schema) = t_def.pointer("/inputSchema") else {
+        return false;
+    };
+    let declared = schema
+        .pointer(&format!("/properties/{}", pointer_escape(field)))
+        .is_some();
+    if !declared {
+        return false; // not an inputSchema field at all — out of V26's scope
+    }
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().any(|v| v.as_str() == Some(field)))
+        .unwrap_or(false);
+    let has_default = schema
+        .pointer(&format!("/properties/{}/default", pointer_escape(field)))
+        .is_some();
+    !required && !has_default
+}
+
 fn validate_use_bindings(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
     for_each_executor_site(def, |site| {
         let exec = site.executor;
@@ -1448,6 +1786,30 @@ fn validate_use_block_shape(id: &str, location: &str, use_val: &Value, out: &mut
             )));
         }
     }
+    // V28 — UNRESOLVABLE_USE_INPUT_SCOPE. A `use.inputs` value is resolved at
+    // spawn time by `use_binding::resolve_one` → `read_in_scopes(.., None)`, which
+    // knows only `$.context.*`, `$.arguments.*`, `$.workflow.input.*` (no
+    // executor output exists yet, so `$.output.*` and `$` are absent too). An
+    // unrecognized `$.`-rooted scope coalesces to null and silently seeds the
+    // child with it. Reject at load — the read-side twin of V25/V27, on the
+    // compose boundary.
+    if let Some(inputs) = obj.get("inputs").and_then(Value::as_object) {
+        for (name, value) in inputs {
+            for operand in write_operand_strings(value) {
+                if crate::guards::is_rooted_operand(operand)
+                    && !is_resolvable_use_input_scope(operand)
+                {
+                    out.push(Diagnostic::Error(format!(
+                        "UNRESOLVABLE_USE_INPUT_SCOPE: workflow '{id}' {location} \
+                         use.inputs[{name}] operand '{operand}' names no resolvable scope — at \
+                         spawn time only `$.context.*`, `$.arguments.*`, and `$.workflow.input.*` \
+                         resolve (no executor output exists yet); anything else coalesces to null. \
+                         (SPEC §6.1, V28)"
+                    )));
+                }
+            }
+        }
+    }
     // V12 (shape half): every use.outputs value must be a string naming a
     // capability output, every key must match `$.context.<simple-name>`.
     if let Some(outputs) = obj.get("outputs").and_then(Value::as_object) {
@@ -1469,6 +1831,94 @@ fn validate_use_block_shape(id: &str, location: &str, use_val: &Value, out: &mut
             }
         }
     }
+}
+
+/// SPEC §5.3, V29 — UNRESOLVABLE_EXECUTOR_ARG_SCOPE.
+///
+/// Executor `args:` (script/cli), `map:` (mcp), and `query:` / `body:` (rest) are
+/// resolved by `read_in_scopes(.., None)` — the same {context, arguments,
+/// workflow.input} set as `use.inputs`, with no executor output at bind time. An
+/// unrecognized `$.`-rooted scope (`$.input.gateway_config_path`) either reaches
+/// the shell/tool/endpoint as its literal token or seeds a null. The runtime now
+/// fails fast on it; this is the load-time prevent that catches it at
+/// `praxec check`, the read-side companion to V27's write side.
+fn validate_executor_arg_scopes(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
+    let Some(states) = def.get("states").and_then(Value::as_object) else {
+        return;
+    };
+    for (state_name, state_def) in states {
+        let Some(transitions) = state_def.pointer("/transitions").and_then(Value::as_object) else {
+            continue;
+        };
+        for (t_name, t_def) in transitions {
+            let Some(exec) = t_def.get("executor") else {
+                continue;
+            };
+            let loc = |field: &str| format!("state '{state_name}' transition '{t_name}' {field}");
+            // script/cli `args:` — array of path strings.
+            if let Some(args) = exec.get("args").and_then(Value::as_array) {
+                for a in args {
+                    check_arg_scope(id, &loc("args"), a, out);
+                }
+            }
+            // mcp `map:` / rest `query:` — object of path strings.
+            for field in ["map", "query"] {
+                if let Some(obj) = exec.get(field).and_then(Value::as_object) {
+                    for v in obj.values() {
+                        check_arg_scope(id, &loc(field), v, out);
+                    }
+                }
+            }
+            // rest `body:` — an arbitrary template tree; recurse into every string.
+            if let Some(body) = exec.get("body") {
+                check_arg_scope_tree(id, &loc("body"), body, out);
+            }
+        }
+    }
+}
+
+/// Flag a single executor-arg value if it is a `$.`-rooted string naming no
+/// resolvable executor-arg scope.
+fn check_arg_scope(id: &str, loc: &str, value: &Value, out: &mut Vec<Diagnostic>) {
+    let Some(s) = value.as_str() else { return };
+    if crate::guards::is_rooted_operand(s) && !is_resolvable_use_input_scope(s) {
+        out.push(Diagnostic::Error(format!(
+            "UNRESOLVABLE_EXECUTOR_ARG_SCOPE: workflow '{id}' {loc}: operand '{s}' names no \
+             resolvable scope — executor args resolve against `$.context.*`, `$.arguments.*`, and \
+             `$.workflow.input.*` only (note: `$.input.*` is NOT `$.workflow.input.*`). It would \
+             reach the tool as a literal or a null (SPEC §5.3, V29)"
+        )));
+    }
+}
+
+/// Recurse an rest-`body:` template tree, checking every leaf string.
+fn check_arg_scope_tree(id: &str, loc: &str, value: &Value, out: &mut Vec<Diagnostic>) {
+    match value {
+        Value::String(_) => check_arg_scope(id, loc, value, out),
+        Value::Array(arr) => {
+            for v in arr {
+                check_arg_scope_tree(id, loc, v, out);
+            }
+        }
+        Value::Object(obj) => {
+            for v in obj.values() {
+                check_arg_scope_tree(id, loc, v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The scopes `use_binding::resolve_one` resolves a `use.inputs` value against:
+/// `$.context.*`, `$.arguments.*`, `$.workflow.input.*`. NOT `$.output`/`$` —
+/// there is no executor output at spawn time. Deliberately a strict subset of
+/// [`crate::mapping::is_resolvable_write_scope`]; a V28 test pins the difference.
+fn is_resolvable_use_input_scope(s: &str) -> bool {
+    let s = s.trim();
+    matches!(s, "$.arguments" | "$.context" | "$.workflow.input")
+        || s.starts_with("$.context.")
+        || s.starts_with("$.arguments.")
+        || s.starts_with("$.workflow.input.")
 }
 
 /// Mirror of `crate::config::host_path_tail` — accept iff the path matches
@@ -2084,6 +2534,44 @@ fn check_mapping_object(
                  (FALLBACK-05)."
             )));
         }
+        // V27 — UNRESOLVABLE_WRITE_SCOPE. Every `$.`-rooted string operand (the
+        // value itself, or an operand inside an arithmetic operator array) must
+        // name a scope `read_in_scopes` resolves. An unrecognized scope
+        // (a typo'd `$.outpt.plan`, a `$.input.x`) coalesces to null and silently
+        // writes it — the write-side twin of the guard's UNRESOLVABLE_GUARD_SCOPE.
+        for operand in write_operand_strings(spec) {
+            if crate::guards::is_rooted_operand(operand)
+                && !crate::mapping::is_resolvable_write_scope(operand)
+            {
+                out.push(Diagnostic::Error(format!(
+                    "UNRESOLVABLE_WRITE_SCOPE: workflow '{id}' state '{state_name}' {where_} key \
+                     '{key}': operand '{operand}' names no resolvable scope — it would coalesce to \
+                     null and silently write it. Use `$.context.*`, `$.output[.*]`, \
+                     `$.arguments.*`, `$.workflow.input.*`, or `$` (SPEC §5.3, V27)"
+                )));
+            }
+        }
+    }
+}
+
+/// The `$.`-rooted string operands a write-mapping value carries: the value
+/// itself when it is a bare path string, or the string operands inside a
+/// single-key arithmetic operator array (`{ add: ["$.context.n", 1] }`). Literals
+/// and nested non-operator objects carry none.
+fn write_operand_strings(spec: &Value) -> Vec<&str> {
+    match spec {
+        Value::String(s) => vec![s.as_str()],
+        Value::Object(obj) if obj.len() == 1 => {
+            let (op, args) = obj.iter().next().expect("len()==1");
+            match op.as_str() {
+                "add" | "subtract" | "multiply" | "divide" | "concat" => args
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -2358,6 +2846,225 @@ mod tests {
         });
         let d = validate_workflows(&config);
         assert!(d.is_empty(), "expected no diagnostics, got: {d:?}");
+    }
+
+    // ── V24 UNWRITTEN_DECLARED_OUTPUT ────────────────────────────────────────
+    //
+    // Modeled on the real defects the runtime terminal check surfaced in the
+    // cognitive-architectures pack, so the static rule is pinned to the bugs it
+    // exists to catch — not to a toy.
+
+    fn v24_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| matches!(d, Diagnostic::Error(_)))
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("UNWRITTEN_DECLARED_OUTPUT"))
+            .collect()
+    }
+
+    /// The `cap.implement.build-loop` shape: an output written only on the happy
+    /// path, with an escalation branch that reaches the SAME terminal without it.
+    fn build_loop_shaped(seed_tests_added: bool) -> Value {
+        let mut wf = json!({
+            "verb": "implement",
+            "initialState": "coding",
+            "snippet": {
+                "inputs": {},
+                "outputs": {
+                    "result":      { "type": "object" },
+                    "tests_added": { "type": "integer" }
+                }
+            },
+            "states": {
+                "coding": { "transitions": {
+                    "green": {
+                        "target": "done", "actor": "deterministic",
+                        "executor": { "kind": "noop" },
+                        "output": { "result": "$.output.result", "tests_added": "$.output.n" }
+                    },
+                    // The escalation branch: reaches `done` via `needs_human`,
+                    // never traversing the transition that writes tests_added.
+                    "escalate": {
+                        "target": "needs_human", "actor": "deterministic",
+                        "executor": { "kind": "noop" }
+                    }
+                }},
+                "needs_human": { "transitions": {
+                    "review": {
+                        "target": "done", "actor": "human",
+                        "executor": { "kind": "noop" },
+                        "output": { "result": "$.arguments.result" }
+                    }
+                }},
+                "done": { "terminal": true }
+            }
+        });
+        if seed_tests_added {
+            wf["initialContext"] = json!({ "tests_added": 0 });
+        }
+        json!({ "workflows": { "cap.implement.loop": wf } })
+    }
+
+    #[test]
+    fn v24_rejects_a_declared_output_missing_on_one_path_to_terminal() {
+        let errors = v24_errors(&build_loop_shaped(false));
+        assert_eq!(
+            errors.len(),
+            1,
+            "the escalation path reaches `done` without ever writing tests_added: {errors:?}"
+        );
+        assert!(
+            errors[0].contains("tests_added"),
+            "must name the unwritten slot: {}",
+            errors[0]
+        );
+        assert!(
+            !errors[0].contains("result"),
+            "`result` IS written on every path — naming it would be a false positive: {}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn v24_accepts_the_same_workflow_once_the_slot_is_seeded() {
+        // The one-line fix the rule is asking for.
+        assert!(
+            v24_errors(&build_loop_shaped(true)).is_empty(),
+            "seeding tests_added in initialContext satisfies it on every path"
+        );
+    }
+
+    /// The whole point of the STATIC rule: the runtime check cannot catch this
+    /// one. A never-written `array`/`object` output is silently repaired to
+    /// `[]`/`{}` by the deterministic-repair rung, so the run goes green and the
+    /// caller reads an empty report. Only must-write analysis sees there is no
+    /// writer at all. (The `flow.pressure-test.use-cases` defect, exactly.)
+    #[test]
+    fn v24_catches_the_unwritten_object_output_the_repair_rung_would_paper_over() {
+        let config = json!({ "workflows": { "flow.pressure-test": {
+            "initialState": "proposing",
+            "outputs": { "report": { "type": "object" } },
+            "states": {
+                "proposing": { "transitions": {
+                    "falsify": {
+                        "target": "done", "actor": "deterministic",
+                        "executor": { "kind": "noop" },
+                        "output": { "report": "$.output.report" }
+                    },
+                    // Human rejects before anything is falsified → `failed`
+                    // terminal, and `report` was never written.
+                    "reject": {
+                        "target": "failed", "actor": "deterministic",
+                        "executor": { "kind": "noop" }
+                    }
+                }},
+                "done":   { "terminal": true },
+                "failed": { "terminal": true }
+            }
+        }}});
+        let errors = v24_errors(&config);
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly one terminal to owe: {errors:?}"
+        );
+        assert!(
+            errors[0].contains("failed") && errors[0].contains("report"),
+            "must name the offending terminal AND slot: {}",
+            errors[0]
+        );
+    }
+
+    /// A retry loop must not be able to launder an unwritten slot into a written
+    /// one. This is why the analysis is a GREATEST fixpoint (seed with everything
+    /// and shrink) rather than a least one — a naive least-fixpoint walk would
+    /// reach `gate` a second time through the cycle, see `verdict` "already
+    /// written", and conclude the terminal is safe.
+    #[test]
+    fn v24_is_not_fooled_by_a_retry_cycle() {
+        let config = json!({ "workflows": { "cap.verify.thing": {
+            "verb": "verify",
+            "initialState": "gate",
+            "snippet": { "inputs": {}, "outputs": { "verdict": { "type": "string" } } },
+            "states": {
+                "gate": { "transitions": {
+                    // Straight to terminal without ever writing `verdict`.
+                    "give_up": {
+                        "target": "done", "actor": "deterministic",
+                        "executor": { "kind": "noop" }
+                    },
+                    "retry": {
+                        "target": "working", "actor": "deterministic",
+                        "executor": { "kind": "noop" }
+                    }
+                }},
+                "working": { "transitions": {
+                    // Writes verdict, then loops BACK to the gate.
+                    "run": {
+                        "target": "gate", "actor": "deterministic",
+                        "executor": { "kind": "noop" },
+                        "output": { "verdict": "$.output.verdict" }
+                    }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        let errors = v24_errors(&config);
+        assert_eq!(
+            errors.len(),
+            1,
+            "the give_up edge fires on the FIRST visit to `gate`, before `working` ever \
+             ran — the cycle must not launder that away: {errors:?}"
+        );
+        assert!(errors[0].contains("verdict"), "{}", errors[0]);
+    }
+
+    #[test]
+    fn v24_counts_an_on_enter_output_as_a_write() {
+        let config = json!({ "workflows": { "cap.record.thing": {
+            "verb": "record",
+            "initialState": "ready",
+            "snippet": { "inputs": {}, "outputs": { "stamp": { "type": "string" } } },
+            "states": {
+                "ready": { "transitions": {
+                    "go": { "target": "done", "actor": "deterministic", "executor": { "kind": "noop" } }
+                }},
+                "done": {
+                    "terminal": true,
+                    // onEnter merges its own `output:` block into context
+                    // (runtime_chain::run_on_enter), so it IS a writer.
+                    "onEnter": {
+                        "executor": { "kind": "noop" },
+                        "output": { "stamp": "$.output.stamp" }
+                    }
+                }
+            }
+        }}});
+        assert!(
+            v24_errors(&config).is_empty(),
+            "an onEnter output on the terminal writes the slot on every path into it"
+        );
+    }
+
+    #[test]
+    fn v24_ignores_a_definition_that_declares_no_outputs() {
+        let config = json!({ "workflows": { "cap.record.thing": {
+            "verb": "record",
+            "initialState": "ready",
+            "snippet": { "inputs": {}, "outputs": {} },
+            "states": {
+                "ready": { "transitions": {
+                    "go": { "target": "done", "actor": "deterministic", "executor": { "kind": "noop" } }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        assert!(
+            v24_errors(&config).is_empty(),
+            "no declared contract, nothing to owe — most caps are this shape and a rule \
+             that fired on them would be a brownout, not a guard"
+        );
     }
 
     // ADR-0008 — outcomes + terminal `outcome` validation.
@@ -2843,6 +3550,314 @@ mod tests {
         assert!(
             d.iter()
                 .any(|d| d.is_error() && d.message().contains("INVALID_GUARD_OPERAND"))
+        );
+    }
+
+    // ── V25 — UNRESOLVABLE_GUARD_SCOPE ───────────────────────────────────────
+
+    #[test]
+    fn v25_rejects_a_guard_reading_an_unresolvable_scope() {
+        // `$.input.mode` is the real bug: the evaluator resolves
+        // `$.workflow.input.*`, not bare `$.input.*`, so this coalesces to null
+        // and the guard is permanently false.
+        let d = validate_workflows(&guarded_workflow(
+            json!({ "kind": "expr", "expr": "$.input.mode == 'auto'" }),
+        ));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("UNRESOLVABLE_GUARD_SCOPE")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn v25_accepts_the_canonical_input_spelling() {
+        let d = validate_workflows(&guarded_workflow(
+            json!({ "kind": "expr", "expr": "$.workflow.input.mode == 'auto'" }),
+        ));
+        assert!(
+            !d.iter()
+                .any(|d| d.message().contains("UNRESOLVABLE_GUARD_SCOPE")),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn v25_checks_the_right_hand_operand_too() {
+        // Slot-vs-slot with a bogus RHS scope.
+        let d = validate_workflows(&guarded_workflow(json!({
+            "kind": "expr", "expr": "$.context.iter < $.input.iter_cap"
+        })));
+        assert!(
+            d.iter()
+                .any(|d| d.is_error() && d.message().contains("UNRESOLVABLE_GUARD_SCOPE")),
+            "{d:?}"
+        );
+    }
+
+    // ── V26 — SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE ─────────────────────────────
+
+    /// A cap declaring a scalar output written from an optional arg, or (when
+    /// `required`) not. `cap.review.analysis` shape.
+    fn scalar_output_cap(required: bool, with_default: bool) -> Value {
+        let mut summary_prop = json!({ "type": "string" });
+        if with_default {
+            summary_prop["default"] = json!("");
+        }
+        let required_list = if required {
+            json!(["findings", "summary"])
+        } else {
+            json!(["findings"])
+        };
+        json!({ "workflows": { "cap.review.thing": {
+            "verb": "review",
+            "initialState": "analyzing",
+            "snippet": { "inputs": {}, "outputs": { "summary": { "type": "string" } } },
+            "states": {
+                "analyzing": { "transitions": { "submit": {
+                    "target": "done", "actor": "agent",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": required_list,
+                        "properties": {
+                            "findings": { "type": "array", "default": [] },
+                            "summary": summary_prop
+                        }
+                    },
+                    "executor": { "kind": "noop" },
+                    "output": { "summary": "$.arguments.summary" }
+                }}},
+                "done": { "terminal": true }
+            }
+        }}})
+    }
+
+    fn v26_warnings(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE"))
+            .collect()
+    }
+
+    #[test]
+    fn v26_warns_on_a_scalar_output_from_an_optional_argument() {
+        let w = v26_warnings(&scalar_output_cap(false, false));
+        assert_eq!(w.len(), 1, "expected one V26 warning: {w:?}");
+        assert!(w[0].contains("summary"), "{}", w[0]);
+    }
+
+    #[test]
+    fn v26_is_satisfied_by_a_default_or_by_required() {
+        assert!(
+            v26_warnings(&scalar_output_cap(false, true)).is_empty(),
+            "a default on the source clears V26"
+        );
+        assert!(
+            v26_warnings(&scalar_output_cap(true, false)).is_empty(),
+            "marking the source required clears V26"
+        );
+    }
+
+    // ── V27 — UNRESOLVABLE_WRITE_SCOPE ───────────────────────────────────────
+
+    fn output_mapping_workflow(output: Value) -> Value {
+        json!({ "workflows": { "wf": {
+            "initialState": "start",
+            "states": {
+                "start": { "transitions": { "go": {
+                    "target": "done", "actor": "deterministic",
+                    "executor": { "kind": "noop" },
+                    "output": output
+                }}},
+                "done": { "terminal": true }
+            }
+        }}})
+    }
+
+    fn v27_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("UNRESOLVABLE_WRITE_SCOPE"))
+            .collect()
+    }
+
+    #[test]
+    fn v27_rejects_an_output_writing_from_an_unresolvable_scope() {
+        // `$.input.plan` — the write-side twin of the guard bug, caught in the
+        // SAME cap the guard fix touched.
+        let d = v27_errors(&output_mapping_workflow(
+            json!({ "plan_final": "$.input.plan" }),
+        ));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("$.input.plan"), "{}", d[0]);
+    }
+
+    #[test]
+    fn v27_accepts_every_valid_write_scope() {
+        let d = v27_errors(&output_mapping_workflow(json!({
+            "a": "$.context.x",
+            "b": "$.output.y",
+            "c": "$.arguments.z",
+            "d": "$.workflow.input.w",
+            "e": "$",
+            // Whole-scope reads (symmetric with `$`) — the ai-review-swarm
+            // `fix_result: "$.arguments"` pattern.
+            "whole_args": "$.arguments",
+            "whole_ctx": "$.context",
+            "whole_input": "$.workflow.input",
+            "lit": "a literal string",
+            "num": 42
+        })));
+        assert!(
+            d.is_empty(),
+            "no valid write scope should be flagged: {d:?}"
+        );
+    }
+
+    #[test]
+    fn v27_checks_arithmetic_operator_operands() {
+        // A typo'd scope inside `{ add: [...] }` silently becomes 0 at runtime.
+        let d = v27_errors(&output_mapping_workflow(json!({
+            "n": { "add": ["$.contxt.counter", 1] }
+        })));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("$.contxt.counter"), "{}", d[0]);
+    }
+
+    // ── V28 — UNRESOLVABLE_USE_INPUT_SCOPE ───────────────────────────────────
+
+    fn use_input_workflow(inputs: Value) -> Value {
+        json!({ "workflows": {
+            "cap.thing": { "verb": "review", "initialState": "s",
+                "snippet": { "inputs": { "x": { "type": "string" } }, "outputs": {} },
+                "states": { "s": { "transitions": { "go": {
+                    "target": "done", "actor": "deterministic", "executor": { "kind": "noop" } } } },
+                    "done": { "terminal": true } } },
+            "flow.host": { "initialState": "a",
+                "states": {
+                    "a": { "transitions": { "call": {
+                        "target": "done", "actor": "deterministic",
+                        "executor": { "kind": "workflow", "definitionId": "cap.thing",
+                            "use": { "inputs": inputs, "outputs": {} } } } } },
+                    "done": { "terminal": true } } }
+        }})
+    }
+
+    fn v28_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("UNRESOLVABLE_USE_INPUT_SCOPE"))
+            .collect()
+    }
+
+    #[test]
+    fn v28_rejects_a_use_input_from_an_unresolvable_scope() {
+        // `$.output.*` in use.inputs — no executor output exists at spawn time.
+        let d = v28_errors(&use_input_workflow(json!({ "x": "$.output.foo" })));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("$.output.foo"), "{}", d[0]);
+    }
+
+    #[test]
+    fn v28_accepts_the_spawn_time_scopes() {
+        for scope in ["$.context.x", "$.arguments.y", "$.workflow.input.z"] {
+            let d = v28_errors(&use_input_workflow(json!({ "x": scope })));
+            assert!(d.is_empty(), "{scope} should be accepted: {d:?}");
+        }
+    }
+
+    // ── V29 — UNRESOLVABLE_EXECUTOR_ARG_SCOPE ────────────────────────────────
+
+    fn v29_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("UNRESOLVABLE_EXECUTOR_ARG_SCOPE"))
+            .collect()
+    }
+
+    fn script_arg_workflow(args: Value) -> Value {
+        json!({ "workflows": { "wf": {
+            "initialState": "s",
+            "states": {
+                "s": { "transitions": { "go": {
+                    "target": "done", "actor": "deterministic",
+                    "executor": { "kind": "script", "subject": "x", "args": args } } } },
+                "done": { "terminal": true }
+            }
+        }}})
+    }
+
+    #[test]
+    fn v29_rejects_an_arg_from_the_bare_input_scope() {
+        // The real bug: `$.input.x` in a script arg (not `$.workflow.input.x`).
+        let d = v29_errors(&script_arg_workflow(json!(["$.input.gateway_config_path"])));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("$.input.gateway_config_path"), "{}", d[0]);
+    }
+
+    #[test]
+    fn v29_accepts_valid_arg_scopes_and_literals() {
+        let d = v29_errors(&script_arg_workflow(json!([
+            "$.workflow.input.x",
+            "$.context.y",
+            "$.arguments.z",
+            "--a-literal-flag"
+        ])));
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn v29_checks_mcp_map_and_rest_body() {
+        let cfg = json!({ "workflows": { "wf": {
+            "initialState": "s",
+            "states": {
+                "s": { "transitions": {
+                    "m": { "target": "done", "actor": "deterministic",
+                           "executor": { "kind": "mcp", "connection": "c", "tool": "t",
+                                         "map": { "p": "$.input.bad" } } },
+                    "b": { "target": "done", "actor": "deterministic",
+                           "executor": { "kind": "rest", "connection": "c",
+                                         "body": { "nested": { "f": "$.input.also_bad" } } } }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        let d = v29_errors(&cfg);
+        assert_eq!(
+            d.len(),
+            2,
+            "both the map and the nested body operand: {d:?}"
+        );
+    }
+
+    #[test]
+    fn v26_ignores_array_and_object_outputs() {
+        // An object output is repairable ({}), so it is out of scope.
+        let config = json!({ "workflows": { "cap.x.thing": {
+            "verb": "review",
+            "initialState": "s",
+            "snippet": { "inputs": {}, "outputs": { "report": { "type": "object" } } },
+            "states": {
+                "s": { "transitions": { "go": {
+                    "target": "done", "actor": "agent",
+                    "inputSchema": { "type": "object", "required": [],
+                                     "properties": { "report": { "type": "object" } } },
+                    "executor": { "kind": "noop" },
+                    "output": { "report": "$.arguments.report" }
+                }}},
+                "done": { "terminal": true }
+            }
+        }}});
+        assert!(
+            v26_warnings(&config).is_empty(),
+            "object output is repairable"
         );
     }
 

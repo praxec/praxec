@@ -66,6 +66,15 @@ pub enum AgentErrorCode {
     /// persisting or loading a frame. Surfaced as Permanent so neither the
     /// same-model retry nor the chain-walk re-runs the whole agent.
     ParkStore,
+    /// (CR#1) The whole model chain-walk for a single agent step exceeded its
+    /// wall-clock budget (`step_budget_seconds`) without producing a result —
+    /// the walk stops escalating rather than burning yet another full-wall
+    /// attempt. Classifies as `ContentOther` (NOT `Capability`): we ARE the
+    /// escalation layer, so this must SURFACE to the flow (→ human review), not
+    /// re-escalate. Distinct from `NoResult` (a single attempt with no answer)
+    /// so an operator can tell "one model gave up" from "the whole step ran out
+    /// of time churning."
+    StepBudgetExhausted,
 }
 
 impl AgentErrorCode {
@@ -91,6 +100,7 @@ impl AgentErrorCode {
             AgentErrorCode::AwaitReplyRequired => "AGENT_AWAIT_REPLY_REQUIRED",
             AgentErrorCode::ParkedSessionCorrupt => "AGENT_PARKED_SESSION_CORRUPT",
             AgentErrorCode::ParkStore => "AGENT_PARK_STORE",
+            AgentErrorCode::StepBudgetExhausted => "AGENT_STEP_BUDGET_EXHAUSTED",
         }
     }
 }
@@ -131,6 +141,10 @@ mod tests {
         assert_eq!(
             AgentErrorCode::ParkedSessionCorrupt.as_wire_code(),
             "AGENT_PARKED_SESSION_CORRUPT"
+        );
+        assert_eq!(
+            AgentErrorCode::StepBudgetExhausted.as_wire_code(),
+            "AGENT_STEP_BUDGET_EXHAUSTED"
         );
     }
 

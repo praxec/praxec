@@ -15,10 +15,12 @@ use praxec_core::store::{
 use serde_json::{Value, json};
 
 use crate::analysis::output_map::{
-    OutputSource, analyze_output, insert_nested, output_field_paths,
+    OutputSource, analyze_output, insert_nested, output_field_paths, whole_output_slots,
 };
 use crate::analysis::plan::{OutputPlan, add_capability_outputs, derive_plan};
-use crate::analysis::reads::{satisfying_context, violating_context};
+use crate::analysis::reads::{
+    definition_wide_context, satisfying_context_over, seed_input_guards, violating_context_over,
+};
 use crate::isolate::{SubmitResult, submit_isolated, submit_isolated_with_acks};
 use crate::smartmock::SmartMockRegistry;
 use crate::walk::{reachable_from, walk};
@@ -104,15 +106,36 @@ fn guidance_ack_subjects(tobj: &Value, snapshot: &Value) -> Vec<(String, String)
 /// This ensures that when the runtime AUTO-CHAINS deterministic transitions (e.g.
 /// `draft → vet → …`), the mock can resolve outputs for any chained transition,
 /// not only the transition under test.
+/// Deep-merge `src` INTO `dst`: recurse where both sides are objects, otherwise
+/// `src` overwrites. Used to overlay a guard-satisfying value onto a full
+/// schema-valid dummy so the object keeps its other required properties.
+///
+/// The ordering matters and used to be wrong: planting the guard value first
+/// (`{status: "pass"}`) then trying to fill in a full `verifyOut` dummy failed,
+/// because the fill step won't clobber an existing key — so the emitted object
+/// was `{status: "pass"}`, missing `summary`/`criteria`, and the runtime rejected
+/// it with BLACKBOARD_TYPE_ERROR. Seed the dummy first, merge the guard value on
+/// top, and only the guarded leaf changes.
+fn deep_merge_into(dst: &mut Value, src: Value) {
+    match (dst, src) {
+        (Value::Object(d), Value::Object(s)) => {
+            for (k, v) in s {
+                deep_merge_into(d.entry(k).or_insert(Value::Null), v);
+            }
+        }
+        (d, s) => *d = s,
+    }
+}
+
 fn def_wide_plan(resolved: &Value, def_id: &str) -> OutputPlan {
     let def = &resolved["workflows"][def_id];
 
-    // Guard-satisfying values for downstream guards + capability snippet outputs.
-    let mut plan = derive_plan(def);
+    // Schema-valid dummies FIRST (capability snippet outputs), guard-satisfying
+    // values overlaid LAST — see `deep_merge_into`.
+    let mut plan = OutputPlan::new();
     add_capability_outputs(&mut plan, def, resolved);
 
-    // Ensure every transition's output fields are present with a typed dummy,
-    // without overwriting guard-satisfying values already planned.
+    // Ensure every transition's output fields are present with a typed dummy.
     //
     // For paths like `$.output.json.deployId` (full_path = "json.deployId") we
     // build a NESTED object so the runtime can resolve the full path correctly:
@@ -122,13 +145,23 @@ fn def_wide_plan(resolved: &Value, def_id: &str) -> OutputPlan {
             if let Some(ts) = state.get("transitions").and_then(|t| t.as_object()) {
                 for (tname, tobj) in ts {
                     for (slot, full_path) in output_field_paths(tobj) {
+                        // Prefer the slot's DECLARED OUTPUT schema over its
+                        // blackboard `type:`. The blackboard type is the coarse
+                        // one — a verify slot is declared `{type: object}` there
+                        // but `{$ref: praxec://hop#/$defs/verifyOut}` in
+                        // snippet.outputs. A dummy built from the blackboard type
+                        // is a bare `{}`: type-correct, contract-invalid. It would
+                        // then OVERWRITE the seeded value on the way to terminal
+                        // and fail the output contract the runtime enforces there.
                         let val = def
-                            .get("blackboard")
-                            .and_then(|b| b.get(&slot))
+                            .pointer("/snippet/outputs")
+                            .or_else(|| def.pointer("/outputs"))
+                            .and_then(|o| o.get(&slot))
+                            .or_else(|| def.get("blackboard").and_then(|b| b.get(&slot)))
                             .map(crate::analysis::dummy::dummy_for_schema)
                             .unwrap_or_else(|| json!("fuzz"));
                         let parts: Vec<&str> = full_path.split('.').collect();
-                        let entry = plan.entry(tname.clone()).or_default();
+                        let entry = crate::analysis::plan::output_obj(&mut plan, tname.as_str());
                         insert_nested(entry, &parts, val);
                     }
                 }
@@ -136,7 +169,106 @@ fn def_wide_plan(resolved: &Value, def_id: &str) -> OutputPlan {
         }
     }
 
+    // Overlay guard-satisfying values ON TOP of the schema-valid dummies. A guard
+    // downstream reads `$.context.verify.status == 'pass'`; the dummy gave `verify`
+    // a full `verifyOut` shape, and this replaces just its `.status` leaf with the
+    // value the guard needs — leaving `summary`/`criteria`/`provenance` intact.
+    for (tname, gval) in derive_plan(def) {
+        deep_merge_into(plan.entry(tname).or_insert_with(|| json!({})), gval);
+    }
+
+    // Whole-output mappings LAST — a `kind: mcp` leaf's result IS the slot's
+    // value, with no field to nest it under, and a bare `{}` is what made
+    // `corpus_search`'s array-typed doc_evidence look like a contract violation.
+    //
+    // ONLY for a transition whose output comes ENTIRELY from the whole result.
+    // A transition routinely maps both ways at once —
+    //   output: { ready: "$.output.ready", report: "$.output" }
+    //   output: { d0_id: "$.output.deliverables.0.id", cohort: "$.output" }
+    // — and there the whole output IS the object the fields were planned into.
+    // Replacing it with a fresh dummy would erase those fields, breaking the
+    // downstream guards they exist to satisfy and dead-ending the chain. Leave
+    // the field-planned object alone; it already serves both mappings.
+    if let Some(states) = def.get("states").and_then(|s| s.as_object()) {
+        for state in states.values() {
+            if let Some(ts) = state.get("transitions").and_then(|t| t.as_object()) {
+                for (tname, tobj) in ts {
+                    if !output_field_paths(tobj).is_empty() {
+                        continue;
+                    }
+                    for slot in whole_output_slots(tobj) {
+                        let Some(schema) = def
+                            .pointer("/snippet/outputs")
+                            .or_else(|| def.pointer("/outputs"))
+                            .and_then(|o| o.get(&slot))
+                            .or_else(|| def.get("blackboard").and_then(|b| b.get(&slot)))
+                        else {
+                            continue;
+                        };
+                        let already_valid = plan.get(tname).is_some_and(|planned| {
+                            praxec_core::hop::validate_against_schema(schema, planned, &slot)
+                                .is_ok()
+                        });
+                        if !already_valid {
+                            plan.insert(
+                                tname.clone(),
+                                crate::analysis::dummy::dummy_for_schema(schema),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     plan
+}
+
+/// Seed the definition's DECLARED outputs (a capability's `snippet.outputs`, a
+/// nestable flow's top-level `outputs:`) into an isolated probe's synthetic
+/// context, whenever the probe hasn't already put a CONTRACT-VALID value there.
+///
+/// The per-transition prober fabricates a context, drops the workflow into ONE
+/// state, fires ONE edge, and lets the deterministic chain run wherever it goes
+/// — which is frequently straight to a terminal. But it seeds only the slots the
+/// probed transition *reads*, and it types those from the `blackboard:` block —
+/// which flows often don't declare at all, so the slot lands as the literal
+/// `"fuzz"`. Any declared output written by a state the probe skipped is missing
+/// outright. The runtime enforces the output contract at terminal (SPEC §5.3)
+/// and would rightly fail it, reporting a violation the DEFINITION does not
+/// have: an artifact of a fabricated history, not a defect.
+///
+/// So make the fabricated history plausible — a mid-flow context is one in which
+/// the states that "already ran" already wrote contract-valid outputs.
+///
+/// A value the probe DID choose deliberately (a guard-satisfying literal, e.g.
+/// `status == 'pass'`) is kept — but only if it satisfies the declared schema.
+/// If it doesn't, it can only be the untyped `"fuzz"` fallback, and keeping it
+/// would just re-create the false failure. Validity is judged with the same
+/// registry-aware compiler the runtime enforces the contract with, so this can't
+/// drift from the check it exists to keep honest.
+fn seed_declared_outputs(ctx: &mut Value, def: &Value) {
+    let Some(schemas) = def
+        .pointer("/snippet/outputs")
+        .or_else(|| def.pointer("/outputs"))
+        .and_then(Value::as_object)
+    else {
+        return;
+    };
+    let Some(map) = ctx.as_object_mut() else {
+        return;
+    };
+    for (name, schema) in schemas {
+        let keep = map
+            .get(name)
+            .is_some_and(|v| praxec_core::hop::validate_against_schema(schema, v, name).is_ok());
+        if !keep {
+            map.insert(
+                name.clone(),
+                crate::analysis::dummy::dummy_for_schema(schema),
+            );
+        }
+    }
 }
 
 /// Build a human principal (carries the "human" role the runtime checks for
@@ -164,23 +296,19 @@ fn input_for(def: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Build a satisfying `arguments` object from a transition's `inputSchema`.
-/// For each property in `inputSchema/properties`, emit a typed dummy value.
-/// Returns `{}` when the transition has no `inputSchema` or no `properties`.
+///
+/// Delegates to `dummy_for_schema`, which resolves a HOP `$ref` and emits every
+/// REQUIRED property (recursively). A `hop_slot` transition carries
+/// `inputSchema: {$ref: "praxec://hop#/$defs/verifyIn"}` — a bare `$ref` with no
+/// `properties` — so the old properties-only walk produced `{}` and the submit
+/// failed verifyIn's `required` with INPUT_SCHEMA_VIOLATION. Same for any deeply
+/// nested required schema (e.g. `cap.plan.build-graph`'s
+/// `graph.deliverables[].{id,…}`): `dummy_for_schema` recurses through `required`.
 fn arguments_for(transition: &serde_json::Value) -> serde_json::Value {
-    let Some(props) = transition
-        .pointer("/inputSchema/properties")
-        .and_then(|v| v.as_object())
-    else {
-        return serde_json::json!({});
-    };
-    let mut m = serde_json::Map::new();
-    for (name, schema) in props {
-        m.insert(
-            name.clone(),
-            crate::analysis::dummy::dummy_for_schema(schema),
-        );
+    match transition.pointer("/inputSchema") {
+        Some(schema) if !schema.is_null() => crate::analysis::dummy::dummy_arguments(schema),
+        _ => serde_json::json!({}),
     }
-    serde_json::Value::Object(m)
 }
 
 /// Test every transition in `definition` (one resolved workflow def) in
@@ -206,6 +334,14 @@ pub async fn fuzz_transitions(
     // `workflow_input` populates `$.workflow.input.*` reads.
     let blackboard = def.get("blackboard").cloned().unwrap_or_else(|| json!({}));
     let workflow_input = input_for(def);
+
+    // The context an isolated probe STARTS from: every slot the definition could
+    // read, seeded once. Without it, a chain that runs past the probed edge dies
+    // on GUARD_UNSET_SLOT the moment it meets a guard on a slot the probe never
+    // set — a defect of the fabricated history, not of the definition. Whether a
+    // slot is genuinely written on every path to its reader is a PATH question,
+    // which a single-state probe cannot answer and static analysis can.
+    let def_context = definition_wide_context(def, &blackboard);
 
     let mut verdicts = Vec::new();
 
@@ -281,7 +417,13 @@ pub async fn fuzz_transitions(
             })
         };
 
-        let sat_ctx = satisfying_context(tobj, &blackboard);
+        let mut sat_ctx = satisfying_context_over(tobj, &blackboard, Some(&def_context));
+        seed_declared_outputs(&mut sat_ctx, def);
+        // Per-edge input: satisfy THIS edge's `$.workflow.input.*` / `$.input.*`
+        // guards. Sibling edges gate the same input slot on exclusive values, so
+        // this can't be shared across the definition.
+        let mut edge_input = workflow_input.clone();
+        seed_input_guards(&mut edge_input, tobj);
         let executors: Arc<dyn ExecutorRegistry> =
             Arc::new(SmartMockRegistry::new(def_plan.clone()));
         let (rt, store, ack_store) = build_runtime(resolved, executors);
@@ -294,7 +436,7 @@ pub async fn fuzz_transitions(
                 definition_id,
                 state,
                 sat_ctx,
-                workflow_input.clone(),
+                edge_input.clone(),
                 transition,
                 principal.clone(),
                 arguments_for(tobj),
@@ -308,7 +450,7 @@ pub async fn fuzz_transitions(
                 definition_id,
                 state,
                 sat_ctx,
-                workflow_input.clone(),
+                edge_input.clone(),
                 transition,
                 principal.clone(),
                 arguments_for(tobj),
@@ -370,7 +512,10 @@ pub async fn fuzz_transitions(
         // ── Violating submit ──────────────────────────────────────────────────
         // Only run when a parseable violating context exists (i.e., there's an
         // expr guard we can flip).
-        let (viol_ok, viol_detail) = if let Some(viol_ctx) = violating_context(tobj, &blackboard) {
+        let (viol_ok, viol_detail) = if let Some(mut viol_ctx) =
+            violating_context_over(tobj, &blackboard, Some(&def_context))
+        {
+            seed_declared_outputs(&mut viol_ctx, def);
             let executors2: Arc<dyn ExecutorRegistry> =
                 Arc::new(SmartMockRegistry::new(def_plan.clone()));
             let (rt2, store2, ack_store2) = build_runtime(resolved, executors2);
@@ -386,7 +531,7 @@ pub async fn fuzz_transitions(
                 definition_id,
                 state,
                 viol_ctx,
-                workflow_input.clone(),
+                edge_input.clone(),
                 transition,
                 principal,
                 arguments_for(tobj),

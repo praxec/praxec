@@ -219,6 +219,15 @@ pub fn read_in_scopes(
     workflow_input: &Value,
     executor_output: Option<&Value>,
 ) -> Option<Value> {
+    // Whole-scope reads — symmetric with `$` / `$.output` (the whole output). An
+    // author writing `fix_result: "$.arguments"` means "the whole submission",
+    // exactly as `$` means the whole executor output.
+    match expr {
+        "$.arguments" => return Some(arguments.clone()),
+        "$.context" => return Some(context.clone()),
+        "$.workflow.input" => return Some(workflow_input.clone()),
+        _ => {}
+    }
     if let Some(path) = expr.strip_prefix("$.arguments.") {
         return resolve_path_with_projection(arguments, path);
     }
@@ -237,6 +246,26 @@ pub fn read_in_scopes(
         }
     }
     None
+}
+
+/// Does `s` name a scope that [`read_in_scopes`] resolves on the WRITE side
+/// (transition `output:`, `onEnter.output:`, `prefill:`, and their operator
+/// operands)? A `false` for a `$.`-rooted string means [`resolve_value`] would
+/// coalesce it to `null` and silently write that null to the blackboard — the
+/// write-side analog of the `$.input.mode` dead-guard bug.
+///
+/// This is the single source of truth for the write-side scope set: `read_in_scopes`
+/// dispatches on exactly these prefixes, and a poka-yoke test asserts the two can't
+/// drift. V27 (`validate.rs`) rejects an unrecognized `$.`-rooted write operand at load.
+pub fn is_resolvable_write_scope(s: &str) -> bool {
+    let s = s.trim();
+    matches!(
+        s,
+        "$" | "$.output" | "$.arguments" | "$.context" | "$.workflow.input"
+    ) || s.starts_with("$.output.")
+        || s.starts_with("$.context.")
+        || s.starts_with("$.arguments.")
+        || s.starts_with("$.workflow.input.")
 }
 
 /// Resolve a dot-separated path against `root`, with `[*]` projection
@@ -273,4 +302,51 @@ fn resolve_path_with_projection(root: &Value, path: &str) -> Option<Value> {
         })
         .collect();
     Some(Value::Array(projected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// POKA-YOKE: `is_resolvable_write_scope` must agree with what `read_in_scopes`
+    /// actually resolves. A scope the predicate calls resolvable must resolve to
+    /// `Some` (given present data); one it rejects must resolve to `None`. If a
+    /// scope arm is added to `read_in_scopes` without updating the predicate (or
+    /// vice-versa), this fails.
+    #[test]
+    fn write_scope_predicate_agrees_with_read_in_scopes() {
+        let args = json!({ "a": 1 });
+        let ctx = json!({ "c": 1 });
+        let input = json!({ "i": 1 });
+        let output = json!({ "o": 1 });
+
+        let cases = [
+            ("$.arguments.a", true),
+            ("$.context.c", true),
+            ("$.workflow.input.i", true),
+            ("$.output.o", true),
+            ("$.output", true),
+            ("$", true),
+            // Whole-scope reads (symmetric with `$`).
+            ("$.arguments", true),
+            ("$.context", true),
+            ("$.workflow.input", true),
+            ("$.input.mode", false), // the bug — not a write scope
+            ("$.outpt.plan", false), // typo
+            ("$.ctx.c", false),
+        ];
+        for (expr, resolvable) in cases {
+            assert_eq!(
+                is_resolvable_write_scope(expr),
+                resolvable,
+                "predicate wrong for `{expr}`"
+            );
+            let resolved = read_in_scopes(expr, &args, &ctx, &input, Some(&output)).is_some();
+            assert_eq!(
+                resolved, resolvable,
+                "read_in_scopes disagrees with predicate for `{expr}`"
+            );
+        }
+    }
 }

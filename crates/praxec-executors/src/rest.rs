@@ -176,10 +176,10 @@ impl Executor for RestExecutor {
         // Query string from `query: {key: value}`. Values may be JSON-path
         // expressions resolved against the usual scopes.
         if let Some(q) = cfg.get("query").and_then(Value::as_object) {
-            let pairs: Vec<(String, String)> = q
-                .iter()
-                .filter_map(|(k, v)| render_value(v, &request).map(|rv| (k.clone(), rv)))
-                .collect();
+            let mut pairs: Vec<(String, String)> = Vec::with_capacity(q.len());
+            for (k, v) in q {
+                pairs.push((k.clone(), render_value(v, &request)?));
+            }
             if !pairs.is_empty() {
                 req = req.query(&pairs);
             }
@@ -187,7 +187,7 @@ impl Executor for RestExecutor {
 
         // Body — full template tree resolved against the scopes.
         if let Some(body_template) = cfg.get("body") {
-            let body = render_template(body_template, &request);
+            let body = render_template(body_template, &request)?;
             req = req.json(&body);
         }
 
@@ -347,7 +347,12 @@ fn lookup(name: &str, request: &ExecuteRequest) -> Option<String> {
         })
 }
 
-fn render_value(v: &Value, request: &ExecuteRequest) -> Option<String> {
+/// True iff `raw` is a `$.`-rooted path expression (vs a plain literal).
+fn is_scope_path(raw: &str) -> bool {
+    raw.starts_with("$.") || raw == "$"
+}
+
+fn render_value(v: &Value, request: &ExecuteRequest) -> Result<String, ExecutorError> {
     match v {
         Value::String(s) => {
             if let Some(expr) = read_in_scopes(
@@ -357,21 +362,32 @@ fn render_value(v: &Value, request: &ExecuteRequest) -> Option<String> {
                 &request.workflow.input,
                 None,
             ) {
-                return match expr {
-                    Value::String(s) => Some(s),
-                    other => Some(other.to_string()),
-                };
+                return Ok(match expr {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                });
             }
-            Some(s.clone())
+            // A `$.`-rooted token that did not resolve is an authoring bug — it
+            // used to ship to the provider as its literal text (e.g. a query
+            // value of the string "$.input.x"). Fail fast, like mcp `map:` does.
+            if is_scope_path(s) {
+                return Err(ExecutorError::Permanent(format!(
+                    "REST_QUERY_UNRESOLVED: query value '{s}' did not resolve against the \
+                     available scopes (arguments / context / workflow.input). Refusing to call \
+                     the endpoint with a literal path token."
+                )));
+            }
+            Ok(s.clone())
         }
-        other => Some(other.to_string()),
+        other => Ok(other.to_string()),
     }
 }
 
 /// Recursively resolve a JSON template: any string value matching a known
-/// scope expression is replaced with the resolved value (preserving its
-/// type), other strings are passed through.
-fn render_template(template: &Value, request: &ExecuteRequest) -> Value {
+/// scope expression is replaced with the resolved value (preserving its type),
+/// other strings are passed through. A `$.`-rooted string that fails to resolve
+/// is an error — not a literal shipped in the request body.
+fn render_template(template: &Value, request: &ExecuteRequest) -> Result<Value, ExecutorError> {
     match template {
         Value::String(s) => {
             if let Some(resolved) = read_in_scopes(
@@ -381,22 +397,30 @@ fn render_template(template: &Value, request: &ExecuteRequest) -> Value {
                 &request.workflow.input,
                 None,
             ) {
-                resolved
+                Ok(resolved)
+            } else if is_scope_path(s) {
+                Err(ExecutorError::Permanent(format!(
+                    "REST_BODY_UNRESOLVED: body field '{s}' did not resolve against the available \
+                     scopes (arguments / context / workflow.input). Refusing to send a literal \
+                     path token in the request body."
+                )))
             } else {
-                Value::String(s.clone())
+                Ok(Value::String(s.clone()))
             }
         }
-        Value::Array(arr) => {
-            Value::Array(arr.iter().map(|v| render_template(v, request)).collect())
-        }
+        Value::Array(arr) => Ok(Value::Array(
+            arr.iter()
+                .map(|v| render_template(v, request))
+                .collect::<Result<_, _>>()?,
+        )),
         Value::Object(obj) => {
             let mut out = serde_json::Map::with_capacity(obj.len());
             for (k, v) in obj {
-                out.insert(k.clone(), render_template(v, request));
+                out.insert(k.clone(), render_template(v, request)?);
             }
-            Value::Object(out)
+            Ok(Value::Object(out))
         }
-        other => other.clone(),
+        other => Ok(other.clone()),
     }
 }
 

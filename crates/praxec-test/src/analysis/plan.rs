@@ -7,10 +7,38 @@ use std::collections::HashMap;
 
 use crate::analysis::dummy::dummy_for_schema;
 use crate::analysis::expr::{GuardClause, parse_clause, satisfying_value};
-use crate::analysis::output_map::{OutputSource, analyze_output};
+use crate::analysis::output_map::{OutputSource, analyze_output, insert_nested, remove_nested};
 
-/// transitionName -> { outputField -> value }
-pub type OutputPlan = HashMap<String, Map<String, Value>>;
+/// transitionName -> the executor output the mock emits for it.
+///
+/// A whole JSON `Value`, not a field map: a transition may map a context slot
+/// from the ENTIRE executor result (`slot: "$.output"`, the shape every
+/// `kind: mcp` leaf uses), and that result is often not an object — e.g.
+/// `corpus_search` returns a bare array of passages. A field-map-only plan can
+/// only ever emit `{}` there, which then fails the slot's declared `array`
+/// contract for a reason the definition is not guilty of.
+pub type OutputPlan = HashMap<String, Value>;
+
+/// The mock's output object for a transition, created empty if absent.
+///
+/// Coerces a non-object entry back to an object: callers that plan individual
+/// FIELDS need somewhere to put them. A whole-output plan (see
+/// `OutputSource::Whole`) is therefore applied LAST, so it wins over field
+/// planning for the same transition rather than being silently flattened.
+pub(crate) fn output_obj<'a>(
+    plan: &'a mut OutputPlan,
+    transition: &str,
+) -> &'a mut Map<String, Value> {
+    let entry = plan
+        .entry(transition.to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(Map::new());
+    }
+    entry
+        .as_object_mut()
+        .expect("just coerced to an object above")
+}
 
 /// `definition` is a resolved workflow definition JSON (one `workflows.<id>` value).
 pub fn derive_plan(definition: &Value) -> OutputPlan {
@@ -72,15 +100,44 @@ pub fn derive_plan(definition: &Value) -> OutputPlan {
                     continue;
                 };
                 // For each downstream clause that reads this slot, compute a satisfying value.
+                //
+                // A guard routinely reads INTO the slot — `$.context.codegen.ok`,
+                // `$.context.verify.status` — while the transition writes the slot
+                // WHOLE (`codegen: "$.output.json"`). Matching only on an exact
+                // slot name misses every one of those, so the mock emitted a bare
+                // `{}` for the object, the guard found no `.ok`, and the runtime
+                // failed it with GUARD_UNSET_SLOT: a defect of the mock, reported
+                // against the definition.
+                //
+                // So match on the clause's TOP segment and plant the satisfying
+                // value at the sub-path INSIDE the emitted field.
                 for clause in clauses {
-                    if &clause.slot == slot {
-                        if let Some(v) = satisfying_value(clause) {
-                            // Last-writer-wins on conflicting clauses is acceptable for P1.
-                            plan.entry(t_name.clone())
-                                .or_default()
-                                .insert(field.clone(), v);
-                        }
+                    let (top, rest) = match clause.slot.split_once('.') {
+                        Some((t, r)) => (t, Some(r)),
+                        None => (clause.slot.as_str(), None),
+                    };
+                    if top != slot.as_str() {
+                        continue;
                     }
+                    let Some(v) = satisfying_value(clause) else {
+                        continue;
+                    };
+                    // Nest at `field` + the guard's sub-path. `field` itself may be
+                    // dotted (`build_passed: "$.output.json.passed"` → field
+                    // "json.passed"): inserting it as a LITERAL key would leave the
+                    // runtime resolving `$.output.json.passed` to the dummy instead,
+                    // so a bool build_passed reads as the string "fuzz" and every
+                    // exhaustive gate branch fails ("no viable deterministic
+                    // transition"). Split BOTH into path segments.
+                    let mut parts: Vec<&str> = field.split('.').collect();
+                    if let Some(sub) = rest {
+                        parts.extend(sub.split('.'));
+                    }
+                    // Last-writer-wins on conflicting clauses is acceptable for P1.
+                    // `insert_nested` won't clobber, so remove any prior leaf first.
+                    let entry = output_obj(&mut plan, t_name);
+                    remove_nested(entry, &parts);
+                    insert_nested(entry, &parts, v);
                 }
             }
         }
@@ -135,15 +192,26 @@ pub fn add_capability_outputs(plan: &mut OutputPlan, definition: &Value, resolve
                 }
             };
 
-            let Some(outputs) = cap_def["snippet"]["outputs"].as_object() else {
+            // A capability declares its invokable outputs under `snippet.outputs`;
+            // a nestable FLOW declares them at the top level (flows have no
+            // `snippet:`). Same harvest rule `expand_use_bindings` uses to embed
+            // `_snippetOutputs` — so the mock plans exactly what the callee is on
+            // the hook for, whichever kind it is.
+            let Some(outputs) = cap_def["snippet"]["outputs"]
+                .as_object()
+                .or_else(|| cap_def["outputs"].as_object())
+            else {
                 continue;
             };
 
+            let outputs: Vec<(String, Value)> = outputs
+                .iter()
+                .map(|(n, s)| (n.clone(), s.clone()))
+                .collect();
             for (out_name, schema) in outputs {
-                plan.entry(t_name.clone())
-                    .or_default()
-                    .entry(out_name.clone())
-                    .or_insert_with(|| dummy_for_schema(schema));
+                output_obj(plan, t_name)
+                    .entry(out_name)
+                    .or_insert_with(|| dummy_for_schema(&schema));
             }
         }
     }
@@ -189,7 +257,11 @@ mod tests {
             }
         });
         let plan = derive_plan(&d);
-        assert!(plan.get("x").map(|m| m.is_empty()).unwrap_or(true));
+        assert!(
+            plan.get("x")
+                .map(|v| v.as_object().is_none_or(Map::is_empty))
+                .unwrap_or(true)
+        );
     }
 
     #[test]

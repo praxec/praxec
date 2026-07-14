@@ -7,19 +7,32 @@
 //!
 //! ## Operators and expected outcomes
 //!
-//! | Operator           | Kind      | Expected  | Rationale                          |
-//! |--------------------|-----------|-----------|------------------------------------|
-//! | orphan_state       | Structural| KILLED    | BFS reachability detects orphans   |
-//! | dangle_target      | Structural| KILLED    | validate catches unknown targets   |
-//! | deadend            | Structural| KILLED    | validate warns non-terminal+empty  |
-//! | det_cycle          | Structural| KILLED    | deterministic_loops() detects loop |
-//! | literal_type_break | Type      | KILLED    | runtime rejects wrong-typed lit    |
-//! | delete_guard       | Semantic  | SURVIVES  | tool can't know guard intent       |
-//! | flip_guard_op      | Semantic  | SURVIVES  | tool can't know correct operator   |
+//! | Operator                  | Kind      | Expected | Detector                     |
+//! |---------------------------|-----------|----------|------------------------------|
+//! | orphan_state              | Structural| KILLED   | BFS reachability             |
+//! | dangle_target             | Structural| KILLED   | validate: unknown target     |
+//! | deadend                   | Structural| KILLED   | validate: non-terminal+empty |
+//! | det_cycle                 | Structural| KILLED   | deterministic_loops()        |
+//! | literal_type_break        | Type      | KILLED   | runtime type check           |
+//! | drop_output_write         | Contract  | KILLED   | V24 UNWRITTEN_DECLARED_OUTPUT|
+//! | drop_initial_context_seed | Contract  | KILLED   | V24 UNWRITTEN_DECLARED_OUTPUT|
+//! | delete_guard              | Semantic  | KILLED   | violating-context probe      |
+//! | flip_guard_op             | Semantic  | KILLED   | violating-context probe      |
 //!
-//! The structural/type operators have ~100% kill rates; that is the tool's
-//! GUARANTEE.  The semantic operators largely survive; those are the tool's
-//! DOCUMENTED BLIND SPOTS (closed by `praxec test --scenarios`).
+//! ## A mutant is KILLED only by a complaint it CAUSED
+//!
+//! Every gate is diffed against what it already said about the UNMUTATED config.
+//! Without that subtraction the score is a lie — run against any real corpus with
+//! one pre-existing warning (the live pack has four, plus 116 known fuzz
+//! findings) and every mutant is "killed" by a defect that was already there.
+//! `mutate::an_unmutated_config_survives_its_own_baseline` is the regression guard.
+//!
+//! ## The CONTRACT operators are why this file matters
+//!
+//! They did not exist, and the gap shipped a bug: a definition that reaches a
+//! terminal owing a declared output it never wrote. Nothing generated that
+//! mutant, so nothing measured that the tool was blind to it. A gate you never
+//! attack is a gate you are only ASSUMING works.
 
 use std::path::Path;
 
@@ -108,6 +121,56 @@ async fn structural_operators_kill_rate_high_on_good_fixtures() {
     }
 }
 
+/// CONTRACT operators — the output-contract class.
+///
+/// This is the one that shipped a bug. No operator modeled "a definition reaches
+/// a terminal owing a declared output it never wrote", so nothing measured that
+/// the tool was blind to it — and it was: the runtime terminal check catches the
+/// scalar cases, but the deterministic-repair rung silently coerces a missing
+/// `array`/`object` output to `[]`/`{}`, so those went GREEN with an empty result.
+///
+/// V24 (`UNWRITTEN_DECLARED_OUTPUT`) closes it statically, and THIS is the number
+/// that says so. If someone weakens V24, this test is what fails.
+#[tokio::test]
+async fn contract_operators_are_killed_on_good_fixtures() {
+    let paths = [GUARDED_YAML, CAPFLOW_YAML];
+    let contract_ops = ["drop_output_write", "drop_initial_context_seed"];
+
+    let mut totals: std::collections::HashMap<&str, (usize, usize)> =
+        contract_ops.iter().map(|op| (*op, (0, 0))).collect();
+
+    for path in &paths {
+        let resolved = load(path);
+        let report = mutation_score(&resolved)
+            .await
+            .unwrap_or_else(|e| panic!("mutation_score failed for {path}: {e}"));
+        for r in &report.per_operator {
+            if let Some(entry) = totals.get_mut(r.operator.as_str()) {
+                entry.0 += r.total;
+                entry.1 += r.killed;
+            }
+        }
+    }
+
+    println!("\n=== CONTRACT operator kill rates (good fixtures) ===");
+    for op in &contract_ops {
+        let (total, killed) = totals[op];
+        if total == 0 {
+            println!("  {op}: no applicable sites in these fixtures — skipping");
+            continue;
+        }
+        let rate = killed as f64 / total as f64;
+        println!("  {op}: {killed}/{total} killed ({:.0}%)", rate * 100.0);
+        assert!(
+            rate >= 0.9,
+            "CONTRACT operator '{op}' kill rate {:.1}% < 90% ({killed}/{total}) — a definition \
+             can drop a declared output's only writer and the tool does not notice. That is \
+             exactly the hole V24 exists to close.",
+            rate * 100.0
+        );
+    }
+}
+
 /// Semantic operators (delete_guard, flip_guard_op) are EXPECTED to produce
 /// surviving mutants — these are the tool's documented blind spots.
 /// This test RECORDS the rates but does NOT assert high kill rates.
@@ -184,9 +247,18 @@ async fn p7_cog_arch_mutation_report() {
     for r in &report.per_operator {
         let note = match r.operator.as_str() {
             "orphan_state" | "dangle_target" | "deadend" | "det_cycle" | "literal_type_break" => {
-                "← GUARANTEED CATCH"
+                "← structural / validate"
             }
-            "delete_guard" | "flip_guard_op" => "← DOCUMENTED BLIND SPOT",
+            "drop_output_write" | "drop_initial_context_seed" => "← V24 must-write",
+            "weaken_output_source" => "← V26 scalar-null",
+            "retarget_guard_scope" => "← V25 guard scope",
+            "retarget_output_scope" => "← V27 write scope",
+            "retarget_use_input_scope" => "← V28 use-input",
+            "retarget_executor_arg_scope" => "← V29 executor-arg",
+            // Once documented blind spots. The per-transition fuzz submits a
+            // deliberately VIOLATING context to every edge and asserts the guard
+            // rejects it, so a deleted/flipped guard is now caught, not survived.
+            "delete_guard" | "flip_guard_op" => "← violating-context probe",
             _ => "",
         };
         println!(

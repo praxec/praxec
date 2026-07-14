@@ -571,6 +571,30 @@ fn eval_expr(expr: &str, instance: &WorkflowInstance, arguments: &Value) -> anyh
     Ok(compare_values(&l, op, &r))
 }
 
+/// Is `s` a `$.`-rooted operand reference (as opposed to a literal like `true`,
+/// `42`, or `'go'`)?
+pub fn is_rooted_operand(s: &str) -> bool {
+    s.trim().starts_with("$.")
+}
+
+/// For a `$.`-rooted guard operand, does it name a scope the evaluator actually
+/// resolves? A `false` means [`resolve_operand`] would have coalesced it to
+/// `Null` — the silent-null footgun (`$.input.mode` resolving to null and making
+/// a guard permanently false). V25 (`validate.rs`) rejects these at load; the
+/// evaluator fails fast on them at eval.
+///
+/// This is the single source of truth for the resolvable-scope set: [`resolve_operand`]
+/// dispatches on exactly these arms, and a poka-yoke test asserts the two cannot drift.
+pub fn is_resolvable_guard_scope(s: &str) -> bool {
+    let s = s.trim();
+    matches!(
+        s,
+        "$.workflow.id" | "$.workflow.state" | "$.workflow.version"
+    ) || s.starts_with("$.context.")
+        || s.starts_with("$.arguments.")
+        || s.starts_with("$.workflow.input.")
+}
+
 fn resolve_operand(
     s: &str,
     instance: &WorkflowInstance,
@@ -631,6 +655,18 @@ fn resolve_operand(
             .pointer(&path_to_pointer(path))
             .cloned()
             .unwrap_or(Value::Null));
+    }
+    // H4 — an unknown `$.`-rooted scope used to coalesce to `Null` (fail-open),
+    // silently making a guard that reads it always-false (the `$.input.mode`
+    // bug). Fail fast instead: V25 rejects these at load, and here we surface the
+    // authoring error rather than pretend the operand is null. A NON-rooted bare
+    // token (not a recognized literal) keeps the legacy `Null` for compatibility.
+    if is_rooted_operand(s) {
+        anyhow::bail!(
+            "UNRESOLVABLE_GUARD_SCOPE: guard operand `{s}` names no resolvable scope — \
+             use `$.context.*`, `$.arguments.*`, `$.workflow.input.*`, or \
+             `$.workflow.{{id,state,version}}`"
+        );
     }
     Ok(Value::Null)
 }
@@ -783,6 +819,12 @@ pub fn expr_parses(expr: &str) -> bool {
     parse_binary_expr(expr).is_some()
 }
 
+/// The two operands of a parseable comparison, trimmed — for V25's scope check.
+/// `None` when the expr doesn't parse (a separate diagnostic already covers that).
+pub fn expr_operands(expr: &str) -> Option<(&str, &str)> {
+    parse_binary_expr(expr).map(|(l, _op, r)| (l, r))
+}
+
 fn parse_binary_expr(expr: &str) -> Option<(&str, &str, &str)> {
     // Order matters: "<=" / ">=" / "==" / "!=" must be tried before "<" / ">".
     // We also need to skip operators that fall inside quoted strings — a
@@ -851,6 +893,52 @@ mod tests {
             depth: 0,
             parent: None,
         }
+    }
+
+    // ── V25 / H4 — resolvable guard scope ───────────────────────────────────
+
+    /// POKA-YOKE: `is_resolvable_guard_scope` must agree with what
+    /// `resolve_operand` actually does — a resolvable scope never bails with
+    /// UNRESOLVABLE_GUARD_SCOPE, and an unresolvable one always does. If someone
+    /// adds a scope arm to `resolve_operand` without updating the predicate (or
+    /// vice-versa), this fails.
+    #[rstest]
+    #[case("$.context.x", true)]
+    #[case("$.arguments.y", true)]
+    #[case("$.workflow.input.z", true)]
+    #[case("$.workflow.id", true)]
+    #[case("$.workflow.state", true)]
+    #[case("$.workflow.version", true)]
+    #[case("$.input.mode", false)] // the bug: not a resolvable guard scope
+    #[case("$.workflow.foo", false)]
+    #[case("$.output.x", false)]
+    fn predicate_agrees_with_resolve_operand(#[case] operand: &str, #[case] resolvable: bool) {
+        assert_eq!(is_resolvable_guard_scope(operand), resolvable);
+
+        // Now the ground truth: does resolve_operand treat it as resolvable?
+        let inst = instance(json!({ "x": 1 }));
+        let bailed = resolve_operand(operand, &inst, &json!({ "y": 1 }))
+            .err()
+            .map(|e| e.to_string())
+            .is_some_and(|m| m.contains("UNRESOLVABLE_GUARD_SCOPE"));
+        // A resolvable scope must NOT bail as unresolvable; an unresolvable one MUST.
+        assert_eq!(
+            !bailed, resolvable,
+            "resolve_operand disagrees for `{operand}`"
+        );
+    }
+
+    /// H4 — an unresolvable `$.`-rooted operand fails fast at EVAL rather than
+    /// coalescing to null and silently making the guard false.
+    #[test]
+    fn eval_fails_fast_on_an_unresolvable_scope() {
+        let inst = instance(json!({}));
+        let err = eval_expr("$.input.mode == 'auto'", &inst, &json!({}))
+            .expect_err("must error, not silently return false");
+        assert!(
+            err.to_string().contains("UNRESOLVABLE_GUARD_SCOPE"),
+            "{err}"
+        );
     }
 
     // G2 — the `expr` evaluation matrix (testing-strategy): operators × operand

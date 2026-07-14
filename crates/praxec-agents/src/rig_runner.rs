@@ -927,7 +927,84 @@ impl RigSessionRunner {
                 content: OneOrMany::many(results).expect("at least one tool result"),
             };
         }
-        Ok(LoopEnd::Exhausted) // turn budget exhausted
+        // (A) Sign-off ceremony — the loop exhausted its turn budget without a
+        // conforming `final_answer`. The signature failure is a REASONING model
+        // that streamed thinking/text every turn but never *called* the terminal
+        // tool: the in-loop `force_final` could only OFFER `final_answer` (Auto),
+        // because thinking-mode models 400 on a forced `tool_choice`, so a model
+        // determined to keep reasoning exhausts with real work done but never
+        // recorded. Before conceding NoResult, make ONE last constrained attempt
+        // with reasoning DISABLED — a non-thinking request DOES accept
+        // `tool_choice = Required`, so the model's only legal move is to emit the
+        // `final_answer` that records the work it already produced. This is
+        // robust handling of the *ceremony*, not a model-class restriction: the
+        // same model signs off, and any miss (a model that thinks unconditionally
+        // and still 400s, a non-conforming answer, a provider error) degrades to
+        // exactly today's `Exhausted`/NoResult.
+        if let Some(answer) = self
+            .sign_off_ceremony(env, history, &input, transcript, total_usage)
+            .await
+        {
+            return Ok(LoopEnd::Answer(answer));
+        }
+        Ok(LoopEnd::Exhausted) // turn budget exhausted, even after the sign-off attempt
+    }
+
+    /// One terminal, reasoning-disabled, tool-forced turn whose sole purpose is
+    /// to capture a `final_answer` from a model that did the work but never
+    /// called the sign-off tool (the reasoning-model NoResult signature). See
+    /// the call site in [`Self::drive_loop`] for the full rationale.
+    ///
+    /// Returns `Some` ONLY on a CONFORMING answer; every miss — still no tool
+    /// call, a non-conforming envelope, or a provider error (e.g. a
+    /// think-always model that rejects the forced `tool_choice`) — yields `None`
+    /// so the caller falls through to `Exhausted` unchanged. Zero regression:
+    /// the worst case is one extra bounded turn before the same NoResult.
+    async fn sign_off_ceremony(
+        &self,
+        env: &LoopEnv<'_>,
+        history: &[Message],
+        input: &Message,
+        transcript: &mut String,
+        total_usage: &mut TurnUsage,
+    ) -> Option<AgentResult> {
+        let turn = TurnRequest {
+            system: Some(env.system_message.to_string()),
+            prompt: input.clone(),
+            // Only the terminal tool is on the table.
+            tools: vec![Self::final_answer_tool()],
+            history: history.to_vec(),
+            // Reasoning OFF — this is the whole point: a non-thinking request
+            // accepts the forced `tool_choice` below; a thinking one 400s.
+            reasoning: None,
+            // Compel the call. With `final_answer` the only tool offered,
+            // Required means "emit `final_answer` now."
+            tool_choice: Some(rig::message::ToolChoice::Required),
+        };
+        let result = drain_turn(
+            &*self.factory,
+            &env.session.model,
+            turn,
+            env.session.stall_timeout,
+            env.heartbeat.as_ref(),
+            // Index past the last real turn — telemetry only, marks the ceremony.
+            self.max_turns,
+        )
+        .await
+        .ok()?;
+        *total_usage = *total_usage + result.usage;
+        transcript.push_str(&result.transcript_fragment);
+        let answer = result.final_answer?;
+        if conforms(
+            &answer.output,
+            &env.session.expected_output_keys,
+            &env.session.expected_output_types,
+        ) {
+            transcript.push_str("\n[sign-off ceremony → final_answer captured]\n");
+            Some(answer)
+        } else {
+            None
+        }
     }
 
     /// P12 R1.4 — **resume** a durably parked session: load the frame by

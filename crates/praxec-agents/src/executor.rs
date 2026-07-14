@@ -45,6 +45,27 @@ pub const MAX_SECONDS_CEILING: u64 = 3600;
 /// ~2 min instead of burning the full 10-min wall, yet generous enough that a
 /// model legitimately streaming a slow "thinking" phase keeps resetting it.
 pub const DEFAULT_STALL_SECONDS: u64 = 120;
+/// (CR#1) Default wall-clock ceiling on a single step's ENTIRE model chain-walk
+/// when the step omits `step_budget_seconds`.
+///
+/// The chain-walk escalates on every infrastructure-class failure — including
+/// `AGENT_NO_RESULT` — and each model it tries gets its own full
+/// [`DEFAULT_MAX_SECONDS`] wall. A chain of reasoning models that all fail to
+/// sign off therefore burned N×600s of *silent churn* with no forward progress
+/// and no state transition (the observed fix-loop stall). This budget bounds the
+/// whole walk: each attempt's wall is clamped to the budget remaining, and when
+/// it runs out the walk stops with a terminal `AGENT_STEP_BUDGET_EXHAUSTED`
+/// rather than starting another full-wall attempt.
+///
+/// Sized to fit one full-wall attempt plus a meaningful escalation (not N of
+/// them): generous enough that a single legitimately-slow model is never
+/// kneecapped, tight enough that a wedged step surfaces to a human in minutes
+/// instead of tens of minutes.
+pub const DEFAULT_STEP_BUDGET_SECONDS: u64 = 900;
+/// Floor below which the remaining step budget is too small to be worth another
+/// model attempt — starting a run with a couple of seconds left would just
+/// manufacture a timeout. Below this, the walk stops and surfaces.
+const MIN_ATTEMPT_SECONDS: u64 = 15;
 
 /// The durable `_agent_await` wait marker, read off the workflow context when
 /// it belongs to the transition being dispatched (transition-identity guarded,
@@ -204,11 +225,17 @@ impl AgentExecutor {
         request: &ExecuteRequest,
         system_prompt: &Option<String>,
         user_prompt: &str,
+        // (CR#1) What's LEFT of the step's chain-walk budget. Clamps this
+        // attempt's wall so the sum across the whole walk can never exceed the
+        // budget — without it, each escalation would silently start a fresh
+        // full-length wall and the "budget" would bound nothing.
+        wall_cap: Duration,
     ) -> Result<ExecuteResult, ExecutorError> {
         let max_seconds = cfg
             .max_seconds
             .unwrap_or(DEFAULT_MAX_SECONDS)
-            .min(MAX_SECONDS_CEILING);
+            .min(MAX_SECONDS_CEILING)
+            .min(wall_cap.as_secs());
         // Stall window: never larger than the total budget (a stall bound that
         // outlived the wall would be dead code — the total timeout would always
         // fire first).
@@ -428,9 +455,60 @@ impl Executor for AgentExecutor {
 
         let mut escalations: Vec<Evidence> = Vec::new();
 
+        // (CR#1) The step's chain-walk budget. `walk_start` is the ONE clock the
+        // whole escalation shares, so N models can't each claim a fresh wall.
+        // Tokio's clock (not `std`'s) so the bound is exercisable under virtual
+        // time — a wall-clock budget you can only test by actually waiting 15
+        // minutes is a wall-clock budget nobody tests.
+        let step_budget = Duration::from_secs(
+            cfg.step_budget_seconds
+                .unwrap_or(DEFAULT_STEP_BUDGET_SECONDS),
+        );
+        let walk_start = tokio::time::Instant::now();
+
         for (idx, model) in planned.iter().enumerate() {
+            // How much wall is left for this attempt? Checked BEFORE the run so
+            // a spent budget stops the walk instead of starting an attempt that
+            // could only time out.
+            let remaining = step_budget.saturating_sub(walk_start.elapsed());
+            // The budget governs ESCALATION, never the first attempt: model 0
+            // always gets to run. Otherwise a budget configured below
+            // `MIN_ATTEMPT_SECONDS` would silently no-op every agent step —
+            // a knob that turns the feature off by accident is a trap, not a
+            // bound. (An explicitly tiny budget still clamps attempt 0's wall
+            // below; that's the operator's stated intent, honestly applied.)
+            if idx > 0 && remaining.as_secs() < MIN_ATTEMPT_SECONDS {
+                // Budget spent mid-walk. STOP escalating and surface. This is
+                // the hard bound that turns silent multi-model churn into a
+                // fast, legible hand-off: `AGENT_STEP_BUDGET_EXHAUSTED`
+                // classifies as ContentOther (NOT Capability), so it does not
+                // re-escalate — it routes to the flow, and on to a human.
+                tracing::warn!(
+                    models_tried = idx,
+                    budget_seconds = step_budget.as_secs(),
+                    "agent step budget exhausted mid-chain-walk; surfacing instead of escalating"
+                );
+                return Err(permanent(
+                    AgentErrorCode::StepBudgetExhausted,
+                    format!(
+                        "the {}s step budget was spent after {} model attempt(s) \
+                         ({}) without a result; stopping the chain-walk rather than \
+                         starting another full-length attempt — this step needs a human",
+                        step_budget.as_secs(),
+                        idx,
+                        planned[..idx].join(" → "),
+                    ),
+                ));
+            }
             match self
-                .run_one(model, &cfg, &request, &system_prompt, &user_prompt)
+                .run_one(
+                    model,
+                    &cfg,
+                    &request,
+                    &system_prompt,
+                    &user_prompt,
+                    remaining,
+                )
                 .await
             {
                 Ok(result) => {
@@ -837,6 +915,178 @@ mod tests {
                 })
             }
         }
+    }
+
+    // ── (CR#1) the chain-walk wall-clock budget ──────────────────────────
+
+    /// Three reasoning models, all of which will fail to sign off — the live
+    /// fix-loop chain (deepseek → glm → qwen-thinking).
+    struct ThreeModelResolver;
+    #[async_trait]
+    impl AgentModelResolver for ThreeModelResolver {
+        async fn resolve(&self, _binding: &ModelBinding) -> Result<String, ExecutorError> {
+            Ok("openrouter:reason-1".into())
+        }
+        async fn resolve_chain(
+            &self,
+            _binding: &ModelBinding,
+        ) -> Result<Vec<String>, ExecutorError> {
+            Ok(vec![
+                "openrouter:reason-1".to_string(),
+                "openrouter:reason-2".to_string(),
+                "openrouter:reason-3".to_string(),
+            ])
+        }
+    }
+
+    /// Every model burns its ENTIRE granted wall and then returns NoResult —
+    /// the observed reasoning-model fix-loop signature. Sleeping exactly
+    /// `session.timeout` is what makes this a faithful mock: it proves the
+    /// executor's clamp on each attempt's wall is what bounds the walk.
+    struct BudgetBurningRunner {
+        seen: std::sync::Mutex<Vec<AgentSession>>,
+    }
+    impl BudgetBurningRunner {
+        fn new() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn sessions(&self) -> Vec<AgentSession> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl AgentSessionRunner for BudgetBurningRunner {
+        async fn run(&self, session: AgentSession) -> Result<AgentRunReport, ExecutorError> {
+            self.seen.lock().unwrap().push(session.clone());
+            tokio::time::sleep(session.timeout).await;
+            Ok(AgentRunReport {
+                outcome: AgentRunOutcome::NoResult,
+                transcript: String::new(),
+                model: session.model.clone(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            })
+        }
+    }
+
+    /// THE CR#1 REGRESSION TEST. A chain of reasoning models that all return
+    /// `AGENT_NO_RESULT` used to give EACH model its own full `max_seconds`
+    /// wall — 3 × 600s = 1800s of silent churn with no forward progress and no
+    /// state transition (the reported fix-loop stall).
+    ///
+    /// With the step budget, the WHOLE walk is bounded by one shared clock:
+    /// attempt 1 gets 600s (its own wall, the smaller bound), attempt 2 is
+    /// clamped to the 300s that remain, and the budget is then spent — so the
+    /// walk STOPS and surfaces `AGENT_STEP_BUDGET_EXHAUSTED` instead of
+    /// starting a third full-length attempt. Total wall == the budget, exactly.
+    #[tokio::test(start_paused = true)]
+    async fn an_all_no_result_chain_walk_is_bounded_by_the_step_budget() {
+        let runner = Arc::new(BudgetBurningRunner::new());
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(ThreeModelResolver));
+        let started = tokio::time::Instant::now();
+
+        let err = exec
+            .execute(request(
+                json!({
+                    "affinity": "coding",
+                    "goal": "fix the failing test",
+                    "max_seconds": 600,
+                    "step_budget_seconds": 900,
+                }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("an all-NoResult chain must not silently churn to success");
+
+        match &err {
+            ExecutorError::Permanent(msg) => assert!(
+                msg.starts_with("AGENT_STEP_BUDGET_EXHAUSTED"),
+                "a spent step budget must surface as its own terminal code, not \
+                 another NoResult — got: {msg}"
+            ),
+            other => panic!("expected a Permanent budget error, got {other:?}"),
+        }
+
+        // It must SURFACE, not re-escalate: ContentOther, never Capability.
+        let class = FailureClass::from_executor_error(&err);
+        assert_eq!(
+            class,
+            FailureClass::ContentOther,
+            "the escalation layer running out of budget must route to a human, \
+             not hand another layer a reason to escalate again"
+        );
+        assert!(
+            !class.is_infrastructure(),
+            "AGENT_STEP_BUDGET_EXHAUSTED must never be chain-escalated"
+        );
+
+        // The hard bound actually held: 2 attempts, not 3, and the total wall
+        // is the budget — not 3 × max_seconds.
+        let sessions = runner.sessions();
+        assert_eq!(
+            sessions.len(),
+            2,
+            "the third full-length attempt must never start once the budget is spent"
+        );
+        assert_eq!(
+            sessions[0].timeout,
+            Duration::from_secs(600),
+            "attempt 1 gets its own max_seconds wall (the smaller of the two bounds)"
+        );
+        assert_eq!(
+            sessions[1].timeout,
+            Duration::from_secs(300),
+            "attempt 2 is clamped to the budget REMAINING — without this clamp the \
+             budget would bound nothing, because each escalation would start a fresh \
+             full-length wall"
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(900),
+            "the whole chain-walk is bounded by the budget (was 3 × 600s = 1800s)"
+        );
+    }
+
+    /// Poka-yoke: the budget governs ESCALATION, never the first attempt. A
+    /// budget configured below `MIN_ATTEMPT_SECONDS` must still run model 0
+    /// (clamped) — a knob that silently turns every agent step into a no-op
+    /// would be a trap, not a bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_tiny_budget_still_runs_the_first_attempt_rather_than_no_opping_the_step() {
+        let runner = Arc::new(BudgetBurningRunner::new());
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(ThreeModelResolver));
+
+        let err = exec
+            .execute(request(
+                json!({
+                    "affinity": "coding",
+                    "goal": "fix the failing test",
+                    "max_seconds": 600,
+                    "step_budget_seconds": 5, // below MIN_ATTEMPT_SECONDS
+                }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("the runner never signs off, so the step still fails");
+
+        let sessions = runner.sessions();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "model 0 must still be attempted under a sub-minimum budget (and only model 0)"
+        );
+        assert_eq!(
+            sessions[0].timeout,
+            Duration::from_secs(5),
+            "the first attempt's wall is clamped to the operator's stated budget — \
+             honestly applied, not silently ignored"
+        );
+        assert!(
+            matches!(&err, ExecutorError::Permanent(m) if m.starts_with("AGENT_STEP_BUDGET_EXHAUSTED")),
+            "and the walk then stops on the spent budget: {err:?}"
+        );
     }
 
     /// P12 R1.4 — a Suspended outcome is FIRST-CLASS: the executor returns

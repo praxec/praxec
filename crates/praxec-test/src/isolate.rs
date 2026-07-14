@@ -153,9 +153,26 @@ fn classify(resp: &Value) -> SubmitResult {
                 code: code.to_string(),
             }
         } else {
-            SubmitResult::Errored {
-                code: code.to_string(),
-            }
+            // A bare `CHAIN_FAILED` says a deterministic chain died but not what
+            // killed it — the operator then has to reproduce the run to find out.
+            // The runtime already classified it; carry that through. Scoped to
+            // CHAIN_FAILED so the exact-code matches downstream (e.g.
+            // BLACKBOARD_TYPE_ERROR in perfuzz) keep matching.
+            let code = match resp.pointer("/error/errorClass").and_then(Value::as_str) {
+                Some(class) if code == "CHAIN_FAILED" && !class.is_empty() => {
+                    let mut out = format!("{code}({class})");
+                    // ...and the message names the offending slot, which is the
+                    // thing you actually need to fix it.
+                    if let Some(msg) = resp.pointer("/error/message").and_then(Value::as_str) {
+                        let msg: String = msg.chars().take(160).collect();
+                        out.push_str(": ");
+                        out.push_str(&msg);
+                    }
+                    out
+                }
+                _ => code.to_string(),
+            };
+            SubmitResult::Errored { code }
         };
     }
     SubmitResult::Fired {

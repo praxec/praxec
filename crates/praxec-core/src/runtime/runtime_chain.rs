@@ -17,6 +17,10 @@ use crate::runtime::runtime_schema::required_str;
 use crate::runtime::{
     ChainOutcome, ChainResult, ChainStep, TransitionRecordParams, WorkflowRuntime,
 };
+use crate::use_binding::{
+    SchemaViolation, project_use_outputs, repair_outputs_against_snippet,
+    validate_outputs_against_snippet,
+};
 
 impl WorkflowRuntime {
     /// Resolve the next state for a transition. The transition's declared
@@ -1018,6 +1022,46 @@ impl WorkflowRuntime {
             }
         }
 
+        // SPEC §5.3 — a definition owes its declared outputs at its OWN
+        // terminal, not merely when some host composes it. Until now the
+        // contract was checked only on the compose path (WorkflowExecutor,
+        // against the host's `use.outputs`), so an author could run a
+        // capability directly, see green, and only discover the violation
+        // once someone wrapped it in a `use:` block. Close that asymmetry
+        // here, at the one place every run — direct or composed — passes
+        // through.
+        if is_terminal(definition, &instance.state)
+            && let Err(violations) = self
+                .enforce_declared_outputs(definition, &instance, correlation_id)
+                .await
+        {
+            let failed_transition = steps
+                .last()
+                .map(|s| s.transition.clone())
+                .unwrap_or_default();
+            let error = format!(
+                "definition '{}' reached terminal state '{}' with outputs failing its declared \
+                 contract: {}",
+                instance.definition_id,
+                instance.state,
+                violations
+                    .iter()
+                    .map(|v| format!("{}: {}", v.slot, v.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            return Ok(ChainOutcome::Failed {
+                failed_transition,
+                error,
+                error_class: "cap_output_schema_violation".into(),
+                partial: ChainResult {
+                    instance,
+                    steps,
+                    evidence: accumulated_evidence,
+                },
+            });
+        }
+
         // Emit chain.completed if any steps were taken
         if !steps.is_empty() {
             self.record_or_self_event(
@@ -1037,6 +1081,76 @@ impl WorkflowRuntime {
             steps,
             evidence: accumulated_evidence,
         }))
+    }
+
+    /// Enforce the definition's declared invokable outputs against the context
+    /// it actually reached terminal with.
+    ///
+    /// The schema block is harvested with the SAME rule `expand_use_bindings`
+    /// uses to embed `_snippetOutputs` — a capability's `snippet.outputs`, or a
+    /// (nestable) flow's top-level `outputs:` — so this validates exactly what a
+    /// composing host would.
+    ///
+    /// The check is deliberately expressed as the compose check under a
+    /// synthesized *full identity binding* (`{name: name, ...}`): it reuses
+    /// [`repair_outputs_against_snippet`] and [`validate_outputs_against_snippet`]
+    /// verbatim rather than reimplementing them, so the direct and compose paths
+    /// cannot drift. A full binding is also the strictest host any composer could
+    /// be, which buys the property that makes this worth having:
+    ///
+    /// > a green direct run implies a green composed run.
+    ///
+    /// The deterministic-repair rung runs first, on a copy — a `Null` array
+    /// output is as repairable here as it is under `use:`, and the terminal
+    /// check must not be harsher than the compose check it mirrors. The repair
+    /// is not persisted; the host repairs its own projection anyway.
+    async fn enforce_declared_outputs(
+        &self,
+        definition: &Value,
+        instance: &WorkflowInstance,
+        correlation_id: &str,
+    ) -> Result<(), Vec<SchemaViolation>> {
+        let Some(schemas) = definition
+            .pointer("/snippet/outputs")
+            .or_else(|| definition.pointer("/outputs"))
+        else {
+            return Ok(());
+        };
+        let Some(names) = schemas.as_object().filter(|o| !o.is_empty()) else {
+            return Ok(());
+        };
+
+        let identity = Value::Object(
+            names
+                .keys()
+                .map(|n| (n.clone(), Value::String(n.clone())))
+                .collect(),
+        );
+        let mut projected = project_use_outputs(&identity, &instance.context);
+        repair_outputs_against_snippet(schemas, &identity, &mut projected);
+        let Err(violations) = validate_outputs_against_snippet(schemas, &identity, &projected)
+        else {
+            return Ok(());
+        };
+
+        // Same event name the compose path emits for the same defect class —
+        // one violation, one event, wherever it is caught.
+        self.record_or_self_event(
+            instance
+                .audit_event("cap.output.schema_violation")
+                .with_correlation(correlation_id)
+                .with_payload(json!({
+                    "definitionId": instance.definition_id,
+                    "terminalState": instance.state,
+                    "caughtAt":     "terminal",
+                    "violations":   violations
+                        .iter()
+                        .map(|v| json!({ "slot": v.slot, "reason": v.reason }))
+                        .collect::<Vec<_>>(),
+                })),
+        )
+        .await;
+        Err(violations)
     }
 
     /// Select which deterministic transition to execute when a state has

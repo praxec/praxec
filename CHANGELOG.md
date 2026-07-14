@@ -10,6 +10,207 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+## [0.0.19] — 2026-07-14 — the silent-scope hardening
+
+A dogfooding-driven consolidation release. Running 0.0.18 against a real
+.NET/React/C# repo surfaced a class of defect — a scope the resolver quietly
+coalesces to `null` (or ships as a literal) — that this release closes on every
+surface (guard, output, use.inputs, executor args), each new validator paired
+with a mutation operator that must kill it. It also finishes the two harnesses
+that let the class hide: `praxec fuzz` is driven to fully green on the pack, and
+the mutation score is made honest against a real baseline.
+
+### Hardening — close the silent/fail-open scope gaps (V25–V29)
+
+The theme is one lesson: **a scope the resolver quietly coalesces to `null` (or
+ships as a literal) is a bug it hides.** The 0.0.18 dogfooding found a guard that
+read `$.input.mode` — a scope the evaluator resolves to `null`, making the guard
+permanently false and wedging the cap. That was one instance of a class, and
+v0.0.19 closes the class **everywhere** it appears — guard, output, use.inputs,
+executor args — with a mutation operator behind each rule so it stays honest. An
+FMECA sweep of both the core and executor crates found every coalescing site;
+none were left as a "follow-on." `$.input.*` turns out to be a bound scope
+**nowhere** (not even in a pipeline); the canonical spelling is
+`$.workflow.input.*`, and the validators now enforce that uniformly.
+
+- **V25 `UNRESOLVABLE_GUARD_SCOPE`.** A load-time error on any guard `expr`
+  operand that is `$.`-rooted but names no resolvable scope (`$.context.*`,
+  `$.arguments.*`, `$.workflow.input.*`, `$.workflow.{id,state,version}`). The
+  resolvable set lives in one predicate the evaluator and the validator both
+  consult — a poka-yoke test keeps them from drifting. The evaluator also now
+  **fails fast** on such an operand instead of coalescing to `null`.
+- **V26 `SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE`.** A warning: V24 proves an output is
+  *written*; V26 catches one *written from a source that can be null*. The
+  repair rung coerces a missing array/object to `[]`/`{}`, but it cannot repair a
+  scalar — so a declared `summary: {type: string}` sourced from an optional
+  argument lands `null` at terminal when the agent omits it. Found exactly three
+  in the pack (survey-confirmed), each fixed with a `default`.
+- **V27 `UNRESOLVABLE_WRITE_SCOPE`.** The write-side twin of V25, from an FMECA
+  sweep of the resolver code. `output:` / `onEnter.output:` / `prefill:` mappings
+  had **no** scope validator — an unrecognized `$.`-rooted path (a typo, an
+  `$.input.x`) silently wrote `null`. V27 caught a real bug on first run: the same
+  human-approve cap wrote `plan_final: "$.input.plan"`, dropping the operator's
+  approved plan on the auto path. It also flagged two of praxec's own test
+  fixtures that had been silently writing null.
+
+- **V28 `UNRESOLVABLE_USE_INPUT_SCOPE`** and **V29 `UNRESOLVABLE_EXECUTOR_ARG_SCOPE`.**
+  The read-side companions. `use.inputs` values and executor `args:`/`map:`/
+  `query:`/`body:` path strings resolve against `{context, arguments,
+  workflow.input}` only — an unrecognized `$.`-rooted scope seeded a null or (for
+  executor args) reached the shell/tool/endpoint as its **literal token**. V29
+  caught the confirmed bug behind this: `arg_render` *documented* `$.input.x`
+  support the code never delivered, so thirteen shipped caps were passing
+  `$.input.gateway_config_path` to the shell verbatim. All fixed.
+
+Alongside the load-time validators, every executor resolver that used to coalesce
+silently now **fails fast** at runtime, mirroring the `mcp` `map:` model that
+already did: `arg_render` (script/cli args), `rest` (query + body — previously no
+guard at all), and the legacy sub-workflow `input:` path.
+
+Each rule ships with a mutation operator that must be killed by it —
+`retarget_guard_scope`, `weaken_output_source`, `retarget_output_scope`,
+`retarget_use_input_scope`, `retarget_executor_arg_scope`. The mutation report on
+the live pack is **100% across all fourteen operators**, so the rules are
+attacked, not assumed.
+
+### Fixes from dogfooding 0.0.18 against a real .NET/React/C# repo
+
+The engine was *silent* where it should have been *loud*.
+
+### Fixed — the multi-turn fix-loop stall on reasoning models
+
+A reasoning model on a real fix-loop would do the work, emit the diff as text,
+and never call the `final_answer` tool. The turn budget exhausted, the step
+reported `AGENT_NO_RESULT`, that classified as `Capability` (escalatable), and
+the chain-walk quietly retried the whole thing on the next model — three 600s
+walls, ~30 minutes, no verdict, and nobody told. Two independent defects were
+conflated there; both are fixed.
+
+- **Sign-off ceremony.** On turn exhaustion the runner now takes one more turn on
+  the *same* model with reasoning disabled and `tool_choice: Required`, purely to
+  capture the sign-off. Thinking-mode models reject a forced `tool_choice` with a
+  hard 400 — which is why the in-loop `force_final` steer can only ever *offer*
+  `final_answer` — but turning reasoning off makes the force legal. The model that
+  did the work signs off on it. This is robust handling of the ceremony, not a
+  capability restriction: reasoning models stay fully in play. Every miss path
+  (transport error, still no tool call, non-conforming output) degrades to exactly
+  the previous `Exhausted`/`AGENT_NO_RESULT`, so a model that still refuses ends
+  where it ended before.
+- **Hard per-step budget.** The chain-walk had no wall-clock bound: each model in
+  the chain got its own `max_seconds`, so an all-`NoResult` walk burned N × 600s in
+  silence. An agent step now carries a budget (`step_budget_seconds`, default
+  **900s**); each attempt's wall is clamped to what remains, and escalation stops
+  once too little is left to try again, surfacing a new terminal
+  `AGENT_STEP_BUDGET_EXHAUSTED`. That code deliberately does **not** classify as
+  `Capability`, so it routes to a human instead of feeding the churn it exists to
+  stop.
+
+### Fixed — a capability's output contract is now enforced on a direct run
+
+A capability's declared `snippet.outputs` was validated **only** on the compose
+path, against the host's `use.outputs` projection. A direct top-level run
+validated nothing. So an author could run a cap on its own, see green, and only
+discover the contract violation once someone wrapped it in a `use:` block —
+which is how a perfectly good `verify` verdict got discarded downstream over a
+single stray provenance key.
+
+A definition now owes its declared outputs at its **own** terminal state, whether
+or not anything composed it. The check is expressed as the existing compose check
+evaluated under a synthesized *full identity binding* — it reuses
+`repair_outputs_against_snippet` and `validate_outputs_against_snippet` verbatim
+rather than reimplementing them, so the two paths cannot drift, and a full binding
+is the strictest host any composer could be. That buys the property worth having:
+
+> **a green direct run implies a green composed run.**
+
+A violation fails the run as `cap_output_schema_violation` with recovery links and
+a `cap.output.schema_violation` audit event naming the offending slot — the same
+event the compose path emits, because it is the same defect. The
+deterministic-repair rung runs first, exactly as it does under `use:`, so the
+terminal check is never harsher than the compose check it mirrors.
+
+### Added — V24 `UNWRITTEN_DECLARED_OUTPUT` (the compile-time half)
+
+The terminal check above cannot catch every unwritten output, and that is not a
+flaw in it: the deterministic-repair rung coerces a missing `array`/`object` to
+`[]`/`{}` *before* validating, because a composing host repairs too and the
+terminal check must never be harsher than the compose check it mirrors. So a
+never-written `report: {type: object}` goes green at runtime and the caller reads
+an empty report instead of an error. Only a static analysis sees that the slot has
+no writer at all.
+
+V24 proves from the state graph that every declared output is written on **every**
+path to **every** terminal — a MUST dataflow over the declared-output lattice,
+computed as a *greatest* fixpoint so a retry cycle cannot launder an unwritten slot
+into a written one. It caught a broken fixture in praxec's own corpus on first run.
+
+### Fixed — the mutation score was measuring nothing
+
+`praxec-test`'s mutation harness credited a kill for *any* diagnostic or fuzz
+failure, absolutely. Run that against a real corpus with a single pre-existing
+complaint and every mutant is "killed" by a defect that was already there. The tell
+was the two semantic operators — which exist to document what the tool *cannot*
+catch — also reporting 100%.
+
+Kills are now credited only for a complaint the mutant **caused**: every gate is
+diffed against what it already said about the unmutated config. Two new CONTRACT
+operators (`drop_output_write`, `drop_initial_context_seed`) delete a declared
+output's only writer — the class that shipped the bug above, and which no operator
+previously modeled, which is precisely why nothing warned us. A gate you never
+attack is a gate you are only assuming works.
+
+### Fixed — the fuzz mock could not produce the contracts it was mocking
+
+Three bugs, all the same shape, each making `praxec fuzz` report failures the
+definitions were not guilty of. The dummy synthesizer had no `$ref` arm, so every
+slot capability in the pack (they all spell their contract as
+`$ref: praxec://hop#/$defs/verifyOut`) got `null` and looked like a contract
+violation. The output plan could only hold an *object*, so a `kind: mcp` leaf whose
+result is legitimately an array (`corpus_search`) could only ever emit `{}`. And
+the isolated prober fabricated a mid-flow context that skipped the states it was
+pretending had already run. On the live pack: **152 → 116** fuzz failures, with
+zero coming from the new terminal check. A bare `CHAIN_FAILED` now also carries its
+error class and message, which is how all three were diagnosed.
+
+### Fixed — `praxec fuzz` is now fully green on the pack (116 → 0 hard failures)
+
+The remaining 116 per-transition failures were all the mock failing to reconstruct
+the state a real prior chain would have produced — not defects in the definitions.
+Each was a distinct fidelity gap, now closed:
+
+- **Nested guard reads.** A guard on `$.context.out.status` was seeded only at
+  `out` (a `{}` dummy), leaving `.status` unset → `GUARD_UNSET_SLOT`. The seeder
+  now writes at the full dotted path, and the mock output plan plants a
+  guard-satisfying value *inside* the field it writes.
+- **Definition-wide context.** An isolated probe fires one edge and lets the chain
+  run, but seeded only the probed edge's reads — so any downstream guard hit an
+  unseeded slot. The probe now starts from a context covering every slot the
+  definition reads, typed from the guards that compare it.
+- **Slot-vs-slot and input guards.** `iter >= iter_cap` (neither side a literal)
+  and `$.workflow.input.stack == 'rust'` (input-scoped) were invisible to the
+  satisfier; both are now seeded — the input per-edge, since siblings gate the same
+  slot on exclusive values.
+- **The violating-context probe.** It set a bool to "violate" a guard, but a bool
+  does not violate `status != 'pass'`, so the transition fired and the fuzz cried
+  "guard did not reject". It now computes a value that genuinely fails the clause,
+  and skips the check when it cannot guarantee one.
+- **`$ref` / nested / `minProperties` arguments.** A `hop_slot` transition's
+  `inputSchema` is a bare `{$ref: verifyIn}`; the arguments builder now resolves the
+  ref, includes optional properties (so an output mapped from an optional argument
+  isn't null), and honors `minProperties`.
+
+Left green the honest way: this surfaced one **real** pack bug —
+`cap.gate.human-approve-plan` guarded on `$.input.mode`, a scope the guard
+evaluator resolves to `null` (it recognizes `$.workflow.input.*`, not bare
+`$.input.*`), so both its transitions were dead. Fixed in the pack. The 44
+remaining smoke wedges on agent-heavy flows stay advisory — a mock chooser cannot
+make an agent's decisions, which is what `--live --model` is for.
+
+With a clean fuzz baseline, the mutation score is now meaningful rather than
+inflated: 100% across all nine operators (1434 mutants), and the two guard
+operators are genuinely *killed* by the violating-context probe — they were never
+really blind spots, only older than the harness.
+
 > **Note on versioning.** This is a pre-1.0, greenfield project on the `0.0.x`
 > line: nothing is API-stable, and any release may change anything (breaking
 > changes are cut over cleanly, by design). The `0.0.6`–`0.0.13` sequence below
