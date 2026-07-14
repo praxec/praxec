@@ -179,7 +179,8 @@ async fn meta_pack_has_no_use_binding_contract_drift() {
     let drift: Vec<String> = praxec_core::validate::validate_workflows(&config)
         .into_iter()
         .filter_map(|d| match d {
-            praxec_core::validate::Diagnostic::Error(m) | praxec_core::validate::Diagnostic::Warning(m)
+            praxec_core::validate::Diagnostic::Error(m)
+            | praxec_core::validate::Diagnostic::Warning(m)
                 if m.contains("USE_BINDING_CONTRACT_DRIFT") =>
             {
                 Some(m)
@@ -213,11 +214,20 @@ async fn author_capability_advances_past_surveying_tools() {
     )
     .await;
 
-    let state = resp.pointer("/workflow/state").and_then(Value::as_str).unwrap_or("?");
-    let status = resp.pointer("/result/status").and_then(Value::as_str).unwrap_or("?");
+    let state = resp
+        .pointer("/workflow/state")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let status = resp
+        .pointer("/result/status")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
     assert_ne!(
         state, "surveying_tools",
         "flow must advance past the survey leg; still stuck: {resp:#}"
     );
-    assert_ne!(status, "failed", "survey leg must not CHAIN_FAILED: {resp:#}");
+    assert_ne!(
+        status, "failed",
+        "survey leg must not CHAIN_FAILED: {resp:#}"
+    );
 }

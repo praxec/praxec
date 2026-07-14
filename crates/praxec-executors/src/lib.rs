@@ -35,9 +35,7 @@ pub use human::HumanExecutor;
 pub use import::import_capabilities;
 pub use ingest::IngestExecutor;
 pub use inventory::InventoryExecutor;
-pub use mcp::{
-    McpConnection, McpConnections, McpExecutor, RelayClientHandler, UpstreamElicitor,
-};
+pub use mcp::{McpConnection, McpConnections, McpExecutor, RelayClientHandler, UpstreamElicitor};
 pub use noop::NoopExecutor;
 pub use parallel::ParallelExecutor;
 pub use pipeline::PipelineExecutor;

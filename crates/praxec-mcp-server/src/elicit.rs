@@ -124,7 +124,10 @@ mod tests {
         let form = form_schema(&gate(HitlSource::HumanGate, Some(schema)));
         assert!(form.properties.contains_key("approved"));
         assert!(form.properties.contains_key("note"));
-        assert_eq!(form.required.as_deref(), Some(&["approved".to_string()][..]));
+        assert_eq!(
+            form.required.as_deref(),
+            Some(&["approved".to_string()][..])
+        );
     }
 
     #[test]
@@ -144,11 +147,17 @@ mod tests {
     fn agent_await_with_no_schema_asks_for_a_response() {
         let form = form_schema(&gate(HitlSource::AgentAwait, None));
         assert!(form.properties.contains_key("response"));
-        assert_eq!(form.required.as_deref(), Some(&["response".to_string()][..]));
+        assert_eq!(
+            form.required.as_deref(),
+            Some(&["response".to_string()][..])
+        );
     }
 
     #[test]
     fn message_prefers_the_prompt() {
-        assert_eq!(message(&gate(HitlSource::HumanGate, None)), "Approve the plan?");
+        assert_eq!(
+            message(&gate(HitlSource::HumanGate, None)),
+            "Approve the plan?"
+        );
     }
 }

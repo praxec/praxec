@@ -65,7 +65,8 @@ async fn gated_server() -> PraxecServer {
     );
     let gate = RepairGate {
         diagnostics: vec![
-            "USE_BINDING_CONTRACT_DRIFT: workflow 'flow.normal' … maps `use.inputs.filter` …".into(),
+            "USE_BINDING_CONTRACT_DRIFT: workflow 'flow.normal' … maps `use.inputs.filter` …"
+                .into(),
         ],
         repair_ids: HashSet::from(["flow.repair".to_string()]),
     };
@@ -88,12 +89,17 @@ async fn dirty_gateway_refuses_starting_a_non_repair_workflow() {
         .dispatch_call_with_principal(start("flow.normal"), Principal::anonymous())
         .await
         .expect("dispatch returns a structured response");
-    assert_eq!(resp["error"]["code"], "CONTRACT_DIRTY_REPAIR_ONLY", "resp: {resp:#}");
+    assert_eq!(
+        resp["error"]["code"], "CONTRACT_DIRTY_REPAIR_ONLY",
+        "resp: {resp:#}"
+    );
     // Precise diagnostics + the callable repair surface are surfaced.
-    assert!(resp["diagnostics"].as_array().unwrap()[0]
-        .as_str()
-        .unwrap()
-        .contains("USE_BINDING_CONTRACT_DRIFT"));
+    assert!(
+        resp["diagnostics"].as_array().unwrap()[0]
+            .as_str()
+            .unwrap()
+            .contains("USE_BINDING_CONTRACT_DRIFT")
+    );
     assert_eq!(resp["repairSurface"][0], "flow.repair");
     assert_eq!(resp["links"][0]["args"]["definitionId"], "flow.repair");
 }
@@ -110,7 +116,10 @@ async fn dirty_gateway_allows_starting_the_repair_surface() {
         resp["error"]["code"], "CONTRACT_DIRTY_REPAIR_ONLY",
         "the repair surface must remain startable while dirty: {resp:#}"
     );
-    assert_eq!(resp["workflow"]["definitionId"], "flow.repair", "resp: {resp:#}");
+    assert_eq!(
+        resp["workflow"]["definitionId"], "flow.repair",
+        "resp: {resp:#}"
+    );
 }
 
 #[tokio::test]
@@ -124,6 +133,12 @@ async fn a_clean_gateway_starts_anything() {
         .dispatch_call_with_principal(start("flow.normal"), Principal::anonymous())
         .await
         .expect("dispatch");
-    assert_ne!(resp["error"]["code"], "CONTRACT_DIRTY_REPAIR_ONLY", "resp: {resp:#}");
-    assert_eq!(resp["workflow"]["definitionId"], "flow.normal", "resp: {resp:#}");
+    assert_ne!(
+        resp["error"]["code"], "CONTRACT_DIRTY_REPAIR_ONLY",
+        "resp: {resp:#}"
+    );
+    assert_eq!(
+        resp["workflow"]["definitionId"], "flow.normal",
+        "resp: {resp:#}"
+    );
 }

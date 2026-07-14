@@ -274,7 +274,8 @@ async fn parent_surfaces_the_childs_human_gate() {
     // human transition — the actionable step.
     assert_eq!(ph["transition"], "approve", "resp: {resp:#}");
     assert_ne!(
-        ph["resolve"]["args"]["workflowId"], json!(parent_id),
+        ph["resolve"]["args"]["workflowId"],
+        json!(parent_id),
         "resolve must target the child workflow, not the parent: {resp:#}"
     );
     assert_eq!(ph["resolve"]["requiresHuman"], true);

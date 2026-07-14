@@ -60,9 +60,11 @@ impl RelayClientHandler {
 }
 
 impl ClientHandler for RelayClientHandler {
+    // These rmcp capability/info structs are `#[non_exhaustive]`, so a struct
+    // literal is impossible from outside the crate — Default + field assignment
+    // is the only way to build them, which is exactly what this lint flags.
+    #[allow(clippy::field_reassign_with_default)]
     fn get_info(&self) -> ClientInfo {
-        // These rmcp capability/info structs are `#[non_exhaustive]`, so build
-        // via Default + field assignment rather than a struct literal.
         let mut elicitation = ElicitationCapability::default();
         elicitation.form = Some(FormElicitationCapability {
             schema_validation: Some(false),
@@ -279,9 +281,13 @@ impl RmcpToolCaller {
             clock.mark();
             let client =
                 with_idle_timeout(idle, &clock, ServiceExt::serve(handler.clone(), transport))
-                .await
-                .map_err(|e| ExecutorError::Connection(format!("mcp http connect '{name}': {e}")))?
-                .map_err(|e| ExecutorError::Connection(format!("mcp http init '{name}': {e}")))?;
+                    .await
+                    .map_err(|e| {
+                        ExecutorError::Connection(format!("mcp http connect '{name}': {e}"))
+                    })?
+                    .map_err(|e| {
+                        ExecutorError::Connection(format!("mcp http init '{name}': {e}"))
+                    })?;
             (client, None)
         } else {
             let command = conn.command.as_deref().ok_or_else(|| {
@@ -1052,7 +1058,10 @@ mod transport_happy_path_tests {
             .await
             .expect("call tool through the relay");
         let structured = result.structured_content.expect("structured result");
-        assert_eq!(structured["action"], "Accept", "relayed accept: {structured}");
+        assert_eq!(
+            structured["action"], "Accept",
+            "relayed accept: {structured}"
+        );
         assert_eq!(
             structured["content"]["anything"], "relayed-through-praxec",
             "the upstream's answer must reach the downstream tool: {structured}"

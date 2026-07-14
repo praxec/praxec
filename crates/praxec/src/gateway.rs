@@ -1269,9 +1269,10 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                 up.clone(),
             );
             Box::pin(async move {
-                let outcome =
-                    reload_gated(&defs, &execs, &disc, &reg, &cfg, &aud, &rt, &regs, &gate, &up)
-                        .await;
+                let outcome = reload_gated(
+                    &defs, &execs, &disc, &reg, &cfg, &aud, &rt, &regs, &gate, &up,
+                )
+                .await;
                 tracker.recapture(praxec_core::config::local_config_file_set(&cfg));
                 outcome
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
@@ -1318,9 +1319,10 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                 tracing::info!(
                     "config changed on disk — triggering gated reload (staleness recheck)"
                 );
-                let _ =
-                    reload_gated(&defs, &execs, &disc, &reg, &cfg, &aud, &rt, &regs, &gate, &up)
-                        .await;
+                let _ = reload_gated(
+                    &defs, &execs, &disc, &reg, &cfg, &aud, &rt, &regs, &gate, &up,
+                )
+                .await;
                 // Recapture regardless of outcome: a REJECTED edit is audited
                 // once (config.reload_rejected), not retried every TTL until
                 // the operator saves the file again.
@@ -1485,14 +1487,11 @@ async fn reload_gated(
             errors = ?errors,
             "config reload is CONTRACT-DIRTY — dropping to repair-only mode; previous definitions kept live"
         );
-        *repair_gate
-            .write()
-            .expect("LOCK_POISONED: repair_gate") = Some(std::sync::Arc::new(
-            praxec_mcp_server::RepairGate {
+        *repair_gate.write().expect("LOCK_POISONED: repair_gate") =
+            Some(std::sync::Arc::new(praxec_mcp_server::RepairGate {
                 diagnostics: errors.clone(),
                 repair_ids: repair_surface_from_config(&new_config),
-            },
-        ));
+            }));
         let _ = audit
             .record(
                 praxec_core::audit::AuditEvent::new("config.reload_repair_only").with_payload(
@@ -1535,9 +1534,7 @@ async fn reload_gated(
             swappable_registry.swap(new_registry);
             // #14 Fork C — a clean reload REOPENS the full surface: clear any
             // repair-only gate the prior (dirty) config had set.
-            *repair_gate
-                .write()
-                .expect("LOCK_POISONED: repair_gate") = None;
+            *repair_gate.write().expect("LOCK_POISONED: repair_gate") = None;
             let _ = audit
                 .record(
                     praxec_core::audit::AuditEvent::new("config.reloaded").with_payload(json!({
@@ -1869,9 +1866,7 @@ fn run_cleanup(config_path: &PathBuf, older_than_days: u64, force: bool) -> anyh
     let total: u64 = candidates.iter().map(|(_, _, s)| *s).sum();
 
     if candidates.is_empty() {
-        println!(
-            "cleanup: no residual audit files older than {older_than_days}d in {audit_dir}"
-        );
+        println!("cleanup: no residual audit files older than {older_than_days}d in {audit_dir}");
         return Ok(());
     }
     println!(
@@ -1899,7 +1894,10 @@ fn run_cleanup(config_path: &PathBuf, older_than_days: u64, force: bool) -> anyh
             Err(e) => eprintln!("  failed to remove {name}: {e}"),
         }
     }
-    println!("cleanup: removed {removed} file(s), freed {} KiB.", freed / 1024);
+    println!(
+        "cleanup: removed {removed} file(s), freed {} KiB.",
+        freed / 1024
+    );
     Ok(())
 }
 
@@ -3933,10 +3931,10 @@ mod tests {
         });
         std::fs::write(&cfg_path, serde_json::to_string(&edited).unwrap()).unwrap();
 
-        let repair_gate: praxec_mcp_server::RepairGateSlot =
-            Arc::new(std::sync::RwLock::new(None));
-        let upstream: Arc<dyn praxec_executors::UpstreamElicitor> =
-            Arc::new(super::ProgressElicitor::new(praxec_mcp_server::ProgressPeer::default()));
+        let repair_gate: praxec_mcp_server::RepairGateSlot = Arc::new(std::sync::RwLock::new(None));
+        let upstream: Arc<dyn praxec_executors::UpstreamElicitor> = Arc::new(
+            super::ProgressElicitor::new(praxec_mcp_server::ProgressPeer::default()),
+        );
         let outcome = reload_gated(
             &swappable_defs,
             &swappable_execs,
@@ -4031,7 +4029,10 @@ mod tests {
         super::run_cleanup(&cfg_path, 30, true).unwrap();
         assert!(!old.exists(), "old file pruned");
         assert!(recent.exists(), "recent file kept");
-        assert!(unparseable.exists(), "undateable file never touched (fail-safe)");
+        assert!(
+            unparseable.exists(),
+            "undateable file never touched (fail-safe)"
+        );
     }
 
     /// #14 — a contract-DIRTY but buildable config boots in repair-only mode

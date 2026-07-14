@@ -1760,7 +1760,12 @@ fn argument_is_optional(t_def: &Value, field: &str) -> bool {
     !required && !has_default
 }
 
-fn validate_use_bindings(id: &str, def: &Value, ctx: &ValidationCtx<'_>, out: &mut Vec<Diagnostic>) {
+fn validate_use_bindings(
+    id: &str,
+    def: &Value,
+    ctx: &ValidationCtx<'_>,
+    out: &mut Vec<Diagnostic>,
+) {
     for_each_executor_site(def, |site| {
         let exec = site.executor;
         if exec.get("kind").and_then(Value::as_str) != Some("workflow") {

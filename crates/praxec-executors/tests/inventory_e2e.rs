@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
-use praxec_core::discovery::{DiscoveryIndex, DiscoveryItem, DiscoveryKind, SearchHit, SearchRequest};
+use praxec_core::discovery::{
+    DiscoveryIndex, DiscoveryItem, DiscoveryKind, SearchHit, SearchRequest,
+};
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::{Principal, StartWorkflow};
 use praxec_core::ports::{Executor, ExecutorRegistry, WorkflowStore};
@@ -114,8 +116,14 @@ fn build_runtime(discovery: Arc<dyn DiscoveryIndex>) -> WorkflowRuntime {
     let registry = Arc::new(InventoryOnlyRegistry {
         inventory: Arc::new(InventoryExecutor::new(discovery)),
     }) as Arc<dyn ExecutorRegistry>;
-    WorkflowRuntime::new(definitions, store, registry, guards, audit as Arc<dyn AuditSink>)
-        .with_evidence(evidence)
+    WorkflowRuntime::new(
+        definitions,
+        store,
+        registry,
+        guards,
+        audit as Arc<dyn AuditSink>,
+    )
+    .with_evidence(evidence)
 }
 
 #[tokio::test]
@@ -155,5 +163,8 @@ async fn tool_inventory_cap_surveys_on_start_and_maps_output() {
         .unwrap_or_else(|| panic!("inventory output must surface; resp: {resp:#}"));
     assert_eq!(inventory["counts"]["total"], 5, "resp: {resp:#}");
     assert_eq!(inventory["mcp_tools"].as_array().unwrap().len(), 1);
-    assert_eq!(inventory["capabilities"][0]["id"], "cap.research.tool-inventory");
+    assert_eq!(
+        inventory["capabilities"][0]["id"],
+        "cap.research.tool-inventory"
+    );
 }

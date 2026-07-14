@@ -160,10 +160,7 @@ mod tests {
         async fn describe(&self, _id: &str) -> anyhow::Result<Option<DiscoveryItem>> {
             Ok(None)
         }
-        async fn list(
-            &self,
-            kind: Option<DiscoveryKind>,
-        ) -> anyhow::Result<Vec<DiscoveryItem>> {
+        async fn list(&self, kind: Option<DiscoveryKind>) -> anyhow::Result<Vec<DiscoveryItem>> {
             Ok(match kind {
                 None => self.items.clone(),
                 Some(k) => self.items.iter().filter(|i| i.kind == k).cloned().collect(),
