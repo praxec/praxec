@@ -10,6 +10,16 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+## [0.0.19] — 2026-07-14 — the silent-scope hardening
+
+A dogfooding-driven consolidation release. Running 0.0.18 against a real
+.NET/React/C# repo surfaced a class of defect — a scope the resolver quietly
+coalesces to `null` (or ships as a literal) — that this release closes on every
+surface (guard, output, use.inputs, executor args), each new validator paired
+with a mutation operator that must kill it. It also finishes the two harnesses
+that let the class hide: `praxec fuzz` is driven to fully green on the pack, and
+the mutation score is made honest against a real baseline.
+
 ### Hardening — close the silent/fail-open scope gaps (V25–V29)
 
 The theme is one lesson: **a scope the resolver quietly coalesces to `null` (or
