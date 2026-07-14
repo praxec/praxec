@@ -1915,7 +1915,8 @@ fn check_arg_scope_tree(id: &str, loc: &str, value: &Value, out: &mut Vec<Diagno
 /// [`crate::mapping::is_resolvable_write_scope`]; a V28 test pins the difference.
 fn is_resolvable_use_input_scope(s: &str) -> bool {
     let s = s.trim();
-    s.starts_with("$.context.")
+    matches!(s, "$.arguments" | "$.context" | "$.workflow.input")
+        || s.starts_with("$.context.")
         || s.starts_with("$.arguments.")
         || s.starts_with("$.workflow.input.")
 }
@@ -3702,6 +3703,11 @@ mod tests {
             "c": "$.arguments.z",
             "d": "$.workflow.input.w",
             "e": "$",
+            // Whole-scope reads (symmetric with `$`) — the ai-review-swarm
+            // `fix_result: "$.arguments"` pattern.
+            "whole_args": "$.arguments",
+            "whole_ctx": "$.context",
+            "whole_input": "$.workflow.input",
             "lit": "a literal string",
             "num": 42
         })));

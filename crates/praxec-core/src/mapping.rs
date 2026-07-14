@@ -219,6 +219,15 @@ pub fn read_in_scopes(
     workflow_input: &Value,
     executor_output: Option<&Value>,
 ) -> Option<Value> {
+    // Whole-scope reads — symmetric with `$` / `$.output` (the whole output). An
+    // author writing `fix_result: "$.arguments"` means "the whole submission",
+    // exactly as `$` means the whole executor output.
+    match expr {
+        "$.arguments" => return Some(arguments.clone()),
+        "$.context" => return Some(context.clone()),
+        "$.workflow.input" => return Some(workflow_input.clone()),
+        _ => {}
+    }
     if let Some(path) = expr.strip_prefix("$.arguments.") {
         return resolve_path_with_projection(arguments, path);
     }
@@ -250,9 +259,10 @@ pub fn read_in_scopes(
 /// drift. V27 (`validate.rs`) rejects an unrecognized `$.`-rooted write operand at load.
 pub fn is_resolvable_write_scope(s: &str) -> bool {
     let s = s.trim();
-    s == "$"
-        || s == "$.output"
-        || s.starts_with("$.output.")
+    matches!(
+        s,
+        "$" | "$.output" | "$.arguments" | "$.context" | "$.workflow.input"
+    ) || s.starts_with("$.output.")
         || s.starts_with("$.context.")
         || s.starts_with("$.arguments.")
         || s.starts_with("$.workflow.input.")
@@ -318,6 +328,10 @@ mod tests {
             ("$.output.o", true),
             ("$.output", true),
             ("$", true),
+            // Whole-scope reads (symmetric with `$`).
+            ("$.arguments", true),
+            ("$.context", true),
+            ("$.workflow.input", true),
             ("$.input.mode", false), // the bug — not a write scope
             ("$.outpt.plan", false), // typo
             ("$.ctx.c", false),

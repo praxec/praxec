@@ -42,7 +42,7 @@ workflows:
             executor:
               kind: cli
               command: lint-check
-              args: ["$.input.service"]
+              args: ["$.workflow.input.service"]
             output:
               lintPassed: "$.output.json.passed"
               lintReport: "$.output.json.report"
@@ -60,7 +60,7 @@ workflows:
             executor:
               kind: cli
               command: test-runner
-              args: ["$.input.service"]
+              args: ["$.workflow.input.service"]
             output:
               testsPassed: "$.output.json.passed"
               testCount: "$.output.json.count"
@@ -79,7 +79,7 @@ workflows:
             executor:
               kind: cli
               command: build-artifact
-              args: ["$.input.service", "$.input.environment"]
+              args: ["$.workflow.input.service", "$.workflow.input.environment"]
             output:
               artifactId: "$.output.json.artifactId"
               imageTag: "$.output.json.imageTag"
@@ -99,7 +99,7 @@ workflows:
             executor:
               kind: cli
               command: deploy
-              args: ["$.context.artifactId", "$.input.environment"]
+              args: ["$.context.artifactId", "$.workflow.input.environment"]
             output:
               deploymentId: "$.output.json.deploymentId"
 
