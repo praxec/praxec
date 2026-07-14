@@ -10,9 +10,62 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
-Fixes from dogfooding 0.0.18 against a real .NET/React/C# repo. Both changes
-target the same class of defect: the engine was *silent* where it should have
-been *loud*.
+### Hardening — close the silent/fail-open scope gaps (V25–V29)
+
+The theme is one lesson: **a scope the resolver quietly coalesces to `null` (or
+ships as a literal) is a bug it hides.** The 0.0.18 dogfooding found a guard that
+read `$.input.mode` — a scope the evaluator resolves to `null`, making the guard
+permanently false and wedging the cap. That was one instance of a class, and
+v0.0.19 closes the class **everywhere** it appears — guard, output, use.inputs,
+executor args — with a mutation operator behind each rule so it stays honest. An
+FMECA sweep of both the core and executor crates found every coalescing site;
+none were left as a "follow-on." `$.input.*` turns out to be a bound scope
+**nowhere** (not even in a pipeline); the canonical spelling is
+`$.workflow.input.*`, and the validators now enforce that uniformly.
+
+- **V25 `UNRESOLVABLE_GUARD_SCOPE`.** A load-time error on any guard `expr`
+  operand that is `$.`-rooted but names no resolvable scope (`$.context.*`,
+  `$.arguments.*`, `$.workflow.input.*`, `$.workflow.{id,state,version}`). The
+  resolvable set lives in one predicate the evaluator and the validator both
+  consult — a poka-yoke test keeps them from drifting. The evaluator also now
+  **fails fast** on such an operand instead of coalescing to `null`.
+- **V26 `SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE`.** A warning: V24 proves an output is
+  *written*; V26 catches one *written from a source that can be null*. The
+  repair rung coerces a missing array/object to `[]`/`{}`, but it cannot repair a
+  scalar — so a declared `summary: {type: string}` sourced from an optional
+  argument lands `null` at terminal when the agent omits it. Found exactly three
+  in the pack (survey-confirmed), each fixed with a `default`.
+- **V27 `UNRESOLVABLE_WRITE_SCOPE`.** The write-side twin of V25, from an FMECA
+  sweep of the resolver code. `output:` / `onEnter.output:` / `prefill:` mappings
+  had **no** scope validator — an unrecognized `$.`-rooted path (a typo, an
+  `$.input.x`) silently wrote `null`. V27 caught a real bug on first run: the same
+  human-approve cap wrote `plan_final: "$.input.plan"`, dropping the operator's
+  approved plan on the auto path. It also flagged two of praxec's own test
+  fixtures that had been silently writing null.
+
+- **V28 `UNRESOLVABLE_USE_INPUT_SCOPE`** and **V29 `UNRESOLVABLE_EXECUTOR_ARG_SCOPE`.**
+  The read-side companions. `use.inputs` values and executor `args:`/`map:`/
+  `query:`/`body:` path strings resolve against `{context, arguments,
+  workflow.input}` only — an unrecognized `$.`-rooted scope seeded a null or (for
+  executor args) reached the shell/tool/endpoint as its **literal token**. V29
+  caught the confirmed bug behind this: `arg_render` *documented* `$.input.x`
+  support the code never delivered, so thirteen shipped caps were passing
+  `$.input.gateway_config_path` to the shell verbatim. All fixed.
+
+Alongside the load-time validators, every executor resolver that used to coalesce
+silently now **fails fast** at runtime, mirroring the `mcp` `map:` model that
+already did: `arg_render` (script/cli args), `rest` (query + body — previously no
+guard at all), and the legacy sub-workflow `input:` path.
+
+Each rule ships with a mutation operator that must be killed by it —
+`retarget_guard_scope`, `weaken_output_source`, `retarget_output_scope`,
+`retarget_use_input_scope`, `retarget_executor_arg_scope`. The mutation report on
+the live pack is **100% across all fourteen operators**, so the rules are
+attacked, not assumed.
+
+### Fixes from dogfooding 0.0.18 against a real .NET/React/C# repo
+
+The engine was *silent* where it should have been *loud*.
 
 ### Fixed — the multi-turn fix-loop stall on reasoning models
 

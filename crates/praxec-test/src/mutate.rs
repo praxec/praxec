@@ -4,7 +4,7 @@
 //! `Vec<(label, mutant)>` — one mutant per applicable injection site. The label
 //! is human-readable and uniquely identifies the site (used in reports).
 //!
-//! Nine operators are provided:
+//! Fourteen operators are provided:
 //!
 //! | Operator                  | Kind       | Expected kill? | Detector           |
 //! |---------------------------|------------|----------------|--------------------|
@@ -15,6 +15,11 @@
 //! | literal_type_break        | Type       | KILLED         | runtime type check |
 //! | drop_output_write         | Contract   | KILLED         | V24 (must-write)   |
 //! | drop_initial_context_seed | Contract   | KILLED         | V24 (must-write)   |
+//! | weaken_output_source      | Contract   | KILLED         | V26 (scalar-null)  |
+//! | retarget_guard_scope      | Scope      | KILLED         | V25 (guard scope)  |
+//! | retarget_output_scope     | Scope      | KILLED         | V27 (write scope)  |
+//! | retarget_use_input_scope  | Scope      | KILLED         | V28 (use-input)    |
+//! | retarget_executor_arg_scope | Scope    | KILLED         | V29 (executor arg) |
 //! | delete_guard              | Semantic   | KILLED         | violating-ctx probe|
 //! | flip_guard_op             | Semantic   | KILLED         | violating-ctx probe|
 //!
@@ -47,6 +52,8 @@
 //! path separator, so `pointer_mut("/workflows/cognitive/cap...")` silently
 //! mis-navigates. All mutations use direct `Map::get_mut` calls on the
 //! `workflows` object to avoid this.
+
+use std::collections::HashSet;
 
 use serde_json::{Map, Value, json};
 
@@ -571,6 +578,124 @@ pub fn drop_output_write(config: &Value) -> Vec<(String, Value)> {
     mutants
 }
 
+/// CONTRACT — remove the `required`/`default` that keeps a scalar output's source
+/// argument non-null.
+///
+/// The operator that proves V26. A declared scalar output sourced from an agent
+/// argument is safe only while that argument is `required` or has a `default`.
+/// Strip that safety and the output can land null at terminal — the exact
+/// "written-but-nullable" class V26 warns on. It must be caught; before V26 it
+/// survived silently, which is the whole reason to model it.
+pub fn weaken_output_source(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+    let Some(wfs) = config.pointer("/workflows").and_then(Value::as_object) else {
+        return mutants;
+    };
+
+    for (wf_id, wf_def) in wfs {
+        // Declared SCALAR outputs of this workflow.
+        let Some(declared) = wf_def
+            .pointer("/snippet/outputs")
+            .or_else(|| wf_def.pointer("/outputs"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let scalar: HashSet<&str> = declared
+            .iter()
+            .filter(|(_, s)| {
+                matches!(
+                    s.get("type").and_then(Value::as_str),
+                    Some("string" | "integer" | "number" | "boolean")
+                )
+            })
+            .map(|(n, _)| n.as_str())
+            .collect();
+        if scalar.is_empty() {
+            continue;
+        }
+        let Some(states) = wf_def.pointer("/states").and_then(Value::as_object) else {
+            continue;
+        };
+
+        for (state_name, state_def) in states {
+            let Some(transitions) = state_def.pointer("/transitions").and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for (t_name, t_def) in transitions {
+                let Some(output) = t_def.pointer("/output").and_then(Value::as_object) else {
+                    continue;
+                };
+                for (out_slot, src) in output {
+                    if !scalar.contains(out_slot.as_str()) {
+                        continue;
+                    }
+                    let Some(field) = src
+                        .as_str()
+                        .and_then(|s| s.strip_prefix("$.arguments."))
+                        .filter(|f| !f.contains('.'))
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    // Only a currently-SAFE source is worth weakening (an
+                    // already-optional one would just re-warn what V26 caught).
+                    let is_required = t_def
+                        .pointer("/inputSchema/required")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().any(|v| v.as_str() == Some(field.as_str())))
+                        .unwrap_or(false);
+                    let has_default = t_def
+                        .pointer(&format!("/inputSchema/properties/{field}/default"))
+                        .is_some();
+                    if !is_required && !has_default {
+                        continue;
+                    }
+
+                    let label =
+                        format!("weaken_output_source/{wf_id}/{state_name}/{t_name}/{field}");
+                    let (wf_id_c, sn_c, tn_c, field_c) = (
+                        wf_id.clone(),
+                        state_name.clone(),
+                        t_name.clone(),
+                        field.clone(),
+                    );
+                    let mutant = mutate(config, |v| {
+                        let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut)
+                        else {
+                            return;
+                        };
+                        let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c) else {
+                            return;
+                        };
+                        let Some(schema) = td.get_mut("inputSchema").and_then(Value::as_object_mut)
+                        else {
+                            return;
+                        };
+                        // Drop the field from `required`...
+                        if let Some(req) = schema.get_mut("required").and_then(Value::as_array_mut)
+                        {
+                            req.retain(|v| v.as_str() != Some(field_c.as_str()));
+                        }
+                        // ...and remove any `default`.
+                        if let Some(prop) = schema
+                            .get_mut("properties")
+                            .and_then(Value::as_object_mut)
+                            .and_then(|p| p.get_mut(&field_c))
+                            .and_then(Value::as_object_mut)
+                        {
+                            prop.remove("default");
+                        }
+                    });
+                    mutants.push((label, mutant));
+                }
+            }
+        }
+    }
+    mutants
+}
+
 /// CONTRACT — for each declared output seeded in `initialContext`, remove the
 /// seed.
 ///
@@ -610,6 +735,178 @@ pub fn drop_initial_context_seed(config: &Value) -> Vec<(String, Value)> {
                     && let Some(ic) = wf.get_mut("initialContext").and_then(Value::as_object_mut)
                 {
                     ic.remove(&slot_c);
+                }
+            });
+            mutants.push((label, mutant));
+        }
+    }
+    mutants
+}
+
+/// SCOPE — for each `use.inputs` value binding `$.workflow.input.<x>`, rewrite it
+/// to the bare `$.input.<x>` spelling `resolve_one` does NOT resolve. Killed by
+/// V28. (The compose-boundary read twin of the guard/output operators.)
+pub fn retarget_use_input_scope(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+    for (wf_id, state_name, t_name, t_def) in each_transition(config) {
+        let Some(inputs) = t_def
+            .pointer("/executor/use/inputs")
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (name, value) in inputs {
+            let Some(src) = value.as_str() else { continue };
+            if !src.starts_with("$.workflow.input.") {
+                continue;
+            }
+            let broken = src.replace("$.workflow.input.", "$.input.");
+            let label = format!("retarget_use_input_scope/{wf_id}/{state_name}/{t_name}/{name}");
+            let (wf_id_c, sn_c, tn_c, name_c) = (
+                wf_id.clone(),
+                state_name.clone(),
+                t_name.clone(),
+                name.clone(),
+            );
+            let mutant = mutate(config, |v| {
+                let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut) else {
+                    return;
+                };
+                if let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c)
+                    && let Some(inp) = td
+                        .get_mut("executor")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|e| e.get_mut("use"))
+                        .and_then(Value::as_object_mut)
+                        .and_then(|u| u.get_mut("inputs"))
+                        .and_then(Value::as_object_mut)
+                {
+                    inp.insert(name_c.clone(), Value::String(broken.clone()));
+                }
+            });
+            mutants.push((label, mutant));
+        }
+    }
+    mutants
+}
+
+/// SCOPE — for each executor `args:` entry binding `$.workflow.input.<x>`, rewrite
+/// it to the bare `$.input.<x>` spelling that reaches the shell as a literal.
+/// Killed by V29.
+pub fn retarget_executor_arg_scope(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+    for (wf_id, state_name, t_name, t_def) in each_transition(config) {
+        let Some(args) = t_def.pointer("/executor/args").and_then(Value::as_array) else {
+            continue;
+        };
+        for (i, arg) in args.iter().enumerate() {
+            let Some(src) = arg.as_str() else { continue };
+            if !src.starts_with("$.workflow.input.") {
+                continue;
+            }
+            let broken = src.replace("$.workflow.input.", "$.input.");
+            let label = format!("retarget_executor_arg_scope/{wf_id}/{state_name}/{t_name}/{i}");
+            let (wf_id_c, sn_c, tn_c) = (wf_id.clone(), state_name.clone(), t_name.clone());
+            let mutant = mutate(config, |v| {
+                let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut) else {
+                    return;
+                };
+                if let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c)
+                    && let Some(a) = td
+                        .get_mut("executor")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|e| e.get_mut("args"))
+                        .and_then(Value::as_array_mut)
+                        .and_then(|a| a.get_mut(i))
+                {
+                    *a = Value::String(broken.clone());
+                }
+            });
+            mutants.push((label, mutant));
+        }
+    }
+    mutants
+}
+
+/// SCOPE — for each `output:` mapping that writes a `$.workflow.input.<x>` value,
+/// rewrite it to the bare `$.input.<x>` spelling the write resolver does NOT
+/// resolve.
+///
+/// The write-side twin of [`retarget_guard_scope`]. `$.input.*` coalesces to
+/// `null` in `resolve_value` and silently writes it — the bug V27
+/// (`UNRESOLVABLE_WRITE_SCOPE`) exists to catch. Before V27 it survived silently.
+pub fn retarget_output_scope(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+
+    for (wf_id, state_name, t_name, t_def) in each_transition(config) {
+        let Some(output) = t_def.get("output").and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, spec) in output {
+            let Some(src) = spec.as_str() else { continue };
+            if !src.starts_with("$.workflow.input.") {
+                continue;
+            }
+            let broken = src.replace("$.workflow.input.", "$.input.");
+            let label = format!("retarget_output_scope/{wf_id}/{state_name}/{t_name}/{key}");
+            let (wf_id_c, sn_c, tn_c, key_c) = (
+                wf_id.clone(),
+                state_name.clone(),
+                t_name.clone(),
+                key.clone(),
+            );
+            let mutant = mutate(config, |v| {
+                let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut) else {
+                    return;
+                };
+                if let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c)
+                    && let Some(o) = td.get_mut("output").and_then(Value::as_object_mut)
+                {
+                    o.insert(key_c.clone(), Value::String(broken.clone()));
+                }
+            });
+            mutants.push((label, mutant));
+        }
+    }
+    mutants
+}
+
+/// SCOPE — for each `expr` guard reading `$.workflow.input.<x>`, rewrite it to the
+/// bare `$.input.<x>` spelling the guard evaluator does NOT resolve.
+///
+/// This is the mutant that proves V25 works. `$.input.*` coalesces to `null` at
+/// eval, so the guard becomes permanently false — the exact dead-guard bug that
+/// shipped in `cap.gate.human-approve-plan`. V25 (`UNRESOLVABLE_GUARD_SCOPE`) must
+/// kill it at load; before V25 it survived silently.
+pub fn retarget_guard_scope(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+
+    for (wf_id, state_name, t_name, t_def) in each_transition(config) {
+        let Some(guards) = t_def.get("guards").and_then(Value::as_array) else {
+            continue;
+        };
+        for (gi, guard) in guards.iter().enumerate() {
+            if guard.get("kind").and_then(Value::as_str) != Some("expr") {
+                continue;
+            }
+            let Some(expr) = guard.get("expr").and_then(Value::as_str) else {
+                continue;
+            };
+            if !expr.contains("$.workflow.input.") {
+                continue;
+            }
+            let broken = expr.replace("$.workflow.input.", "$.input.");
+            let label = format!("retarget_guard_scope/{wf_id}/{state_name}/{t_name}/guard[{gi}]");
+            let (wf_id_c, sn_c, tn_c) = (wf_id.clone(), state_name.clone(), t_name.clone());
+            let mutant = mutate(config, |v| {
+                let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut) else {
+                    return;
+                };
+                if let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c)
+                    && let Some(gs) = td.get_mut("guards").and_then(Value::as_array_mut)
+                    && let Some(g) = gs.get_mut(gi).and_then(Value::as_object_mut)
+                {
+                    g.insert("expr".into(), Value::String(broken.clone()));
                 }
             });
             mutants.push((label, mutant));
@@ -873,6 +1170,11 @@ pub async fn mutation_score(resolved: &Value) -> anyhow::Result<MutationReport> 
         ("literal_type_break", literal_type_break),
         ("drop_output_write", drop_output_write),
         ("drop_initial_context_seed", drop_initial_context_seed),
+        ("weaken_output_source", weaken_output_source),
+        ("retarget_guard_scope", retarget_guard_scope),
+        ("retarget_output_scope", retarget_output_scope),
+        ("retarget_use_input_scope", retarget_use_input_scope),
+        ("retarget_executor_arg_scope", retarget_executor_arg_scope),
         ("delete_guard", delete_guard),
         ("flip_guard_op", flip_guard_op),
     ];
@@ -1167,6 +1469,164 @@ mod tests {
                 "delete_guard mutant should have no guards"
             );
         }
+    }
+
+    #[test]
+    fn weaken_output_source_strips_safety_and_is_killed_by_v26() {
+        // A scalar output sourced from a currently-SAFE (defaulted) argument.
+        let cfg = json!({ "workflows": { "cap.review.thing": {
+            "verb": "review",
+            "initialState": "s",
+            "snippet": { "inputs": {}, "outputs": { "summary": { "type": "string" } } },
+            "states": {
+                "s": { "transitions": { "submit": {
+                    "target": "done", "actor": "agent",
+                    "inputSchema": { "type": "object", "required": [],
+                        "properties": { "summary": { "type": "string", "default": "" } } },
+                    "executor": { "kind": "noop" },
+                    "output": { "summary": "$.arguments.summary" }
+                }}},
+                "done": { "terminal": true }
+            }
+        }}});
+        let mutants = weaken_output_source(&cfg);
+        assert_eq!(mutants.len(), 1, "one safe scalar source to weaken");
+        let (_l, mutant) = &mutants[0];
+        // The default is gone.
+        assert!(
+            mutant
+                .pointer("/workflows/cap.review.thing/states/s/transitions/submit/inputSchema/properties/summary/default")
+                .is_none(),
+            "default must be stripped"
+        );
+        // ...and V26 catches it.
+        assert!(
+            praxec_core::validate::validate_workflows(mutant)
+                .iter()
+                .any(|d| d.message().contains("SCALAR_OUTPUT_FROM_OPTIONAL_SOURCE")),
+            "the mutant must be killed by V26"
+        );
+    }
+
+    #[test]
+    fn retarget_guard_scope_breaks_only_input_guards_and_is_killed_by_v25() {
+        let cfg = json!({ "workflows": { "wf": {
+            "initialState": "start",
+            "states": {
+                "start": { "transitions": {
+                    "go": { "target": "done", "actor": "deterministic", "executor": { "kind": "noop" },
+                            "guards": [ { "kind": "expr", "expr": "$.workflow.input.mode == 'auto'" } ] }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        let mutants = retarget_guard_scope(&cfg);
+        assert_eq!(mutants.len(), 1, "one input-scoped guard to retarget");
+        let (_label, mutant) = &mutants[0];
+        let expr = mutant
+            .pointer("/workflows/wf/states/start/transitions/go/guards/0/expr")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_eq!(
+            expr, "$.input.mode == 'auto'",
+            "rewritten to the dead spelling"
+        );
+
+        // The whole point: V25 must catch it.
+        assert!(
+            praxec_core::validate::validate_workflows(mutant)
+                .iter()
+                .any(|d| d.message().contains("UNRESOLVABLE_GUARD_SCOPE")),
+            "the mutant must be killed by V25"
+        );
+    }
+
+    #[test]
+    fn retarget_output_scope_breaks_input_writes_and_is_killed_by_v27() {
+        let cfg = json!({ "workflows": { "wf": {
+            "initialState": "start",
+            "states": {
+                "start": { "transitions": {
+                    "go": { "target": "done", "actor": "deterministic", "executor": { "kind": "noop" },
+                            "output": { "plan_final": "$.workflow.input.plan" } }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        let mutants = retarget_output_scope(&cfg);
+        assert_eq!(
+            mutants.len(),
+            1,
+            "one input-scoped output write to retarget"
+        );
+        let (_l, mutant) = &mutants[0];
+        assert_eq!(
+            mutant
+                .pointer("/workflows/wf/states/start/transitions/go/output/plan_final")
+                .and_then(Value::as_str),
+            Some("$.input.plan"),
+            "rewritten to the dead spelling"
+        );
+        assert!(
+            praxec_core::validate::validate_workflows(mutant)
+                .iter()
+                .any(|d| d.message().contains("UNRESOLVABLE_WRITE_SCOPE")),
+            "the mutant must be killed by V27"
+        );
+    }
+
+    #[test]
+    fn retarget_use_input_scope_is_killed_by_v28() {
+        let cfg = json!({ "workflows": {
+            "cap.thing": { "verb": "review", "initialState": "s",
+                "snippet": { "inputs": { "x": { "type": "string" } }, "outputs": {} },
+                "states": { "s": { "transitions": { "go": {
+                    "target": "d", "actor": "deterministic", "executor": { "kind": "noop" } } } },
+                    "d": { "terminal": true } } },
+            "flow.h": { "initialState": "a", "states": {
+                "a": { "transitions": { "call": {
+                    "target": "d", "actor": "deterministic",
+                    "executor": { "kind": "workflow", "definitionId": "cap.thing",
+                        "use": { "inputs": { "x": "$.workflow.input.src" }, "outputs": {} } } } } },
+                "d": { "terminal": true } } }
+        }});
+        let mutants = retarget_use_input_scope(&cfg);
+        assert_eq!(mutants.len(), 1, "one use.inputs binding to retarget");
+        assert!(
+            praxec_core::validate::validate_workflows(&mutants[0].1)
+                .iter()
+                .any(|d| d.message().contains("UNRESOLVABLE_USE_INPUT_SCOPE")),
+            "must be killed by V28"
+        );
+    }
+
+    #[test]
+    fn retarget_executor_arg_scope_is_killed_by_v29() {
+        let cfg = json!({ "workflows": { "wf": {
+            "initialState": "s",
+            "states": {
+                "s": { "transitions": { "go": {
+                    "target": "d", "actor": "deterministic",
+                    "executor": { "kind": "script", "subject": "x",
+                                  "args": ["$.workflow.input.path"] } } } },
+                "d": { "terminal": true }
+            }
+        }}});
+        let mutants = retarget_executor_arg_scope(&cfg);
+        assert_eq!(mutants.len(), 1, "one executor arg to retarget");
+        assert_eq!(
+            mutants[0]
+                .1
+                .pointer("/workflows/wf/states/s/transitions/go/executor/args/0")
+                .and_then(Value::as_str),
+            Some("$.input.path")
+        );
+        assert!(
+            praxec_core::validate::validate_workflows(&mutants[0].1)
+                .iter()
+                .any(|d| d.message().contains("UNRESOLVABLE_EXECUTOR_ARG_SCOPE")),
+            "must be killed by V29"
+        );
     }
 
     #[test]
