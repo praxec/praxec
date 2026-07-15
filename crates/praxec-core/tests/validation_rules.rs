@@ -707,3 +707,189 @@ workflows:
         "got: {err2:#}"
     );
 }
+
+// ---------- per-spawn repo_root override scope (v0.0.22) ----------
+
+/// A `kind: workflow` `repoRoot:` override is resolved at spawn time, so a
+/// `$.`-rooted value must name a spawn-time-resolvable scope — including the
+/// run-ambient `$.run.repo_root`.
+#[test]
+fn repo_root_override_accepts_spawn_time_scopes() {
+    for scope in [
+        "$.context.route_repo",
+        "$.workflow.input.repo",
+        "$.run.repo_root",
+    ] {
+        let yaml = format!(
+            r#"
+version: "1.0.0"
+workflows:
+  flow.router:
+    initialState: routing
+    states:
+      routing:
+        transitions:
+          route:
+            target: done
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: flow.child
+              repoRoot: "{scope}"
+      done: {{ terminal: true }}
+  flow.child:
+    initialState: done
+    states:
+      done: {{ terminal: true }}
+"#
+        );
+        let d = diagnostics_for(&yaml);
+        assert!(
+            !has_error_containing(&d, "UNRESOLVABLE_REPO_ROOT_OVERRIDE_SCOPE"),
+            "{scope} should be accepted as a repoRoot override: {d:?}"
+        );
+    }
+}
+
+#[test]
+fn repo_root_override_rejects_an_unresolvable_scope() {
+    // `$.output.*` does not resolve at spawn time (no executor output yet).
+    let yaml = r#"
+version: "1.0.0"
+workflows:
+  flow.router:
+    initialState: routing
+    states:
+      routing:
+        transitions:
+          route:
+            target: done
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: flow.child
+              repoRoot: "$.output.nope"
+      done: { terminal: true }
+  flow.child:
+    initialState: done
+    states:
+      done: { terminal: true }
+"#;
+    let d = diagnostics_for(yaml);
+    assert!(
+        has_error_containing(&d, "UNRESOLVABLE_REPO_ROOT_OVERRIDE_SCOPE"),
+        "an $.output.* repoRoot override must be rejected: {d:?}"
+    );
+}
+
+// ---------- SCOPE_OPERAND_WHITESPACE — adversarial (v0.0.22) ----------
+// One atomic behavioral assertion per test.
+
+fn arg_scope_config(arg: &str) -> String {
+    format!(
+        r#"
+version: "1.0.0"
+workflows:
+  wf:
+    initialState: s
+    states:
+      s:
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor: {{ kind: script, subject: x, args: ["{arg}"] }}
+      done: {{ terminal: true }}
+"#
+    )
+}
+
+#[test]
+fn whitespace_padded_arg_scope_is_rejected() {
+    let d = diagnostics_for(&arg_scope_config("  $.context.x  "));
+    assert!(
+        has_error_containing(&d, "SCOPE_OPERAND_WHITESPACE"),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn clean_arg_scope_has_no_whitespace_error() {
+    let d = diagnostics_for(&arg_scope_config("$.context.x"));
+    assert!(
+        !has_error_containing(&d, "SCOPE_OPERAND_WHITESPACE"),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn padded_literal_arg_is_not_flagged_as_scope_whitespace() {
+    // A genuine literal (not `$.`-rooted) with spaces is not a scope — no error.
+    let d = diagnostics_for(&arg_scope_config("  a literal  "));
+    assert!(
+        !has_error_containing(&d, "SCOPE_OPERAND_WHITESPACE"),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn whitespace_padded_use_input_scope_is_rejected() {
+    let yaml = r#"
+version: "1.0.0"
+workflows:
+  cap.thing:
+    verb: review
+    initialState: s
+    snippet: { inputs: { x: { type: string } }, outputs: {} }
+    states:
+      s:
+        transitions:
+          go: { target: done, actor: deterministic, executor: { kind: noop } }
+      done: { terminal: true }
+  flow.host:
+    initialState: a
+    states:
+      a:
+        transitions:
+          call:
+            target: done
+            actor: deterministic
+            executor:
+              kind: workflow
+              definitionId: cap.thing
+              use: { inputs: { x: "  $.context.y  " }, outputs: {} }
+      done: { terminal: true }
+"#;
+    let d = diagnostics_for(yaml);
+    assert!(
+        has_error_containing(&d, "SCOPE_OPERAND_WHITESPACE"),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn whitespace_padded_repo_root_override_is_rejected() {
+    let yaml = r#"
+version: "1.0.0"
+workflows:
+  flow.router:
+    initialState: r
+    states:
+      r:
+        transitions:
+          route:
+            target: done
+            actor: deterministic
+            executor: { kind: workflow, definitionId: flow.child, repoRoot: "  $.context.repo  " }
+      done: { terminal: true }
+  flow.child:
+    initialState: done
+    states:
+      done: { terminal: true }
+"#;
+    let d = diagnostics_for(yaml);
+    assert!(
+        has_error_containing(&d, "SCOPE_OPERAND_WHITESPACE"),
+        "{d:?}"
+    );
+}

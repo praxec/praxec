@@ -699,3 +699,330 @@ fn double_set_runtime_panics() {
     executor.set_runtime(runtime.clone());
     executor.set_runtime(runtime);
 }
+
+// ── per-spawn repo_root override (v0.0.22) ──────────────────────────────────
+
+/// The run-ambient env the child sub-run is actually driven with.
+#[derive(Default)]
+struct CapturedEnv {
+    repo_root: Option<String>,
+    run_id: Option<String>,
+}
+
+/// Records the `run_env` (repo_root + run_id) the child sub-run is driven with.
+struct CaptureRootExecutor(Arc<std::sync::Mutex<CapturedEnv>>);
+#[async_trait]
+impl Executor for CaptureRootExecutor {
+    async fn execute(
+        &self,
+        request: ExecuteRequest,
+    ) -> Result<ExecuteResult, praxec_core::error::ExecutorError> {
+        let mut c = self.0.lock().unwrap();
+        c.repo_root = Some(request.workflow.run_env.repo_root.as_str().to_string());
+        c.run_id = request.workflow.run_env.run_id.clone();
+        Ok(ExecuteResult::default())
+    }
+}
+
+fn override_runtime(
+    repos: Vec<praxec_core::RepoRoot>,
+    captured: Arc<std::sync::Mutex<CapturedEnv>>,
+) -> WorkflowRuntime {
+    // child auto-drives its deterministic `capture` transition at spawn.
+    let config = resolve_str(
+        r#"
+version: "1.0.0"
+workflows:
+  capture_child:
+    initialState: start
+    states:
+      start:
+        transitions:
+          go:
+            target: done
+            actor: deterministic
+            executor: { kind: capture }
+      done: { terminal: true }
+"#,
+    )
+    .unwrap();
+    let definitions = Arc::new(ConfigDefinitionStore::from_config(&config));
+    let store: Arc<dyn WorkflowStore> = Arc::new(InMemoryWorkflowStore::new());
+    let evidence = Arc::new(InMemoryEvidenceStore::new());
+    let guards = Arc::new(DefaultGuardEvaluator::with_evidence(evidence.clone()));
+    let audit = Arc::new(MemoryAuditSink::new());
+
+    struct Reg(Arc<CaptureRootExecutor>);
+    impl ExecutorRegistry for Reg {
+        fn get(&self, _kind: &str) -> Option<Arc<dyn Executor>> {
+            Some(self.0.clone())
+        }
+    }
+    WorkflowRuntime::new(
+        definitions,
+        store,
+        Arc::new(Reg(Arc::new(CaptureRootExecutor(captured)))),
+        guards,
+        audit as Arc<dyn AuditSink>,
+    )
+    .with_writable_repo_roots(repos)
+    .with_evidence(evidence)
+}
+
+#[tokio::test]
+async fn repo_root_override_routes_child_to_a_different_writable_repo() {
+    let repo_a = praxec_core::RepoRoot::for_test();
+    let dir_b = std::env::temp_dir().join("praxec_repo_b_override_v22");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let repo_b = praxec_core::RepoRoot::new(&dir_b).unwrap();
+
+    let captured = Arc::new(std::sync::Mutex::new(CapturedEnv::default()));
+    let runtime = override_runtime(vec![repo_a.clone(), repo_b.clone()], captured.clone());
+    let executor = WorkflowExecutor::new(runtime.clone(), runtime.audit().clone());
+
+    executor
+        .execute(ExecuteRequest {
+            workflow: praxec_core::model::WorkflowInstance {
+                id: "parent_override".to_string(),
+                definition_id: "parent".to_string(),
+                definition_version: "1.0.0".to_string(),
+                definition: json!({"initialState": "running", "states": {}}),
+                state: "running".to_string(),
+                version: 1,
+                input: json!({}),
+                // parent runs on repo_a; routes the child to repo_b.
+                context: json!({ "route_repo": repo_b.as_str() }),
+                started_at: chrono::Utc::now(),
+                run_env: praxec_core::RunEnv::new(
+                    repo_a.clone(),
+                    Some("run-1".to_string()),
+                    Some("trace-1".to_string()),
+                ),
+                cancelled_at: None,
+                cancelled_reason: None,
+                depth: 0,
+                parent: None,
+            },
+            transition: Some("route".to_string()),
+            arguments: json!({}),
+            executor_config: json!({
+                "definitionId": "capture_child",
+                "repoRoot": "$.context.route_repo",
+                "input": {},
+            }),
+            idempotency_key: None,
+            correlation_id: None,
+        })
+        .await
+        .unwrap();
+
+    // The child was driven with the ROUTED repo (repo_b), not the parent's repo_a.
+    assert_eq!(
+        captured.lock().unwrap().repo_root.as_deref(),
+        Some(repo_b.as_str()),
+        "child sub-run should be routed to the overridden repo_root"
+    );
+    assert_ne!(
+        repo_a.as_str(),
+        repo_b.as_str(),
+        "test needs two distinct repos"
+    );
+}
+
+/// Adversarial: routing the child to a different repo must NOT reset the run/trace
+/// correlation — the override swaps only the root.
+#[tokio::test]
+async fn repo_root_override_preserves_run_correlation() {
+    let repo_a = praxec_core::RepoRoot::for_test();
+    let dir_b = std::env::temp_dir().join("praxec_repo_b_corr_v22");
+    std::fs::create_dir_all(&dir_b).unwrap();
+    let repo_b = praxec_core::RepoRoot::new(&dir_b).unwrap();
+
+    let captured = Arc::new(std::sync::Mutex::new(CapturedEnv::default()));
+    let runtime = override_runtime(vec![repo_a.clone(), repo_b.clone()], captured.clone());
+    let executor = WorkflowExecutor::new(runtime.clone(), runtime.audit().clone());
+
+    executor
+        .execute(ExecuteRequest {
+            workflow: praxec_core::model::WorkflowInstance {
+                id: "parent_corr".to_string(),
+                definition_id: "parent".to_string(),
+                definition_version: "1.0.0".to_string(),
+                definition: json!({"initialState": "running", "states": {}}),
+                state: "running".to_string(),
+                version: 1,
+                input: json!({}),
+                context: json!({ "route_repo": repo_b.as_str() }),
+                started_at: chrono::Utc::now(),
+                run_env: praxec_core::RunEnv::new(
+                    repo_a.clone(),
+                    Some("run-42".to_string()),
+                    Some("trace-42".to_string()),
+                ),
+                cancelled_at: None,
+                cancelled_reason: None,
+                depth: 0,
+                parent: None,
+            },
+            transition: Some("route".to_string()),
+            arguments: json!({}),
+            executor_config: json!({
+                "definitionId": "capture_child",
+                "repoRoot": "$.context.route_repo",
+                "input": {},
+            }),
+            idempotency_key: None,
+            correlation_id: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        captured.lock().unwrap().run_id.as_deref(),
+        Some("run-42"),
+        "the run_id must survive a repo_root override"
+    );
+}
+
+#[tokio::test]
+async fn repo_root_override_to_an_undeclared_repo_fails_fast() {
+    let repo_a = praxec_core::RepoRoot::for_test();
+    let captured = Arc::new(std::sync::Mutex::new(CapturedEnv::default()));
+    // Only repo_a is declared writable; the override names an undeclared path.
+    let runtime = override_runtime(vec![repo_a.clone()], captured.clone());
+    let executor = WorkflowExecutor::new(runtime.clone(), runtime.audit().clone());
+
+    let err = executor
+        .execute(ExecuteRequest {
+            workflow: praxec_core::model::WorkflowInstance {
+                id: "parent_bad_override".to_string(),
+                definition_id: "parent".to_string(),
+                definition_version: "1.0.0".to_string(),
+                definition: json!({"initialState": "running", "states": {}}),
+                state: "running".to_string(),
+                version: 1,
+                input: json!({}),
+                context: json!({ "route_repo": "/no/such/declared/repo" }),
+                started_at: chrono::Utc::now(),
+                run_env: praxec_core::RunEnv::for_test(),
+                cancelled_at: None,
+                cancelled_reason: None,
+                depth: 0,
+                parent: None,
+            },
+            transition: Some("route".to_string()),
+            arguments: json!({}),
+            executor_config: json!({
+                "definitionId": "capture_child",
+                "repoRoot": "$.context.route_repo",
+                "input": {},
+            }),
+            idempotency_key: None,
+            correlation_id: None,
+        })
+        .await
+        .expect_err("an override naming an undeclared repo must fail fast");
+    assert!(
+        format!("{err:?}").contains("REPO_ROOT_OVERRIDE_INVALID"),
+        "expected REPO_ROOT_OVERRIDE_INVALID, got: {err:?}"
+    );
+    assert!(
+        captured.lock().unwrap().repo_root.is_none(),
+        "child must not have been driven"
+    );
+}
+
+/// Adversarial: an override pointing at a real, EXISTING directory that is NOT a
+/// declared writable repo must still fail — the gate is declaration, not mere
+/// existence (proves it can't be tricked by any real path on disk).
+#[tokio::test]
+async fn repo_root_override_to_existing_but_undeclared_dir_fails_fast() {
+    let repo_a = praxec_core::RepoRoot::for_test();
+    let existing = std::env::temp_dir().join("praxec_existing_undeclared_v22");
+    std::fs::create_dir_all(&existing).unwrap();
+    let existing_canon = std::fs::canonicalize(&existing).unwrap();
+
+    let captured = Arc::new(std::sync::Mutex::new(CapturedEnv::default()));
+    let runtime = override_runtime(vec![repo_a.clone()], captured.clone());
+    let executor = WorkflowExecutor::new(runtime.clone(), runtime.audit().clone());
+
+    let err = executor
+        .execute(ExecuteRequest {
+            workflow: praxec_core::model::WorkflowInstance {
+                id: "parent_existing_undeclared".to_string(),
+                definition_id: "parent".to_string(),
+                definition_version: "1.0.0".to_string(),
+                definition: json!({"initialState": "running", "states": {}}),
+                state: "running".to_string(),
+                version: 1,
+                input: json!({}),
+                context: json!({ "route_repo": existing_canon.display().to_string() }),
+                started_at: chrono::Utc::now(),
+                run_env: praxec_core::RunEnv::for_test(),
+                cancelled_at: None,
+                cancelled_reason: None,
+                depth: 0,
+                parent: None,
+            },
+            transition: Some("route".to_string()),
+            arguments: json!({}),
+            executor_config: json!({
+                "definitionId": "capture_child",
+                "repoRoot": "$.context.route_repo",
+                "input": {},
+            }),
+            idempotency_key: None,
+            correlation_id: None,
+        })
+        .await
+        .expect_err("an existing but undeclared dir must be rejected");
+    assert!(
+        format!("{err:?}").contains("REPO_ROOT_OVERRIDE_INVALID"),
+        "expected REPO_ROOT_OVERRIDE_INVALID, got: {err:?}"
+    );
+}
+
+/// Adversarial: an override that resolves to a NON-string (here a number) must
+/// fail fast, not silently fall back to inheriting the parent's root.
+#[tokio::test]
+async fn repo_root_override_non_string_value_fails_fast() {
+    let repo_a = praxec_core::RepoRoot::for_test();
+    let captured = Arc::new(std::sync::Mutex::new(CapturedEnv::default()));
+    let runtime = override_runtime(vec![repo_a.clone()], captured.clone());
+    let executor = WorkflowExecutor::new(runtime.clone(), runtime.audit().clone());
+
+    let err = executor
+        .execute(ExecuteRequest {
+            workflow: praxec_core::model::WorkflowInstance {
+                id: "parent_nonstring".to_string(),
+                definition_id: "parent".to_string(),
+                definition_version: "1.0.0".to_string(),
+                definition: json!({"initialState": "running", "states": {}}),
+                state: "running".to_string(),
+                version: 1,
+                input: json!({}),
+                context: json!({ "route_repo": 42 }),
+                started_at: chrono::Utc::now(),
+                run_env: praxec_core::RunEnv::for_test(),
+                cancelled_at: None,
+                cancelled_reason: None,
+                depth: 0,
+                parent: None,
+            },
+            transition: Some("route".to_string()),
+            arguments: json!({}),
+            executor_config: json!({
+                "definitionId": "capture_child",
+                "repoRoot": "$.context.route_repo",
+                "input": {},
+            }),
+            idempotency_key: None,
+            correlation_id: None,
+        })
+        .await
+        .expect_err("a non-string override must fail fast");
+    assert!(
+        format!("{err:?}").contains("REPO_ROOT_OVERRIDE_UNRESOLVED"),
+        "expected REPO_ROOT_OVERRIDE_UNRESOLVED, got: {err:?}"
+    );
+}
