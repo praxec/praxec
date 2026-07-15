@@ -55,6 +55,9 @@ pub struct PreflightReport {
     /// Where the provider-keys file resolves on this machine (for messaging;
     /// its contents are already loaded into env at startup).
     pub keys_file: Option<PathBuf>,
+    /// Present iff `praxec.agents.auto_drive` is enabled; `ok()` false iff its
+    /// affinity resolves to no model (a doomed drive). See [`AutoDriveModelCheck`].
+    pub auto_drive_model: Option<AutoDriveModelCheck>,
     pub ok: bool,
 }
 
@@ -142,15 +145,77 @@ pub fn check_credentials_with(
         .collect()
 }
 
+/// Whether an auto-drive-enabled config has a model its agents can actually use.
+///
+/// `praxec.agents.auto_drive: true` means every auto-drivable `actor: agent` leaf
+/// is driven against the `auto_drive_affinity` (default `reasoning`), resolved
+/// through `gateway.models_yaml`. If that affinity resolves to NO model — the
+/// `models_yaml` key is unset, the file won't load, or it defines no binding for
+/// the affinity — the drive is doomed: every agent leaf fails at runtime with no
+/// model, AFTER burning setup + wall-clock. That is a silent fail-open on a
+/// runtime binding — the exact class as a coding leaf handed an empty
+/// `repo_root`. This surfaces it as a LOUD preflight failure (the model analog of
+/// `REPO_ROOT_REQUIRED`). `Some` iff auto-drive is enabled (so the check applies).
+pub struct AutoDriveModelCheck {
+    pub affinity: String,
+    pub models_yaml: Option<String>,
+    /// `Some(model)` iff the affinity resolves to a concrete model.
+    pub resolved_model: Option<String>,
+}
+
+impl AutoDriveModelCheck {
+    pub fn ok(&self) -> bool {
+        self.resolved_model.is_some()
+    }
+}
+
+/// `Some` iff `praxec.agents.auto_drive` is on; the inner `resolved_model` is
+/// `Some` iff the `auto_drive_affinity` resolves through `gateway.models_yaml`.
+pub fn check_auto_drive_model(config: &Value) -> Option<AutoDriveModelCheck> {
+    let auto_drive = config
+        .pointer("/praxec/agents/auto_drive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !auto_drive {
+        return None;
+    }
+    let affinity = config
+        .pointer("/praxec/agents/auto_drive_affinity")
+        .and_then(Value::as_str)
+        .unwrap_or("reasoning")
+        .to_string();
+    let models_yaml = config
+        .pointer("/gateway/models_yaml")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let resolved_model = models_yaml.as_deref().and_then(|path| {
+        crate::affinity_resolver::AgentsYamlAffinityResolver::from_path(std::path::Path::new(path))
+            .ok()
+            .and_then(|loaded| {
+                crate::affinity_resolver::resolve_affinity_to_model(loaded.resolver(), &affinity)
+            })
+    });
+    Some(AutoDriveModelCheck {
+        affinity,
+        models_yaml,
+        resolved_model,
+    })
+}
+
 /// Assemble the full report with an injectable env lookup (test seam).
 pub fn preflight_with(config: &Value, has_env: impl Fn(&str) -> bool) -> PreflightReport {
     let credentials = check_credentials_with(&referenced_providers(config), has_env);
     let tools = provision::detect(&provision_config_from(config));
-    let ok = credentials.iter().all(CredCheck::ok);
+    let auto_drive_model = check_auto_drive_model(config);
+    let ok = credentials.iter().all(CredCheck::ok)
+        && auto_drive_model
+            .as_ref()
+            .is_none_or(AutoDriveModelCheck::ok);
     PreflightReport {
         credentials,
         tools,
         keys_file: praxec_core::provider_keys::resolve_path().ok(),
+        auto_drive_model,
         ok,
     }
 }
@@ -277,10 +342,33 @@ pub fn format_report(report: &PreflightReport) -> String {
              will fail at invocation)\n"
         ));
     }
+    if let Some(adm) = &report.auto_drive_model {
+        out.push_str("auto-drive model (praxec.agents.auto_drive is on):\n");
+        match &adm.resolved_model {
+            Some(model) => out.push_str(&format!(
+                "  ok       affinity '{}' -> {model}\n",
+                adm.affinity
+            )),
+            None => {
+                let why = match &adm.models_yaml {
+                    None => "gateway.models_yaml is unset".to_string(),
+                    Some(p) => format!("'{p}' defines no binding for it (or failed to load)"),
+                };
+                out.push_str(&format!(
+                    "  MISSING  AUTO_DRIVE_NO_MODEL: affinity '{}' resolves to no model — {why}. \
+                     Set gateway.models_yaml to a bindings file defining '{}' (or a 'default' \
+                     chain); without it every auto-driven agent leaf fails at runtime with no \
+                     model.\n",
+                    adm.affinity, adm.affinity
+                ));
+            }
+        }
+    }
     out.push_str(if report.ok {
         "preflight: ok\n"
     } else {
-        "preflight: FAILED — required provider credential(s) missing\n"
+        "preflight: FAILED — see the MISSING line(s) above (a required provider credential, \
+         or auto-drive has no model)\n"
     });
     out
 }
@@ -418,5 +506,63 @@ mod tests {
             guard_provider_credentials_with(&cfg, &["openrouter:m"], |v| v == "OPENROUTER_API_KEY")
                 .is_ok()
         );
+    }
+
+    // ── AUTO_DRIVE_NO_MODEL poka-yoke (the dogfood finding) ──────────────────
+
+    /// The exact misconfig that passed doctor silently: auto-drive on, no
+    /// `gateway.models_yaml`. Now a loud preflight FAILURE.
+    #[test]
+    fn auto_drive_without_models_yaml_fails_preflight() {
+        let cfg = json!({ "praxec": { "agents": { "auto_drive": true } } });
+        let report = preflight_with(&cfg, |_| true);
+        assert!(
+            !report.ok,
+            "auto-drive with no models_yaml must fail preflight"
+        );
+        let adm = report
+            .auto_drive_model
+            .as_ref()
+            .expect("check applies when auto_drive on");
+        assert!(!adm.ok());
+        assert_eq!(adm.affinity, "reasoning"); // the default
+        assert!(format_report(&report).contains("AUTO_DRIVE_NO_MODEL"));
+    }
+
+    /// Not applicable when auto-drive is off — a config with no agents to drive
+    /// needs no model, and preflight reflects only credentials.
+    #[test]
+    fn auto_drive_disabled_is_not_flagged() {
+        let cfg = json!({ "praxec": { "agents": { "auto_drive": false } } });
+        let report = preflight_with(&cfg, |_| true);
+        assert!(report.auto_drive_model.is_none());
+        assert!(report.ok);
+    }
+
+    /// Passes when `models_yaml` resolves the affinity to a concrete model.
+    #[test]
+    fn auto_drive_with_resolvable_models_yaml_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models.yaml");
+        std::fs::write(
+            &models,
+            "version: 1\n\
+             default:\n\
+             \x20 - provider: { name: openrouter }\n\
+             \x20   model: openrouter/base\n\
+             activity:\n\
+             \x20 reasoning:\n\
+             \x20   - provider: { name: openrouter }\n\
+             \x20     model: openrouter/reasoning\n",
+        )
+        .unwrap();
+        let cfg = json!({
+            "gateway": { "models_yaml": models.to_str().unwrap() },
+            "praxec": { "agents": { "auto_drive": true, "auto_drive_affinity": "reasoning" } }
+        });
+        let report = preflight_with(&cfg, |_| true);
+        let adm = report.auto_drive_model.as_ref().expect("check applies");
+        assert!(adm.ok(), "affinity must resolve: {:?}", adm.resolved_model);
+        assert!(report.ok);
     }
 }

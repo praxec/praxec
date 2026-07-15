@@ -29,6 +29,19 @@ empty `$.run.repo_root` and died much later at the first file-leaf
 - (FB-1b) Confirmed + test-locked that `start`'s repo_root resolution already
   fails fast (`REPO_ROOT_REQUIRED`) on an empty set at every boundary — the
   earlier "empty root at start" symptom was the reload-not-rewiring bug above.
+### Fixed — `doctor`/preflight now fails loud when auto-drive has no model (dogfood find)
+
+Surfaced by dogfooding: a config with `praxec.agents.auto_drive: true` but no
+`gateway.models_yaml` passed `praxec doctor` with **`preflight: ok`** — then every
+auto-driven agent leaf would fail at runtime with no model, after burning setup
+and wall-clock. A silent fail-open on a runtime binding — the same class as a
+coding leaf handed an empty `repo_root`. Preflight now checks that, when
+auto-drive is enabled, its `auto_drive_affinity` (default `reasoning`) resolves
+to a concrete model through `gateway.models_yaml`; if it doesn't (key unset, file
+won't load, or no binding for the affinity) it fails with `AUTO_DRIVE_NO_MODEL`
+naming the affinity and the exact fix — the model analog of `REPO_ROOT_REQUIRED`.
+Generalizes `doctor` from "validate the artifacts present" to "validate the
+dependencies of enabled features."
 
 ## [0.0.22] — 2026-07-15 — hardening release: scope parity, cross-repo routing, and invariant proofs
 
