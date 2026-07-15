@@ -172,6 +172,62 @@ workflows:
     );
 }
 
+#[test]
+fn v6_accepts_research_cap_with_inventory_executor() {
+    // `cap.research.tool-inventory` surveys the gateway deterministically — a
+    // Cognitive verb backed by a deterministic executor is allowed (0.0.21 V6).
+    let yaml = r#"
+version: "1.0.0"
+workflows:
+  cap.research.tool-inventory:
+    verb: research
+    initialState: surveying
+    snippet:
+      inputs:  {}
+      outputs: {}
+    states:
+      surveying:
+        transitions:
+          t:
+            target: done
+            actor: deterministic
+            executor: { kind: inventory }
+      done: { terminal: true }
+"#;
+    let d = diagnostics_for(yaml);
+    assert!(
+        !has_error_containing(&d, "INVALID_PRIMARY_EXECUTOR"),
+        "research cap with kind: inventory must pass V6: {d:?}"
+    );
+}
+
+#[test]
+fn v6_accepts_verify_cap_with_path_grounding_executor() {
+    let yaml = r#"
+version: "1.0.0"
+workflows:
+  cap.verify.path-grounding:
+    verb: verify
+    initialState: grounding
+    snippet:
+      inputs:  {}
+      outputs: {}
+    states:
+      grounding:
+        transitions:
+          t:
+            target: done
+            actor: deterministic
+            executor: { kind: path_grounding, groundedPaths: ["$.context.files"] }
+      done: { terminal: true }
+"#;
+    let d = diagnostics_for(yaml);
+    assert!(
+        !has_error_containing(&d, "INVALID_PRIMARY_EXECUTOR"),
+        "verify cap with kind: path_grounding must pass V6: {d:?}"
+    );
+}
+
 // ---------- V7 — flow id matches flow.<name> ----------
 
 #[test]
