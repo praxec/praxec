@@ -238,6 +238,44 @@ async fn discovery_include_filter_respected() {
     assert!(all.iter().any(|i| i.id == "demo"));
 }
 
+// FB-6 — a declared `connections:` entry is a wired tool (reachable by executor
+// transitions and auto-driven agent leaves). It must also be DISCOVERABLE via
+// `praxec.query` search when `discovery.include` is left unset — the default
+// now includes "connections". Regression for the dogfood report where a
+// `log-analyzer` connection returned no search match.
+#[tokio::test]
+async fn connection_indexed_and_searchable_by_default() {
+    let cfg = json!({
+        "version": "1.0.0",
+        // NOTE: no `discovery.include` — exercise the default.
+        "connections": {
+            "log-analyzer": { "kind": "mcp", "command": "log-analyzer" }
+        }
+    });
+    let idx = InMemoryDiscoveryIndex::from_config(&cfg).unwrap();
+
+    let all = idx.list(None).await.unwrap();
+    assert!(
+        all.iter()
+            .any(|i| i.id == "connection:log-analyzer" && i.kind == DiscoveryKind::Connection),
+        "declared connection should be in the default index; got {:?}",
+        all.iter().map(|i| &i.id).collect::<Vec<_>>()
+    );
+
+    let hits = idx
+        .search(SearchRequest {
+            query: "log-analyzer".into(),
+            kind: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert!(
+        hits.iter().any(|h| h.item.id == "connection:log-analyzer"),
+        "search for 'log-analyzer' should match the connection by default"
+    );
+}
+
 // CMP-031 — a typo'd discovery.include token (`workflow` for `workflows`)
 // would silently drop a whole category from the index. The indexer must reject
 // it with INVALID_DISCOVERY_INCLUDE rather than building a partial index.
