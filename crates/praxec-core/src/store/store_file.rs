@@ -182,7 +182,7 @@ impl WorkflowStore for FileWorkflowStore {
                     continue;
                 }
             };
-            if inst.run_id.as_deref() == Some(run_id) {
+            if inst.run_env.run_id.as_deref() == Some(run_id) {
                 return Ok(Some(inst.id));
             }
         }

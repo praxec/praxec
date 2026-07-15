@@ -19,6 +19,8 @@ pub use crate::gateway_config::llm_overlay_registrar;
 pub use crate::provision::detect;
 use anyhow::Context;
 use clap::Parser;
+use praxec_core::RepoRoot;
+use praxec_core::RunEnv;
 use praxec_core::SingleKindOverlay;
 use praxec_core::WorkflowRuntime;
 use praxec_core::capability::CapabilityRegistry;
@@ -555,13 +557,16 @@ async fn orchestrate(
         (None, Some(def)) => {
             let input_value: Value = serde_json::from_str(&input)
                 .map_err(|e| anyhow::anyhow!("--input is not valid JSON: {e}"))?;
+            // v0.0.21 — resolve the run's mandatory repo_root from the declared
+            // writable repos (single one auto-selects; a multi-repo CLI selector
+            // is a follow-on).
+            let repo_root = runtime.resolve_run_repo_root(None)?;
             let resp = runtime
                 .start(StartWorkflow {
                     definition_id: def.clone(),
                     input: input_value,
                     principal: Principal::anonymous(),
-                    trace_id: None,
-                    run_id: None,
+                    run_env: RunEnv::new(repo_root, None, None),
                     depth: 0,
                     parent: None,
                 })
@@ -760,6 +765,7 @@ async fn build_runtime_for_orchestrate(
         audit.clone(),
     )
     .with_evidence(evidence)
+    .with_writable_repo_roots(writable_repo_roots_from_config(config)?)
     .with_repo_locks(repo_locks)
     .with_lock_scheduler(lock_scheduler)
     .with_auto_drive_agents(
@@ -774,9 +780,10 @@ async fn build_runtime_for_orchestrate(
         {
             // Auto-drive tool set = every wired connection PLUS any operator
             // `praxec.agents.auto_drive_tools` entries (data-not-code). The
-            // latter carries e.g. `file:{{ $.workflow.input.repo_path }}` —
-            // templated per-leaf by AgentExecutor; non-coding leaves (no
-            // repo_path) get no file tools (CompositeToolHost guard).
+            // latter carries e.g. `file:{{ $.run.repo_root }}` (v0.0.21) —
+            // templated per-leaf by AgentExecutor against the run-ambient root,
+            // which is mandatory and always resolves, so a coding leaf can never
+            // silently get an empty filesystem root.
             let mut t: Vec<String> = config
                 .pointer("/connections")
                 .and_then(Value::as_object)
@@ -922,6 +929,7 @@ async fn build_oneshot_server(
         audit.clone(),
     )
     .with_evidence(evidence)
+    .with_writable_repo_roots(writable_repo_roots_from_config(config)?)
     .with_repo_locks(repo_locks)
     .with_lock_scheduler(lock_scheduler)
     .with_auto_drive_agents(
@@ -936,9 +944,10 @@ async fn build_oneshot_server(
         {
             // Auto-drive tool set = every wired connection PLUS any operator
             // `praxec.agents.auto_drive_tools` entries (data-not-code). The
-            // latter carries e.g. `file:{{ $.workflow.input.repo_path }}` —
-            // templated per-leaf by AgentExecutor; non-coding leaves (no
-            // repo_path) get no file tools (CompositeToolHost guard).
+            // latter carries e.g. `file:{{ $.run.repo_root }}` (v0.0.21) —
+            // templated per-leaf by AgentExecutor against the run-ambient root,
+            // which is mandatory and always resolves, so a coding leaf can never
+            // silently get an empty filesystem root.
             let mut t: Vec<String> = config
                 .pointer("/connections")
                 .and_then(Value::as_object)
@@ -1666,6 +1675,31 @@ async fn build_hot_components(
             Arc::new(praxec_executors::InventoryExecutor::new(discovery.clone())),
         ));
     Ok((definitions, executors, discovery, registry, workflow_handle))
+}
+
+/// v0.0.21 — the run-ambient repo-root set: the config's `writable: true` repos
+/// (`/praxec/_writableRepos`), each validated as a canonical absolute existing
+/// directory via [`RepoRoot::new`]. A top-level `start` resolves the run's
+/// mandatory `repo_root` from this set. A declared root that doesn't resolve is
+/// a boot error — a run's root must be real, not a hopeful string. An empty set
+/// (no writable repo declared) is allowed at boot but makes every `start` fail
+/// fast (the mandatory-repo precondition).
+fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<Vec<RepoRoot>> {
+    let mut out = Vec::new();
+    if let Some(arr) = config
+        .pointer("/praxec/_writableRepos")
+        .and_then(Value::as_array)
+    {
+        for e in arr {
+            if let Some(root) = e.pointer("/root").and_then(Value::as_str) {
+                let rr = RepoRoot::new(root).map_err(|err| {
+                    anyhow::anyhow!("declared writable repo root `{root}` is invalid: {err}")
+                })?;
+                out.push(rr);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// SPEC §8.4 — when `praxec.authoring.write_enabled` is set, overlay an
@@ -2683,13 +2717,20 @@ async fn fuzz_live(
             };
 
             // Start a fresh workflow instance for this definition.
+            let repo_root = match runtime.resolve_run_repo_root(None) {
+                Ok(r) => r,
+                Err(e) => {
+                    println!("✗ {id} [run {i}] — EngineError: {e}");
+                    any_violation = true;
+                    continue;
+                }
+            };
             let resp = match runtime
                 .start(StartWorkflow {
                     definition_id: id.clone(),
                     input: json!({}),
                     principal: Principal::anonymous(),
-                    trace_id: None,
-                    run_id: None,
+                    run_env: RunEnv::new(repo_root, None, None),
                     depth: 0,
                     parent: None,
                 })
@@ -4047,7 +4088,13 @@ mod tests {
         // as the repair surface.
         let cfg = json!({
             "version": "1.0.0",
-            "praxec": { "repair_surface": ["flow.repair"] },
+            "praxec": {
+                "repair_surface": ["flow.repair"],
+                // v0.0.21 — a run's mandatory repo_root is resolved from the
+                // declared writable repos; the repair flow repairs configs in a
+                // repo, so it needs one. The tempdir exists, so it canonicalizes.
+                "_writableRepos": [{ "root": dir.path().display().to_string(), "push": false }]
+            },
             "workflows": {
                 "flow.repair": {
                     "initialState": "s",

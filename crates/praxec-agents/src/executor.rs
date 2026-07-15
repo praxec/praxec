@@ -244,15 +244,38 @@ impl AgentExecutor {
             .unwrap_or(DEFAULT_STALL_SECONDS)
             .min(max_seconds);
 
+        // Render the leaf's tool connections against the blackboard + the
+        // run-ambient root. A `file:<root>` whose root does NOT render absolute
+        // is an unresolved/mis-threaded template — e.g. a pack still on the
+        // legacy `file:{{ $.workflow.input.repo_path }}` with `repo_path` unset,
+        // rendering to a bare `file:`. Fail FAST at dispatch, before spending a
+        // second of the step budget, instead of handing the agent an empty
+        // toolbelt and letting it burn the whole budget producing nothing (the
+        // v0.0.20 defect). This is the DETECTION half of the poka-yoke; the
+        // PREVENTION half is the mandatory `$.run.repo_root`, which always
+        // resolves to an absolute canonical dir, so a migrated leaf never trips
+        // this.
+        let tools: Vec<String> = cfg
+            .tools
+            .iter()
+            .map(|t| render_template(t, &request.workflow))
+            .collect();
+        if let Some(bad) = tools.iter().find(|t| {
+            t.strip_prefix(crate::file_tools::FILE_CONNECTION_PREFIX)
+                .is_some_and(|root| !std::path::Path::new(root).is_absolute())
+        }) {
+            return Err(ExecutorError::Permanent(format!(
+                "FILE_TOOL_ROOT_UNRESOLVED: agent-leaf tool `{bad}` did not resolve to an absolute \
+                 repo root (its `$.run.repo_root` / legacy `$.workflow.input.repo_path` template \
+                 rendered empty or relative). A file-touching leaf requires a real root; refusing \
+                 to dispatch with no filesystem rather than exhausting the step budget."
+            )));
+        }
         let session = AgentSession {
             model: model.to_string(),
             system_prompt: system_prompt.clone(),
             user_prompt: user_prompt.to_string(),
-            tools: cfg
-                .tools
-                .iter()
-                .map(|t| render_template(t, &request.workflow))
-                .collect(),
+            tools,
             reasoning_effort: cfg.reasoning_effort.clone(),
             timeout: Duration::from_secs(max_seconds),
             stall_timeout: Duration::from_secs(stall_seconds),
@@ -584,8 +607,7 @@ mod tests {
             input: json!({}),
             context: json!({ "ticket": "T-7" }),
             started_at: chrono::Utc::now(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             cancelled_at: None,
             cancelled_reason: None,
             depth: 0,
@@ -670,6 +692,49 @@ mod tests {
                 "engine".to_string()
             ],
             "tool connection strings must be rendered against the blackboard"
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_file_root_fails_fast_at_dispatch() {
+        // A leaf declares a `file:` tool whose root template does NOT resolve —
+        // here the legacy `$.workflow.input.repo_path` with no `repo_path` set,
+        // rendering to a non-absolute stub. The executor must REFUSE to dispatch
+        // (FILE_TOOL_ROOT_UNRESOLVED) rather than hand the agent an empty
+        // toolbelt and let it burn the whole step budget (the v0.0.20 defect).
+        // The runner must never be invoked.
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        // `instance()` has empty `input`, so `$.workflow.input.repo_path` does
+        // not resolve to an absolute root.
+        let req = request(
+            json!({
+                "affinity": "coding",
+                "goal": "build",
+                "tools": ["file:{{ $.workflow.input.repo_path }}", "engine"]
+            }),
+            bare_def(),
+        );
+        let err = exec
+            .execute(req)
+            .await
+            .expect_err("must fail fast at dispatch");
+        match err {
+            ExecutorError::Permanent(m) => {
+                assert!(m.contains("FILE_TOOL_ROOT_UNRESOLVED"), "{m}")
+            }
+            other => panic!("expected Permanent, got {other:?}"),
+        }
+        assert!(
+            runner.sessions().is_empty(),
+            "the runner must NOT be invoked when the file root is unresolved"
         );
     }
 

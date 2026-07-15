@@ -19,6 +19,7 @@ pub mod kind_doctor;
 pub mod mcp;
 pub mod noop;
 pub mod parallel;
+pub mod path_grounding;
 pub mod pipeline;
 pub mod registry;
 pub mod registry_executor;
@@ -38,6 +39,7 @@ pub use inventory::InventoryExecutor;
 pub use mcp::{McpConnection, McpConnections, McpExecutor, RelayClientHandler, UpstreamElicitor};
 pub use noop::NoopExecutor;
 pub use parallel::ParallelExecutor;
+pub use path_grounding::PathGroundingExecutor;
 pub use pipeline::PipelineExecutor;
 
 /// SPEC §24 GAP-E mitigation — the canonical list of executor kinds the
@@ -76,6 +78,9 @@ pub const REGISTERED_EXECUTOR_KINDS: &[&str] = &[
     "structural_analysis",
     "ingest",
     "diff",
+    // #7 (v0.0.21) — deterministic path-hallucination gate; needs no live
+    // handle, so it wires straight into the default registry.
+    "path_grounding",
     // `inventory` (like `agent`/`llm`) is added by the binary's overlay — it
     // needs the live `DiscoveryIndex` handle, wired after the index is built —
     // not the default registry. Listed here so `check` recognizes it.
@@ -121,6 +126,8 @@ pub const ALL_EXECUTOR_KINDS: &[&str] = &[
     "structural_analysis",
     "ingest",
     "diff",
+    // #7 — deterministic path-grounding gate (wired into the default registry).
+    "path_grounding",
     // Overlaid by the binary with the live `DiscoveryIndex` (deterministic
     // gateway self-survey; unblocks `cap.research.tool-inventory`).
     "inventory",
@@ -249,5 +256,29 @@ fn with_authoring_executors(registry: HashMapExecutorRegistry) -> HashMapExecuto
         .with("structural_analysis", Arc::new(StructuralAnalysisExecutor))
         .with("ingest", Arc::new(crate::ingest::IngestExecutor))
         .with("diff", Arc::new(crate::diff::DiffExecutor))
+        // #7 (v0.0.21) — deterministic path-grounding gate. Stateless, needs no
+        // live handle, so it wires here (not the binary overlay).
+        .with(
+            "path_grounding",
+            Arc::new(crate::path_grounding::PathGroundingExecutor::new()),
+        )
         .with("registry", Arc::new(RegistryExecutor::disabled()))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Poka-yoke: every kind V6 accepts as a deterministic capability primary
+    /// (`praxec_core::validate::DETERMINISTIC_PRIMARY_KINDS`) must be a real,
+    /// registered executor kind. If a kind is added to one list but not the
+    /// other, this fails the build rather than letting V6 bless a kind the
+    /// runtime can't dispatch (or vice-versa).
+    #[test]
+    fn deterministic_primaries_are_all_registered() {
+        for kind in praxec_core::validate::DETERMINISTIC_PRIMARY_KINDS {
+            assert!(
+                super::ALL_EXECUTOR_KINDS.contains(kind),
+                "V6 deterministic-primary kind `{kind}` is not a registered executor kind"
+            );
+        }
+    }
 }

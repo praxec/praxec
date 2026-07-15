@@ -72,6 +72,7 @@ fn runtime() -> WorkflowRuntime {
         Arc::new(DefaultGuardEvaluator::with_evidence(evidence.clone())),
         Arc::new(MemoryAuditSink::new()) as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence)
 }
 
@@ -92,8 +93,7 @@ async fn a_running_mission_response_conforms_to_the_schema() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -114,8 +114,7 @@ async fn a_resolved_mission_response_conforms_to_the_schema() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -151,8 +150,7 @@ async fn the_running_response_carries_the_orchestrator_binding() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

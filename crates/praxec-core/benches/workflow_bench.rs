@@ -12,6 +12,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
+use praxec_core::RunEnv;
 use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::error::ExecutorError;
@@ -104,7 +105,9 @@ async fn start_workflow(runtime: &WorkflowRuntime) -> (String, u64) {
             definition_id: "bench".into(),
             input: json!({"key": "value"}),
             principal: Principal::anonymous(),
-            ..Default::default()
+            run_env: RunEnv::for_test(),
+            depth: 0,
+            parent: None,
         })
         .await
         .expect("start should succeed");
@@ -131,7 +134,9 @@ fn bench_start(c: &mut Criterion) {
                     definition_id: "bench".into(),
                     input: json!({"key": "value"}),
                     principal: Principal::anonymous(),
-                    ..Default::default()
+                    run_env: RunEnv::for_test(),
+                    depth: 0,
+                    parent: None,
                 })
                 .await
                 .expect("start should succeed");

@@ -102,8 +102,9 @@ impl Executor for DryRunExecutor {
                 definition_id: definition_id.clone(),
                 input,
                 principal: Principal::anonymous(),
-                trace_id: None,
-                run_id: None,
+                // Preview inherits the caller's run-ambient env: the dry-run
+                // executes against the same repo root the live run operates on.
+                run_env: request.workflow.run_env.clone(),
                 // Top-level dry-run start: depth 0.
                 depth: 0,
                 parent: None,

@@ -38,8 +38,7 @@ async fn record_emitted_per_applied_transition() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -82,8 +81,7 @@ async fn record_write_failure_aborts_transition() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -125,8 +123,7 @@ async fn version_unchanged_when_record_write_fails() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -193,8 +190,7 @@ async fn timeout_emits_workflow_transition_record_with_system_actor() {
             definition_id: "short_lived".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -303,15 +299,15 @@ async fn blackboard_delta_populated_with_output_writes() {
     });
     let guards = Arc::new(praxec_core::guards::DefaultGuardEvaluator::new());
     let runtime =
-        WorkflowRuntime::new(definitions, store.clone(), executors, guards, audit.clone());
+        WorkflowRuntime::new(definitions, store.clone(), executors, guards, audit.clone())
+            .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
 
     let start = runtime
         .start(StartWorkflow {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -373,8 +369,7 @@ async fn blackboard_delta_empty_when_no_context_change() {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -446,8 +441,7 @@ async fn guards_array_populated_with_kind_and_result() {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -529,15 +523,15 @@ async fn blackboard_delta_chain_hops_have_distinct_deltas() {
         }),
     });
     let guards = Arc::new(praxec_core::guards::DefaultGuardEvaluator::new());
-    let runtime = WorkflowRuntime::new(definitions, store, executors, guards, audit.clone());
+    let runtime = WorkflowRuntime::new(definitions, store, executors, guards, audit.clone())
+        .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
 
     runtime
         .start(StartWorkflow {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

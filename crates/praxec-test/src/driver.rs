@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use praxec_agents::orchestrator::{
     HeadlessPolicy, MissionGateway, RuntimeMissionGateway, drive_mission, run_headless_consumer,
 };
+use praxec_core::RunEnv;
 use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
 use praxec_core::bus::Bus;
@@ -170,8 +171,7 @@ async fn run_one(
             definition_id: definition_id.to_string(),
             input: start_input,
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

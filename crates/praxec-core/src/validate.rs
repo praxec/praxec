@@ -2120,6 +2120,36 @@ fn v2_id_matches_verb_name(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Executor kinds that run **deterministically, with no model call** — the
+/// authoring / introspection / gate family: `inventory` surveys the live
+/// gateway, `path_grounding` checks that referenced paths exist,
+/// `structural_analysis` reads code shape, and so on. Each produces a
+/// structured, factual result rather than generated prose, so it is a
+/// *strictly-safe* primary for any Cognitive or Deterministic verb — V6 never
+/// treats it as gross misuse. (Contrast `script`/`cli`/`rest`: also
+/// deterministic, but arbitrary shell/HTTP execution, so they stay bound to
+/// their category as before — you can't shell your way to a `plan`.)
+///
+/// Kept in step with the deterministic executors registered in
+/// `praxec-executors`; `deterministic_primaries_are_all_registered` (in that
+/// crate's tests) fails the build if this drifts from the registry.
+pub const DETERMINISTIC_PRIMARY_KINDS: &[&str] = &[
+    "inventory",
+    "path_grounding",
+    "structural_analysis",
+    "ingest",
+    "diff",
+    "dry_run",
+    "registry",
+    "tool_source",
+];
+
+/// True when `kind` is a model-free deterministic authoring/introspection/gate
+/// executor (see [`DETERMINISTIC_PRIMARY_KINDS`]).
+pub fn is_deterministic_primary_kind(kind: &str) -> bool {
+    DETERMINISTIC_PRIMARY_KINDS.contains(&kind)
+}
+
 /// V6 — primary-executor verb-shape check. Inspects the executor on the
 /// transition leaving the capability's initial state (TRIZ Local Quality:
 /// narrow check that catches gross misuse without walking every transition).
@@ -2164,10 +2194,17 @@ fn v6_primary_executor_verb_shape(id: &str, def: &Value, out: &mut Vec<Diagnosti
 
     let category = verb.category();
     let ok = match category {
-        CapVerbCategory::Cognitive => primary_kinds.iter().any(|k| matches!(*k, "mcp" | "noop")),
-        CapVerbCategory::Deterministic => {
-            primary_kinds.iter().any(|k| matches!(*k, "script" | "mcp"))
-        }
+        // A deterministic authoring/introspection/gate executor (inventory,
+        // path_grounding, …) is a strictly-safe primary for any Cognitive or
+        // Deterministic verb — e.g. `cap.research.tool-inventory` surveys the
+        // gateway with `kind: inventory`, `cap.verify.path-grounding` gates with
+        // `kind: path_grounding`. See DETERMINISTIC_PRIMARY_KINDS.
+        CapVerbCategory::Cognitive => primary_kinds
+            .iter()
+            .any(|k| matches!(*k, "mcp" | "noop") || is_deterministic_primary_kind(k)),
+        CapVerbCategory::Deterministic => primary_kinds
+            .iter()
+            .any(|k| matches!(*k, "script" | "mcp") || is_deterministic_primary_kind(k)),
         CapVerbCategory::Coordination => match verb {
             CapVerb::Gate => has_human_actor,
             // Spec §4.1 ideal for `coordinate` is `kind: mcp` AND
@@ -2180,8 +2217,14 @@ fn v6_primary_executor_verb_shape(id: &str, def: &Value, out: &mut Vec<Diagnosti
     };
     if !ok {
         let allowed = match category {
-            CapVerbCategory::Cognitive => "kind: mcp OR kind: noop (skill-surfacing)",
-            CapVerbCategory::Deterministic => "kind: script OR kind: mcp",
+            CapVerbCategory::Cognitive => {
+                "kind: mcp OR kind: noop (skill-surfacing) OR a deterministic \
+                 executor (inventory, path_grounding, …)"
+            }
+            CapVerbCategory::Deterministic => {
+                "kind: script OR kind: mcp OR a deterministic executor \
+                 (inventory, path_grounding, …)"
+            }
             CapVerbCategory::Coordination => match verb {
                 CapVerb::Gate => {
                     "at least one initial-state transition with actor: human OR purpose: ask"

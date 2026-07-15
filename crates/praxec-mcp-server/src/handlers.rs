@@ -2,6 +2,7 @@
 //! block (same crate, same type — see `lib.rs` for the struct definition
 //! and `ServerHandler` trait impl).
 
+use praxec_core::RunEnv;
 use praxec_core::audit::AuditEvent;
 use praxec_core::discovery::{DiscoveryKind, SearchRequest};
 use praxec_core::embeddings::{EmbeddingProvider, entry_embed_text};
@@ -613,15 +614,23 @@ impl PraxecServer {
             .ok_or_else(|| bad_request("definitionId is required"))?;
         let input = parsed.input.unwrap_or_else(|| json!({}));
 
+        // v0.0.21 — every run carries a mandatory repo_root, resolved at this
+        // boundary from the config-declared writable repos (never a free-text
+        // path). Fails fast if none is declared or the selector is ambiguous.
+        let repo_root = self
+            .runtime
+            .resolve_run_repo_root(parsed.repo_root.as_deref())
+            .map_err(|e| bad_request(e.to_string()))?;
+
         self.runtime
             .start(StartWorkflow {
                 definition_id,
                 input,
                 principal,
-                // SPEC §20.2 — caller-supplied trace/run propagate to every
-                // audit event for this workflow. Persisted on the instance.
-                trace_id: parsed.trace_id,
-                run_id: parsed.run_id,
+                // SPEC §20.2 — caller-supplied trace/run ride the run-ambient
+                // env so they propagate to every audit event AND survive a
+                // sub-workflow spawn. Persisted on the instance.
+                run_env: RunEnv::new(repo_root, parsed.run_id, parsed.trace_id),
                 // Top-level start: depth 0. A `kind: workflow` spawn is the
                 // only path that stamps a deeper child (parent.depth + 1).
                 depth: 0,

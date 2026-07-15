@@ -36,7 +36,8 @@ fn build_runtime_with_audit() -> (WorkflowRuntime, Arc<MemoryAuditSink>) {
         Arc::new(NoopRegistry),
         Arc::new(DefaultGuardEvaluator::new()),
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     (runtime, audit)
 }
 

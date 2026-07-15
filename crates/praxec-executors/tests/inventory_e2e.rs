@@ -123,6 +123,7 @@ fn build_runtime(discovery: Arc<dyn DiscoveryIndex>) -> WorkflowRuntime {
         guards,
         audit as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence)
 }
 
@@ -144,8 +145,7 @@ async fn tool_inventory_cap_surveys_on_start_and_maps_output() {
             definition_id: "cap.research.tool-inventory".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

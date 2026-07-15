@@ -20,8 +20,7 @@ async fn auto_drive_off_stops_at_agent_state() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -45,8 +44,7 @@ async fn auto_drive_on_advances_through_agent_state() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -95,8 +93,7 @@ async fn auto_drive_composes_the_final_answer_contract_and_expected_keys() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -159,8 +156,7 @@ async fn auto_drive_feeds_agent_output_as_arguments() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -197,8 +193,7 @@ async fn agent_completed_carries_cost_telemetry() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -248,8 +243,7 @@ async fn agent_completed_cost_is_null_for_uncatalogued_model() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

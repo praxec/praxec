@@ -956,6 +956,7 @@
             "structural_analysis",
             "ingest",
             "diff",
+            "path_grounding",
             "inventory",
             "tool_source"
           ]

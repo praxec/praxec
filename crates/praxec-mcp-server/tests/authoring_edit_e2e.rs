@@ -59,7 +59,8 @@ fn build_server() -> PraxecServer {
         executors,
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     PraxecServer::new(runtime).with_ack_store(ack)
 }
 

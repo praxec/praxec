@@ -634,6 +634,7 @@ fn resolve_template(
             &request.workflow.context,
             &request.workflow.input,
             None,
+            Some(&request.workflow.run_env),
         )
         .ok_or_else(|| {
             ExecutorError::Permanent(format!(
@@ -797,8 +798,7 @@ mod render_args_tests {
                 input,
                 context,
                 started_at: chrono::Utc::now(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 cancelled_at: None,
                 cancelled_reason: None,
                 depth: 0,

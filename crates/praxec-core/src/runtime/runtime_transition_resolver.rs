@@ -125,8 +125,7 @@ mod tests {
                 definition_id: "p".into(),
                 input: json!({}),
                 principal: Principal::anonymous(),
-                trace_id: None,
-                run_id: None,
+                run_env: crate::RunEnv::for_test(),
                 depth: 0,
                 parent: None,
             })

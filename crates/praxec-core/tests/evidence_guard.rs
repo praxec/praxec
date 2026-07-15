@@ -113,6 +113,7 @@ fn build() -> (WorkflowRuntime, Arc<InMemoryEvidenceStore>) {
         guards,
         Arc::new(NullAuditSink),
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence.clone());
     (runtime, evidence)
 }
@@ -126,8 +127,7 @@ async fn evidence_guard_blocks_until_required_kind_recorded() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -232,6 +232,7 @@ async fn evidence_guard_rejects_without_required_kind() {
         guards,
         Arc::new(NullAuditSink),
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence);
 
     let started = runtime
@@ -239,8 +240,7 @@ async fn evidence_guard_rejects_without_required_kind() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

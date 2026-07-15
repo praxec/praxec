@@ -58,7 +58,8 @@ fn build_runtime(
         registry,
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     workflow_handle.set_runtime(runtime.clone());
 
     (runtime, store, audit)
@@ -76,8 +77,7 @@ async fn start_and_suspend(
             definition_id: "parent".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -280,8 +280,7 @@ async fn bounded_loop_over_subworkflow_survives_second_iteration() {
             definition_id: "parent".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -421,8 +420,7 @@ async fn back_edge_two_leaf_convergence_loop_drives_to_terminal() {
             definition_id: "parent".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

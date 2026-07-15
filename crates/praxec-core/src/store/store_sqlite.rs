@@ -55,8 +55,8 @@ impl SqliteWorkflowStore {
         )?;
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_run_id \
-             ON workflows (json_extract(instance, '$.run_id')) \
-             WHERE json_extract(instance, '$.run_id') IS NOT NULL",
+             ON workflows (json_extract(instance, '$.run_env.run_id')) \
+             WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL",
             [],
         )?;
         Ok(Self {
@@ -77,8 +77,8 @@ impl SqliteWorkflowStore {
         )?;
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_run_id \
-             ON workflows (json_extract(instance, '$.run_id')) \
-             WHERE json_extract(instance, '$.run_id') IS NOT NULL",
+             ON workflows (json_extract(instance, '$.run_env.run_id')) \
+             WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL",
             [],
         )?;
         Ok(Self {
@@ -214,7 +214,7 @@ impl WorkflowStore for SqliteWorkflowStore {
             let conn = conn.lock().expect("LOCK_POISONED: sqlite connection");
             let mut stmt = conn.prepare(
                 "SELECT id FROM workflows \
-                 WHERE json_extract(instance, '$.run_id') = ?1 \
+                 WHERE json_extract(instance, '$.run_env.run_id') = ?1 \
                  LIMIT 1",
             )?;
             let id: Option<String> = stmt
@@ -299,8 +299,7 @@ mod tests {
             input: serde_json::json!({}),
             context: serde_json::json!({}),
             started_at: chrono::Utc::now(),
-            trace_id: None,
-            run_id: None,
+            run_env: crate::RunEnv::for_test(),
             cancelled_at: None,
             cancelled_reason: None,
             depth: 0,

@@ -21,8 +21,7 @@ async fn chain_auto_executes_deterministic_and_stops_at_agent() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -53,8 +52,7 @@ async fn fully_deterministic_chain_reaches_terminal() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -87,8 +85,7 @@ async fn mixed_state_stops_chain() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -156,8 +153,7 @@ async fn deterministic_transitions_hidden_from_links() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -197,8 +193,7 @@ async fn no_chain_when_already_terminal() {
             definition_id: "instant".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -233,8 +228,7 @@ async fn no_chain_when_state_has_no_transitions() {
             definition_id: "stuck".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -285,8 +279,7 @@ async fn chain_works_without_executor() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

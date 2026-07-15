@@ -134,7 +134,8 @@ fn build_runtime_with(
         executors,
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     (runtime, audit)
 }
 
@@ -185,8 +186,7 @@ async fn chain_loop_two_turns_emits_two_transitioned_events_in_order() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -322,8 +322,7 @@ async fn chain_loop_caps_at_max_chained_llm_turns() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -428,8 +427,7 @@ async fn on_enter_next_transition_fails_fast() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -475,8 +473,7 @@ async fn deterministic_next_transition_fails_fast() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -523,8 +520,7 @@ async fn input_defaults_seed_into_context_at_start() {
             definition_id: "pipeline".into(),
             input: json!({}), // no matrix_strategy supplied → schema default applies
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

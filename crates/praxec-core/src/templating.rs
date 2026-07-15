@@ -73,6 +73,13 @@ pub(crate) fn resolve_template_path(path: &str, instance: &WorkflowInstance) -> 
     if path == "$.workflow.version" {
         return instance.definition_version.clone();
     }
+    // Run-ambient root (v0.0.21) — always resolves, because `run_env` is
+    // mandatory on every instance. This is what a coding leaf's
+    // `file:{{ $.run.repo_root }}` connection renders against; it replaces the
+    // former hand-threaded `$.workflow.input.repo_path` convention.
+    if path == "$.run.repo_root" {
+        return instance.run_env.repo_root.as_str().to_string();
+    }
 
     // SPEC §17.x — `$.praxec.authoring.*` resolves against the snapshot's
     // stamped `_authoringPrefs`. This is gateway-level operator preferences

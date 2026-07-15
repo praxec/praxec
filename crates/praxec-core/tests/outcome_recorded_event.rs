@@ -78,6 +78,7 @@ fn runtime_with_sink() -> (WorkflowRuntime, Arc<MemoryAuditSink>) {
         Arc::new(DefaultGuardEvaluator::with_evidence(evidence.clone())),
         sink.clone() as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence);
     (rt, sink)
 }
@@ -87,8 +88,7 @@ async fn start(rt: &WorkflowRuntime, def: &str) -> Value {
         definition_id: def.into(),
         input: json!({}),
         principal: Principal::anonymous(),
-        trace_id: None,
-        run_id: None,
+        run_env: praxec_core::RunEnv::for_test(),
         depth: 0,
         parent: None,
     })

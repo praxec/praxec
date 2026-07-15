@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::run_env::RunEnv;
+
 pub type WorkflowId = String;
 pub type WorkflowDefinitionId = String;
 pub type StateName = String;
@@ -30,14 +32,13 @@ pub struct WorkflowInstance {
     /// instances loaded from older stores that didn't persist this field.
     #[serde(default = "Utc::now")]
     pub started_at: DateTime<Utc>,
-    /// SPEC §20.2 — caller-supplied trace id propagated to every audit
-    /// event for this instance. Captured at `workflow.start` and persisted
-    /// with the snapshot so it survives reload + drain.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trace_id: Option<String>,
-    /// SPEC §20.2 — caller-supplied run id, same lifecycle as `trace_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_id: Option<String>,
+    /// Run-ambient environment: the repo root plus SPEC §20.2 correlation ids
+    /// (`run_id`/`trace_id`), captured at `workflow.start` and persisted with
+    /// the snapshot. **Mandatory, no serde default** — `RepoRoot` has no safe
+    /// default, so a pre-v0.0.21 snapshot lacking `run_env` fails to
+    /// deserialize (documented store-wipe cutover). Reachable from every
+    /// executor via `request.workflow.run_env`; rendered as `$.run.repo_root`.
+    pub run_env: RunEnv,
     /// Sub-workflow nesting depth (0 at the top level). Persisted so the
     /// recursion guard survives async re-drive — replaces the former
     /// `WORKFLOW_DEPTH` task-local, which assumed a synchronous call stack.
@@ -78,10 +79,10 @@ impl WorkflowInstance {
     /// boilerplate at every call site.
     pub fn audit_event(&self, event_type: impl Into<String>) -> crate::audit::AuditEvent {
         let mut e = crate::audit::AuditEvent::new(event_type).with_workflow(&self.id);
-        if let Some(t) = &self.trace_id {
+        if let Some(t) = &self.run_env.trace_id {
             e = e.with_trace_id(t.clone());
         }
-        if let Some(r) = &self.run_id {
+        if let Some(r) = &self.run_env.run_id {
             e = e.with_run_id(r.clone());
         }
         e
@@ -172,16 +173,17 @@ impl Principal {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct StartWorkflow {
     pub definition_id: WorkflowDefinitionId,
     pub input: Value,
     pub principal: Principal,
-    /// SPEC §20.2 — optional trace id propagated to every audit event
-    /// for the created instance. Persisted on the instance.
-    pub trace_id: Option<String>,
-    /// SPEC §20.2 — optional run id, same lifecycle as `trace_id`.
-    pub run_id: Option<String>,
+    /// Run-ambient environment established at this start: the repo root plus the
+    /// SPEC §20.2 correlation ids (`run_id`/`trace_id`). Mandatory — every run
+    /// is about a repo. Propagated unchanged parent→child at a `kind: workflow`
+    /// spawn so the child inherits the root and the correlation identity. (Was
+    /// the standalone `trace_id`/`run_id` fields, which reset at each spawn.)
+    pub run_env: RunEnv,
     /// Nesting depth to stamp onto the created instance. 0 for a top-level
     /// start; a `kind: workflow` spawn passes `parent.depth + 1`.
     pub depth: u32,

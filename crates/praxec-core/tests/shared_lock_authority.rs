@@ -45,6 +45,7 @@ fn build_runtime_with_locks(locks: Arc<dyn RepoLocks>) -> WorkflowRuntime {
         guards,
         audit as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_repo_locks(locks)
 }
 

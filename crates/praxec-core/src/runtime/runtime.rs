@@ -162,6 +162,14 @@ pub struct WorkflowRuntime {
     /// Wall-clock bound (seconds) for an auto-driven agent step — fail-fast so a
     /// non-converging agent surfaces in minutes, not the 600s executor default.
     pub(crate) auto_drive_max_seconds: u64,
+    /// The repo roots a run may operate on, from the config's `writable: true`
+    /// repos (`/praxec/_writableRepos`). A top-level `start` resolves the run's
+    /// mandatory [`crate::run_env::RepoRoot`] from this set (see
+    /// [`Self::resolve_run_repo_root`]). Empty means the deployment declared no
+    /// writable repo — and, since `repo_root` is mandatory, every start then
+    /// fails fast. Sub-workflow spawns never consult this: they inherit the
+    /// parent's `run_env` verbatim.
+    pub(crate) writable_repo_roots: Vec<crate::run_env::RepoRoot>,
 }
 
 impl WorkflowRuntime {
@@ -188,6 +196,62 @@ impl WorkflowRuntime {
             auto_drive_affinity: "reasoning".to_string(),
             auto_drive_tools: Vec::new(),
             auto_drive_max_seconds: 180,
+            writable_repo_roots: Vec::new(),
+        }
+    }
+
+    /// Wire the config-declared writable repo roots (from `/praxec/_writableRepos`)
+    /// that a top-level `start` resolves the run's `repo_root` from.
+    pub fn with_writable_repo_roots(mut self, roots: Vec<crate::run_env::RepoRoot>) -> Self {
+        self.writable_repo_roots = roots;
+        self
+    }
+
+    /// Resolve the mandatory run `repo_root` for a top-level start from the
+    /// config-declared writable repos (v0.0.21):
+    /// - 0 declared → fail fast (a run requires a repo_root);
+    /// - exactly 1 → use it (a `selector` naming it is accepted, anything else
+    ///   rejected);
+    /// - N declared → require `selector` to name one of them, else fail listing
+    ///   the choices.
+    ///
+    /// The selector matches a declared root by its canonical path string only —
+    /// arbitrary free-text paths are never accepted, so a caller (or an LLM)
+    /// cannot inject a hallucinated root.
+    pub fn resolve_run_repo_root(
+        &self,
+        selector: Option<&str>,
+    ) -> anyhow::Result<crate::run_env::RepoRoot> {
+        let roots = &self.writable_repo_roots;
+        if roots.is_empty() {
+            anyhow::bail!(
+                "REPO_ROOT_REQUIRED: a run requires a repo_root, but no writable repo is \
+                 declared. Declare a repo with `writable: true` in the gateway config."
+            );
+        }
+        match selector {
+            Some(sel) => roots
+                .iter()
+                .find(|r| r.as_str() == sel)
+                .cloned()
+                .ok_or_else(|| {
+                    let choices: Vec<&str> = roots.iter().map(|r| r.as_str()).collect();
+                    anyhow::anyhow!(
+                        "REPO_ROOT_UNKNOWN: `{sel}` is not a declared writable repo root. \
+                         Choose one of: {}",
+                        choices.join(", ")
+                    )
+                }),
+            None if roots.len() == 1 => Ok(roots[0].clone()),
+            None => {
+                let choices: Vec<&str> = roots.iter().map(|r| r.as_str()).collect();
+                anyhow::bail!(
+                    "REPO_ROOT_AMBIGUOUS: {} writable repos are declared; name one via the \
+                     `repoRoot` selector. Choices: {}",
+                    roots.len(),
+                    choices.join(", ")
+                )
+            }
         }
     }
 
@@ -496,7 +560,7 @@ impl WorkflowRuntime {
         // run_id, reject duplicates with a structured error. Stores that
         // return Ok(None) by trait default opt out of the check; their
         // runtime sees no constraint (best-effort safety net).
-        if let Some(run_id) = &request.run_id {
+        if let Some(run_id) = &request.run_env.run_id {
             if let Some(existing_workflow_id) = self.store.find_by_run_id(run_id).await? {
                 return Err(RuntimeError::RunIdAlreadyRunning {
                     run_id: run_id.clone(),
@@ -622,10 +686,11 @@ impl WorkflowRuntime {
             input: request.input,
             context: initial_context,
             started_at: Utc::now(),
-            // SPEC §20.2 — persist trace/run on the instance so every
-            // downstream audit event for this workflow inherits them.
-            trace_id: request.trace_id,
-            run_id: request.run_id,
+            // SPEC §20.2 — persist the run-ambient env (repo root + trace/run
+            // correlation) on the instance so every downstream audit event and
+            // every executor inherits them, and a sub-workflow spawn propagates
+            // the same root/identity to the child.
+            run_env: request.run_env,
             depth: request.depth,
             cancelled_at: None,
             cancelled_reason: None,
@@ -1209,8 +1274,7 @@ mod reap_tests {
             input: json!({}),
             context: json!({}),
             started_at: chrono::Utc::now(),
-            trace_id: None,
-            run_id: None,
+            run_env: crate::RunEnv::for_test(),
             cancelled_at: None,
             cancelled_reason: None,
             depth: 0,

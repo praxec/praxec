@@ -34,6 +34,7 @@ fn build_runtime(config: Value) -> WorkflowRuntime {
         guards,
         audit as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
 }
 
 #[tokio::test]
@@ -69,8 +70,7 @@ async fn instance_describe_returns_snapshot_body_not_live_config() {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -144,8 +144,7 @@ async fn unknown_subject_returns_none() {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

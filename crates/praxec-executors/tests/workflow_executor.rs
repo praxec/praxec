@@ -82,6 +82,7 @@ workflows:
         guards,
         audit.clone() as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence);
 
     (runtime, audit)
@@ -104,8 +105,7 @@ async fn sub_workflow_completes_and_returns_context() {
                 input: json!({}),
                 context: json!({}),
                 started_at: chrono::Utc::now(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 cancelled_at: None,
                 cancelled_reason: None,
                 depth: 0,
@@ -151,8 +151,7 @@ async fn sub_workflow_terminal_at_spawn_returns_context() {
                 input: json!({}),
                 context: json!({}),
                 started_at: chrono::Utc::now(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 cancelled_at: None,
                 cancelled_reason: None,
                 depth: 0,
@@ -203,8 +202,7 @@ async fn non_terminal_child_suspends_instead_of_polling() {
             input: json!({}),
             context: json!({}),
             started_at: chrono::Utc::now(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             cancelled_at: None,
             cancelled_reason: None,
             depth: 0,
@@ -262,8 +260,7 @@ async fn terminal_child_advances_fast_path() {
                 input: json!({}),
                 context: json!({}),
                 started_at: chrono::Utc::now(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 cancelled_at: None,
                 cancelled_reason: None,
                 depth: 0,
@@ -314,8 +311,7 @@ async fn reevaluation_reuses_the_recorded_child() {
             input: json!({}),
             context,
             started_at: chrono::Utc::now(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             cancelled_at: None,
             cancelled_reason: None,
             depth: 0,
@@ -408,8 +404,7 @@ async fn sub_workflow_missing_definition_surfaces_as_executor_error() {
                 input: json!({}),
                 context: json!({}),
                 started_at: chrono::Utc::now(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 cancelled_at: None,
                 cancelled_reason: None,
                 depth: 0,
@@ -453,8 +448,7 @@ async fn sub_workflow_audit_events_emitted() {
                 input: json!({}),
                 context: json!({}),
                 started_at: chrono::Utc::now(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 cancelled_at: None,
                 cancelled_reason: None,
                 depth: 0,
@@ -547,6 +541,7 @@ workflows:
         guards,
         audit.clone() as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence);
 
     let wf_exec = Arc::new(WorkflowExecutor::new(runtime.clone(), audit.clone()));
@@ -564,8 +559,7 @@ workflows:
                 input: json!({}),
                 context: json!({}),
                 started_at: chrono::Utc::now(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 cancelled_at: None,
                 cancelled_reason: None,
                 depth: 0,
@@ -608,8 +602,7 @@ async fn depth_guard_reads_instance_data_not_a_task_local() {
         input: json!({}),
         context: json!({}),
         started_at: chrono::Utc::now(),
-        trace_id: None,
-        run_id: None,
+        run_env: praxec_core::RunEnv::for_test(),
         cancelled_at: None,
         cancelled_reason: None,
         depth: 10, // == MAX_WORKFLOW_DEPTH
@@ -648,8 +641,7 @@ fn run_sub_request(parent_id: &str) -> ExecuteRequest {
             input: json!({}),
             context: json!({}),
             started_at: chrono::Utc::now(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             cancelled_at: None,
             cancelled_reason: None,
             depth: 0,
