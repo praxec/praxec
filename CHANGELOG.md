@@ -10,6 +10,25 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+### Fixed — `reload` now rewires the writable repo set (FB-1, dogfood find)
+
+`writable_repo_roots` was applied to the runtime only at serve startup, so
+`praxec.command { reload: true }` after declaring/changing a `writable: true`
+repo had **no effect** — the operator got a bare `"reloaded"`, then a run got an
+empty `$.run.repo_root` and died much later at the first file-leaf
+(`FILE_TOOL_ROOT_UNRESOLVED`): a silent, deferred, mislocated failure.
+
+- The runtime's writable set is now a hot-swappable slot (`Arc<RwLock<Vec<RepoRoot>>>`,
+  matching the `Swappable*` reload idiom); `reload_gated` re-derives it from the new
+  config and swaps it atomically with the definitions/executors — no restart.
+- A writable repo that no longer resolves (`RepoRoot::new`: path missing) drops the
+  reload to **repair-only** (`WRITABLE_REPO_INVALID`), keeping the previous set live —
+  never a half-swap, exactly like a contract-dirty edit.
+- The reload response now surfaces the resolved `writable_repos` (and audits them),
+  so the operator sees what runs can actually write to, not a bare `"reloaded"`.
+- (FB-1b) Confirmed + test-locked that `start`'s repo_root resolution already
+  fails fast (`REPO_ROOT_REQUIRED`) on an empty set at every boundary — the
+  earlier "empty root at start" symptom was the reload-not-rewiring bug above.
 ### Fixed — `doctor`/preflight now fails loud when auto-drive has no model (dogfood find)
 
 Surfaced by dogfooding: a config with `praxec.agents.auto_drive: true` but no

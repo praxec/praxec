@@ -169,7 +169,12 @@ pub struct WorkflowRuntime {
     /// writable repo — and, since `repo_root` is mandatory, every start then
     /// fails fast. Sub-workflow spawns never consult this: they inherit the
     /// parent's `run_env` verbatim.
-    pub(crate) writable_repo_roots: Vec<crate::run_env::RepoRoot>,
+    ///
+    /// Hot-swappable (behind `Arc<RwLock>`) so `reload_gated` can re-derive it
+    /// from a new config without a restart — matching the `Swappable*` reload
+    /// wrappers' `RwLock<Arc<…>>` idiom. Reads (per run `start`) take a read
+    /// lock; a reload takes a write lock via [`set_writable_repo_roots`].
+    pub(crate) writable_repo_roots: Arc<std::sync::RwLock<Vec<crate::run_env::RepoRoot>>>,
 }
 
 impl WorkflowRuntime {
@@ -196,15 +201,37 @@ impl WorkflowRuntime {
             auto_drive_affinity: "reasoning".to_string(),
             auto_drive_tools: Vec::new(),
             auto_drive_max_seconds: 180,
-            writable_repo_roots: Vec::new(),
+            writable_repo_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
 
     /// Wire the config-declared writable repo roots (from `/praxec/_writableRepos`)
     /// that a top-level `start` resolves the run's `repo_root` from.
     pub fn with_writable_repo_roots(mut self, roots: Vec<crate::run_env::RepoRoot>) -> Self {
-        self.writable_repo_roots = roots;
+        self.writable_repo_roots = Arc::new(std::sync::RwLock::new(roots));
         self
+    }
+
+    /// Hot-swap the writable repo set from a re-derived config (FB-1) — called by
+    /// `reload_gated` so `praxec.command { reload: true }` actually rewires which
+    /// repos runs may operate on. Takes `&self`: the shared long-lived runtime and
+    /// every handle cloned from it see the swap (the slot is a shared `Arc<RwLock>`).
+    pub fn set_writable_repo_roots(&self, roots: Vec<crate::run_env::RepoRoot>) {
+        *self
+            .writable_repo_roots
+            .write()
+            .expect("LOCK_POISONED: writable_repo_roots") = roots;
+    }
+
+    /// The canonical paths of the currently-live writable repos — for the reload
+    /// response so the operator sees what actually got wired, not a bare "reloaded".
+    pub fn writable_repo_roots_snapshot(&self) -> Vec<String> {
+        self.writable_repo_roots
+            .read()
+            .expect("LOCK_POISONED: writable_repo_roots")
+            .iter()
+            .map(|r| r.as_str().to_string())
+            .collect()
     }
 
     /// Resolve the mandatory run `repo_root` for a top-level start from the
@@ -228,7 +255,11 @@ impl WorkflowRuntime {
         &self,
         selector: Option<&str>,
     ) -> anyhow::Result<crate::run_env::RepoRoot> {
-        let roots = &self.writable_repo_roots;
+        let roots = self
+            .writable_repo_roots
+            .read()
+            .expect("LOCK_POISONED: writable_repo_roots");
+        let roots = &*roots;
         if roots.is_empty() {
             anyhow::bail!(
                 "REPO_ROOT_REQUIRED: a run requires a repo_root, but no writable repo is \
@@ -1397,10 +1428,9 @@ mod reap_tests {
 }
 
 #[cfg(test)]
-mod repo_root_resolution_tests {
-    //! FB-3 — a top-level `start` `repoRoot` selector resolves to a declared
-    //! writable root OR a worktree/subpath under one, still bounded by the
-    //! allowlist.
+mod writable_repo_tests {
+    //! FB-1 (reload rewire + empty-set fail-fast) and FB-3 (worktree/subpath
+    //! selectors) — the writable-repo set and how a `start` selector resolves it.
     use super::*;
     use crate::audit::{AuditSink, MemoryAuditSink};
     use crate::guards::DefaultGuardEvaluator;
@@ -1428,6 +1458,10 @@ mod repo_root_resolution_tests {
             Arc::new(MemoryAuditSink::new()) as Arc<dyn AuditSink>,
         )
         .with_writable_repo_roots(roots)
+    }
+
+    fn runtime() -> WorkflowRuntime {
+        runtime_with_roots(vec![])
     }
 
     #[test]
@@ -1503,5 +1537,51 @@ mod repo_root_resolution_tests {
             .resolve_run_repo_root(Some(sibling.to_str().unwrap()))
             .expect_err("a string-prefix sibling must not resolve");
         assert!(format!("{err:#}").contains("REPO_ROOT_OUTSIDE_ALLOWLIST"));
+    }
+
+    /// FB-1(b) — an empty writable set makes `start`'s repo_root resolution fail
+    /// fast (REPO_ROOT_REQUIRED), not defer to a later file-leaf.
+    #[test]
+    fn resolve_fails_fast_on_empty_writable_set() {
+        let err = runtime()
+            .resolve_run_repo_root(None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("REPO_ROOT_REQUIRED"), "{err}");
+    }
+
+    /// FB-1(a) — `set_writable_repo_roots` (what `reload_gated` calls) hot-swaps the
+    /// live set: resolution goes from failing to returning the new root, and the
+    /// snapshot (the reload response) reflects it — no restart.
+    #[test]
+    fn set_writable_repo_roots_rewires_resolution_and_snapshot() {
+        let rt = runtime();
+        assert!(rt.resolve_run_repo_root(None).is_err());
+        assert!(rt.writable_repo_roots_snapshot().is_empty());
+
+        let root = RepoRoot::for_test();
+        rt.set_writable_repo_roots(vec![root.clone()]);
+
+        assert_eq!(
+            rt.resolve_run_repo_root(None).unwrap().as_str(),
+            root.as_str()
+        );
+        assert_eq!(
+            rt.writable_repo_roots_snapshot(),
+            vec![root.as_str().to_string()]
+        );
+    }
+
+    /// The swap is visible through a CLONE of the runtime (the shared `Arc<RwLock>`
+    /// slot) — reload swaps once, every handle sees it.
+    #[test]
+    fn swap_is_visible_through_a_runtime_clone() {
+        let rt = runtime();
+        let handle = rt.clone();
+        rt.set_writable_repo_roots(vec![RepoRoot::for_test()]);
+        assert!(
+            handle.resolve_run_repo_root(None).is_ok(),
+            "a runtime clone must see the swap"
+        );
     }
 }
