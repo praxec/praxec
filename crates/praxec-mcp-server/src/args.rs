@@ -229,6 +229,14 @@ pub struct QueryArgs {
     /// events since X" — re-query with the returned `next_since` cursor to
     /// tail. Requires `audit.sink: file` (fails fast otherwise).
     pub observe: Option<bool>,
+    /// HITL read: present-and-true (alone) → the store-derived queue of every
+    /// live mission parked awaiting a human (an `actor: human` approval gate or
+    /// an agent's elicitation). Each entry carries the `transition` +
+    /// `expectedVersion` a human needs to resolve it, plus a ready-to-fire
+    /// resolve link. The MCP-native complement to the CLI `praxec approvals`,
+    /// so a human driving through an agent can SEE and clear a gate without a
+    /// terminal into the gateway.
+    pub approvals: Option<bool>,
     /// RFC3339 floor for `observe` — only events with `timestamp >= since`
     /// are returned. Modifier on `observe` only.
     pub since: Option<String>,

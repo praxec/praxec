@@ -502,7 +502,11 @@ pub trait DiscoveryIndex: Send + Sync {
 
 fn default_home() -> Value {
     json!({
-        "resource": { "type": "gateway", "id": "home" },
+        // `version` is the running gateway binary's version — the first thing a
+        // consumer reads to tell whether the long-lived `serve` process is the
+        // build they expect (a stdio server keeps its exec'd binary until
+        // restarted; `cargo install` does not hot-swap it).
+        "resource": { "type": "gateway", "id": "home", "version": env!("CARGO_PKG_VERSION") },
         "result": {
             "status": "ready",
             "message": "Available workflows and proxy capabilities can be discovered here."

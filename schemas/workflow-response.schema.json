@@ -23,6 +23,7 @@
       "default": []
     },
     "error": { "$ref": "#/$defs/error" },
+    "pending_human": { "$ref": "#/$defs/pendingHuman" },
     "chain": {
       "type": "array",
       "items": { "$ref": "#/$defs/chainStep" },
@@ -165,6 +166,25 @@
         "id": { "type": "string" },
         "uri": { "type": "string" },
         "summary": { "type": "string" }
+      }
+    },
+    "pendingHuman": {
+      "type": "object",
+      "description": "The typed human gate this mission (or its sub-workflow) is parked on, with a ready-to-fire `resolve` handle. Surfaced so an MCP-driving agent escalates to the operator instead of treating `waiting` as a soft stall.",
+      "additionalProperties": true,
+      "properties": {
+        "workflow_id": { "type": "string" },
+        "definition_id": { "type": "string" },
+        "state": { "type": "string" },
+        "expected_version": { "type": "integer" },
+        "transition": { "type": "string" },
+        "prompt": { "type": "string" },
+        "input_schema": { "type": "object" },
+        "source": { "type": "string", "enum": ["human_gate", "agent_await"] },
+        "since": { "type": "string" },
+        "onChildWorkflow": { "type": "boolean" },
+        "note": { "type": "string" },
+        "resolve": { "type": "object" }
       }
     },
     "error": {

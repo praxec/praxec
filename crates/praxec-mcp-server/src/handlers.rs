@@ -935,6 +935,16 @@ impl PraxecServer {
                 .await;
         }
 
+        // Approvals: `approvals: true` is an exclusive shape (no modifiers) — the
+        // MCP-native HITL queue. Mixed with any other intent field it's ambiguous.
+        let ap = parsed.approvals.unwrap_or(false);
+        if ap && (q || s || wid || tr || d || parsed.since.is_some()) {
+            return Ok(ambiguous_intent_query());
+        }
+        if ap {
+            return self.handle_approvals().await;
+        }
+
         // Detect ambiguity: `query` (search intent) alongside subject/workflow
         // fields (describe/get/explain intent) is unresolvable.
         if q && (s || wid || tr) {
@@ -1088,9 +1098,20 @@ impl PraxecServer {
         let total = events.len();
         let limit = limit.unwrap_or(DEFAULT_OBSERVE_LIMIT) as usize;
         let truncated = total > limit;
-        // Oldest-first page: the client walks FORWARD through the stream via
-        // the `next_since` cursor (matches the replay order of the CLI tail).
-        events.truncate(limit);
+        // Window selection. Events are ascending by timestamp across ALL retained
+        // logs (weeks of history). With NO `since` cursor the caller means "what's
+        // happening now" — so default to the TAIL (the most recent `limit`),
+        // NOT the oldest. Truncating from the front returned a 3-week-old window
+        // (the first `server.initialized` from a long-dead session), which is why
+        // `observe:true` looked stuck on stale events. With a `since` cursor the
+        // caller is paging FORWARD, so keep oldest-first-from-floor. Either way
+        // the returned window stays ascending, and `next_since` = its newest
+        // timestamp lets a re-query pull only newer events (live tail).
+        if since.is_none() && total > limit {
+            events.drain(0..total - limit);
+        } else {
+            events.truncate(limit);
+        }
         let next_since = events.last().map(|e| e.timestamp.to_rfc3339());
 
         let mut links = vec![json!({ "rel": "home", "method": "praxec.query", "args": {} })];
@@ -1115,6 +1136,57 @@ impl PraxecServer {
                      since=next_since to tail. Rebuild the execution tree from workflow_id + \
                      parent_workflow_id + depth. Event schema: `praxec schema audit-event`.",
             "links": links
+        }))
+    }
+
+    /// MCP-native HITL discovery: the store-derived queue of every live mission
+    /// parked awaiting a human — an `actor: human` approval gate or an agent's
+    /// elicitation. The pull/fallback complement to the push path (server-issued
+    /// `elicitation/create`): a human driving through an agent lists what needs
+    /// them and gets a ready-to-fire resolve link per gate. Also what a client
+    /// that does NOT advertise the `elicitation` capability falls back to.
+    pub(crate) async fn handle_approvals(&self) -> anyhow::Result<Value> {
+        let gates = self.runtime.list_pending_human().await?;
+        let items: Vec<Value> = gates
+            .iter()
+            .map(|g| {
+                let mut item = serde_json::to_value(g).unwrap_or_else(|_| json!({}));
+                // A ready-to-fire resolve call. It is an `actor: human` gate, so
+                // the submit MUST carry a human-origin identity — otherwise the
+                // runtime rejects it ACTOR_MISMATCH. Say so, and name the channel.
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert(
+                        "resolve".into(),
+                        json!({
+                            "rel": "resolve_human_gate",
+                            "method": "praxec.command",
+                            "args": {
+                                "workflowId": g.workflow_id,
+                                "expectedVersion": g.expected_version,
+                                "transition": g.transition,
+                            },
+                            "requiresHuman": true,
+                            "note": "This is an actor:human gate. The submit must carry a \
+                                     human-origin identity — the CLI `--human` flag, or the MCP \
+                                     `_meta` principal claim `io.praxec/principal`. An anonymous \
+                                     agent submit is rejected ACTOR_MISMATCH."
+                        }),
+                    );
+                }
+                item
+            })
+            .collect();
+
+        Ok(json!({
+            "resource": { "type": "approvals", "id": "pending-human" },
+            "result": { "status": "ok" },
+            "count": items.len(),
+            "pending": items,
+            "note": "Missions parked awaiting a human (oldest-first). A client that advertises \
+                     the `elicitation` capability is instead prompted in-line via \
+                     `elicitation/create` when a `praxec.command` hits a gate; this list is the \
+                     pull complement for finding gates parked out-of-band.",
+            "links": [ { "rel": "home", "method": "praxec.query", "args": {} } ]
         }))
     }
 

@@ -281,6 +281,64 @@ impl WorkflowRuntime {
             body["error"] = err;
         }
 
+        // HITL — when the mission is parked awaiting a HUMAN (an `actor: human`
+        // gate or an agent's elicitation), surface the typed gate prominently so
+        // a driving agent can't miss that it must escalate to the operator rather
+        // than treat `waiting` as a soft stall. This is the in-band signal that a
+        // capability-supporting client turns into an `elicitation/create`, and
+        // that any client can act on via the `resolve` handle.
+        //
+        // The gate may live on THIS instance, or — when this mission is parked
+        // waiting on a `kind: workflow` child — on the CHILD. In the latter case
+        // the parent's own `links` are empty (it can only be re-driven when the
+        // child terminates), so without this a human staring at the parent sees
+        // nothing actionable. We traverse to the child and surface ITS gate, with
+        // the `resolve` handle targeting the child workflow.
+        let gate_from_child = match crate::hitl::pending_gate(instance) {
+            Some(gate) => Some((gate, false)),
+            None => match crate::hitl::subworkflow_child_id(instance) {
+                Some(child_id) => self
+                    .store
+                    .load(&child_id)
+                    .await
+                    .ok()
+                    .and_then(|child| crate::hitl::pending_gate(&child))
+                    .map(|gate| (gate, true)),
+                None => None,
+            },
+        };
+        if let Some((gate, on_child)) = gate_from_child {
+            if let Ok(mut v) = serde_json::to_value(&gate) {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert(
+                        "resolve".into(),
+                        json!({
+                            "method": "praxec.command",
+                            "args": {
+                                "workflowId": gate.workflow_id,
+                                "expectedVersion": gate.expected_version,
+                                "transition": gate.transition,
+                            },
+                            "requiresHuman": true,
+                        }),
+                    );
+                    if on_child {
+                        obj.insert("onChildWorkflow".into(), json!(true));
+                        obj.insert(
+                            "note".into(),
+                            json!(format!(
+                                "This mission is parked waiting on sub-workflow '{}', where the \
+                                 human gate lives. `resolve` targets THAT workflow; clearing it \
+                                 re-drives this parent.",
+                                gate.workflow_id
+                            )),
+                        );
+                    }
+                }
+                body["pending_human"] = v;
+            }
+        }
+
         // Phase guidance: attach goal/instructions from the current state.
         // `{{ }}` placeholders are interpolated at render time against the
         // live instance; stored strings are never mutated (SPEC v2 §5.2).

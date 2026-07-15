@@ -44,6 +44,13 @@ impl ProgressPeer {
     fn get(&self) -> Option<Peer<RoleServer>> {
         self.0.lock().ok().and_then(|slot| slot.as_ref().cloned())
     }
+
+    /// The connected upstream peer, if a `call_tool` is (or was) in flight.
+    /// Public so the #11 elicitation relay (wired in the `praxec` binary) can
+    /// forward a downstream server's `elicitation/create` to it.
+    pub fn current(&self) -> Option<Peer<RoleServer>> {
+        self.get()
+    }
 }
 
 /// [`AuditSink`] decorator that pushes each event to the connected MCP client as

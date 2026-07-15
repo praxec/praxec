@@ -117,6 +117,12 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             }
         }
         Command::Migrate { config } => migrate(config),
+        Command::Cleanup {
+            config,
+            older_than_days,
+            force,
+        } => run_cleanup(&config, older_than_days, force),
+        Command::Sync { config } => run_sync(&config),
         Command::Inspect { command } => match command {
             InspectCommand::Workflow { config, id } => inspect_workflow(&config, &id).await,
         },
@@ -735,8 +741,9 @@ async fn build_runtime_for_orchestrate(
     // The registry is discarded with the index for the same reason (nothing here
     // ranks candidates) — but it is still LOADED, so a broken `discovery.registry`
     // fails an orchestrate run exactly as it fails a serve.
+    // Headless orchestrate has no upstream MCP peer to relay elicitations to.
     let (initial_defs, initial_executors, _discovery, _registry, workflow_handle) =
-        build_hot_components(config, &audit, &no_embedder).await?;
+        build_hot_components(config, &audit, &no_embedder, None).await?;
     let swappable_defs = Arc::new(SwappableDefinitionStore::new(initial_defs));
     let swappable_executors = Arc::new(SwappableExecutorRegistry::new(initial_executors));
     let store = build_workflow_store(config)?;
@@ -820,16 +827,32 @@ async fn build_oneshot_server(
     // `praxec check`. An unknown executor kind, an unpinned stable cap, a
     // `tools:` injection, or any other Diagnostic::Error must refuse to boot
     // rather than fail mid-flight once a workflow is already running.
+    // #14 — contract errors no longer ABORT the boot. A buildable-but-dirty pack
+    // comes up in REPAIR-ONLY mode: the runtime is built, but the server gates
+    // the functional HATEOAS surface down to the operator-declared repair
+    // capabilities until the contracts are 100% clean (poka-yoke). A config that
+    // cannot even BUILD still errors downstream → serve_degraded. The full
+    // diagnostics ride on the gate so the consuming LLM has the precise
+    // information to fix them.
+    // #9 — cheap, offline staleness nudge: a local pack repo checked out on a
+    // branch other than `main` is the stale-pack failure mode (the consumer's
+    // praxec-meta was left on `dev`). Warn loudly at startup; `praxec sync`
+    // fast-forwards it. No `git fetch` here — startup must not depend on the
+    // network — so this catches the wrong-branch case, not behind-on-main.
+    warn_local_repos_off_main(config);
+
     let diagnostics = collect_diagnostics_with(config, &overlays.diagnostics);
-    let error_count = diagnostics.iter().filter(|d| d.is_error()).count();
-    if error_count > 0 {
+    let repair_gate = build_repair_gate(config, &diagnostics);
+    if let Some(gate) = &repair_gate {
+        let mut surface: Vec<&String> = gate.repair_ids.iter().collect();
+        surface.sort();
+        eprintln!(
+            "  CONTRACT-DIRTY → repair-only mode: {} error(s); startable repair surface: {surface:?}",
+            gate.diagnostics.len()
+        );
         for d in &diagnostics {
             eprintln!("  {d}");
         }
-        anyhow::bail!(
-            "refusing to start: config validation failed with {error_count} error(s) — \
-             run `praxec check --config <path>` for the full report"
-        );
     }
 
     // #18 — wrap the configured audit sink so events recorded during a drive
@@ -846,8 +869,13 @@ async fn build_oneshot_server(
     // the semantic index used to be bolted on after the fact, which is exactly
     // why reload never re-embedded.
     let embedder = resolve_embedder(config);
+    // #11 — the upstream elicitation relay, backed by the SAME peer slot the
+    // server captures per call. Threaded into the mcp executor so a downstream
+    // server's `elicitation/create` is forwarded to praxec's own client.
+    let upstream: Arc<dyn praxec_executors::UpstreamElicitor> =
+        Arc::new(ProgressElicitor::new(progress_peer.clone()));
     let (initial_defs, initial_executors, initial_discovery, initial_registry, workflow_handle) =
-        build_hot_components(config, &audit, &embedder).await?;
+        build_hot_components(config, &audit, &embedder, Some(upstream.clone())).await?;
 
     let swappable_defs = Arc::new(SwappableDefinitionStore::new(initial_defs));
     let swappable_executors = Arc::new(SwappableExecutorRegistry::new(initial_executors));
@@ -1071,6 +1099,11 @@ async fn build_oneshot_server(
         server = server.with_trust_meta_principal(trust);
     }
 
+    // #14 — set the boot repair gate and hold its shared slot so `serve`'s
+    // reload path can flip the live posture (clean → clear, dirty → set).
+    let server = server.with_repair_gate(repair_gate);
+    let repair_gate = server.repair_gate_slot();
+
     Ok(OneshotServer {
         server,
         runtime,
@@ -1079,6 +1112,53 @@ async fn build_oneshot_server(
         swappable_executors,
         swappable_discovery,
         swappable_registry,
+        repair_gate,
+        upstream,
+    })
+}
+
+/// #14 — the operator/pack-declared repair surface: definition ids that stay
+/// STARTABLE while the pack is contract-dirty (Fork B). Two declaration forms,
+/// unioned: the `praxec.repair_surface` config allowlist, and any workflow that
+/// marks itself `repair: true` (so a pack declares its own repair capabilities
+/// without a central list). Pack-agnostic — the engine never hardcodes a pack's
+/// ids.
+fn repair_surface_from_config(config: &Value) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    if let Some(list) = config
+        .pointer("/praxec/repair_surface")
+        .and_then(Value::as_array)
+    {
+        ids.extend(list.iter().filter_map(|v| v.as_str().map(str::to_string)));
+    }
+    if let Some(wfs) = config.pointer("/workflows").and_then(Value::as_object) {
+        for (id, def) in wfs {
+            if def.get("repair").and_then(Value::as_bool) == Some(true) {
+                ids.insert(id.clone());
+            }
+        }
+    }
+    ids
+}
+
+/// #14 — build the repair-only gate iff the config carries contract errors
+/// (else `None` = clean, full surface). Carries the exact error diagnostics for
+/// the LLM to fix plus the declared repair surface that stays startable.
+fn build_repair_gate(
+    config: &Value,
+    diagnostics: &[praxec_core::validate::Diagnostic],
+) -> Option<praxec_mcp_server::RepairGate> {
+    let errors: Vec<String> = diagnostics
+        .iter()
+        .filter(|d| d.is_error())
+        .map(|d| d.message().to_string())
+        .collect();
+    if errors.is_empty() {
+        return None;
+    }
+    Some(praxec_mcp_server::RepairGate {
+        diagnostics: errors,
+        repair_ids: repair_surface_from_config(config),
     })
 }
 
@@ -1123,6 +1203,8 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         swappable_executors,
         swappable_discovery,
         swappable_registry,
+        repair_gate,
+        upstream,
     } = match healthy {
         Ok(oneshot) => oneshot,
         Err(err) => return serve_degraded(config_path, err).await,
@@ -1170,8 +1252,10 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         let rt = runtime.clone();
         let regs = overlays.registrars.clone();
         let tracker = staleness_tracker.clone();
+        let gate = repair_gate.clone();
+        let up = upstream.clone();
         let hook: praxec_mcp_server::ReloadHook = Arc::new(move || {
-            let (defs, execs, disc, reg, cfg, aud, rt, regs, tracker) = (
+            let (defs, execs, disc, reg, cfg, aud, rt, regs, tracker, gate, up) = (
                 defs.clone(),
                 execs.clone(),
                 disc.clone(),
@@ -1181,10 +1265,14 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                 rt.clone(),
                 regs.clone(),
                 tracker.clone(),
+                gate.clone(),
+                up.clone(),
             );
             Box::pin(async move {
-                let outcome =
-                    reload_gated(&defs, &execs, &disc, &reg, &cfg, &aud, &rt, &regs).await;
+                let outcome = reload_gated(
+                    &defs, &execs, &disc, &reg, &cfg, &aud, &rt, &regs, &gate, &up,
+                )
+                .await;
                 tracker.recapture(praxec_core::config::local_config_file_set(&cfg));
                 outcome
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
@@ -1208,8 +1296,10 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         let rt = runtime.clone();
         let regs = overlays.registrars.clone();
         let tracker = staleness_tracker.clone();
+        let gate = repair_gate.clone();
+        let up = upstream.clone();
         let hook: praxec_mcp_server::StalenessHook = Arc::new(move || {
-            let (defs, execs, disc, reg, cfg, aud, rt, regs, tracker) = (
+            let (defs, execs, disc, reg, cfg, aud, rt, regs, tracker, gate, up) = (
                 defs.clone(),
                 execs.clone(),
                 disc.clone(),
@@ -1219,6 +1309,8 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                 rt.clone(),
                 regs.clone(),
                 tracker.clone(),
+                gate.clone(),
+                up.clone(),
             );
             Box::pin(async move {
                 if !tracker.stale_check_due() {
@@ -1227,7 +1319,10 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                 tracing::info!(
                     "config changed on disk — triggering gated reload (staleness recheck)"
                 );
-                let _ = reload_gated(&defs, &execs, &disc, &reg, &cfg, &aud, &rt, &regs).await;
+                let _ = reload_gated(
+                    &defs, &execs, &disc, &reg, &cfg, &aud, &rt, &regs, &gate, &up,
+                )
+                .await;
                 // Recapture regardless of outcome: a REJECTED edit is audited
                 // once (config.reload_rejected), not retried every TTL until
                 // the operator saves the file again.
@@ -1254,6 +1349,8 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         let reload_runtime = runtime.clone();
         let reload_registrars = overlays.registrars.clone();
         let reload_tracker = staleness_tracker.clone();
+        let reload_gate = repair_gate.clone();
+        let reload_upstream = upstream.clone();
         tokio::spawn(async move {
             let mut sighup =
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
@@ -1275,6 +1372,8 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
                     &reload_audit,
                     &reload_runtime,
                     &reload_registrars,
+                    &reload_gate,
+                    &reload_upstream,
                 )
                 .await;
                 // P6b — re-baseline the staleness tracker so this reload's
@@ -1354,6 +1453,8 @@ async fn reload_gated(
     audit: &Arc<dyn praxec_core::audit::AuditSink>,
     runtime: &WorkflowRuntime,
     registrars: &[OverlayRegistrar],
+    repair_gate: &praxec_mcp_server::RepairGateSlot,
+    upstream: &Arc<dyn praxec_executors::UpstreamElicitor>,
 ) -> Value {
     let new_config = match load_config(config_path) {
         Ok(c) => c,
@@ -1375,21 +1476,34 @@ async fn reload_gated(
         .map(|d| d.message().to_string())
         .collect();
     if !errors.is_empty() {
+        // #14 Fork C — a dirty edit does NOT swap in the broken definitions
+        // (the previous good ones keep running for in-flight work), but it DOES
+        // drop the live serving posture to REPAIR-ONLY: no new non-repair work
+        // may start until the contracts are clean again. Poka-yoke — the
+        // operator is forced to fix, not left running the old config while the
+        // on-disk one is broken.
         tracing::error!(
             error_count = errors.len(),
             errors = ?errors,
-            "config reload REJECTED — validation errors; keeping previous configuration"
+            "config reload is CONTRACT-DIRTY — dropping to repair-only mode; previous definitions kept live"
         );
+        *repair_gate.write().expect("LOCK_POISONED: repair_gate") =
+            Some(std::sync::Arc::new(praxec_mcp_server::RepairGate {
+                diagnostics: errors.clone(),
+                repair_ids: repair_surface_from_config(&new_config),
+            }));
         let _ = audit
             .record(
-                praxec_core::audit::AuditEvent::new("config.reload_rejected").with_payload(json!({
-                    "config": config_path.display().to_string(),
-                    "errors": errors,
-                })),
+                praxec_core::audit::AuditEvent::new("config.reload_repair_only").with_payload(
+                    json!({
+                        "config": config_path.display().to_string(),
+                        "errors": errors,
+                    }),
+                ),
             )
             .await;
         return json!({
-            "status": "rejected",
+            "status": "repair_only",
             "reason": "validation_errors",
             "errors": errors,
             "config": config_path.display().to_string(),
@@ -1402,7 +1516,7 @@ async fn reload_gated(
     // live and healthy, which is the whole point of the reload path now sharing
     // `build_hot_components` with startup.
     let embedder = resolve_embedder(&new_config);
-    match build_hot_components(&new_config, audit, &embedder).await {
+    match build_hot_components(&new_config, audit, &embedder, Some(upstream.clone())).await {
         Ok((new_defs, new_executors, new_discovery, new_registry, new_workflow_handle)) => {
             // Re-wire the fresh runtime-less `kind: workflow` handle against the
             // SAME long-lived runtime, and re-apply the overlays so the reloaded
@@ -1418,6 +1532,9 @@ async fn reload_gated(
             // keeps the previous everything), so the selector can never rank
             // against a registry the index doesn't hold.
             swappable_registry.swap(new_registry);
+            // #14 Fork C — a clean reload REOPENS the full surface: clear any
+            // repair-only gate the prior (dirty) config had set.
+            *repair_gate.write().expect("LOCK_POISONED: repair_gate") = None;
             let _ = audit
                 .record(
                     praxec_core::audit::AuditEvent::new("config.reloaded").with_payload(json!({
@@ -1485,6 +1602,10 @@ async fn build_hot_components(
     // `build_runtime_for_orchestrate` — has no business paying for a health probe
     // and a full catalog embed on every headless drive.
     embedder: &Arc<dyn EmbeddingProvider>,
+    // #11 — the upstream elicitation relay, so a downstream `kind: mcp` server
+    // that prompts a human reaches one through praxec's own client. `None` on
+    // headless paths (orchestrate) that have no upstream peer.
+    upstream: Option<Arc<dyn praxec_executors::UpstreamElicitor>>,
 ) -> anyhow::Result<(
     Arc<dyn praxec_core::ports::DefinitionStore>,
     Arc<dyn praxec_core::ports::ExecutorRegistry>,
@@ -1501,7 +1622,7 @@ async fn build_hot_components(
     Arc<praxec_executors::WorkflowExecutor>,
 )> {
     let mcp_conns = McpConnections::from_config(config);
-    let mcp_executor = Arc::new(McpExecutor::new(mcp_conns));
+    let mcp_executor = Arc::new(McpExecutor::new_with_upstream(mcp_conns, upstream));
     let imported = import_capabilities(config, &mcp_executor, audit).await;
     let effective_config = with_imports(config.clone(), &imported);
     let cli_conns = Arc::new(CliConnections::from_config(&effective_config));
@@ -1532,6 +1653,18 @@ async fn build_hot_components(
         audit,
     )
     .await?;
+    // Overlay the `inventory` executor with the freshly-built discovery index —
+    // the deterministic gateway self-survey behind `cap.research.tool-inventory`.
+    // Wired HERE (not in the default registry) because it needs the live
+    // `DiscoveryIndex`, which is built just above and swapped as a whole on every
+    // reload; overlaying per-rebuild hands each survey the current index with
+    // nothing to re-wire. Same overlay idiom as `registry`/`llm`/`agent`.
+    let executors: Arc<dyn praxec_core::ports::ExecutorRegistry> =
+        Arc::new(praxec_core::overlay::SingleKindOverlay::new(
+            executors,
+            "inventory",
+            Arc::new(praxec_executors::InventoryExecutor::new(discovery.clone())),
+        ));
     Ok((definitions, executors, discovery, registry, workflow_handle))
 }
 
@@ -1685,6 +1818,261 @@ fn maybe_enable_sandbox(
         "script",
         Arc::new(script_exec),
     )))
+}
+
+/// `praxec cleanup` — prune residual rotated audit-log files older than a
+/// threshold. Fail-safe by construction: it only ever considers `.log` files in
+/// the configured `audit.path` whose FILENAME timestamp parses (the same key
+/// `AuditRetention` uses) AND is older than the cutoff, and it DRY-RUNS unless
+/// `--force`. Recent/active files date after any sane cutoff, so they can never
+/// be selected.
+fn run_cleanup(config_path: &PathBuf, older_than_days: u64, force: bool) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let audit_dir = config
+        .pointer("/audit/path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cleanup needs `audit.path` in the config to locate residual audit files \
+                 (this config has none — nothing on disk to prune)"
+            )
+        })?;
+    let dir = std::path::Path::new(audit_dir);
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(older_than_days as i64);
+
+    let mut candidates: Vec<(std::path::PathBuf, String, u64)> = Vec::new();
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(dir)
+            .with_context(|| format!("reading audit dir {audit_dir}"))?
+            .flatten()
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".log") {
+                continue;
+            }
+            // Only files we can DATE (fail-safe: unparseable → never deleted),
+            // and only those strictly older than the cutoff.
+            let Some(stamp) = praxec_core::audit::parse_filename_stamp(&name) else {
+                continue;
+            };
+            if stamp >= cutoff {
+                continue;
+            }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            candidates.push((entry.path(), name, size));
+        }
+    }
+    candidates.sort_by(|a, b| a.1.cmp(&b.1));
+    let total: u64 = candidates.iter().map(|(_, _, s)| *s).sum();
+
+    if candidates.is_empty() {
+        println!("cleanup: no residual audit files older than {older_than_days}d in {audit_dir}");
+        return Ok(());
+    }
+    println!(
+        "{} residual audit file(s) older than {older_than_days}d in {audit_dir} ({} KiB):",
+        candidates.len(),
+        total / 1024
+    );
+    for (_, name, size) in &candidates {
+        println!("  {name} ({} KiB)", size / 1024);
+    }
+    if !force {
+        println!(
+            "\nDRY-RUN — nothing deleted. Re-run with `--force` to remove these {} file(s).",
+            candidates.len()
+        );
+        return Ok(());
+    }
+    let (mut removed, mut freed) = (0u64, 0u64);
+    for (path, name, size) in &candidates {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                removed += 1;
+                freed += size;
+            }
+            Err(e) => eprintln!("  failed to remove {name}: {e}"),
+        }
+    }
+    println!(
+        "cleanup: removed {removed} file(s), freed {} KiB.",
+        freed / 1024
+    );
+    Ok(())
+}
+
+/// `praxec sync` — fast-forward local git-backed pack repos to `origin/main`.
+/// Fail-safe: only pulls a clean checkout that is on `main` and behind by a
+/// fast-forwardable amount; anything else is reported and left untouched.
+fn run_sync(config_path: &PathBuf) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(config_path)
+        .with_context(|| format!("reading config {}", config_path.display()))?;
+    let cfg: Value = serde_yaml::from_str(&raw)
+        .with_context(|| format!("parsing config {}", config_path.display()))?;
+    let repos = cfg
+        .get("repos")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if repos.is_empty() {
+        println!("sync: no `repos:` declared — nothing to sync.");
+        return Ok(());
+    }
+
+    let (mut updated, mut attention) = (0u32, 0u32);
+    for entry in &repos {
+        if let Some(uri) = entry.get("uri").and_then(Value::as_str) {
+            println!("  {uri} (remote) — refreshed to its ref on every load; nothing to do.");
+            continue;
+        }
+        let Some(path) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let dir = expand_tilde(path);
+        if !dir.join(".git").exists() {
+            println!("  {path} — not a git checkout; skipped.");
+            continue;
+        }
+        if !git_ok(&["fetch", "--quiet", "origin"], &dir) {
+            println!("  {path} — `git fetch` failed (offline?); left as-is.");
+            attention += 1;
+            continue;
+        }
+        let branch = git_out(&["rev-parse", "--abbrev-ref", "HEAD"], &dir)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let dirty = git_out(&["status", "--porcelain"], &dir)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(true);
+        let behind = git_out(&["rev-list", "--count", "HEAD..origin/main"], &dir)
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+
+        if branch != "main" {
+            println!(
+                "  {path} — on branch '{branch}', not 'main'; NOT auto-switched (check out main to sync)."
+            );
+            attention += 1;
+        } else if behind == 0 {
+            println!("  {path} — up to date with origin/main.");
+        } else if dirty {
+            println!(
+                "  {path} — {behind} commit(s) behind origin/main but the working tree is DIRTY; not pulled (commit or stash first)."
+            );
+            attention += 1;
+        } else if git_ok(&["merge", "--ff-only", "origin/main"], &dir) {
+            println!("  {path} — fast-forwarded {behind} commit(s) to origin/main.");
+            updated += 1;
+        } else {
+            println!(
+                "  {path} — {behind} behind origin/main but not fast-forwardable (diverged); resolve manually."
+            );
+            attention += 1;
+        }
+    }
+    println!("\nsync: {updated} repo(s) updated, {attention} needing attention.");
+    Ok(())
+}
+
+/// #11 — the [`UpstreamElicitor`](praxec_executors::UpstreamElicitor) backed by
+/// the live upstream peer the server captures per call. When a downstream
+/// `kind: mcp` server prompts a human, the relay forwards it here and this calls
+/// `elicitation/create` on praxec's OWN client (the agent host) — so ANY
+/// eliciting tool reaches a human THROUGH praxec. No peer connected → an error
+/// the relay hands back to the downstream server (fail clean, don't hang).
+/// Defined in the binary so neither `praxec-mcp-server` nor `praxec-executors`
+/// needs a dependency on the other.
+struct ProgressElicitor {
+    peer: praxec_mcp_server::ProgressPeer,
+}
+
+impl ProgressElicitor {
+    fn new(peer: praxec_mcp_server::ProgressPeer) -> Self {
+        Self { peer }
+    }
+}
+
+#[async_trait::async_trait]
+impl praxec_executors::UpstreamElicitor for ProgressElicitor {
+    async fn elicit(
+        &self,
+        params: rmcp::model::CreateElicitationRequestParams,
+    ) -> Result<rmcp::model::CreateElicitationResult, String> {
+        let peer = self
+            .peer
+            .current()
+            .ok_or_else(|| "no upstream MCP peer connected to relay elicitation to".to_string())?;
+        peer.create_elicitation(params)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// #9 — warn (best-effort, no network) about any local `path:` pack repo whose
+/// git checkout is on a branch other than `main`. This is the exact stale-pack
+/// failure mode a consumer hit (praxec-meta left on `dev`), caught at startup.
+fn warn_local_repos_off_main(config: &Value) {
+    let Some(repos) = config.pointer("/repos").and_then(Value::as_array) else {
+        return;
+    };
+    for entry in repos {
+        let Some(path) = entry.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let dir = expand_tilde(path);
+        if !dir.join(".git").exists() {
+            continue;
+        }
+        if let Some(branch) = git_out(&["rev-parse", "--abbrev-ref", "HEAD"], &dir) {
+            let branch = branch.trim();
+            if branch != "main" && branch != "HEAD" {
+                tracing::warn!(
+                    repo = %path,
+                    branch,
+                    "pack repo is checked out on '{branch}', not 'main' — it may be STALE. \
+                     Run `praxec sync` to fast-forward it (SPEC #9)."
+                );
+                eprintln!(
+                    "  WARNING: pack repo '{path}' is on branch '{branch}', not 'main' — \
+                     it may be stale. Run `praxec sync`."
+                );
+            }
+        }
+    }
+}
+
+/// Expand a leading `~/` against `$HOME` (mirrors config's `expand_repo_path`).
+fn expand_tilde(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(p)
+}
+
+/// Run `git <args>` in `cwd`, returning trimmed stdout on success (else `None`).
+fn git_out(args: &[&str], cwd: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Run `git <args>` in `cwd` for its exit status only (output discarded).
+fn git_ok(args: &[&str], cwd: &std::path::Path) -> bool {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn migrate(config_path: PathBuf) -> anyhow::Result<()> {
@@ -2113,6 +2501,13 @@ fn health(config_path: PathBuf) -> anyhow::Result<()> {
         .to_string();
 
     let snapshot = json!({
+        // The running binary's version — so a consumer can tell whether the
+        // long-lived `serve` process is the build they expect. An MCP stdio
+        // server keeps the binary it was exec'd with until restarted; a
+        // `cargo install` does NOT hot-swap it. Without this field the only way
+        // to detect a stale server was to read a `server.initialized` audit
+        // event, which the observe path could show from a dead session.
+        "version": env!("CARGO_PKG_VERSION"),
         "connections": connections,
         "repos": repos,
         "definition_count": definition_count,
@@ -3451,7 +3846,7 @@ mod tests {
             Arc::new(SpeedAxisEmbedder);
 
         let (_defs, _execs, discovery, _registry, _handle) =
-            build_hot_components(&cache_flow_config(), &audit, &embedder)
+            build_hot_components(&cache_flow_config(), &audit, &embedder, None)
                 .await
                 .expect("components build");
 
@@ -3471,7 +3866,7 @@ mod tests {
             Arc::new(praxec_core::embeddings::NoopEmbedder);
 
         let (_defs, _execs, discovery, _registry, _handle) =
-            build_hot_components(&cache_flow_config(), &audit, &embedder)
+            build_hot_components(&cache_flow_config(), &audit, &embedder, None)
                 .await
                 .expect("components build");
 
@@ -3515,7 +3910,7 @@ mod tests {
         let embedder: Arc<dyn praxec_core::embeddings::EmbeddingProvider> =
             Arc::new(praxec_core::embeddings::NoopEmbedder);
         let (defs, execs, discovery, registry, handle) =
-            build_hot_components(&config, &audit, &embedder)
+            build_hot_components(&config, &audit, &embedder, None)
                 .await
                 .expect("components build");
         handle.set_runtime((*runtime).clone());
@@ -3536,6 +3931,10 @@ mod tests {
         });
         std::fs::write(&cfg_path, serde_json::to_string(&edited).unwrap()).unwrap();
 
+        let repair_gate: praxec_mcp_server::RepairGateSlot = Arc::new(std::sync::RwLock::new(None));
+        let upstream: Arc<dyn praxec_executors::UpstreamElicitor> = Arc::new(
+            super::ProgressElicitor::new(praxec_mcp_server::ProgressPeer::default()),
+        );
         let outcome = reload_gated(
             &swappable_defs,
             &swappable_execs,
@@ -3545,6 +3944,8 @@ mod tests {
             &audit,
             &runtime,
             &overlays.registrars,
+            &repair_gate,
+            &upstream,
         )
         .await;
         assert_eq!(outcome["status"], "reloaded", "reload completes: {outcome}");
@@ -3567,6 +3968,152 @@ mod tests {
                 .event_types()
                 .contains(&"discovery.index_degraded".to_string()),
             "embeddings off → lexical is the configured answer, not a degrade"
+        );
+    }
+
+    /// #9 — `sync` reads the config's `repos:`, skips non-git local paths and
+    /// notes remote repos, without touching anything it shouldn't.
+    #[test]
+    fn sync_handles_missing_repos_and_non_git_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        // No repos → clean no-op.
+        let empty = dir.path().join("empty.yaml");
+        std::fs::write(&empty, "version: \"1.0.0\"\nworkflows: {}\n").unwrap();
+        super::run_sync(&empty).expect("no-repos sync is a clean no-op");
+
+        // A local path that is NOT a git checkout → skipped (never errors).
+        let plain = dir.path().join("plain-pack");
+        std::fs::create_dir_all(&plain).unwrap();
+        let cfg = dir.path().join("with-repos.yaml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n  - uri: \"git+https://example.com/x@main\"\nworkflows: {{}}\n",
+                plain.display()
+            ),
+        )
+        .unwrap();
+        super::run_sync(&cfg).expect("non-git local path + remote uri are handled, not errored");
+    }
+
+    /// #8 — `cleanup` prunes only OLD, dateable audit files, dry-runs by
+    /// default, and never touches recent/active or unparseable files.
+    #[test]
+    fn cleanup_prunes_old_audit_files_only_and_dry_runs_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit-logs");
+        std::fs::create_dir_all(&audit).unwrap();
+        let old = audit.join("2020-01-01-1-audit.log");
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let recent = audit.join(format!("{today}-1-audit.log"));
+        let unparseable = audit.join("heartbeat.log");
+        std::fs::write(&old, "x").unwrap();
+        std::fs::write(&recent, "y").unwrap();
+        std::fs::write(&unparseable, "z").unwrap();
+
+        let cfg_path = dir.path().join("praxec.yaml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "version: \"1.0.0\"\naudit:\n  sink: file\n  path: \"{}\"\nworkflows: {{}}\n",
+                audit.display()
+            ),
+        )
+        .unwrap();
+
+        // Dry-run (default): reports but deletes nothing.
+        super::run_cleanup(&cfg_path, 30, false).unwrap();
+        assert!(old.exists(), "dry-run must not delete");
+
+        // Force: removes only the old, dateable file.
+        super::run_cleanup(&cfg_path, 30, true).unwrap();
+        assert!(!old.exists(), "old file pruned");
+        assert!(recent.exists(), "recent file kept");
+        assert!(
+            unparseable.exists(),
+            "undateable file never touched (fail-safe)"
+        );
+    }
+
+    /// #14 — a contract-DIRTY but buildable config boots in repair-only mode
+    /// (not aborted, not fully degraded): the server refuses to start a
+    /// non-repair workflow but allows the declared repair surface.
+    #[tokio::test]
+    async fn dirty_config_boots_into_repair_only_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("praxec.yaml");
+        // `flow.normal` carries an unknown executor kind → a load-time
+        // Diagnostic::Error (kind_doctor). `flow.repair` is clean and declared
+        // as the repair surface.
+        let cfg = json!({
+            "version": "1.0.0",
+            "praxec": { "repair_surface": ["flow.repair"] },
+            "workflows": {
+                "flow.repair": {
+                    "initialState": "s",
+                    "states": { "s": { "transitions": {
+                        "go": { "target": "done", "actor": "deterministic" }
+                    }}, "done": { "terminal": true } }
+                },
+                "flow.normal": {
+                    "initialState": "s",
+                    "states": { "s": { "transitions": {
+                        "go": { "target": "done", "actor": "deterministic",
+                                "executor": { "kind": "totally-bogus-kind" } }
+                    }}, "done": { "terminal": true } }
+                }
+            }
+        });
+        std::fs::write(&cfg_path, serde_json::to_string(&cfg).unwrap()).unwrap();
+
+        let overlays = GatewayOverlays::default();
+        let config = crate::gateway_config::load_config(&cfg_path).unwrap();
+        // Boots (does NOT bail) despite the contract error.
+        let bundle = super::build_oneshot_server(&config, &overlays)
+            .await
+            .expect("dirty-but-buildable config boots in repair-only mode, not aborted");
+
+        // A non-repair start is refused with the precise diagnostics.
+        let refused = bundle
+            .server
+            .dispatch_call_with_principal(
+                {
+                    let mut r = rmcp::model::CallToolRequestParams::new("praxec.command");
+                    let mut a = serde_json::Map::new();
+                    a.insert("definitionId".into(), json!("flow.normal"));
+                    a.insert("input".into(), json!({}));
+                    r.arguments = Some(a);
+                    r
+                },
+                praxec_core::model::Principal::anonymous(),
+            )
+            .await
+            .expect("structured response");
+        assert_eq!(
+            refused["error"]["code"], "CONTRACT_DIRTY_REPAIR_ONLY",
+            "resp: {refused:#}"
+        );
+        assert_eq!(refused["repairSurface"][0], "flow.repair");
+
+        // The declared repair surface remains startable.
+        let allowed = bundle
+            .server
+            .dispatch_call_with_principal(
+                {
+                    let mut r = rmcp::model::CallToolRequestParams::new("praxec.command");
+                    let mut a = serde_json::Map::new();
+                    a.insert("definitionId".into(), json!("flow.repair"));
+                    a.insert("input".into(), json!({}));
+                    r.arguments = Some(a);
+                    r
+                },
+                praxec_core::model::Principal::anonymous(),
+            )
+            .await
+            .expect("structured response");
+        assert_ne!(
+            allowed["error"]["code"], "CONTRACT_DIRTY_REPAIR_ONLY",
+            "the repair surface must remain startable: {allowed:#}"
         );
     }
 

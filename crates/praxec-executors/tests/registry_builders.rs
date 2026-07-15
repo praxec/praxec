@@ -16,7 +16,10 @@ use serde_json::json;
 /// (`default_registry_with_late_workflow` registers it; the binary late-binds
 /// the runtime via `WorkflowExecutor::set_runtime`). It must therefore RESOLVE
 /// from the base registry — that resolution is the C1 regression guard.
-const WIRED_ELSEWHERE: &[&str] = &["llm", "agent"];
+/// `inventory` (like `llm`/`agent`) is overlaid by the binary with the live
+/// `DiscoveryIndex` handle — it cannot resolve from the base registry, which has
+/// no discovery index to survey.
+const WIRED_ELSEWHERE: &[&str] = &["llm", "agent", "inventory"];
 
 #[test]
 fn default_registry_resolves_every_base_registered_kind() {

@@ -104,6 +104,34 @@ pub(crate) enum Command {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Prune residual on-disk artifacts left by prior versions / long runs:
+    /// rotated audit-log files whose filename timestamp is older than
+    /// `--older-than-days`. DRY-RUN by default (lists what WOULD be removed);
+    /// pass `--force` to actually delete. Fail-safe: never touches a file whose
+    /// timestamp it cannot parse, and recent/active files are never in range.
+    Cleanup {
+        /// Path to the gateway YAML config (to locate `audit.path`).
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Age threshold in days; audit files older than this are candidates.
+        #[arg(long, default_value_t = 30)]
+        older_than_days: u64,
+        /// Actually delete the listed files (default: dry-run — only report).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Bring every git-backed pack dependency up to latest `main`. Remote
+    /// (`uri:`) repos are refreshed on every load already; this syncs the
+    /// operator's LOCAL (`path:`) repo checkouts — the stale-pack failure mode
+    /// (a checkout left on the wrong branch). Fail-safe: fetches, then
+    /// fast-forwards to `origin/main` ONLY when the working tree is clean and on
+    /// `main`; a dirty tree, a non-`main` branch, or a non-fast-forward is
+    /// reported and left untouched (never destroys local work).
+    Sync {
+        /// Path to the gateway YAML config (its `repos:` declare the deps).
+        #[arg(short, long)]
+        config: PathBuf,
+    },
     /// Inspect a running workflow.
     Inspect {
         #[command(subcommand)]
@@ -480,6 +508,14 @@ pub(crate) struct OneshotServer {
     /// D6 — the loaded `praxec.packs/v3` registry (`None` when unconfigured).
     /// Swapped by `reload_gated` in lockstep with the discovery index it fed.
     pub(crate) swappable_registry: Arc<praxec_core::hot_reload::SwappableRegistry>,
+    /// #14 — the live repair-only gate slot. `Some(gate)` inside when the loaded
+    /// pack is contract-dirty; `serve`'s reload path flips it (clean → clear,
+    /// dirty → set) so the serving posture tracks the on-disk contracts.
+    pub(crate) repair_gate: praxec_mcp_server::RepairGateSlot,
+    /// #11 — the upstream elicitation relay (backed by the same peer slot the
+    /// server captures). `serve`'s reload path re-threads it into each rebuilt
+    /// mcp executor so the relay survives a hot reload.
+    pub(crate) upstream: Arc<dyn praxec_executors::UpstreamElicitor>,
 }
 
 /// Apply every registrar to `base`, folding each result into the next, so the
