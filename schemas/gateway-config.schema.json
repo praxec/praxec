@@ -111,13 +111,39 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": [
-          "path"
-        ],
+        "description": "A declared repo. Exactly one of `path` (local dir) or `uri` (remote git import) is required.",
         "properties": {
           "path": {
             "type": "string",
-            "description": "Directory containing a `praxec.repo.yaml` manifest. Accepts absolute, relative (resolved against the host config's directory), or `~/`-prefixed paths."
+            "description": "Directory containing a `praxec.repo.yaml` manifest (unless `definitions: false`). Accepts absolute, relative (resolved against the host config's directory), or `~/`-prefixed paths."
+          },
+          "uri": {
+            "type": "string",
+            "description": "SPEC §9 — a remote git repo to import (clone/update) into a local cache instead of a local `path`. Exactly one of `path` / `uri` per entry."
+          },
+          "ref": {
+            "type": "string",
+            "description": "Git ref (branch/tag/sha) to pin a `uri` import to. Default `main`."
+          },
+          "writable": {
+            "type": "boolean",
+            "default": false,
+            "description": "SPEC §8.4 — opt this repo in as an authoring write target and a run `repo_root`. Its canonical path is stamped into `/praxec/_writableRepos`."
+          },
+          "push": {
+            "type": "boolean",
+            "default": false,
+            "description": "SPEC §9 — `git push` authored commits after each register. Requires `writable: true`."
+          },
+          "definitions": {
+            "type": "boolean",
+            "default": true,
+            "description": "FB-2 — whether this entry is a definition repo (ships a `praxec.repo.yaml` manifest + layout to load). Default true. `definitions: false` is a bare writable run target: its manifest/layout are NOT loaded (0 definitions) but its canonical `path` is still registered as a writable `repo_root`. A `definitions: false` entry MUST set `writable: true`."
+          },
+          "priority": {
+            "type": "integer",
+            "default": 0,
+            "description": "Spec A §5 — repo priority for `hop_slot:` cap-resolution tie-breaking. Highest wins; an equal-priority tie is a hard load error (HOP_SLOT_AMBIGUOUS)."
           },
           "grant_connections": {
             "type": "array",
@@ -183,6 +209,16 @@
             "type": "string"
           },
           "default": {}
+        },
+        "idleTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-connection inactivity (no-activity) ceiling in ms for each tool call. Inbound MCP bytes reset the window, so a slow-but-alive call survives while a silent one is cut off. Defaults to 30000."
+        },
+        "startupTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "FB-7 — inactivity ceiling in ms for the connect/`initialize` phase specifically. Lets a server that indexes a large repo on cold start (e.g. structureos) get a wider establishment budget without loosening the per-call `idleTimeoutMs`. Defaults to `idleTimeoutMs` (which defaults to 30000)."
         }
       }
     },

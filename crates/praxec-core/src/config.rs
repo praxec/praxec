@@ -2910,6 +2910,7 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
         source,
         writable,
         push,
+        definitions,
         priority,
         grant_connections,
     } in repos
@@ -2935,6 +2936,17 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
                     .with_context(|| format!("importing repo {uri}"))?
             }
         };
+        // FB-2 — a bare writable run target (`definitions: false`) ships no
+        // `praxec.repo.yaml`: skip manifest + layout loading entirely (0
+        // definitions, no namespace, no connections to gate) but STILL register
+        // its canonical path as a writable repo_root so a run can be scoped to
+        // it. The path is validated (canonical + existing dir) downstream by
+        // `RepoRoot::new` when the gateway builds `_writableRepos`.
+        if !definitions {
+            // `parse_repo_entry` already guaranteed `writable` here.
+            writable_repo_roots.push((repo_path.display().to_string(), push));
+            continue;
+        }
         let (manifest, mut repo_value) = crate::repo::load_repo(&repo_path)
             .with_context(|| format!("loading repo at {}", repo_path.display()))?;
         if writable {
@@ -3337,6 +3349,15 @@ struct RepoDecl {
     source: RepoSource,
     writable: bool,
     push: bool,
+    /// FB-2 (SPEC §9) — whether this entry is a **definition repo** (carries a
+    /// `praxec.repo.yaml` manifest + a layout of workflows/skills/scripts to
+    /// load). Default `true`. When `false`, the entry is a bare *writable run
+    /// target*: its manifest + layout are NOT loaded (0 definitions) but its
+    /// canonical `path` is still registered as a writable `repo_root` (so a run
+    /// can be scoped to a plain code checkout that ships no praxec manifest).
+    /// A `definitions: false` entry MUST be `writable: true` — a non-definition,
+    /// non-writable repo contributes nothing and is a config mistake.
+    definitions: bool,
     /// Spec A §5 — repo-priority for `hop_slot:` cap resolution. When multiple
     /// declared repos provide the same `cap.<slot>.<stack>`, the highest
     /// `priority` wins; an equal-priority tie is a hard load error
@@ -3433,6 +3454,25 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
              only a writable repo has authored commits to push."
         );
     }
+    // FB-2 — a repo defaults to a DEFINITION repo (manifest + layout loaded).
+    // `definitions: false` opts out: a bare writable run target that ships no
+    // `praxec.repo.yaml`. It contributes nothing unless it is a write target,
+    // so require `writable: true` (poka-yoke against a silently inert entry).
+    let definitions = match entry.get("definitions") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(b)) => *b,
+        Some(other) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}].definitions` must be a boolean ({})",
+            short_value_kind(other)
+        ),
+    };
+    if !definitions && !writable {
+        bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}]` sets `definitions: false` without \
+             `writable: true` — a non-definition repo that is not a write target contributes \
+             nothing. Add `writable: true` (a bare writable run target) or remove the entry."
+        );
+    }
     // Spec A §5 — optional numeric `priority:` (default 0) breaks `hop_slot:`
     // cap-resolution ties between repos providing the same `cap.<slot>.<stack>`.
     let priority = match entry.get("priority") {
@@ -3500,6 +3540,7 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
         source,
         writable,
         push,
+        definitions,
         priority,
         grant_connections,
     })

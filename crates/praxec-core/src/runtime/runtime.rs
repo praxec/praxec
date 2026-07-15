@@ -210,14 +210,20 @@ impl WorkflowRuntime {
     /// Resolve the mandatory run `repo_root` for a top-level start from the
     /// config-declared writable repos (v0.0.21):
     /// - 0 declared → fail fast (a run requires a repo_root);
-    /// - exactly 1 → use it (a `selector` naming it is accepted, anything else
-    ///   rejected);
-    /// - N declared → require `selector` to name one of them, else fail listing
-    ///   the choices.
+    /// - exactly 1 → use it (a `selector` naming it — or a subpath of it — is
+    ///   accepted, anything else rejected);
+    /// - N declared → require `selector` to name one of them (or a subpath),
+    ///   else fail listing the choices.
     ///
-    /// The selector matches a declared root by its canonical path string only —
-    /// arbitrary free-text paths are never accepted, so a caller (or an LLM)
-    /// cannot inject a hallucinated root.
+    /// The selector resolves against the declared roots by canonical path:
+    /// either the exact canonical path of a declared root, OR (FB-3) a
+    /// **worktree / subpath UNDER** a declared root — so an operator can scope a
+    /// run to a git worktree or subdirectory of an already-declared repo without
+    /// pre-declaring every such path. Still bounded by the allowlist: a selector
+    /// that canonicalizes to a path outside *every* declared root is rejected, so
+    /// a caller (or an LLM) can never inject a hallucinated / out-of-tree root.
+    /// This is the same invariant `flow.drive-program`'s per-spawn `repoRoot`
+    /// override enforces, now available at top-level `start`.
     pub fn resolve_run_repo_root(
         &self,
         selector: Option<&str>,
@@ -230,18 +236,38 @@ impl WorkflowRuntime {
             );
         }
         match selector {
-            Some(sel) => roots
-                .iter()
-                .find(|r| r.as_str() == sel)
-                .cloned()
-                .ok_or_else(|| {
+            Some(sel) => {
+                // Fast path: an exact match against a declared canonical root —
+                // no filesystem touch.
+                if let Some(r) = roots.iter().find(|r| r.as_str() == sel) {
+                    return Ok(r.clone());
+                }
+                // FB-3: the selector may be a worktree / subpath under a declared
+                // root. Canonicalize it (this asserts it is an absolute, existing
+                // directory) and accept it only if it lies within a declared root.
+                let candidate = crate::run_env::RepoRoot::new(sel).map_err(|e| {
                     let choices: Vec<&str> = roots.iter().map(|r| r.as_str()).collect();
                     anyhow::anyhow!(
-                        "REPO_ROOT_UNKNOWN: `{sel}` is not a declared writable repo root. \
-                         Choose one of: {}",
+                        "REPO_ROOT_UNKNOWN: `{sel}` is neither a declared writable repo root nor \
+                         a resolvable directory under one ({e}). Declared roots: {}",
                         choices.join(", ")
                     )
-                }),
+                })?;
+                // `Path::starts_with` is component-wise, so `/repo-foo` does NOT
+                // match declared `/repo` — no string-prefix false positives.
+                if roots
+                    .iter()
+                    .any(|r| candidate.as_path().starts_with(r.as_path()))
+                {
+                    return Ok(candidate);
+                }
+                let choices: Vec<&str> = roots.iter().map(|r| r.as_str()).collect();
+                anyhow::bail!(
+                    "REPO_ROOT_OUTSIDE_ALLOWLIST: `{sel}` resolves to `{candidate}`, which is not \
+                     under any declared writable repo root. Choose a path within one of: {}",
+                    choices.join(", ")
+                )
+            }
             None if roots.len() == 1 => Ok(roots[0].clone()),
             None => {
                 let choices: Vec<&str> = roots.iter().map(|r| r.as_str()).collect();
@@ -1367,5 +1393,115 @@ mod reap_tests {
                 .cancelled_at
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod repo_root_resolution_tests {
+    //! FB-3 — a top-level `start` `repoRoot` selector resolves to a declared
+    //! writable root OR a worktree/subpath under one, still bounded by the
+    //! allowlist.
+    use super::*;
+    use crate::audit::{AuditSink, MemoryAuditSink};
+    use crate::guards::DefaultGuardEvaluator;
+    use crate::run_env::RepoRoot;
+    use crate::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    struct EmptyRegistry;
+    impl ExecutorRegistry for EmptyRegistry {
+        fn get(&self, _kind: &str) -> Option<Arc<dyn Executor>> {
+            None
+        }
+    }
+
+    fn runtime_with_roots(roots: Vec<RepoRoot>) -> WorkflowRuntime {
+        let defs = Arc::new(ConfigDefinitionStore::from_config(&json!({
+            "version": "1.0.0", "workflows": {}
+        })));
+        WorkflowRuntime::new(
+            defs,
+            Arc::new(InMemoryWorkflowStore::new()),
+            Arc::new(EmptyRegistry),
+            Arc::new(DefaultGuardEvaluator::new()),
+            Arc::new(MemoryAuditSink::new()) as Arc<dyn AuditSink>,
+        )
+        .with_writable_repo_roots(roots)
+    }
+
+    #[test]
+    fn exact_declared_root_resolves() {
+        let td = tempfile::TempDir::new().unwrap();
+        let root = RepoRoot::new(td.path()).unwrap();
+        let rt = runtime_with_roots(vec![root.clone()]);
+        let got = rt.resolve_run_repo_root(Some(root.as_str())).unwrap();
+        assert_eq!(got, root);
+    }
+
+    #[test]
+    fn subpath_of_a_declared_root_resolves_to_that_subpath() {
+        // A git-worktree-like subdirectory under a declared root. It is NOT
+        // pre-declared, but resolves because it lies within the allowlist.
+        let td = tempfile::TempDir::new().unwrap();
+        let root = RepoRoot::new(td.path()).unwrap();
+        let sub = td.path().join("worktrees").join("feature-x");
+        std::fs::create_dir_all(&sub).unwrap();
+        let rt = runtime_with_roots(vec![root.clone()]);
+        let got = rt
+            .resolve_run_repo_root(Some(sub.to_str().unwrap()))
+            .expect("a subpath of a declared root resolves");
+        // The resolved root is the subpath itself, canonicalized.
+        assert_eq!(got.as_path(), std::fs::canonicalize(&sub).unwrap());
+        // …and it is genuinely under the declared root.
+        assert!(got.as_path().starts_with(root.as_path()));
+    }
+
+    #[test]
+    fn path_outside_every_declared_root_is_rejected() {
+        let declared = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap(); // a sibling temp dir
+        let root = RepoRoot::new(declared.path()).unwrap();
+        let rt = runtime_with_roots(vec![root]);
+        let err = rt
+            .resolve_run_repo_root(Some(outside.path().to_str().unwrap()))
+            .expect_err("an out-of-tree path must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("REPO_ROOT_OUTSIDE_ALLOWLIST"),
+            "expected allowlist rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn nonexistent_selector_is_rejected_as_unknown() {
+        let td = tempfile::TempDir::new().unwrap();
+        let root = RepoRoot::new(td.path()).unwrap();
+        let rt = runtime_with_roots(vec![root]);
+        let err = rt
+            .resolve_run_repo_root(Some("/definitely/not/here/praxec-fb3-xyz"))
+            .expect_err("a non-existent selector must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("REPO_ROOT_UNKNOWN"),
+            "expected unknown-root rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn sibling_with_shared_string_prefix_is_not_a_subpath() {
+        // `/tmp/repo-foo` must NOT be treated as under declared `/tmp/repo`:
+        // component-wise `starts_with`, not string-prefix.
+        let base = tempfile::TempDir::new().unwrap();
+        let declared = base.path().join("repo");
+        let sibling = base.path().join("repo-foo");
+        std::fs::create_dir_all(&declared).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let root = RepoRoot::new(&declared).unwrap();
+        let rt = runtime_with_roots(vec![root]);
+        let err = rt
+            .resolve_run_repo_root(Some(sibling.to_str().unwrap()))
+            .expect_err("a string-prefix sibling must not resolve");
+        assert!(format!("{err:#}").contains("REPO_ROOT_OUTSIDE_ALLOWLIST"));
     }
 }
