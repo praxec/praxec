@@ -121,7 +121,8 @@ fn build(test_results: &[RunnerResult]) -> (WorkflowRuntime, Arc<MemoryAuditSink
         executors,
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     (runtime, audit)
 }
 
@@ -135,8 +136,7 @@ async fn start(runtime: &WorkflowRuntime) -> (String, u64, Value) {
                 "runner_path": "/dev/null",
             }),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

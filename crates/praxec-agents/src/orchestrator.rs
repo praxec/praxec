@@ -1511,8 +1511,7 @@ mod tests {
                 definition_id: "demo".to_string(),
                 input: serde_json::json!({}),
                 principal: Principal::anonymous(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 depth: 0,
                 parent: None,
             })

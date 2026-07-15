@@ -77,8 +77,7 @@ async fn run_cap_directly(executor_output: Value) -> Value {
             definition_id: "cap.verify.thing".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -154,8 +153,7 @@ async fn the_violation_is_recorded_as_a_cap_output_schema_violation_event() {
             definition_id: "cap.verify.thing".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -217,8 +215,7 @@ async fn a_deterministically_repairable_null_output_does_not_fail_the_terminal_c
             definition_id: "cap.review.thing".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -266,8 +263,7 @@ async fn a_cap_declaring_no_outputs_is_untouched() {
             definition_id: "cap.record.thing".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

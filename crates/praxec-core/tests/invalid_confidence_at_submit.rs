@@ -80,6 +80,7 @@ fn build_runtime(executor: Arc<dyn Executor>) -> WorkflowRuntime {
         guards,
         audit,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
 }
 
 #[tokio::test]
@@ -90,8 +91,7 @@ async fn out_of_range_negative_confidence_rejects_with_invalid_confidence() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -129,8 +129,7 @@ async fn out_of_range_above_one_confidence_rejects_with_invalid_confidence() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -164,8 +163,7 @@ async fn in_range_confidence_passes_through() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

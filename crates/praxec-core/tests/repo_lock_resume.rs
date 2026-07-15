@@ -93,6 +93,7 @@ fn rt(
         Arc::new(DefaultGuardEvaluator::new()),
         audit as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_repo_locks(locks)
     .with_lock_scheduler(sched)
 }
@@ -103,8 +104,7 @@ async fn start(r: &WorkflowRuntime) -> (String, u64) {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

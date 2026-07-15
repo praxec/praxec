@@ -83,7 +83,8 @@ pub fn build_runtime(
         inner: Arc::new(NoopExecutor),
     });
     let guards = Arc::new(DefaultGuardEvaluator::new());
-    let runtime = WorkflowRuntime::new(definitions, store.clone(), executors, guards, audit);
+    let runtime = WorkflowRuntime::new(definitions, store.clone(), executors, guards, audit)
+        .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     (runtime, store)
 }
 

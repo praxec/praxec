@@ -44,7 +44,7 @@ impl WorkflowStore for InMemoryWorkflowStore {
         if g.contains_key(&instance.id) {
             bail!("workflow id collision: {}", instance.id);
         }
-        if let Some(rid) = &instance.run_id {
+        if let Some(rid) = &instance.run_env.run_id {
             // Hold the run_id index lock across the check AND the insert so the
             // uniqueness check is atomic: two concurrent creates with the same
             // run_id can't both pass the check (closing the start-path TOCTOU).
@@ -523,8 +523,11 @@ mod tests {
             input: serde_json::json!({}),
             context: serde_json::json!({}),
             started_at: chrono::Utc::now(),
-            trace_id: None,
-            run_id: run_id.map(str::to_string),
+            run_env: crate::RunEnv::new(
+                crate::RepoRoot::for_test(),
+                run_id.map(str::to_string),
+                None,
+            ),
             cancelled_at: None,
             cancelled_reason: None,
             depth: 0,

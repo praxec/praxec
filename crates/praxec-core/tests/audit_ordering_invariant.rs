@@ -135,7 +135,8 @@ fn build_runtime() -> (WorkflowRuntime, Arc<MemoryAuditSink>) {
         executors,
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     (runtime, audit)
 }
 
@@ -148,8 +149,7 @@ async fn submit_emits_audit_events_in_record_first_order() {
             definition_id: "pipeline".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

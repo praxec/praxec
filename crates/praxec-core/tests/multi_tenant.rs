@@ -95,6 +95,7 @@ fn build_runtime() -> WorkflowRuntime {
         guards,
         audit,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence)
 }
 
@@ -143,8 +144,7 @@ async fn admin_sees_admin_links() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: admin(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -166,8 +166,7 @@ async fn admin_does_not_see_user_links() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: admin(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -189,8 +188,7 @@ async fn user_sees_user_links() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: user(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -212,8 +210,7 @@ async fn user_does_not_see_admin_links() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: user(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -235,8 +232,7 @@ async fn writer_sees_write_action() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: writer(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -258,8 +254,7 @@ async fn anonymous_sees_no_links() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -281,8 +276,7 @@ async fn admin_can_submit_admin_action() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: admin(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -318,8 +312,7 @@ async fn user_cannot_submit_admin_action() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: admin(), // Start as admin so the link exists
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -357,8 +350,7 @@ async fn link_filter_by_guards_respects_principal() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: admin(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -372,8 +364,7 @@ async fn link_filter_by_guards_respects_principal() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: user(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -387,8 +378,7 @@ async fn link_filter_by_guards_respects_principal() {
             definition_id: "tenant_demo".to_string(),
             input: json!({}),
             principal: writer(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -437,8 +427,7 @@ async fn all_of_guard_respects_principal() {
             definition_id: "all_of_demo".to_string(),
             input: json!({}),
             principal: admin(), // admin role + write permission
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -457,8 +446,7 @@ async fn all_of_guard_respects_principal() {
             definition_id: "all_of_demo".to_string(),
             input: json!({}),
             principal: user(), // user role, read permission only
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

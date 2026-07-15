@@ -65,6 +65,7 @@ fn build_runtime() -> WorkflowRuntime {
         guards,
         audit,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence)
 }
 
@@ -85,8 +86,7 @@ async fn drain_rejects_new_workflows() {
             definition_id: "drain_demo".to_string(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -108,8 +108,7 @@ async fn drain_allows_inflight_submit_and_get() {
             definition_id: "drain_demo".to_string(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

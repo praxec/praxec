@@ -133,7 +133,8 @@ fn build_runtime() -> (WorkflowRuntime, Arc<InMemoryWorkflowStore>) {
         registry,
         guards,
         audit as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     workflow_handle.set_runtime(runtime.clone());
 
     (runtime, store)
@@ -212,8 +213,7 @@ async fn sequential_subworkflow_leaves_spawn_fresh_children() {
             definition_id: "parent".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

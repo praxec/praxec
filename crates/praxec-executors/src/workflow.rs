@@ -52,6 +52,7 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
+use praxec_core::RunEnv;
 use praxec_core::audit::{AuditEvent, AuditSink};
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{
@@ -249,6 +250,7 @@ impl Executor for WorkflowExecutor {
                             &request.arguments,
                             &request.workflow.context,
                             &request.workflow.input,
+                            Some(&request.workflow.run_env),
                         ))
                     }
                     None => {
@@ -257,7 +259,12 @@ impl Executor for WorkflowExecutor {
                             .get("input")
                             .cloned()
                             .unwrap_or_else(|| json!({}));
-                        resolve_input(&input, &request.workflow.context, &request.arguments)?
+                        resolve_input(
+                            &input,
+                            &request.workflow.context,
+                            &request.arguments,
+                            Some(&request.workflow.run_env),
+                        )?
                     }
                 };
 
@@ -285,8 +292,14 @@ impl Executor for WorkflowExecutor {
                         definition_id: definition_id.clone(),
                         input: sub_input,
                         principal: Principal::anonymous(),
-                        trace_id: None,
-                        run_id: None,
+                        // Inherit the parent's run-ambient env verbatim: the
+                        // child operates on the SAME repo root, and the run/trace
+                        // correlation must survive the spawn (the former
+                        // `trace_id: None, run_id: None` here silently reset
+                        // correlation at every sub-workflow boundary). This
+                        // structural inheritance is what makes a coding leaf get
+                        // the real root with zero hand-threaded `repo_path`.
+                        run_env: request.workflow.run_env.clone(),
                         // Stamp the child one level deeper than this parent so
                         // the recursion guard sees an accurate depth even when
                         // the child is driven on a different task.
@@ -651,6 +664,7 @@ fn resolve_input(
     input: &Value,
     context: &Value,
     arguments: &Value,
+    run_env: Option<&RunEnv>,
 ) -> Result<Value, ExecutorError> {
     match input {
         Value::String(s) if s.starts_with("$.") => {
@@ -658,7 +672,7 @@ fn resolve_input(
             // resolve used to seed the child with null (with a warn). That silently
             // hands the child a wrong (null) input. Fail fast — a `$.`-rooted input
             // that doesn't resolve is an authoring bug, not a null seed.
-            praxec_core::mapping::read_in_scopes(s, arguments, context, &json!({}), None)
+            praxec_core::mapping::read_in_scopes(s, arguments, context, &json!({}), None, run_env)
                 .ok_or_else(|| {
                     ExecutorError::Permanent(format!(
                         "SUBWORKFLOW_INPUT_UNRESOLVED: legacy `input:` reference '{s}' did not \
@@ -670,7 +684,7 @@ fn resolve_input(
         Value::Object(map) => {
             let mut resolved = serde_json::Map::new();
             for (k, v) in map {
-                resolved.insert(k.clone(), resolve_input(v, context, arguments)?);
+                resolved.insert(k.clone(), resolve_input(v, context, arguments, run_env)?);
             }
             Ok(Value::Object(resolved))
         }

@@ -27,8 +27,7 @@ async fn invariant_4_executor_failure_yields_failed_not_advanced_state() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -66,8 +65,7 @@ async fn invariant_5_invalid_transitions_return_current_links() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -112,8 +110,7 @@ async fn invariant_6_stale_expected_version_is_rejected() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -148,8 +145,7 @@ async fn invariant_7_successful_transition_increments_version() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -188,8 +184,7 @@ async fn invariant_8_terminal_state_has_no_links() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -233,8 +228,7 @@ async fn invariant_10_unknown_transition_does_not_invoke_executor() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

@@ -10,6 +10,87 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+## [0.0.21] — 2026-07-15 — run-ambient repo root + path-grounding gate
+
+Dogfooding 0.0.20's delivery flows surfaced a blocker class: a coding agent leaf
+got an **empty filesystem root** because `repo_path` was never hand-threaded
+through a sub-workflow's `use.inputs`, so it burned its full step budget writing
+nothing. That was a **plumbing** failure — a string that didn't get threaded —
+not a reasoning one, so the fix is structural, not a smarter prompt. This release
+makes the run's repo root **run-ambient**: a structurally-guaranteed, contained
+write root established once at the boundary and propagated through every spawn, so
+a coding leaf can never be handed a missing root and can never write outside it.
+
+Two **independent** mechanisms ship together, with deliberately distinct jobs —
+they are not two halves of one anti-hallucination trick:
+
+- **`repo_root` is containment + guaranteed presence.** Its value is that it is
+  always there (no un-threaded string to forget) and that it is a wall a run
+  cannot write past — which matters most for untrusted, sandboxed write agents.
+  It is *not* a scoping hint that keeps a model "on track"; a model that needs to
+  focus on one area is told so in its prompt.
+- **`path_grounding` is the anti-hallucination gate.** It deterministically
+  checks that the paths a plan actually names exist under the root before a human
+  sign-off. This is the piece that catches an *invented* path.
+
+### Added — mandatory run-ambient `repo_root` (`$.run.repo_root`)
+
+- New typed `RepoRoot` (a canonical, absolute, existing directory — illegal
+  states unrepresentable) carried on a `RunEnv` that also holds the run/trace
+  correlation ids. `RunEnv` rides the same structural rail as `depth`:
+  established at `workflow.start`, persisted on the instance, and propagated
+  **parent → child at every `kind: workflow` spawn** (which previously reset
+  `run_id`/`trace_id` to `None`, breaking correlation across a run tree).
+- Templates resolve `$.run.repo_root` in both scope systems (goal/tool strings
+  and executor arg/prompt/body rendering). A coding leaf's file tool is now
+  `file:{{ $.run.repo_root }}` — always resolves, so there is no un-threaded
+  path to forget.
+- The root is sourced at the boundary from the config's declared **writable
+  repos** (never a free-text path an agent could invent): one writable repo is
+  used automatically; multiple require a `repoRoot` selector on `start`; none
+  declared → `start` fails fast (`REPO_ROOT_REQUIRED`). Every deployment now
+  declares ≥1 `writable: true` repo.
+- **`repo_root` is the *containment boundary* — declare the whole writable repo,
+  not a subdirectory.** It is the outer wall, meant to be broad; narrowing a
+  monorepo run to one sub-app is a *focus* concern (handled today by the agent's
+  prompt), not a job for the root. A future `workdir` cursor *inside* the root
+  will make focus structural without shrinking reach — so that shared-package
+  reads and legitimate cross-directory edits are never walled off, and
+  `path_grounding` (which grounds under the root) never false-blocks a real
+  sibling path. Declaring a subdirectory as the writable repo to fake focus is
+  unsupported: the git commit/push path resolves the enclosing `.git`, so a
+  sub-repo root breaks it.
+
+### Added — `path_grounding` gate (#7)
+
+A deterministic, fail-closed executor that checks every file path an agent
+referenced in a plan actually exists under the run's `repo_root` **before** a
+human sign-off — catching invented paths (e.g. a plan naming
+`src/sysadmin/.../CatalogView.tsx` when the tree has
+`src/_components/tools/SysadminSignalCatalog/`). Data-driven via `groundedPaths`
+context pointers; edit-targets must exist, optional `createPaths` need only their
+parent dir; a `..`/absolute escape is a distinct hard refusal. A missing path
+fails the chain (`PATH_NOT_GROUNDED`) so the instance never advances past the
+gate. `resolve_under` is lifted to a shared `praxec-core::path_safety` module
+used by both the gate and the file-edit tool host.
+
+### Added — dispatch-time fail-fast for an unresolved file root
+
+If an agent leaf's `file:` connection renders to a non-absolute root (an
+un-migrated `file:{{ $.workflow.input.repo_path }}` with no `repo_path`), the
+executor now refuses to dispatch (`FILE_TOOL_ROOT_UNRESOLVED`) **before** spending
+any step budget — converting the silent budget-burn defect into an instant
+diagnostic. The prevention half (a mandatory root that always resolves) plus this
+detection half close the class.
+
+### Changed
+
+- `WorkflowInstance` / `StartWorkflow` carry `run_env` in place of the standalone
+  `trace_id` / `run_id` fields. **Breaking for durable stores**: `run_env` has no
+  serde default, so a pre-0.0.21 persisted instance fails to deserialize — a
+  documented store-wipe on upgrade (greenfield, dev-tier stores). The sqlite
+  run-id index/query now reads `$.run_env.run_id`.
+
 ## [0.0.20] — 2026-07-14 — observability, HITL, and contract-clean gating
 
 A consumer-dogfooding release: driving 0.0.19 to mint and deliver real workflows

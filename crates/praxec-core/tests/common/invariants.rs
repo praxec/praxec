@@ -96,7 +96,8 @@ pub fn build_runtime(
         executors,
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     (runtime, executor, audit)
 }
 

@@ -44,7 +44,8 @@ fn server_with_sink(audit: Arc<dyn AuditSink>) -> PraxecServer {
     let defs = Arc::new(ConfigDefinitionStore::from_config(&resolved));
     let store = Arc::new(InMemoryWorkflowStore::new());
     let guards = Arc::new(DefaultGuardEvaluator::new());
-    let runtime = WorkflowRuntime::new(defs, store, Arc::new(NoopRegistry), guards, audit);
+    let runtime = WorkflowRuntime::new(defs, store, Arc::new(NoopRegistry), guards, audit)
+        .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     PraxecServer::new(runtime)
 }
 

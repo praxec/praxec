@@ -21,6 +21,15 @@ gateway:
     subject: operator
     roles: [human]
 
+# v0.0.21 — every run carries a mandatory repo_root, resolved from a declared
+# writable repo. This self-contained fixture operates on the gateway's working
+# directory (canonicalized at start); `hello_flow` writes nothing to it, it only
+# needs a real root to exist.
+praxec:
+  _writableRepos:
+    - root: "."
+      push: false
+
 workflows:
   hello_flow:
     initialState: start

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use praxec_core::RunEnv;
 #[cfg(test)]
 use praxec_core::audit::AuditSink;
 use praxec_core::model::{Principal, SubmitTransition, WorkflowInstance};
@@ -117,8 +118,7 @@ async fn submit_isolated_inner(
         input,
         context,
         started_at: chrono::Utc::now(),
-        trace_id: None,
-        run_id: None,
+        run_env: RunEnv::for_test(),
         depth: 0,
         cancelled_at: None,
         cancelled_reason: None,

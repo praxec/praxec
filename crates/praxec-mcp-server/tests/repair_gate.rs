@@ -62,7 +62,8 @@ async fn gated_server() -> PraxecServer {
         Arc::new(NoopRegistry),
         guards,
         audit as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     let gate = RepairGate {
         diagnostics: vec![
             "USE_BINDING_CONTRACT_DRIFT: workflow 'flow.normal' … maps `use.inputs.filter` …"

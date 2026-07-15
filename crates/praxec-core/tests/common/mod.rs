@@ -127,7 +127,8 @@ impl Scenario {
             executors,
             guards,
             audit.clone() as Arc<dyn AuditSink>,
-        );
+        )
+        .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
         let runtime = if with_evidence {
             runtime.with_evidence(evidence)
         } else {
@@ -148,8 +149,7 @@ impl Scenario {
                 definition_id: def.to_string(),
                 input,
                 principal,
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 depth: 0,
                 parent: None,
             })

@@ -70,7 +70,8 @@ fn build_runtime() -> (WorkflowRuntime, Arc<MemoryAuditSink>) {
         executors,
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     (runtime, audit)
 }
 
@@ -86,8 +87,7 @@ async fn submit_with_summary_stores_and_surfaces() {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -133,8 +133,7 @@ async fn get_after_summary_submit_returns_summary() {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -186,8 +185,7 @@ async fn summary_persists_when_omitted_on_subsequent_submit() {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -245,8 +243,7 @@ async fn later_summary_overwrites_earlier() {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

@@ -1189,6 +1189,7 @@ fn resolve_branches(
                 &request.workflow.context,
                 &request.workflow.input,
                 None,
+                Some(&request.workflow.run_env),
             )
             .ok_or_else(|| {
                 ExecutorError::Permanent(format!(

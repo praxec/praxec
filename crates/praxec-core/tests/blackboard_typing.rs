@@ -68,7 +68,8 @@ fn build_runtime(config: Value, executor_output: Value) -> (WorkflowRuntime, Arc
         executors,
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     (runtime, audit)
 }
 
@@ -109,8 +110,7 @@ async fn typed_slot_mismatch_aborts_with_blackboard_type_error() {
             definition_id: "ci".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -192,8 +192,7 @@ async fn typed_slot_conforming_value_advances_transition() {
             definition_id: "ci".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -261,8 +260,7 @@ async fn bare_name_slot_accepts_any_value() {
             definition_id: "ci".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

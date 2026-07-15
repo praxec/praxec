@@ -73,6 +73,7 @@ fn build_runtime(config: Value, executor_output: Value) -> WorkflowRuntime {
         guards,
         audit as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
 }
 
 /// The registered inner schema for a `finding.fix` payload (Spec A.1 §2.3).
@@ -142,8 +143,7 @@ async fn start_and_submit(runtime: &WorkflowRuntime) -> Value {
             definition_id: "sdlc".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

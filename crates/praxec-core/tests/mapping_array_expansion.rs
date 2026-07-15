@@ -31,6 +31,7 @@ fn wildcard_projects_each_element_field() {
         &context,
         &no_input(),
         None,
+        None,
     )
     .expect("path resolves");
     assert_eq!(v, json!([true, false, true]));
@@ -46,6 +47,7 @@ fn wildcard_with_no_suffix_returns_array_clone() {
         &no_args(),
         &context,
         &no_input(),
+        None,
         None,
     )
     .expect("resolves");
@@ -63,6 +65,7 @@ fn wildcard_on_empty_array_returns_empty_array() {
         &context,
         &no_input(),
         None,
+        None,
     )
     .expect("resolves");
     assert_eq!(v, json!([]));
@@ -78,6 +81,7 @@ fn wildcard_on_non_array_returns_none() {
         &no_args(),
         &context,
         &no_input(),
+        None,
         None,
     );
     assert_eq!(v, None);
@@ -100,6 +104,7 @@ fn wildcard_with_nested_suffix_projects_nested_field() {
         &context,
         &no_input(),
         None,
+        None,
     )
     .expect("resolves");
     assert_eq!(v, json!([90, 85, 95]));
@@ -121,6 +126,7 @@ fn nested_wildcards_recurse_through_inner_array() {
         &context,
         &no_input(),
         None,
+        None,
     )
     .expect("resolves");
     // Top-level [*] projects each group; for each group, the inner
@@ -138,6 +144,7 @@ fn non_wildcard_path_unchanged_after_extension() {
         &no_args(),
         &context,
         &no_input(),
+        None,
         None,
     )
     .expect("resolves");
@@ -161,6 +168,7 @@ fn wildcard_works_against_output_scope() {
         &json!({}),
         &no_input(),
         Some(&output),
+        None,
     )
     .expect("resolves");
     assert_eq!(v, json!([true, true, false]));
@@ -176,6 +184,7 @@ fn wildcard_on_missing_prefix_returns_none() {
         &no_args(),
         &context,
         &no_input(),
+        None,
         None,
     );
     assert_eq!(v, None);
@@ -196,6 +205,7 @@ fn missing_field_per_element_becomes_null_in_result() {
         &no_args(),
         &context,
         &no_input(),
+        None,
         None,
     )
     .expect("resolves");

@@ -18,8 +18,11 @@ fn instance(id: &str, run_id: &str) -> WorkflowInstance {
         input: json!({}),
         context: json!({}),
         started_at: chrono::Utc::now(),
-        trace_id: None,
-        run_id: Some(run_id.to_string()),
+        run_env: praxec_core::RunEnv::new(
+            praxec_core::RepoRoot::for_test(),
+            Some(run_id.to_string()),
+            None,
+        ),
         cancelled_at: None,
         cancelled_reason: None,
         depth: 0,

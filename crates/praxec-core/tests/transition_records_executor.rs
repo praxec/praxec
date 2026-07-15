@@ -47,8 +47,7 @@ async fn executor_descriptor_carries_kind_ok_and_duration_ms() {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -114,8 +113,7 @@ async fn executor_descriptor_omitted_when_no_executor_runs() {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

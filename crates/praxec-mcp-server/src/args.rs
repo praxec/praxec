@@ -61,6 +61,11 @@ pub(crate) struct StartArgs {
     /// SPEC §20.2 — optional run id for grouping related workflow
     /// instances. Opaque to the gateway.
     pub run_id: Option<String>,
+    /// v0.0.21 — selects which declared writable repo becomes this run's
+    /// mandatory `repo_root` when more than one is configured. Must match a
+    /// declared writable root exactly (never an arbitrary path). Omit when a
+    /// single writable repo is declared (it is used automatically).
+    pub repo_root: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]

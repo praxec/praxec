@@ -86,7 +86,8 @@ fn build_runtime(
         placeholder,
         guards.clone(),
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
 
     let resolver: Arc<dyn TransitionResolver> =
         Arc::new(RuntimeTransitionResolver::new(prelim_runtime));
@@ -101,7 +102,8 @@ fn build_runtime(
         noop: Arc::new(NoopExecutor),
     });
 
-    let runtime = WorkflowRuntime::new(definitions, store, registry, guards, audit.clone());
+    let runtime = WorkflowRuntime::new(definitions, store, registry, guards, audit.clone())
+        .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     (runtime, audit, factory)
 }
 
@@ -283,8 +285,7 @@ async fn start_workflow(runtime: &WorkflowRuntime, definition_id: &str) -> (Stri
             definition_id: definition_id.into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -992,8 +993,7 @@ async fn audit_failure_on_successful_turn_is_retryable() {
             input: json!({}),
             context: json!({}),
             started_at: chrono::Utc::now(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             cancelled_at: None,
             cancelled_reason: None,
             depth: 0,
