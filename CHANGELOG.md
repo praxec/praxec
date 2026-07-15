@@ -8,7 +8,19 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
-## [Unreleased]
+## [0.0.23] — 2026-07-15 — dogfood ergonomics: writable code targets, worktree selectors, honest reload
+
+An ergonomics + fail-loud release driven entirely by dogfooding praxec as the
+implementation engine for a real external code repo (a C# checkout on a git
+worktree). Every change below closes a silent-drift or foot-gun that surfaced in
+one real setup+run session: `reload` that looked fine but didn't rewire the
+writable set, a writable code target forced to carry a definition manifest,
+worktree fan-out that forced pre-declaring every worktree, a connection reaped
+mid-scan by a fixed idle timeout, declared connections invisible to discovery,
+and `doctor` passing a config whose enabled feature had no model. The praise
+item (fail-closed honesty on an unresolved root) was preserved, not weakened —
+the theme is moving that same rejection *earlier* and making the happy paths
+ergonomic.
 
 ### Fixed — `reload` now rewires the writable repo set (FB-1, dogfood find)
 
@@ -42,6 +54,47 @@ won't load, or no binding for the affinity) it fails with `AUTO_DRIVE_NO_MODEL`
 naming the affinity and the exact fix — the model analog of `REPO_ROOT_REQUIRED`.
 Generalizes `doctor` from "validate the artifacts present" to "validate the
 dependencies of enabled features."
+
+### Added — a writable code target no longer needs a `praxec.repo.yaml` (FB-2, dogfood find)
+
+`repos:` conflated "definition-providing pack" with "writable code target," so a
+real code repo (no praxec manifest) hard-failed at config load
+(`reading repo manifest <target>/praxec.repo.yaml: No such file or directory`) —
+the workaround was to plant a dummy manifest inside the checkout and git-exclude
+it, a foot-gun one `git add -A` away from a PR. A `repos:` entry may now set
+`definitions: false` (default `true`): it skips manifest + layout loading
+entirely but still registers the canonical path as a writable `repo_root`.
+Requires `writable: true` on the same entry (a non-writable, non-definition repo
+would be inert) — rejected loud otherwise.
+
+### Added — `start`'s `repoRoot` selector resolves worktrees under a declared root (FB-3, dogfood find)
+
+To run N parallel single-run flows on N git worktrees, the operator previously
+had to pre-declare all N as `writable: true` repos. A `start` `repoRoot` selector
+now also resolves to a **subpath of an already-declared writable root** (e.g. a
+worktree checkout under it), so one declaration + a per-call worktree path covers
+fan-out — matching the per-spawn `repoRoot` override `flow.drive-program` already
+threads. Containment is component-wise (`Path::starts_with`, not string-prefix,
+so `/repo-foo` is not "under" `/repo`); a path outside every declared root is
+rejected `REPO_ROOT_OUTSIDE_ALLOWLIST` and an unknown selector `REPO_ROOT_UNKNOWN`.
+Still an allowlist — never arbitrary free-text roots.
+
+### Fixed — declared `connections:` are indexed in the default discovery surface (FB-6, dogfood find)
+
+`discovery.include` defaulted to `["proxy", "workflows"]` while the docs promised
+connections were searchable — a doc-vs-code drift that left a declared `kind: mcp`
+connection absent from capability search (`praxec_query` returned no match for a
+tool that was configured). The default is now `["proxy", "workflows", "connections"]`,
+so declared connections are discoverable out of the box.
+
+### Added — per-connection `startupTimeoutMs` (FB-7, dogfood find)
+
+A slow deterministic MCP whose first output legitimately takes longer than the
+30 s idle timeout (a repo scan) was reaped mid-work
+(`idle for 30000ms with no activity`). A connection may now declare a distinct
+`startupTimeoutMs` bounding the connect/initialize phase separately from
+steady-state idle; resolution falls back `startupTimeoutMs → idleTimeoutMs → 30s`,
+so long-starting scanners aren't killed before they produce anything.
 
 ## [0.0.22] — 2026-07-15 — hardening release: scope parity, cross-repo routing, and invariant proofs
 
