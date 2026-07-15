@@ -383,6 +383,90 @@ fn repos_default_to_read_only_with_no_writable_stamp() {
     );
 }
 
+// ---------- FB-2 — `definitions: false` bare writable run target ----------
+
+#[test]
+fn definitions_false_registers_writable_root_without_a_manifest() {
+    // A plain code checkout that ships NO `praxec.repo.yaml`. `definitions:
+    // false` must skip manifest+layout loading (0 definitions) yet still stamp
+    // the canonical path as a writable repo_root, so a run can be scoped to it.
+    let td = TempDir::new().unwrap();
+    let code = TempDir::new().unwrap(); // no praxec.repo.yaml inside
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n    definitions: false\n    writable: true\n",
+        code.path().display(),
+    );
+    let path = write_host(&td, &host);
+    let (config, _diagnostics) =
+        load_resolved_with_repos(&path).expect("manifest-less writable target loads");
+
+    // No definitions were loaded (no workflows contributed by this entry).
+    assert!(
+        config.pointer("/workflows").is_none(),
+        "a definitions:false entry must contribute 0 definitions: {config:?}"
+    );
+    // But its root IS in the writable set.
+    let roots = config
+        .pointer("/praxec/_writableRepos")
+        .and_then(Value::as_array)
+        .expect("writable roots stamped");
+    assert_eq!(roots.len(), 1, "exactly one writable root: {roots:?}");
+    assert_eq!(
+        roots[0]["root"].as_str(),
+        Some(code.path().display().to_string().as_str()),
+        "the manifest-less code dir is the writable root"
+    );
+}
+
+#[test]
+fn definitions_false_without_writable_is_rejected() {
+    // A non-definition, non-writable entry contributes nothing — a config
+    // mistake that must fail loud, not silently no-op.
+    let td = TempDir::new().unwrap();
+    let code = TempDir::new().unwrap();
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n    definitions: false\n",
+        code.path().display(),
+    );
+    let path = write_host(&td, &host);
+    let err = load_resolved_with_repos(&path).expect_err("must reject inert entry");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("definitions: false") && msg.contains("writable: true"),
+        "error should name the remedy: {msg}"
+    );
+}
+
+#[test]
+fn definitions_false_mixes_with_a_real_definition_repo() {
+    // One real definition repo (swe-core) + one bare writable target. The
+    // definitions load from the former; both are independent.
+    let td = TempDir::new().unwrap();
+    let code = TempDir::new().unwrap();
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{swe}\"\n  - path: \"{code}\"\n    definitions: false\n    writable: true\n",
+        swe = fixtures_root().join("swe-core").display(),
+        code = code.path().display(),
+    );
+    let path = write_host(&td, &host);
+    let (config, _diagnostics) = load_resolved_with_repos(&path).expect("mixed repos load");
+    // swe-core's definitions are present…
+    assert!(
+        config.pointer("/workflows/swe~1cap.plan.vet").is_some(),
+        "the definition repo still contributes its caps"
+    );
+    // …and the bare target is the only writable root.
+    let roots = config
+        .pointer("/praxec/_writableRepos")
+        .and_then(Value::as_array)
+        .expect("writable roots stamped");
+    assert_eq!(roots.len(), 1);
+    assert_eq!(
+        roots[0]["root"].as_str(),
+        Some(code.path().display().to_string().as_str()),
+    );
+}
+
 // ---------- SPEC §9 — remote repo import (clone + layer) ----------
 
 /// Build a local git "origin" repo with a manifest (namespace `imported`) and
