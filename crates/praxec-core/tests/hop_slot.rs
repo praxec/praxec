@@ -82,6 +82,7 @@ fn build_runtime(config: Value, executor_output: Value) -> WorkflowRuntime {
         guards,
         audit as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
 }
 
 /// A minimal `cap.verify.<stack>` workflow: a terminal state + the HOP-typed
@@ -148,8 +149,7 @@ async fn start_and_submit(runtime: &WorkflowRuntime, valid_input: bool) -> Value
             definition_id: "sdlc".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

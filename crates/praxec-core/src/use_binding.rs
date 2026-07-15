@@ -39,6 +39,7 @@
 use serde_json::{Map, Value};
 
 use crate::mapping::read_in_scopes;
+use crate::run_env::RunEnv;
 
 /// Structured snippet-output schema violation. `slot` is the cap-declared
 /// output name; `reason` carries the jsonschema validator's message,
@@ -70,33 +71,46 @@ pub fn resolve_use_inputs(
     host_arguments: &Value,
     host_context: &Value,
     host_workflow_input: &Value,
+    host_run_env: Option<&RunEnv>,
 ) -> Map<String, Value> {
     let Some(obj) = use_inputs.as_object() else {
         return Map::new();
     };
     let mut resolved = Map::new();
     for (name, expr) in obj {
-        let value = resolve_one(expr, host_arguments, host_context, host_workflow_input);
+        let value = resolve_one(
+            expr,
+            host_arguments,
+            host_context,
+            host_workflow_input,
+            host_run_env,
+        );
         resolved.insert(name.clone(), value);
     }
     resolved
 }
 
-fn resolve_one(expr: &Value, args: &Value, ctx: &Value, wf_input: &Value) -> Value {
+fn resolve_one(
+    expr: &Value,
+    args: &Value,
+    ctx: &Value,
+    wf_input: &Value,
+    run_env: Option<&RunEnv>,
+) -> Value {
     match expr {
         Value::String(s) if s.starts_with("$.") => {
-            read_in_scopes(s, args, ctx, wf_input, None).unwrap_or(Value::Null)
+            read_in_scopes(s, args, ctx, wf_input, None, run_env).unwrap_or(Value::Null)
         }
         Value::Object(map) => {
             let mut out = Map::new();
             for (k, v) in map {
-                out.insert(k.clone(), resolve_one(v, args, ctx, wf_input));
+                out.insert(k.clone(), resolve_one(v, args, ctx, wf_input, run_env));
             }
             Value::Object(out)
         }
         Value::Array(arr) => Value::Array(
             arr.iter()
-                .map(|v| resolve_one(v, args, ctx, wf_input))
+                .map(|v| resolve_one(v, args, ctx, wf_input, run_env))
                 .collect(),
         ),
         other => other.clone(),
@@ -297,14 +311,14 @@ mod tests {
     fn resolve_use_inputs_dereferences_context_path() {
         let use_inputs = json!({ "plan": "$.context.draft_plan" });
         let ctx = json!({ "draft_plan": { "title": "ship it" } });
-        let r = resolve_use_inputs(&use_inputs, &json!({}), &ctx, &json!({}));
+        let r = resolve_use_inputs(&use_inputs, &json!({}), &ctx, &json!({}), None);
         assert_eq!(r.get("plan"), Some(&json!({ "title": "ship it" })));
     }
 
     #[test]
     fn resolve_use_inputs_passes_literal_values_through() {
         let use_inputs = json!({ "max_iterations": 3, "label": "primary" });
-        let r = resolve_use_inputs(&use_inputs, &json!({}), &json!({}), &json!({}));
+        let r = resolve_use_inputs(&use_inputs, &json!({}), &json!({}), &json!({}), None);
         assert_eq!(r.get("max_iterations"), Some(&json!(3)));
         assert_eq!(r.get("label"), Some(&json!("primary")));
     }
@@ -312,7 +326,7 @@ mod tests {
     #[test]
     fn resolve_use_inputs_returns_null_for_unresolved_path() {
         let use_inputs = json!({ "missing": "$.context.does_not_exist" });
-        let r = resolve_use_inputs(&use_inputs, &json!({}), &json!({}), &json!({}));
+        let r = resolve_use_inputs(&use_inputs, &json!({}), &json!({}), &json!({}), None);
         assert_eq!(r.get("missing"), Some(&Value::Null));
     }
 
@@ -322,7 +336,7 @@ mod tests {
             "config": { "plan": "$.context.plan", "limit": 5 }
         });
         let ctx = json!({ "plan": "P1" });
-        let r = resolve_use_inputs(&use_inputs, &json!({}), &ctx, &json!({}));
+        let r = resolve_use_inputs(&use_inputs, &json!({}), &ctx, &json!({}), None);
         assert_eq!(r.get("config"), Some(&json!({ "plan": "P1", "limit": 5 })));
     }
 

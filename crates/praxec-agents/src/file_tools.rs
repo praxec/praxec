@@ -6,7 +6,7 @@
 //! root via `..` is refused (no traversal) — fail-fast, never a silent write
 //! outside scope.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -35,19 +35,12 @@ impl FileEditToolHost {
 }
 
 /// Resolve `rel` under `root`, refusing absolute paths and any `..` escape.
+/// Delegates to the shared [`praxec_core::path_safety::resolve_under`] (one
+/// traversal guard, also used by the `path_grounding` gate) and preserves this
+/// host's `FILE_TOOL_PATH_ESCAPE:` error prefix.
 fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let p = Path::new(rel);
-    if p.is_absolute() {
-        return Err(format!(
-            "FILE_TOOL_PATH_ESCAPE: '{rel}' is absolute; paths must be relative to the repo root"
-        ));
-    }
-    if p.components().any(|c| matches!(c, Component::ParentDir)) {
-        return Err(format!(
-            "FILE_TOOL_PATH_ESCAPE: '{rel}' contains '..'; paths may not escape the repo root"
-        ));
-    }
-    Ok(root.join(p))
+    praxec_core::path_safety::resolve_under(root, rel)
+        .map_err(|e| format!("FILE_TOOL_PATH_ESCAPE: {e}"))
 }
 
 fn write_file_def() -> ToolDefinition {

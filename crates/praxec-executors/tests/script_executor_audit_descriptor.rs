@@ -55,6 +55,7 @@ fn build_runtime(
     let store = Arc::new(InMemoryWorkflowStore::new());
     let guards = Arc::new(DefaultGuardEvaluator::new());
     WorkflowRuntime::new(defs, store, executors, guards, audit as Arc<dyn AuditSink>)
+        .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
 }
 
 fn last_transition_record(audit: &MemoryAuditSink) -> Value {
@@ -107,8 +108,7 @@ workflows:
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -188,8 +188,7 @@ workflows:
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

@@ -32,8 +32,7 @@ async fn audit_records_workflow_transitioned() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -74,8 +73,7 @@ async fn audit_records_transition_rejected_on_guard_rejection() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -116,8 +114,7 @@ async fn audit_records_transition_rejected_on_stale_version() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -228,15 +225,15 @@ async fn audit_records_fallback_selected_when_primary_exhausts() {
         executors,
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
 
     let started = runtime
         .start(StartWorkflow {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -282,8 +279,7 @@ async fn actor_gate_rejects_agent_on_human_only_transition() {
             definition_id: "approval".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -328,8 +324,7 @@ async fn actor_gate_admits_human_on_human_only_transition() {
             definition_id: "approval".into(),
             input: json!({}),
             principal: human_principal(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

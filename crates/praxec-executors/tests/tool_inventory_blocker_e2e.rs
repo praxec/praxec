@@ -117,6 +117,7 @@ fn build_runtime(config: &Value) -> WorkflowRuntime {
         guards,
         audit as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence);
     workflow_handle.set_runtime(runtime.clone());
     runtime
@@ -128,8 +129,7 @@ async fn start(runtime: &WorkflowRuntime, definition_id: &str, input: Value) -> 
             definition_id: definition_id.to_string(),
             input,
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

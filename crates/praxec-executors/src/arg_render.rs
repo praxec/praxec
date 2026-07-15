@@ -36,6 +36,7 @@ pub(crate) fn render_arg(value: &Value, request: &ExecuteRequest) -> Result<Stri
         &request.workflow.context,
         &request.workflow.input,
         None,
+        Some(&request.workflow.run_env),
     ) {
         return Ok(match v {
             Value::String(s) => s,
@@ -86,8 +87,7 @@ mod tests {
                 input: json!({}),
                 context,
                 started_at: Utc::now(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 cancelled_at: None,
                 cancelled_reason: None,
                 depth: 0,

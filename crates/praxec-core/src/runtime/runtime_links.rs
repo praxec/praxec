@@ -54,6 +54,7 @@ pub(crate) fn links(definition: &Value, instance: &WorkflowInstance) -> Vec<Valu
                         &instance.context,
                         &instance.input,
                         &empty,             // no executor output at link-gen time
+                        Some(&instance.run_env),
                     );
                     resolved.insert(k.clone(), v);
                 }
@@ -336,8 +337,7 @@ mod recovery_tests {
             input: json!({}),
             context: json!({}),
             started_at: chrono::Utc::now(),
-            trace_id: None,
-            run_id: None,
+            run_env: crate::RunEnv::for_test(),
             cancelled_at: None,
             cancelled_reason: None,
             depth: 0,

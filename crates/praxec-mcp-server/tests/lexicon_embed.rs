@@ -52,7 +52,8 @@ fn build_server(cfg: Value) -> (PraxecServer, Arc<MemoryAuditSink>) {
         Arc::new(NoopRegistry),
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     (
         PraxecServer::new(runtime)
             .with_lexicon_writes(true)

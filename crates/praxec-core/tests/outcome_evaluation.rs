@@ -67,6 +67,7 @@ fn runtime() -> WorkflowRuntime {
         Arc::new(DefaultGuardEvaluator::with_evidence(evidence.clone())),
         Arc::new(MemoryAuditSink::new()) as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence)
 }
 
@@ -75,8 +76,7 @@ async fn start(rt: &WorkflowRuntime) -> Value {
         definition_id: "multi".into(),
         input: json!({}),
         principal: Principal::anonymous(),
-        trace_id: None,
-        run_id: None,
+        run_env: praxec_core::RunEnv::for_test(),
         depth: 0,
         parent: None,
     })

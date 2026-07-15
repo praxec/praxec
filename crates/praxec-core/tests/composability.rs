@@ -564,15 +564,15 @@ async fn capability_ref_in_workflow_actually_dispatches() {
         executors,
         guards,
         Arc::new(NullAuditSink),
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
 
     let started = runtime
         .start(StartWorkflow {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -707,14 +707,14 @@ async fn capability_ref_emits_full_audit_trail() {
         Arc::new(OneExecRegistry(recorder.clone())),
         Arc::new(DefaultGuardEvaluator::new()),
         audit.clone() as Arc<dyn praxec_core::audit::AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     let started = runtime
         .start(StartWorkflow {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

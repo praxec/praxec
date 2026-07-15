@@ -80,15 +80,15 @@ async fn workflow_executor_sets_child_workflow_id_on_record() {
     })));
     let guards = Arc::new(DefaultGuardEvaluator::new());
     let audit: Arc<dyn AuditSink> = Arc::new(MemoryAuditSink::new());
-    let runtime = WorkflowRuntime::new(definitions, store, executors, guards, audit.clone());
+    let runtime = WorkflowRuntime::new(definitions, store, executors, guards, audit.clone())
+        .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
 
     let start = runtime
         .start(StartWorkflow {
             definition_id: "parent".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -165,15 +165,15 @@ async fn non_workflow_executor_leaves_child_workflow_id_null() {
     let executors = Arc::new(AnyKindRegistry(Arc::new(PlainExecutor)));
     let guards = Arc::new(DefaultGuardEvaluator::new());
     let audit: Arc<dyn AuditSink> = Arc::new(MemoryAuditSink::new());
-    let runtime = WorkflowRuntime::new(definitions, store, executors, guards, audit.clone());
+    let runtime = WorkflowRuntime::new(definitions, store, executors, guards, audit.clone())
+        .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
 
     let start = runtime
         .start(StartWorkflow {
             definition_id: "wf".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

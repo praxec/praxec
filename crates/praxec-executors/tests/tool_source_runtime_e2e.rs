@@ -65,6 +65,7 @@ fn build_runtime(config: &Value, audit: Arc<MemoryAuditSink>) -> WorkflowRuntime
         guards,
         audit as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence)
 }
 
@@ -82,8 +83,7 @@ async fn start_and_submit(
             definition_id: definition_id.to_string(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

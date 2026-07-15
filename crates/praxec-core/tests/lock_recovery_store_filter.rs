@@ -33,8 +33,7 @@ fn suspended_instance(id: &str) -> WorkflowInstance {
             }
         }),
         started_at: chrono::Utc::now(),
-        trace_id: None,
-        run_id: None,
+        run_env: praxec_core::RunEnv::for_test(),
         cancelled_at: None,
         cancelled_reason: None,
         depth: 0,

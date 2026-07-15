@@ -95,7 +95,8 @@ fn build_runtime() -> (
         registry,
         guards,
         audit.clone() as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     // Late-bind the runtime into the `workflow` executor so `kind: workflow`
     // transitions spawn/drive sub-workflows through THIS runtime.
     workflow_handle.set_runtime(runtime.clone());
@@ -114,8 +115,7 @@ async fn suspended_parent_resumes_when_child_terminates() {
             definition_id: "parent".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -230,8 +230,7 @@ async fn parent_surfaces_the_childs_human_gate() {
             definition_id: "parent".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

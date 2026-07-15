@@ -143,6 +143,7 @@ workflows:
         guards,
         audit.clone() as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence);
 
     let workflow_executor = Arc::new(WorkflowExecutor::new(
@@ -159,8 +160,7 @@ workflows:
             definition_id: "flow.add-feature".to_string(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

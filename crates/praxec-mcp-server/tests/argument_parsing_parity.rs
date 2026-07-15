@@ -62,6 +62,7 @@ fn build_runtime() -> WorkflowRuntime {
         Arc::new(DefaultGuardEvaluator::new()),
         Arc::new(NullAuditSink),
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
 }
 
 fn build_discovery() -> Arc<InMemoryDiscoveryIndex> {

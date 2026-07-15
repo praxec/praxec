@@ -30,8 +30,11 @@ fn instance_with_run_id(
         input: json!({}),
         context: json!({}),
         started_at: chrono::Utc::now(),
-        trace_id: None,
-        run_id: run_id.map(str::to_string),
+        run_env: praxec_core::RunEnv::new(
+            praxec_core::RepoRoot::for_test(),
+            run_id.map(str::to_string),
+            None,
+        ),
         cancelled_at: None,
         cancelled_reason: None,
         depth: 0,

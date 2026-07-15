@@ -1101,6 +1101,7 @@ impl WorkflowRuntime {
                         &arguments,
                         &next.input,
                         &result.output,
+                        Some(&next.run_env),
                     )?;
                     // P2 — the executor returned a TERMINAL child result (not a
                     // suspend), so this `kind: workflow` leaf is resolving and
@@ -1243,6 +1244,7 @@ impl WorkflowRuntime {
                             &arguments,
                             &next.input,
                             updates,
+                            Some(&next.run_env),
                         ) {
                             Ok(()) => {
                                 next.version = instance.version + 1;
@@ -1350,6 +1352,7 @@ impl WorkflowRuntime {
                 &arguments,
                 &next.input,
                 &Value::Null,
+                Some(&next.run_env),
             )?;
             if let Err((slot, reason)) =
                 validate_blackboard_writes(&definition, transition.get("output"), &next.context)
@@ -1802,8 +1805,7 @@ mod tests {
                 definition_id: "p".into(),
                 input: json!({}),
                 principal: Principal::anonymous(),
-                trace_id: None,
-                run_id: None,
+                run_env: crate::RunEnv::for_test(),
                 depth: 0,
                 parent: None,
             })
@@ -1931,8 +1933,7 @@ mod tests {
                 definition_id: "p".into(),
                 input: json!({}),
                 principal: Principal::anonymous(),
-                trace_id: None,
-                run_id: None,
+                run_env: crate::RunEnv::for_test(),
                 depth: 0,
                 parent: None,
             })
@@ -2060,8 +2061,7 @@ mod tests {
                 definition_id: "p".into(),
                 input: json!({}),
                 principal: Principal::anonymous(),
-                trace_id: None,
-                run_id: None,
+                run_env: crate::RunEnv::for_test(),
                 depth: 0,
                 parent: None,
             })
@@ -2278,8 +2278,7 @@ mod tests {
                 definition_id: "p".into(),
                 input: json!({}),
                 principal: Principal::anonymous(),
-                trace_id: None,
-                run_id: None,
+                run_env: crate::RunEnv::for_test(),
                 depth: 0,
                 parent: None,
             })
@@ -2345,8 +2344,7 @@ mod tests {
             input: json!({}),
             context: json!({ "_lock_wait": lock_wait }),
             started_at: Utc::now(),
-            trace_id: None,
-            run_id: None,
+            run_env: crate::RunEnv::for_test(),
             cancelled_at: None,
             cancelled_reason: None,
             depth: 0,

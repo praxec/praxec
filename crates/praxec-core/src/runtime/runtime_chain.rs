@@ -336,12 +336,14 @@ impl WorkflowRuntime {
         }
 
         let on_enter_input = instance.input.clone();
+        let on_enter_run_env = instance.run_env.clone();
         merge_output(
             &mut instance.context,
             on_enter.get("output"),
             &json!({}),
             &on_enter_input,
             &result.output,
+            Some(&on_enter_run_env),
         )?;
         if let Err((slot, reason)) =
             validate_blackboard_writes(&definition, on_enter.get("output"), &instance.context)
@@ -800,6 +802,7 @@ impl WorkflowRuntime {
                             &chain_arguments,
                             &instance.input,
                             &result.output,
+                            Some(&instance.run_env),
                         )?;
                         // P2 — the executor returned a TERMINAL child result
                         // (not a suspend), so this `kind: workflow` chain leaf is
@@ -894,6 +897,7 @@ impl WorkflowRuntime {
                     &chain_arguments,
                     &instance.input,
                     &Value::Null,
+                    Some(&instance.run_env),
                 )?;
                 if let Err((slot, reason)) = validate_blackboard_writes(
                     definition,

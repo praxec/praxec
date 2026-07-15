@@ -35,8 +35,7 @@ async fn invariant_2_input_schema_is_validated_before_executor() {
             definition_id: DEFAULT_PROXY_WORKFLOW_ID.into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -74,8 +73,7 @@ async fn invariant_3_guards_run_before_executor() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

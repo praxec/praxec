@@ -121,6 +121,7 @@ async fn permanent_executor_failure_does_not_report_completed() {
         guards,
         audit.clone() as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence);
 
     let resp = runtime
@@ -128,8 +129,7 @@ async fn permanent_executor_failure_does_not_report_completed() {
             definition_id: "test.fail".to_string(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -228,6 +228,7 @@ async fn guard_failure_on_submit_blocks_advance() {
         guards,
         audit.clone() as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence);
 
     // Step 1: start the workflow. It stops in "waiting" (no deterministic
@@ -237,8 +238,7 @@ async fn guard_failure_on_submit_blocks_advance() {
             definition_id: "test.guard".to_string(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -381,6 +381,7 @@ async fn runtime_timeout_transitions_workflow_to_terminal() {
         guards,
         audit.clone() as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence);
 
     let resp = runtime
@@ -388,8 +389,7 @@ async fn runtime_timeout_transitions_workflow_to_terminal() {
             definition_id: "test.timeout".to_string(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -500,6 +500,7 @@ async fn cancellation_mid_walk_leaves_recoverable_state() {
         guards,
         audit.clone() as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
     .with_evidence(evidence);
 
     let resp = runtime
@@ -507,8 +508,7 @@ async fn cancellation_mid_walk_leaves_recoverable_state() {
             definition_id: "test.cancel".to_string(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

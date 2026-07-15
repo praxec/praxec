@@ -361,6 +361,7 @@ fn render_value(v: &Value, request: &ExecuteRequest) -> Result<String, ExecutorE
                 &request.workflow.context,
                 &request.workflow.input,
                 None,
+                Some(&request.workflow.run_env),
             ) {
                 return Ok(match expr {
                     Value::String(s) => s,
@@ -396,6 +397,7 @@ fn render_template(template: &Value, request: &ExecuteRequest) -> Result<Value, 
                 &request.workflow.context,
                 &request.workflow.input,
                 None,
+                Some(&request.workflow.run_env),
             ) {
                 Ok(resolved)
             } else if is_scope_path(s) {
@@ -443,8 +445,7 @@ mod grant_gate_tests {
                 input: json!({}),
                 context: json!({}),
                 started_at: chrono::Utc::now(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 cancelled_at: None,
                 cancelled_reason: None,
                 depth: 0,
@@ -528,8 +529,7 @@ mod tests {
                 input: json!({}),
                 context,
                 started_at: chrono::Utc::now(),
-                trace_id: None,
-                run_id: None,
+                run_env: praxec_core::RunEnv::for_test(),
                 cancelled_at: None,
                 cancelled_reason: None,
                 depth: 0,

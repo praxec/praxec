@@ -102,6 +102,7 @@ fn build_runtime(audit: Arc<dyn AuditSink>) -> WorkflowRuntime {
     let store = Arc::new(InMemoryWorkflowStore::new());
     let guards = Arc::new(DefaultGuardEvaluator::new());
     WorkflowRuntime::new(defs, store, Arc::new(NoopRegistry), guards, audit)
+        .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
 }
 
 // ── Helper directly: success path records once ─────────────────────────────
@@ -116,8 +117,7 @@ async fn helper_records_primary_event_on_sink_success() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -222,8 +222,7 @@ async fn failing_non_critical_audit_event_does_not_abort_workflow() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })
@@ -292,8 +291,7 @@ async fn both_sink_failures_do_not_panic_or_propagate() {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

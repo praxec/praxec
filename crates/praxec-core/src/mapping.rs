@@ -1,6 +1,8 @@
 use anyhow::anyhow;
 use serde_json::{Value, json};
 
+use crate::run_env::RunEnv;
+
 /// Apply an output-mapping object to the workflow's context.
 ///
 /// Each mapping value is either:
@@ -21,6 +23,7 @@ pub fn merge_output(
     arguments: &Value,
     workflow_input: &Value,
     executor_output: &Value,
+    run_env: Option<&RunEnv>,
 ) -> anyhow::Result<()> {
     let Some(mapping) = mapping.and_then(Value::as_object) else {
         return Ok(());
@@ -35,7 +38,14 @@ pub fn merge_output(
     let pending: Vec<(String, Value)> = mapping
         .iter()
         .map(|(k, spec)| {
-            let v = resolve_value(spec, arguments, context, workflow_input, executor_output);
+            let v = resolve_value(
+                spec,
+                arguments,
+                context,
+                workflow_input,
+                executor_output,
+                run_env,
+            );
             (k.clone(), v)
         })
         .collect();
@@ -71,6 +81,7 @@ pub fn resolve_value(
     context: &Value,
     workflow_input: &Value,
     executor_output: &Value,
+    run_env: Option<&RunEnv>,
 ) -> Value {
     match spec {
         Value::String(s) => {
@@ -78,8 +89,15 @@ pub fn resolve_value(
             // else is a literal. Lets authors write `base: "main"` instead
             // of having to wrap every literal in `{ set: "main" }`.
             if s.starts_with("$.") || s == "$" {
-                read_in_scopes(s, arguments, context, workflow_input, Some(executor_output))
-                    .unwrap_or(Value::Null)
+                read_in_scopes(
+                    s,
+                    arguments,
+                    context,
+                    workflow_input,
+                    Some(executor_output),
+                    run_env,
+                )
+                .unwrap_or(Value::Null)
             } else {
                 Value::String(s.clone())
             }
@@ -102,6 +120,7 @@ pub fn resolve_value(
                         context,
                         workflow_input,
                         executor_output,
+                        run_env,
                     ) {
                         Some(n) => n,
                         None => return Value::Null,
@@ -138,6 +157,7 @@ pub fn resolve_value(
                             context,
                             workflow_input,
                             executor_output,
+                            run_env,
                         );
                         match resolved {
                             Value::String(s) => result.push_str(&s),
@@ -168,15 +188,21 @@ fn resolve_operands(
     context: &Value,
     workflow_input: &Value,
     executor_output: &Value,
+    run_env: Option<&RunEnv>,
 ) -> Option<Vec<f64>> {
     let arr = spec.as_array()?;
     let mut out = Vec::with_capacity(arr.len());
     for v in arr {
         let resolved = match v {
-            Value::String(s) => {
-                read_in_scopes(s, arguments, context, workflow_input, Some(executor_output))
-                    .unwrap_or(Value::Null)
-            }
+            Value::String(s) => read_in_scopes(
+                s,
+                arguments,
+                context,
+                workflow_input,
+                Some(executor_output),
+                run_env,
+            )
+            .unwrap_or(Value::Null),
             other => other.clone(),
         };
         let n = match &resolved {
@@ -218,6 +244,7 @@ pub fn read_in_scopes(
     context: &Value,
     workflow_input: &Value,
     executor_output: Option<&Value>,
+    run_env: Option<&RunEnv>,
 ) -> Option<Value> {
     // Whole-scope reads — symmetric with `$` / `$.output` (the whole output). An
     // author writing `fix_result: "$.arguments"` means "the whole submission",
@@ -226,6 +253,13 @@ pub fn read_in_scopes(
         "$.arguments" => return Some(arguments.clone()),
         "$.context" => return Some(context.clone()),
         "$.workflow.input" => return Some(workflow_input.clone()),
+        // Run-ambient root (v0.0.21). Resolves ONLY when the caller supplies the
+        // run env (an executor/instance context); load-time/validation callers
+        // pass `None` and get an unresolved read, exactly like any other scope
+        // they can't see. Kept in lockstep with `is_resolvable_write_scope`.
+        "$.run.repo_root" => {
+            return run_env.map(|e| Value::String(e.repo_root.as_str().to_string()));
+        }
         _ => {}
     }
     if let Some(path) = expr.strip_prefix("$.arguments.") {
@@ -261,7 +295,7 @@ pub fn is_resolvable_write_scope(s: &str) -> bool {
     let s = s.trim();
     matches!(
         s,
-        "$" | "$.output" | "$.arguments" | "$.context" | "$.workflow.input"
+        "$" | "$.output" | "$.arguments" | "$.context" | "$.workflow.input" | "$.run.repo_root"
     ) || s.starts_with("$.output.")
         || s.starts_with("$.context.")
         || s.starts_with("$.arguments.")
@@ -320,6 +354,7 @@ mod tests {
         let ctx = json!({ "c": 1 });
         let input = json!({ "i": 1 });
         let output = json!({ "o": 1 });
+        let run_env = crate::RunEnv::for_test();
 
         let cases = [
             ("$.arguments.a", true),
@@ -332,6 +367,9 @@ mod tests {
             ("$.arguments", true),
             ("$.context", true),
             ("$.workflow.input", true),
+            // Run-ambient root (v0.0.21) — resolvable on both sides.
+            ("$.run.repo_root", true),
+            ("$.run.bogus", false),  // no other `$.run.*` is a scope
             ("$.input.mode", false), // the bug — not a write scope
             ("$.outpt.plan", false), // typo
             ("$.ctx.c", false),
@@ -342,7 +380,8 @@ mod tests {
                 resolvable,
                 "predicate wrong for `{expr}`"
             );
-            let resolved = read_in_scopes(expr, &args, &ctx, &input, Some(&output)).is_some();
+            let resolved =
+                read_in_scopes(expr, &args, &ctx, &input, Some(&output), Some(&run_env)).is_some();
             assert_eq!(
                 resolved, resolvable,
                 "read_in_scopes disagrees with predicate for `{expr}`"

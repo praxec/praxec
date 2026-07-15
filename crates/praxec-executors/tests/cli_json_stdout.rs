@@ -59,15 +59,15 @@ async fn cli_stdout_parsed_as_json_into_output_json() {
         default_registry(&config),
         Arc::new(DefaultGuardEvaluator::new()),
         Arc::new(NullAuditSink),
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
 
     let started = runtime
         .start(StartWorkflow {
             definition_id: "demo".into(),
             input: json!({}),
             principal: Principal::anonymous(),
-            trace_id: None,
-            run_id: None,
+            run_env: praxec_core::RunEnv::for_test(),
             depth: 0,
             parent: None,
         })

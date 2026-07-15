@@ -61,7 +61,8 @@ async fn test_server() -> PraxecServer {
         Arc::new(NoopRegistry),
         guards,
         audit as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     PraxecServer::new(runtime)
 }
 
@@ -619,7 +620,8 @@ async fn lexicon_define_via_dispatch_call_succeeds_when_writes_enabled() {
         Arc::new(NoopRegistry),
         guards,
         audit as Arc<dyn AuditSink>,
-    );
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
     let server = PraxecServer::new(runtime).with_lexicon_writes(true);
 
     // Human principal — passes governance gate on new terms (default human-only).

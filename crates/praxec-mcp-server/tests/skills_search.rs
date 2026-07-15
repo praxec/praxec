@@ -32,6 +32,7 @@ fn build_runtime() -> WorkflowRuntime {
         Arc::new(DefaultGuardEvaluator::new()),
         Arc::new(NullAuditSink) as Arc<dyn AuditSink>,
     )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
 }
 
 fn fixture_item(subject: &str, verb: &str) -> DiscoveryItem {

@@ -53,6 +53,7 @@ pub mod model;
 pub mod model_catalog;
 pub mod model_resolver;
 pub mod overlay;
+pub mod path_safety;
 pub mod plan;
 pub mod ports;
 pub mod promotion;
@@ -64,6 +65,7 @@ pub mod reliability;
 pub mod repo;
 pub mod repo_git;
 pub mod repo_locks;
+pub mod run_env;
 pub mod runtime;
 pub mod sandbox;
 pub mod skills;
@@ -101,6 +103,7 @@ pub use registry_v3::{
 };
 pub use reliability::{Backoff, FallbackPolicy, ReliabilityPolicy, RetryPolicy};
 pub use repo::{REPO_MANIFEST_SCHEMA_V1, RepoLayout, RepoManifest, load_manifest, load_repo};
+pub use run_env::{RepoRoot, RepoRootError, RunEnv};
 pub use runtime::WorkflowRuntime;
 pub use store::{
     ConfigDefinitionStore, FileWorkflowStore, InMemoryEvidenceStore, InMemoryWorkflowStore,
