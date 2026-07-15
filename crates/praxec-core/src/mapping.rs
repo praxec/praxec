@@ -369,9 +369,13 @@ mod tests {
             ("$.workflow.input", true),
             // Run-ambient root (v0.0.21) — resolvable on both sides.
             ("$.run.repo_root", true),
-            ("$.run.bogus", false),  // no other `$.run.*` is a scope
-            ("$.input.mode", false), // the bug — not a write scope
-            ("$.outpt.plan", false), // typo
+            ("$.run.bogus", false),       // no other `$.run.*` is a scope
+            ("$.run.repo_root.x", false), // adversarial: exact match, NOT a prefix
+            ("$.run.repo_rootx", false),  // adversarial: no fuzzy suffix match
+            ("$.run", false),             // adversarial: bare namespace
+            ("$.run.", false),            // adversarial: dangling dot
+            ("$.input.mode", false),      // the bug — not a write scope
+            ("$.outpt.plan", false),      // typo
             ("$.ctx.c", false),
         ];
         for (expr, resolvable) in cases {
@@ -387,5 +391,25 @@ mod tests {
                 "read_in_scopes disagrees with predicate for `{expr}`"
             );
         }
+    }
+
+    /// Adversarial: `$.run.repo_root` is a single leaf, matched EXACTLY — a
+    /// trailing path must not resolve, or a typo'd deeper read would silently
+    /// coalesce to null at runtime.
+    #[test]
+    fn run_repo_root_is_an_exact_match_not_a_prefix() {
+        let run_env = crate::RunEnv::for_test();
+        let got = read_in_scopes(
+            "$.run.repo_root.x",
+            &json!({}),
+            &json!({}),
+            &json!({}),
+            None,
+            Some(&run_env),
+        );
+        assert!(
+            got.is_none(),
+            "a trailing path must not resolve, got {got:?}"
+        );
     }
 }

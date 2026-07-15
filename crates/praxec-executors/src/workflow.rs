@@ -268,6 +268,49 @@ impl Executor for WorkflowExecutor {
                     }
                 };
 
+                // Per-spawn repo_root override (v0.0.22). A `kind: workflow`
+                // transition may route its child to a DIFFERENT declared writable
+                // repo — the cross-repo case (`flow.drive-program` routes each
+                // deliverable to its own repo). The `repoRoot` value is resolved
+                // against the parent's spawn-time scopes (like `use.inputs`), then
+                // matched against the declared writable repos with the EXACT same
+                // invariant as a top-level `repoRoot` selector — a declared repo's
+                // canonical path only, never an arbitrary/hallucinated path. When
+                // set, the child's run-ambient root becomes the routed repo (so it
+                // uses `$.run.repo_root` uniformly); run/trace correlation is
+                // preserved. Absent → inherit the parent's env verbatim.
+                let child_run_env = match request
+                    .executor_config
+                    .get("repoRoot")
+                    .and_then(Value::as_str)
+                {
+                    Some(expr) => {
+                        let resolved = praxec_core::mapping::read_in_scopes(
+                            expr,
+                            &request.arguments,
+                            &request.workflow.context,
+                            &request.workflow.input,
+                            None,
+                            Some(&request.workflow.run_env),
+                        );
+                        let selector = resolved.as_ref().and_then(Value::as_str).ok_or_else(|| {
+                            ExecutorError::Permanent(format!(
+                                "REPO_ROOT_OVERRIDE_UNRESOLVED: workflow-executor `repoRoot: {expr}` \
+                                 resolved to {resolved:?}, not a path string naming a writable repo"
+                            ))
+                        })?;
+                        let root = runtime.resolve_run_repo_root(Some(selector)).map_err(|e| {
+                            ExecutorError::Permanent(format!("REPO_ROOT_OVERRIDE_INVALID: {e}"))
+                        })?;
+                        RunEnv::new(
+                            root,
+                            request.workflow.run_env.run_id.clone(),
+                            request.workflow.run_env.trace_id.clone(),
+                        )
+                    }
+                    None => request.workflow.run_env.clone(),
+                };
+
                 // Emit cap.invoked for capability calls so audit reconstruction
                 // can link parent ↔ child via parent_correlation_id (SPEC §6.3).
                 if use_block.is_some() {
@@ -292,14 +335,15 @@ impl Executor for WorkflowExecutor {
                         definition_id: definition_id.clone(),
                         input: sub_input,
                         principal: Principal::anonymous(),
-                        // Inherit the parent's run-ambient env verbatim: the
-                        // child operates on the SAME repo root, and the run/trace
-                        // correlation must survive the spawn (the former
-                        // `trace_id: None, run_id: None` here silently reset
-                        // correlation at every sub-workflow boundary). This
-                        // structural inheritance is what makes a coding leaf get
-                        // the real root with zero hand-threaded `repo_path`.
-                        run_env: request.workflow.run_env.clone(),
+                        // Inherit the parent's run-ambient env (or the routed
+                        // repo when a `repoRoot` override is set — see
+                        // `child_run_env` above). The run/trace correlation must
+                        // survive the spawn (the former `trace_id: None,
+                        // run_id: None` here silently reset correlation at every
+                        // sub-workflow boundary). Inheritance is what makes a
+                        // coding leaf get the real root with zero hand-threaded
+                        // `repo_path`.
+                        run_env: child_run_env,
                         // Stamp the child one level deeper than this parent so
                         // the recursion guard sees an accurate depth even when
                         // the child is driven on a different task.

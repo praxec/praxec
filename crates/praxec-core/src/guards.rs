@@ -589,7 +589,7 @@ pub fn is_resolvable_guard_scope(s: &str) -> bool {
     let s = s.trim();
     matches!(
         s,
-        "$.workflow.id" | "$.workflow.state" | "$.workflow.version"
+        "$.workflow.id" | "$.workflow.state" | "$.workflow.version" | "$.run.repo_root"
     ) || s.starts_with("$.context.")
         || s.starts_with("$.arguments.")
         || s.starts_with("$.workflow.input.")
@@ -633,6 +633,14 @@ fn resolve_operand(
     if s == "$.workflow.version" {
         return Ok(Value::String(instance.definition_version.clone()));
     }
+    // `$.run.repo_root` — the run-ambient repo root (established at run start,
+    // always present). Resolvable in guards exactly as in executor args and
+    // use.inputs, so validator↔runtime parity holds across every scope position.
+    if s == "$.run.repo_root" {
+        return Ok(Value::String(
+            instance.run_env.repo_root.as_str().to_string(),
+        ));
+    }
     // Path — `$.context.*` fails fast on missing; other scopes coalesce.
     if let Some(path) = s.strip_prefix("$.context.") {
         return match instance.context.pointer(&path_to_pointer(path)) {
@@ -664,8 +672,8 @@ fn resolve_operand(
     if is_rooted_operand(s) {
         anyhow::bail!(
             "UNRESOLVABLE_GUARD_SCOPE: guard operand `{s}` names no resolvable scope — \
-             use `$.context.*`, `$.arguments.*`, `$.workflow.input.*`, or \
-             `$.workflow.{{id,state,version}}`"
+             use `$.context.*`, `$.arguments.*`, `$.workflow.input.*`, `$.run.repo_root`, \
+             or `$.workflow.{{id,state,version}}`"
         );
     }
     Ok(Value::Null)
@@ -908,6 +916,7 @@ mod tests {
     #[case("$.workflow.id", true)]
     #[case("$.workflow.state", true)]
     #[case("$.workflow.version", true)]
+    #[case("$.run.repo_root", true)] // run-ambient — resolvable in guards too
     #[case("$.input.mode", false)] // the bug: not a resolvable guard scope
     #[case("$.workflow.foo", false)]
     #[case("$.output.x", false)]
@@ -924,6 +933,20 @@ mod tests {
         assert_eq!(
             !bailed, resolvable,
             "resolve_operand disagrees for `{operand}`"
+        );
+    }
+
+    /// Adversarial: a guard that READS `$.run.repo_root` resolves it to the
+    /// instance's ambient repo root at eval time (not just accepted by the
+    /// predicate). One atomic assertion.
+    #[test]
+    fn guard_resolves_run_repo_root_to_the_instance_repo_root() {
+        let inst = instance(json!({}));
+        let got = resolve_operand("$.run.repo_root", &inst, &json!({}))
+            .expect("`$.run.repo_root` resolves in a guard");
+        assert_eq!(
+            got,
+            Value::String(inst.run_env.repo_root.as_str().to_string())
         );
     }
 

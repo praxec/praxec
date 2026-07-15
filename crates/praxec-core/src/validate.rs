@@ -1137,6 +1137,9 @@ fn check_guard_kind_recursive(
                 // `null` and makes the guard permanently false (the `$.input.mode`
                 // dead-guard bug). Reject at load so the author never ships it.
                 for operand in [lhs, rhs] {
+                    let guard_loc =
+                        format!("transition '{t_name}' in state '{state_name}' 'expr' guard");
+                    push_scope_whitespace_error(id, &guard_loc, operand, out);
                     if crate::guards::is_rooted_operand(operand)
                         && !crate::guards::is_resolvable_guard_scope(operand)
                     {
@@ -1145,7 +1148,8 @@ fn check_guard_kind_recursive(
                              state '{state_name}' has an 'expr' guard whose operand '{operand}' \
                              names no resolvable scope — it would coalesce to null and make the \
                              guard always-false. Use `$.context.*`, `$.arguments.*`, \
-                             `$.workflow.input.*`, or `$.workflow.{{id,state,version}}`"
+                             `$.workflow.input.*`, `$.run.repo_root`, or \
+                             `$.workflow.{{id,state,version}}`"
                         )));
                     }
                 }
@@ -1792,6 +1796,24 @@ fn validate_use_bindings(
                 validate_use_contract(id, &site.location, def_id, use_val, ctx, out);
             }
         }
+        // v0.0.22 — a `repoRoot` override routes the child to a DIFFERENT declared
+        // writable repo (cross-repo work). It is resolved at spawn time exactly
+        // like `use.inputs`, so a `$.`-rooted operand is bound by the same V28
+        // scope rule; anything unresolvable would coalesce to null and silently
+        // defeat the override (the runtime then fails REPO_ROOT_OVERRIDE_*).
+        if let Some(rr) = exec.get("repoRoot").and_then(Value::as_str) {
+            let rr_loc = format!("{} `repoRoot`", site.location);
+            push_scope_whitespace_error(id, &rr_loc, rr, out);
+            if crate::guards::is_rooted_operand(rr) && !is_resolvable_use_input_scope(rr) {
+                out.push(Diagnostic::Error(format!(
+                    "UNRESOLVABLE_REPO_ROOT_OVERRIDE_SCOPE: workflow '{id}' {} `repoRoot: {rr}` \
+                     names no resolvable scope — a per-spawn repo_root override resolves at spawn \
+                     time against `$.context.*`, `$.arguments.*`, `$.workflow.input.*`, and \
+                     `$.run.repo_root` (SPEC §6.1, V28).",
+                    site.location
+                )));
+            }
+        }
     });
 }
 
@@ -1923,15 +1945,17 @@ fn validate_use_block_shape(id: &str, location: &str, use_val: &Value, out: &mut
     if let Some(inputs) = obj.get("inputs").and_then(Value::as_object) {
         for (name, value) in inputs {
             for operand in write_operand_strings(value) {
+                let ui_loc = format!("{location} use.inputs[{name}]");
+                push_scope_whitespace_error(id, &ui_loc, operand, out);
                 if crate::guards::is_rooted_operand(operand)
                     && !is_resolvable_use_input_scope(operand)
                 {
                     out.push(Diagnostic::Error(format!(
                         "UNRESOLVABLE_USE_INPUT_SCOPE: workflow '{id}' {location} \
                          use.inputs[{name}] operand '{operand}' names no resolvable scope — at \
-                         spawn time only `$.context.*`, `$.arguments.*`, and `$.workflow.input.*` \
-                         resolve (no executor output exists yet); anything else coalesces to null. \
-                         (SPEC §6.1, V28)"
+                         spawn time only `$.context.*`, `$.arguments.*`, `$.workflow.input.*`, and \
+                         `$.run.repo_root` resolve (no executor output exists yet); anything else \
+                         coalesces to null. (SPEC §6.1, V28)"
                     )));
                 }
             }
@@ -2008,12 +2032,13 @@ fn validate_executor_arg_scopes(id: &str, def: &Value, out: &mut Vec<Diagnostic>
 /// resolvable executor-arg scope.
 fn check_arg_scope(id: &str, loc: &str, value: &Value, out: &mut Vec<Diagnostic>) {
     let Some(s) = value.as_str() else { return };
+    push_scope_whitespace_error(id, loc, s, out);
     if crate::guards::is_rooted_operand(s) && !is_resolvable_use_input_scope(s) {
         out.push(Diagnostic::Error(format!(
             "UNRESOLVABLE_EXECUTOR_ARG_SCOPE: workflow '{id}' {loc}: operand '{s}' names no \
-             resolvable scope — executor args resolve against `$.context.*`, `$.arguments.*`, and \
-             `$.workflow.input.*` only (note: `$.input.*` is NOT `$.workflow.input.*`). It would \
-             reach the tool as a literal or a null (SPEC §5.3, V29)"
+             resolvable scope — executor args resolve against `$.context.*`, `$.arguments.*`, \
+             `$.workflow.input.*`, and `$.run.repo_root` only (note: `$.input.*` is NOT \
+             `$.workflow.input.*`). It would reach the tool as a literal or a null (SPEC §5.3, V29)"
         )));
     }
 }
@@ -2042,10 +2067,42 @@ fn check_arg_scope_tree(id: &str, loc: &str, value: &Value, out: &mut Vec<Diagno
 /// [`crate::mapping::is_resolvable_write_scope`]; a V28 test pins the difference.
 fn is_resolvable_use_input_scope(s: &str) -> bool {
     let s = s.trim();
-    matches!(s, "$.arguments" | "$.context" | "$.workflow.input")
-        || s.starts_with("$.context.")
+    // `$.run.repo_root` is run-ambient — established at run start, so it resolves
+    // at spawn time (use.inputs) and in executor args just like `$.workflow.input`.
+    // read_in_scopes resolves it; this keeps the validator in parity.
+    matches!(
+        s,
+        "$.arguments" | "$.context" | "$.workflow.input" | "$.run.repo_root"
+    ) || s.starts_with("$.context.")
         || s.starts_with("$.arguments.")
         || s.starts_with("$.workflow.input.")
+}
+
+/// Reject a `$.`-rooted scope operand written with surrounding whitespace.
+///
+/// This closes a validator↔runtime drift: the load-time scope validators trim
+/// before matching (`is_rooted_operand`, `is_resolvable_*` all call `.trim()`),
+/// so a padded operand like `"  $.context.x  "` LOOKS resolvable and passes
+/// `praxec check`. But the runtime scope-gate (`mapping::resolve_value`,
+/// `guards::resolve_operand`) matches VERBATIM — `starts_with("$.")` on the
+/// untrimmed string is false — so the padded operand is treated as a *literal*
+/// and the raw string `"  $.context.x  "` reaches the tool/guard instead of the
+/// resolved value. Silent wrong-value. Per the poka-yoke posture we reject it at
+/// load with the exact fix rather than guess the author's intent.
+///
+/// `location` is the caller's already-formatted site phrase. Returns without
+/// pushing when `operand` is a clean scope or a genuine (non-rooted) literal.
+fn push_scope_whitespace_error(id: &str, location: &str, operand: &str, out: &mut Vec<Diagnostic>) {
+    let trimmed = operand.trim();
+    if operand != trimmed && crate::guards::is_rooted_operand(operand) {
+        out.push(Diagnostic::Error(format!(
+            "SCOPE_OPERAND_WHITESPACE: workflow '{id}' {location}: scope operand '{operand}' has \
+             surrounding whitespace. Scopes are matched VERBATIM at runtime (the load-time \
+             validators trim, but `resolve_value`/`resolve_operand` do not), so this reaches the \
+             tool as the literal string '{operand}' instead of resolving. Write it exactly as \
+             '{trimmed}' — no leading or trailing spaces."
+        )));
+    }
 }
 
 /// Mirror of `crate::config::host_path_tail` — accept iff the path matches
@@ -2710,6 +2767,8 @@ fn check_mapping_object(
         // (a typo'd `$.outpt.plan`, a `$.input.x`) coalesces to null and silently
         // writes it — the write-side twin of the guard's UNRESOLVABLE_GUARD_SCOPE.
         for operand in write_operand_strings(spec) {
+            let w_loc = format!("state '{state_name}' {where_} key '{key}'");
+            push_scope_whitespace_error(id, &w_loc, operand, out);
             if crate::guards::is_rooted_operand(operand)
                 && !crate::mapping::is_resolvable_write_scope(operand)
             {
@@ -3935,7 +3994,13 @@ mod tests {
 
     #[test]
     fn v28_accepts_the_spawn_time_scopes() {
-        for scope in ["$.context.x", "$.arguments.y", "$.workflow.input.z"] {
+        // `$.run.repo_root` is run-ambient: resolvable at spawn time (v0.0.22).
+        for scope in [
+            "$.context.x",
+            "$.arguments.y",
+            "$.workflow.input.z",
+            "$.run.repo_root",
+        ] {
             let d = v28_errors(&use_input_workflow(json!({ "x": scope })));
             assert!(d.is_empty(), "{scope} should be accepted: {d:?}");
         }
@@ -3978,9 +4043,55 @@ mod tests {
             "$.workflow.input.x",
             "$.context.y",
             "$.arguments.z",
+            "$.run.repo_root",
             "--a-literal-flag"
         ])));
         assert!(d.is_empty(), "{d:?}");
+    }
+
+    // ── Cross-position scope parity (v0.0.22) ────────────────────────────────
+
+    /// METAMORPHIC PARITY INVARIANT — the structural fix for the validator↔runtime
+    /// drift class (V6 / V28 / V29 / guard scope): for every run-ambient scope
+    /// token, EVERY validator allowlist must accept it AND the runtime resolver
+    /// must return a non-null value. Add a new ambient token, or a new scope
+    /// position that forgets it, and this test fails — no silent drift, in either
+    /// direction (validator-rejects-but-runtime-resolves, or the v0.0.19
+    /// validator-accepts-but-runtime-nulls silent-scope bug).
+    #[test]
+    fn run_ambient_scopes_have_validator_runtime_parity_in_every_position() {
+        let run_env = crate::run_env::RunEnv::for_test();
+        // The run-ambient scope set (grows as more `$.run.*` tokens are added).
+        let ambient_scopes: &[&str] = &["$.run.repo_root"];
+        for &token in ambient_scopes {
+            // Validator allowlists — all three scope positions.
+            assert!(
+                is_resolvable_use_input_scope(token),
+                "use.inputs / executor-arg validator (V28/V29) rejects ambient `{token}`"
+            );
+            assert!(
+                crate::guards::is_resolvable_guard_scope(token),
+                "guard validator rejects ambient `{token}`"
+            );
+            assert!(
+                crate::mapping::is_resolvable_write_scope(token),
+                "write/merge-output validator (V27) rejects ambient `{token}`"
+            );
+            // Runtime must actually resolve it to a value — else the validators
+            // would be blessing a scope that coalesces to null (silent-scope).
+            let resolved = crate::mapping::read_in_scopes(
+                token,
+                &json!({}),
+                &json!({}),
+                &json!({}),
+                None,
+                Some(&run_env),
+            );
+            assert!(
+                matches!(resolved, Some(Value::String(_))),
+                "runtime read_in_scopes must resolve ambient `{token}`, got {resolved:?}"
+            );
+        }
     }
 
     #[test]

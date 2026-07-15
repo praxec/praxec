@@ -114,3 +114,49 @@ pub(crate) fn resolve_template_path(path: &str, instance: &WorkflowInstance) -> 
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::WorkflowInstance;
+    use serde_json::json;
+
+    fn instance() -> WorkflowInstance {
+        WorkflowInstance {
+            id: "wf".into(),
+            definition_id: "d".into(),
+            definition_version: "1".into(),
+            definition: json!({}),
+            state: "s".into(),
+            version: 1,
+            input: json!({}),
+            context: json!({}),
+            started_at: chrono::Utc::now(),
+            run_env: crate::RunEnv::for_test(),
+            cancelled_at: None,
+            cancelled_reason: None,
+            depth: 0,
+            parent: None,
+        }
+    }
+
+    /// #6 (v0.0.22) — the templating renderer is the one scope position outside
+    /// the `read_in_scopes` family; it must resolve `$.run.repo_root` to the same
+    /// ambient root, not the `{{…}}` literal or an `(unset)` stub. Completes the
+    /// cross-position scope parity invariant.
+    #[test]
+    fn templating_resolves_run_repo_root_to_the_ambient_root() {
+        let inst = instance();
+        let rendered = render_template("{{ $.run.repo_root }}", &inst);
+        assert_eq!(rendered, inst.run_env.repo_root.as_str());
+    }
+
+    /// Adversarial: a trailing path under the ambient root is NOT swallowed by a
+    /// prefix match — it renders as an unset stub, matching read_in_scopes' None.
+    #[test]
+    fn templating_does_not_prefix_match_run_repo_root() {
+        let inst = instance();
+        let rendered = render_template("{{ $.run.repo_root.x }}", &inst);
+        assert_ne!(rendered, inst.run_env.repo_root.as_str());
+    }
+}
