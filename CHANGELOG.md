@@ -61,6 +61,22 @@ they are not two halves of one anti-hallucination trick:
   unsupported: the git commit/push path resolves the enclosing `.git`, so a
   sub-repo root breaks it.
 
+### Fixed — V6 blocked deterministic executors from backing a capability
+
+The primary-executor contract (V6) predated the deterministic-executor family,
+so its allowlists (`Cognitive → mcp|noop`, `Deterministic → script|mcp`) rejected
+every model-free authoring/introspection/gate kind — including the `inventory`
+executor 0.0.20 added for `cap.research.tool-inventory` and the `path_grounding`
+gate this release adds. A capability could therefore only use them via a flow's
+inline transition, never as its own primary — half their intended value, and the
+reason the deterministic-tool-inventory capability could not validate at all. V6
+now accepts the deterministic family (`inventory`, `path_grounding`,
+`structural_analysis`, `ingest`, `diff`, `dry_run`, `registry`, `tool_source`)
+as a strictly-safe primary for any Cognitive or Deterministic verb, driven by a
+`DETERMINISTIC_PRIMARY_KINDS` set (poka-yoke: a build-failing test cross-checks it
+against the executor registry). `script`/`cli`/`rest` stay category-bound as
+before — you still can't shell your way to a `plan`.
+
 ### Added — `path_grounding` gate (#7)
 
 A deterministic, fail-closed executor that checks every file path an agent

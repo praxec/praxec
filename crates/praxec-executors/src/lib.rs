@@ -264,3 +264,21 @@ fn with_authoring_executors(registry: HashMapExecutorRegistry) -> HashMapExecuto
         )
         .with("registry", Arc::new(RegistryExecutor::disabled()))
 }
+
+#[cfg(test)]
+mod tests {
+    /// Poka-yoke: every kind V6 accepts as a deterministic capability primary
+    /// (`praxec_core::validate::DETERMINISTIC_PRIMARY_KINDS`) must be a real,
+    /// registered executor kind. If a kind is added to one list but not the
+    /// other, this fails the build rather than letting V6 bless a kind the
+    /// runtime can't dispatch (or vice-versa).
+    #[test]
+    fn deterministic_primaries_are_all_registered() {
+        for kind in praxec_core::validate::DETERMINISTIC_PRIMARY_KINDS {
+            assert!(
+                super::ALL_EXECUTOR_KINDS.contains(kind),
+                "V6 deterministic-primary kind `{kind}` is not a registered executor kind"
+            );
+        }
+    }
+}
