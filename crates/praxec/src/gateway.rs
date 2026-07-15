@@ -1518,6 +1518,39 @@ async fn reload_gated(
             "config": config_path.display().to_string(),
         });
     }
+    // FB-1 — re-derive the writable repo set from the NEW config and VALIDATE it
+    // before swapping anything, so `reload: true` actually rewires which repos runs
+    // may operate on (this used to be a startup-only field, so a reloaded
+    // `writable: true` repo silently had no effect → runs got an empty repo_root
+    // and died at the first file-leaf). A writable repo that no longer resolves
+    // (`RepoRoot::new`: path missing) drops the reload to REPAIR-ONLY exactly like a
+    // contract-dirty edit — never a half-swap. Applied to the live runtime only on
+    // full build success (in the Ok arm below), atomic with the other swaps.
+    let new_writable_roots = match writable_repo_roots_from_config(&new_config) {
+        Ok(roots) => roots,
+        Err(e) => {
+            let msg = format!("WRITABLE_REPO_INVALID: {e}");
+            tracing::error!(error = %e, "reload writable-repo set is invalid — dropping to repair-only; previous set kept live");
+            *repair_gate.write().expect("LOCK_POISONED: repair_gate") =
+                Some(std::sync::Arc::new(praxec_mcp_server::RepairGate {
+                    diagnostics: vec![msg.clone()],
+                    repair_ids: repair_surface_from_config(&new_config),
+                }));
+            let _ = audit
+                .record(
+                    praxec_core::audit::AuditEvent::new("config.reload_repair_only").with_payload(
+                        json!({ "config": config_path.display().to_string(), "errors": [msg] }),
+                    ),
+                )
+                .await;
+            return json!({
+                "status": "repair_only",
+                "reason": "writable_repo_invalid",
+                "error": e.to_string(),
+                "config": config_path.display().to_string(),
+            });
+        }
+    };
     // Re-resolve from the NEW config: an operator who turns
     // `praxec.embeddings.enabled` on (or registers a model) gets semantic
     // discovery at the next reload, and one who turns it off gets lexical —
@@ -1541,13 +1574,19 @@ async fn reload_gated(
             // keeps the previous everything), so the selector can never rank
             // against a registry the index doesn't hold.
             swappable_registry.swap(new_registry);
+            // FB-1 — swap the writable repo set into the live runtime, atomic with
+            // the definitions/executors above. Now `reload: true` rewires run
+            // repo_root resolution without a restart.
+            runtime.set_writable_repo_roots(new_writable_roots);
             // #14 Fork C — a clean reload REOPENS the full surface: clear any
             // repair-only gate the prior (dirty) config had set.
             *repair_gate.write().expect("LOCK_POISONED: repair_gate") = None;
+            let writable_repos = runtime.writable_repo_roots_snapshot();
             let _ = audit
                 .record(
                     praxec_core::audit::AuditEvent::new("config.reloaded").with_payload(json!({
                         "config": config_path.display().to_string(),
+                        "writable_repos": writable_repos.clone(),
                     })),
                 )
                 .await;
@@ -1556,6 +1595,9 @@ async fn reload_gated(
                 "status": "reloaded",
                 "config": config_path.display().to_string(),
                 "repos": new_config.pointer("/repos").cloned().unwrap_or_else(|| json!([])),
+                // FB-1 — surface the resolved writable repos so the operator sees
+                // what runs will actually be able to write to, not a bare "reloaded".
+                "writable_repos": writable_repos,
             })
         }
         Err(e) => {
