@@ -10,6 +10,104 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+## [0.0.22] — 2026-07-15 — hardening release: scope parity, cross-repo routing, and invariant proofs
+
+A hardening release. It closes the `$.run.repo_root` validator↔runtime parity gap
+that blocked pack authors, adds per-spawn `repo_root` routing for cross-repo work,
+and — via adversarial probing and proof-through-induction — surfaces and fixes a
+silent scope-drift defect and pins a suite of system invariants (link↔submit
+parity, guard fail-closed, store differential parity, no-silent-wedge liveness,
+serde round-trip, cross-position scope parity) so the whole classes stay closed.
+
+### Hardening — proof-through-induction invariant suite
+
+Six invariants pinned as property / metamorphic / inductive tests, each targeting
+a place where two representations could silently drift or a safety property could
+regress:
+
+- **Link ↔ submit parity** — under `linkFilter: byGuards`, the surfaced HATEOAS
+  links equal exactly the set of transitions a submit accepts; the two deliberate
+  asymmetries (the actor gate; default `linkFilter: all` = discovery-not-
+  enforcement) are pinned so a change to either is conscious, not silent.
+- **Guard fail-closed** — every store-dependent guard kind (`evidence`,
+  `guidance_acknowledged`, `script_acknowledged`) denies when its backing store is
+  unwired; a governance gate can never pass by default.
+- **Store differential parity** — the same op sequence yields the same observable
+  state across the in-memory / file / sqlite `WorkflowStore` backends (set-
+  compared). Directly targets the class that once escaped (sqlite querying
+  `$._lock_wait` instead of `$.context._lock_wait`, silently stranding lock-
+  suspended workflows on prod while the in-memory test stayed green).
+- **No-silent-wedge liveness** — a run that structurally can reach a terminal but
+  whose only exit is permanently guard-blocked never falsely reports `succeeded`;
+  it stays put and surfaces no legal action. (A load-time guard-satisfiability
+  rule is deliberately omitted — undecidable in general, so it would risk false-
+  positives on valid packs; the structural liveness checks already run at load.)
+- **Serde round-trip** — persisted `WorkflowInstance` re-serializes identically
+  (the regression net for schema cutovers like the `run_env` field), and a
+  snapshot lacking `run_env` is rejected rather than defaulted.
+- **Cross-position scope parity** — the templating renderer (the one scope
+  position outside the `read_in_scopes` family) resolves `$.run.repo_root`
+  identically, completing the metamorphic scope-parity invariant.
+
+0.0.21 shipped `$.run.repo_root` resolution in the runtime but did not teach the
+**static validator** about it: the read-scope allowlists behind V28
+(`use.inputs`), V29 (executor args), and the guard-scope check listed only
+`$.context.*` / `$.arguments.*` / `$.workflow.input.*`. So a pack that wrote
+`$.run.repo_root` in a `workingDirectory`, an `args` operand, a `use.inputs`
+value, or a guard failed `praxec check` even though the engine would have
+resolved it at runtime — the flagship feature was usable via the engine's own
+`file:{{ … }}` auto-drive injection but not by pack authors. This release closes
+the parity gap and hardens against the whole drift class.
+
+### Fixed — `$.run.repo_root` accepted wherever the runtime resolves it
+
+- V28 / V29 read-scope allowlist (`is_resolvable_use_input_scope`) and the guard
+  validator (`is_resolvable_guard_scope`) now accept `$.run.repo_root`; the guard
+  runtime (`resolve_operand`) resolves it from the instance's `RunEnv`, so guards
+  reach parity with args / use.inputs / merge-output (V27 already had it).
+- Diagnostic hints (V27/V28/V29 + `UNRESOLVABLE_GUARD_SCOPE`) now list
+  `$.run.repo_root` so authors see it as a legal scope.
+
+### Fixed — reject scope operands with surrounding whitespace (adversarial find)
+
+Found by adversarially probing the scope machinery: the load-time validators
+trim an operand before matching (`is_rooted_operand` / `is_resolvable_*` all call
+`.trim()`), but the runtime scope-gate (`mapping::resolve_value`,
+`guards::resolve_operand`) matches VERBATIM — `starts_with("$.")` on the untrimmed
+string. So a padded operand like `"  $.context.x  "` passed `praxec check` yet, at
+runtime, was treated as a *literal* and the raw string reached the tool/guard
+instead of resolving — a silent wrong-value the clean-token parity test never saw.
+`praxec check` now rejects any `$.`-rooted operand carrying surrounding whitespace
+(`SCOPE_OPERAND_WHITESPACE`) across all five operand positions (guard `expr`,
+`use.inputs`, executor args, merge-output/`output:`, and the `repoRoot` override),
+with a message naming the operand and the exact trimmed form to write. Fail-loud
+over guess-the-intent.
+
+### Added — per-spawn `repo_root` override (cross-repo routing)
+
+A `kind: workflow` transition may now carry a `repoRoot:` value that routes its
+child sub-run to a **different declared writable repo**, instead of inheriting the
+parent's. This is the cross-repo primitive: an orchestrator like
+`flow.drive-program` routes each deliverable to its own repo, and the child then
+uses `$.run.repo_root` uniformly (the routed repo becomes its ambient root) — no
+per-cap `repo_path` fallback, no split single-vs-multi-repo capabilities. The
+override value resolves at spawn time against the parent's scopes (`$.context.*`,
+`$.arguments.*`, `$.workflow.input.*`, `$.run.repo_root`) and is then matched
+against the declared writable repos with the **same invariant as a top-level
+`repoRoot` selector** — a declared repo's canonical path only, never an arbitrary
+or hallucinated path (`REPO_ROOT_OVERRIDE_INVALID` / `_UNRESOLVED` fail-fast at
+spawn; `UNRESOLVABLE_REPO_ROOT_OVERRIDE_SCOPE` at `praxec check`). Absent → the
+child inherits the parent's root as before; run/trace correlation is preserved.
+
+### Added — metamorphic parity test (kills the drift class)
+
+A cross-position invariant asserts that every run-ambient scope token is accepted
+by **all** validator allowlists **and** resolved to a non-null value by the
+runtime — failing the build on drift in either direction (validator-rejects-but-
+runtime-resolves, or the v0.0.19 validator-accepts-but-runtime-nulls silent-scope
+bug). This is the structural fix for the class that produced the V6, V28/V29, and
+guard-scope gaps.
+
 ## [0.0.21] — 2026-07-15 — run-ambient repo root + path-grounding gate
 
 Dogfooding 0.0.20's delivery flows surfaced a blocker class: a coding agent leaf
