@@ -18,6 +18,7 @@
 
 pub mod args;
 pub mod degraded;
+mod elicit;
 mod handlers;
 pub mod progress;
 mod tools;
@@ -36,11 +37,11 @@ use praxec_core::runtime::WorkflowRuntime;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Implementation, InitializeRequestParams,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-    ServerInfo, Tool,
+    CallToolRequestParams, CallToolResult, CreateElicitationRequestParams, ElicitationAction,
+    Implementation, InitializeRequestParams, InitializeResult, ListToolsResult,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
-use rmcp::service::{NotificationContext, RequestContext, RoleServer};
+use rmcp::service::{NotificationContext, Peer, RequestContext, RoleServer};
 use serde_json::{Value, json};
 
 pub use progress::{ProgressPeer, progress_bridge};
@@ -176,6 +177,43 @@ pub struct PraxecServer {
     /// no manual reload, no fs-event watcher (unreliable on WSL). `None` on
     /// the CLI/one-shot/test paths.
     pub(crate) staleness_hook: Option<StalenessHook>,
+    /// #14 — repair-only gate, a SWAPPABLE slot. Holds `Some` when the loaded
+    /// pack is contract-DIRTY but still buildable: the gateway stays live, but
+    /// the ONLY workflows it will START are the operator-declared repair
+    /// surface. Every other `start` is refused with the precise contract
+    /// diagnostics, so the consuming LLM fixes the contracts (through the
+    /// repair surface) before the functional surface reopens. `None` ⇒ clean,
+    /// full surface. A slot (not a plain field) so a hot reload can flip it:
+    /// clean reload clears it, dirty reload sets it (Fork C).
+    pub(crate) repair_gate: RepairGateSlot,
+}
+
+/// #14 — the shared, hot-swappable repair-gate slot. Cloned into the serve
+/// reload closure so a reload can flip the live server's serving posture
+/// without rebuilding it.
+pub type RepairGateSlot = Arc<std::sync::RwLock<Option<Arc<RepairGate>>>>;
+
+/// #14 — the repair-only serving posture (poka-yoke). When the loaded pack has
+/// contract errors, the gateway must not let any NON-repair work begin; it may
+/// only be repaired. This carries the two things every gated call needs: the
+/// exact contract violations to surface, and the set of definition ids that
+/// remain startable (the declared repair surface, Fork B).
+#[derive(Debug, Clone)]
+pub struct RepairGate {
+    /// The contract violations that put the gateway in repair-only mode —
+    /// surfaced verbatim on `home` and on every gated refusal so the consuming
+    /// LLM has the precise information needed to fix them.
+    pub diagnostics: Vec<String>,
+    /// Definition ids the caller MAY still `start` while dirty — the operator's
+    /// declared repair surface. Everything else is refused until clean.
+    pub repair_ids: std::collections::HashSet<String>,
+}
+
+impl RepairGate {
+    /// Whether `definition_id` is on the repair surface (startable while dirty).
+    pub fn allows(&self, definition_id: &str) -> bool {
+        self.repair_ids.contains(definition_id)
+    }
 }
 
 /// CMP-001 — reverse-DNS `_meta` key under which the embedding host passes a
@@ -209,7 +247,34 @@ impl PraxecServer {
             progress_peer: ProgressPeer::default(),
             reload_hook: None,
             staleness_hook: None,
+            repair_gate: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// #14 — put the server in repair-only mode. When set, only the gate's
+    /// declared repair surface may be `start`ed; every other start is refused
+    /// with the contract diagnostics. Cleared (`None`) once contracts
+    /// re-validate clean, reopening the full surface.
+    pub fn with_repair_gate(self, gate: Option<RepairGate>) -> Self {
+        *self
+            .repair_gate
+            .write()
+            .expect("LOCK_POISONED: repair_gate") = gate.map(Arc::new);
+        self
+    }
+
+    /// #14 — the shared repair-gate slot, so the serve reload path can flip the
+    /// live server's posture (dirty → set, clean → clear) without rebuilding it.
+    pub fn repair_gate_slot(&self) -> RepairGateSlot {
+        self.repair_gate.clone()
+    }
+
+    /// The current repair gate, if the gateway is in repair-only mode.
+    pub(crate) fn current_repair_gate(&self) -> Option<Arc<RepairGate>> {
+        self.repair_gate
+            .read()
+            .expect("LOCK_POISONED: repair_gate")
+            .clone()
     }
 
     /// P6 — wire the in-band config reload hook (serve path only). With it set,
@@ -270,6 +335,74 @@ impl PraxecServer {
         meta.get(PRINCIPAL_META_KEY)
             .and_then(Principal::from_claim)
             .unwrap_or_else(|| self.default_principal.clone())
+    }
+
+    /// HITL elicitation push. Given a command `result` that MAY carry a
+    /// `pending_human` gate, turn it into an `elicitation/create` round-trip when
+    /// the client supports it and resume the mission in-band on accept.
+    ///
+    /// Returns the ORIGINAL parked result unchanged when: the result carries no
+    /// gate, the client does not advertise `elicitation`, the elicitation call
+    /// fails, or the human declines/cancels. In every one of those cases the
+    /// `pending_human` block and its `resolve` handle remain, so the pull-list
+    /// fallback (`praxec.query { approvals: true }`) still works.
+    async fn drive_human_elicitation(
+        &self,
+        peer: &Peer<RoleServer>,
+        principal: &Principal,
+        result: Value,
+    ) -> Result<Value, McpError> {
+        let Some(pending) = result.get("pending_human").cloned() else {
+            return Ok(result);
+        };
+        // Capability negotiation (MCP 2025-11-25 / SEP-1319): push only to a
+        // client that declared the top-level `elicitation` capability. Everyone
+        // else keeps the pull handle.
+        let supports = peer
+            .peer_info()
+            .map(|info| info.capabilities.elicitation.is_some())
+            .unwrap_or(false);
+        if !supports {
+            return Ok(result);
+        }
+        let gate: praxec_core::hitl::PendingHumanGate = match serde_json::from_value(pending) {
+            Ok(gate) => gate,
+            // A malformed gate is not worth failing the whole call over — the
+            // caller still has the raw `pending_human` block to act on.
+            Err(e) => {
+                tracing::warn!(error = %e, "pending_human did not deserialize; skipping elicitation push");
+                return Ok(result);
+            }
+        };
+
+        let params = CreateElicitationRequestParams::FormElicitationParams {
+            meta: None,
+            message: elicit::message(&gate),
+            requested_schema: elicit::form_schema(&gate),
+        };
+        let elicited = match peer.create_elicitation(params).await {
+            Ok(elicited) => elicited,
+            Err(e) => {
+                tracing::warn!(error = %e, "elicitation/create failed; returning parked result");
+                return Ok(result);
+            }
+        };
+
+        match elicited.action {
+            ElicitationAction::Accept => {
+                // Resume: fire the gate transition under a HUMAN principal (the
+                // person answered the form — that IS the human channel), passing
+                // the elicited content as the submit's `arguments`. Reuses the
+                // fully-governed submit path (guards, actor gate, audit).
+                let content = elicited.content.unwrap_or_else(|| json!({}));
+                let submit = build_gate_submit(&gate, content);
+                self.dispatch_call_with_principal(submit, human_principal(principal))
+                    .await
+            }
+            // Declined / cancelled: leave the mission parked, hand back the
+            // original result so the operator can still resolve out-of-band.
+            ElicitationAction::Decline | ElicitationAction::Cancel => Ok(result),
+        }
     }
 
     /// SPEC §30.10.10 — wire an embedding backend. Default is `NoopEmbedder`
@@ -720,7 +853,18 @@ impl PraxecServer {
                         }
                         self.handle_lexicon_lookup(json!({ "term": term })).await
                     }
-                    _ => self.dispatch_query(args, principal).await,
+                    _ => self.dispatch_query(args, principal).await.map(|mut resp| {
+                        // #14 — when in repair-only mode, stamp the read surface
+                        // (home included) with the contract diagnostics + the
+                        // callable repair surface, so the LLM sees WHY the
+                        // functional surface is withheld and WHERE to fix it.
+                        if let Some(gate) = self.current_repair_gate() {
+                            if let Some(obj) = resp.as_object_mut() {
+                                obj.insert("repair_required".into(), repair_mode_block(&gate));
+                            }
+                        }
+                        resp
+                    }),
                 }
             }
             TOOL_COMMAND => {
@@ -748,6 +892,19 @@ impl PraxecServer {
                             }
                         })),
                     };
+                }
+                // #14 — repair-only gate. While the pack is contract-dirty, only
+                // the declared repair surface may be STARTED. `reload` (above)
+                // and `define` (below) stay open — they are how contracts get
+                // fixed. Any other `start` is refused with the precise
+                // diagnostics so the LLM repairs the contracts first, then the
+                // full surface reopens on a clean reload.
+                if let Some(gate) = self.current_repair_gate() {
+                    if let Some(def_id) = parsed.definition_id.as_deref() {
+                        if !gate.allows(def_id) {
+                            return Ok(repair_required_response(def_id, &gate));
+                        }
+                    }
                 }
                 let is_lexicon_define = parsed
                     .subject
@@ -910,9 +1067,24 @@ impl ServerHandler for PraxecServer {
         // CMP-001 — resolve identity from the request `_meta` (host channel)
         // falling back to the configured default, then dispatch under it.
         let principal = self.resolve_principal(&context.meta);
-        self.dispatch_call_with_principal(request, principal)
-            .await
-            .map(CallToolResult::structured)
+        // Only a command can park a mission on a human gate; capture the tool
+        // name before `request` is moved into dispatch so the elicitation push
+        // knows whether to inspect the result.
+        let is_command = request.name.as_ref() == TOOL_COMMAND;
+        let result = self
+            .dispatch_call_with_principal(request, principal.clone())
+            .await?;
+        // HITL — if the command parked on a human gate AND this client speaks
+        // elicitation, turn the gate into an `elicitation/create` round-trip and
+        // resume in-band on accept. A non-capable client is untouched (it keeps
+        // the `pending_human` block + its `resolve` handle — the pull fallback).
+        let result = if is_command {
+            self.drive_human_elicitation(&context.peer, &principal, result)
+                .await?
+        } else {
+            result
+        };
+        Ok(CallToolResult::structured(result))
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
@@ -922,4 +1094,85 @@ impl ServerHandler for PraxecServer {
     async fn on_initialized(&self, _context: NotificationContext<RoleServer>) {
         tracing::info!("praxec client initialized");
     }
+}
+
+/// #14 — the structured refusal returned when a `start` is blocked by the
+/// repair-only gate. Carries the precise contract diagnostics AND the callable
+/// repair surface (with ready-to-fire `start_repair` links), so the consuming
+/// LLM has everything it needs to fix the contracts through the gateway.
+fn repair_required_response(def_id: &str, gate: &RepairGate) -> Value {
+    let mut resp = repair_mode_block(gate);
+    if let Some(obj) = resp.as_object_mut() {
+        obj.insert(
+            "error".into(),
+            json!({
+                "code": "CONTRACT_DIRTY_REPAIR_ONLY",
+                "message": format!(
+                    "Gateway is in repair-only mode: the loaded pack has {} contract violation(s). \
+                     Starting '{def_id}' is refused until the contracts are 100% clean — only the \
+                     declared repair surface may run now. Fix the contracts (the diagnostics name \
+                     the exact definition, binding, and expected contract), then reload.",
+                    gate.diagnostics.len()
+                ),
+            }),
+        );
+    }
+    resp
+}
+
+/// #14 — the shared repair-mode payload: the precise contract diagnostics, the
+/// declared repair surface, and ready-to-fire `start_repair` links. Stamped on
+/// a gated `start` refusal AND on every read while in repair-only mode.
+fn repair_mode_block(gate: &RepairGate) -> Value {
+    let mut repair: Vec<&String> = gate.repair_ids.iter().collect();
+    repair.sort();
+    let links: Vec<Value> = repair
+        .iter()
+        .map(|id| {
+            json!({
+                "rel": "start_repair",
+                "title": format!("Start repair capability '{id}'"),
+                "method": "praxec.command",
+                "args": { "definitionId": id, "input": {} }
+            })
+        })
+        .collect();
+    json!({
+        "mode": "repair_only",
+        "diagnostics": gate.diagnostics,
+        "repairSurface": repair,
+        "links": links,
+    })
+}
+
+/// Build the `praxec.command` submit that resolves a human gate: the exact
+/// `resolve` args the `pending_human` block advertises, plus the human's
+/// elicited answer as `arguments`.
+fn build_gate_submit(
+    gate: &praxec_core::hitl::PendingHumanGate,
+    arguments: Value,
+) -> CallToolRequestParams {
+    let mut args = serde_json::Map::new();
+    args.insert("workflowId".into(), json!(gate.workflow_id));
+    args.insert("expectedVersion".into(), json!(gate.expected_version));
+    args.insert("transition".into(), json!(gate.transition));
+    args.insert("arguments".into(), arguments);
+    let mut request = CallToolRequestParams::new(TOOL_COMMAND);
+    request.arguments = Some(args);
+    request
+}
+
+/// Elevate the caller to a human principal for the resume submit. The person
+/// physically accepted the elicitation form, so the elicitation IS the human
+/// channel: tag the principal with [`Principal::HUMAN_ROLE`] so it passes the
+/// `actor: human` gate, giving it a subject when the caller was anonymous.
+fn human_principal(base: &Principal) -> Principal {
+    let mut principal = base.clone();
+    if !principal.is_human() {
+        principal.roles.push(Principal::HUMAN_ROLE.to_string());
+    }
+    if principal.subject.is_empty() || principal.subject == "anonymous" {
+        principal.subject = "elicited-human".to_string();
+    }
+    principal
 }

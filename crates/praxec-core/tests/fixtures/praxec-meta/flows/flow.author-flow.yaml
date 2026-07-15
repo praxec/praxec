@@ -26,8 +26,9 @@ workflows:
               kind: workflow
               definitionId: cap.research.tool-inventory
               use:
-                inputs:
-                  filter: "$.context.goal"
+                # No inputs: the survey is a deterministic gateway self-survey
+                # (cap.research.tool-inventory declares no inputs). A `filter`
+                # binding here would be dead — V30 rejects it.
                 outputs:
                   "$.context.inventory": inventory
 

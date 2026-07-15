@@ -956,6 +956,7 @@
             "structural_analysis",
             "ingest",
             "diff",
+            "inventory",
             "tool_source"
           ]
         },

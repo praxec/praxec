@@ -5,28 +5,26 @@ workflows:
     verb: research
     lifecycle: experimental
     description: >
-      Survey the live gateway for reachable tools/scripts/skills/caps;
-      emit a typed inventory the planner can compose against.
+      Survey the live gateway for reachable tools/scripts/skills/caps; emit a
+      typed inventory the planner can compose against. Deterministic: the
+      gateway reads its OWN discovery index (the same surface `praxec.query`
+      serves) — no model, no step budget, no hallucinated tools. An LLM agent
+      here had no way to enumerate the gateway and exhausted the step budget
+      producing nothing, which made the whole authoring pack unusable.
     snippet:
-      inputs:
-        filter: { type: object, default: {} }
       outputs:
         inventory: { type: object }
-    skills: [research.tool-inventory.assemble]
     initialState: ready
     states:
       ready:
         goal: Build the typed inventory of reachable tooling.
         transitions:
-          submit_inventory:
+          survey:
             target: done
-            actor: agent
-            inputSchema:
-              type: object
-              required: [inventory]
-              properties:
-                inventory: { type: object }
-            executor: { kind: noop }
+            # Deterministic: fires on `start` via the runtime's deterministic
+            # chain, so step 1 of every authoring flow completes instantly.
+            actor: deterministic
+            executor: { kind: inventory }
             output:
-              inventory: "$.arguments.inventory"
+              inventory: "$.output.inventory"
       done: { terminal: true }

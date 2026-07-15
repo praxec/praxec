@@ -16,21 +16,21 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.19"
+version = "0.0.20"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/praxec/praxec"
 
 [workspace.dependencies]
-praxec-core = { path = "crates/praxec-core", version = "0.0.19" }
-praxec-executors = { path = "crates/praxec-executors", version = "0.0.19" }
-praxec-mcp-server = { path = "crates/praxec-mcp-server", version = "0.0.19" }
-praxec-test = { path = "crates/praxec-test", version = "0.0.19" }
-praxec-llm-executor = { path = "crates/praxec-llm-executor", version = "0.0.19" }
-praxec-agents = { path = "crates/praxec-agents", version = "0.0.19" }
-praxec-cockpit = { path = "crates/praxec-cockpit", version = "0.0.19" }
-praxec-embeddings = { path = "crates/praxec-embeddings", version = "0.0.19" }
+praxec-core = { path = "crates/praxec-core", version = "0.0.20" }
+praxec-executors = { path = "crates/praxec-executors", version = "0.0.20" }
+praxec-mcp-server = { path = "crates/praxec-mcp-server", version = "0.0.20" }
+praxec-test = { path = "crates/praxec-test", version = "0.0.20" }
+praxec-llm-executor = { path = "crates/praxec-llm-executor", version = "0.0.20" }
+praxec-agents = { path = "crates/praxec-agents", version = "0.0.20" }
+praxec-cockpit = { path = "crates/praxec-cockpit", version = "0.0.20" }
+praxec-embeddings = { path = "crates/praxec-embeddings", version = "0.0.20" }
 # praxec-tui and praxec-agents are workspace members in this repo.
 # The praxec-pro-gateway binary was retired; its wiring was folded into
 # the praxec binary behind the default-on `agents` cargo feature.
@@ -48,7 +48,7 @@ clap_mangen = "0.2"
 futures = "0.3"
 jsonschema = { version = "0.46", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
-rmcp = { version = "1.7", default-features = false, features = ["server", "client", "macros", "transport-io", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "1.8", default-features = false, features = ["server", "client", "macros", "elicitation", "transport-io", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 rpassword = "7"
 rstest = "0.23"
 rusqlite = { version = "0.32", features = ["bundled"] }
