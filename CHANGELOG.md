@@ -15,12 +15,23 @@ covered by a stability commitment.
 Dogfooding 0.0.20's delivery flows surfaced a blocker class: a coding agent leaf
 got an **empty filesystem root** because `repo_path` was never hand-threaded
 through a sub-workflow's `use.inputs`, so it burned its full step budget writing
-nothing. The root cause is that the repo a run operates on was modeled as
-per-leaf `input`, hand-wired at every boundary. This release makes it **run-
-ambient**: established once at the run boundary and threaded structurally through
-every spawn, so a coding leaf can never be handed a missing root. Two poka-yoke
-halves ship together — the root is always real, and every path referenced under
-it is checked before sign-off.
+nothing. That was a **plumbing** failure — a string that didn't get threaded —
+not a reasoning one, so the fix is structural, not a smarter prompt. This release
+makes the run's repo root **run-ambient**: a structurally-guaranteed, contained
+write root established once at the boundary and propagated through every spawn, so
+a coding leaf can never be handed a missing root and can never write outside it.
+
+Two **independent** mechanisms ship together, with deliberately distinct jobs —
+they are not two halves of one anti-hallucination trick:
+
+- **`repo_root` is containment + guaranteed presence.** Its value is that it is
+  always there (no un-threaded string to forget) and that it is a wall a run
+  cannot write past — which matters most for untrusted, sandboxed write agents.
+  It is *not* a scoping hint that keeps a model "on track"; a model that needs to
+  focus on one area is told so in its prompt.
+- **`path_grounding` is the anti-hallucination gate.** It deterministically
+  checks that the paths a plan actually names exist under the root before a human
+  sign-off. This is the piece that catches an *invented* path.
 
 ### Added — mandatory run-ambient `repo_root` (`$.run.repo_root`)
 
@@ -39,6 +50,16 @@ it is checked before sign-off.
   used automatically; multiple require a `repoRoot` selector on `start`; none
   declared → `start` fails fast (`REPO_ROOT_REQUIRED`). Every deployment now
   declares ≥1 `writable: true` repo.
+- **`repo_root` is the *containment boundary* — declare the whole writable repo,
+  not a subdirectory.** It is the outer wall, meant to be broad; narrowing a
+  monorepo run to one sub-app is a *focus* concern (handled today by the agent's
+  prompt), not a job for the root. A future `workdir` cursor *inside* the root
+  will make focus structural without shrinking reach — so that shared-package
+  reads and legitimate cross-directory edits are never walled off, and
+  `path_grounding` (which grounds under the root) never false-blocks a real
+  sibling path. Declaring a subdirectory as the writable repo to fake focus is
+  unsupported: the git commit/push path resolves the enclosing `.git`, so a
+  sub-repo root breaks it.
 
 ### Added — `path_grounding` gate (#7)
 
