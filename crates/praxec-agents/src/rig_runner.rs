@@ -1289,10 +1289,19 @@ async fn drain_turn(
     heartbeat: Option<&HeartbeatEmitter>,
     turn_index: u32,
 ) -> Result<TurnResult, ExecutorError> {
-    let mut stream = factory
-        .stream(model, turn)
-        .await
-        .map_err(|e| permanent(AgentErrorCode::ProviderError, e))?;
+    // Bound stream ESTABLISHMENT with the same stall window as inter-event
+    // silence. The no-progress watchdog below only starts its clock once the
+    // stream object exists — so a provider that accepts the request but never
+    // returns the first frame (connect-but-no-token, the hang-prone-lead
+    // failure shape) would otherwise be caught only by the whole-session wall
+    // (`max_seconds`, ~600s) and burn it once per model in the chain-walk.
+    // Timeout here surfaces as `ExecutorError::Timeout` (stall-class), so a
+    // first-frame hang escalates to the next model in ~`stall_timeout`.
+    let mut stream = match tokio::time::timeout(stall_timeout, factory.stream(model, turn)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(permanent(AgentErrorCode::ProviderError, e)),
+        Err(_) => return Err(ExecutorError::Timeout(stall_timeout.as_millis() as u64)),
+    };
     let mut text = String::new();
     let mut tool_calls = Vec::new();
     let mut final_answer = None;

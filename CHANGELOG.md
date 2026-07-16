@@ -8,6 +8,48 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.24] — 2026-07-16 — stall defense: no silent hangs, no runaway livelocks
+
+Two liveness backstops surfaced by dogfooding, closing the last places a governed
+run could burn the model indefinitely — one hanging silently, one livelocking.
+Both reuse existing typed-failure / cancel machinery and add no new infrastructure.
+
+### Fixed — an LLM leaf can no longer hang on stream establishment (FB-8)
+
+The agent leaf's no-progress watchdog only started its clock once the model
+stream object existed, so `factory.stream().await` — stream *establishment* —
+was un-timed. A provider that accepts the request but never returns the first
+frame (connect-but-no-token, the hang-prone-lead failure shape) was caught only
+by the whole-session wall (`max_seconds`, ~600s) and burned it once per model in
+the chain-walk. Establishment is now bounded by the same `stall_timeout` window
+as inter-event silence and reclassified to `ExecutorError::Timeout`, so a
+first-frame hang escalates to the next model in ~`stall_timeout` (~120s) instead
+of the full session budget. (Same class as the previously-closed 47-minute
+`host.tools()` hang; this was the remaining un-timed await in the leaf.)
+
+### Fixed — a livelocking run is quarantined instead of burning forever (FB-9)
+
+The deterministic chain was bounded only by `maxChainDepth` (default 50), which
+counts a *single drive's* steps and resets on every submit and every restart. A
+livelocking run (observed cycling states ~42 min at chain depth 27, all verdicts
+false) re-armed that budget on each poll and **survived restarts** —
+`reap_orphaned_runs` deliberately skips `_agent_await` instances, so the
+livelocking agent loop auto-resumed straight back into the burn.
+
+- A **cumulative** hop counter (`_chain_hops_total`) is now persisted in the
+  instance context, so it survives re-drives and restarts. On reaching
+  `livelockHopBudget` (default **300** — generous; legitimate flows finish in
+  tens of hops, a large CPM program in the low hundreds) without a terminal
+  state, the chain returns the new `ChainOutcome::Quarantined` and the run is
+  **cancelled** (via the existing `cancel()` path: terminal, `workflow.cancelled`,
+  wakes any suspended parent) with reason `livelock_quarantine`.
+- `reap_orphaned_runs` gains a boot-time backstop that quarantines an instance
+  already over budget **before** the engine-wait skip — closing the
+  `_agent_await` auto-resume hole.
+- Override per-definition with `livelockHopBudget`. The generous default is the
+  false-positive margin: a run that terminates under budget is never touched
+  (pinned by test).
+
 ## [0.0.23] — 2026-07-15 — dogfood ergonomics: writable code targets, worktree selectors, honest reload
 
 An ergonomics + fail-loud release driven entirely by dogfooding praxec as the
