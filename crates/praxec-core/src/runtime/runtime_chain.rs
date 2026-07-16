@@ -22,6 +22,21 @@ use crate::use_binding::{
     validate_outputs_against_snippet,
 };
 
+/// Engine-internal context slot holding the CUMULATIVE number of
+/// deterministic-chain hops this run has taken across ALL drives and restarts.
+/// Unlike `max_depth` (which counts a single drive's steps and resets on every
+/// submit/restart), this counter lives in the persisted context, so a
+/// livelocking run that re-arms `max_depth` on each poll still accumulates
+/// toward `livelock_budget`. `_`-prefixed = engine bookkeeping, excluded from
+/// the user-facing blackboard like `_while_iter` / `_agent_await`.
+pub(crate) const CHAIN_HOPS_TOTAL_KEY: &str = "_chain_hops_total";
+
+/// Default cumulative hop ceiling before a non-terminating run is quarantined
+/// as a livelock. Deliberately GENEROUS — legitimate flows finish in tens of
+/// hops and a large CPM program in the low hundreds, so only a pathological
+/// (livelocking) run trips it. Override per-definition with `livelockHopBudget`.
+pub(crate) const DEFAULT_LIVELOCK_HOP_BUDGET: u64 = 300;
+
 impl WorkflowRuntime {
     /// Resolve the next state for a transition. The transition's declared
     /// `target` is the default; if `branches: [{when, target}]` is present,
@@ -382,6 +397,7 @@ impl WorkflowRuntime {
         principal: &Principal,
         correlation_id: &str,
         max_depth: u64,
+        livelock_budget: u64,
     ) -> anyhow::Result<ChainOutcome> {
         let mut steps: Vec<ChainStep> = Vec::new();
         let mut accumulated_evidence: Vec<Evidence> = Vec::new();
@@ -395,6 +411,49 @@ impl WorkflowRuntime {
             // Stop: depth limit
             if steps.len() as u64 >= max_depth {
                 break;
+            }
+
+            // Quarantine: cumulative livelock budget. `_chain_hops_total`
+            // (persisted in context) counts hops across ALL drives + restarts,
+            // so — unlike `max_depth`, which resets each poll — a livelocking
+            // run that re-arms its per-drive budget still hits this hard
+            // ceiling. Breach = a non-terminating run burning the model with no
+            // net progress; return `Quarantined` and let the caller cancel it.
+            // Read at the top so a run already over budget from prior drives
+            // (e.g. one that persisted across a restart) is quarantined before
+            // it fires another hop.
+            let hops_total = instance
+                .context
+                .get(CHAIN_HOPS_TOTAL_KEY)
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if hops_total >= livelock_budget {
+                self.record_or_self_event(
+                    instance
+                        .audit_event("chain.quarantined")
+                        .with_correlation(correlation_id)
+                        .with_payload(json!({
+                            "state": instance.state,
+                            "chainHopsTotal": hops_total,
+                            "livelockBudget": livelock_budget,
+                            "reason": "livelock_quarantine",
+                        })),
+                )
+                .await;
+                let reason = format!(
+                    "livelock_quarantine: run took {hops_total} cumulative chain hops \
+                     (budget {livelock_budget}) without reaching a terminal state — \
+                     cancelling to stop the burn (raise `livelockHopBudget` if this run is \
+                     legitimately long)"
+                );
+                return Ok(ChainOutcome::Quarantined {
+                    partial: ChainResult {
+                        instance,
+                        steps,
+                        evidence: accumulated_evidence,
+                    },
+                    reason,
+                });
             }
 
             // Gather transitions for current state
@@ -947,6 +1006,22 @@ impl WorkflowRuntime {
             let expected_version = instance.version;
             instance.state = target.clone();
             instance.version += 1;
+
+            // Bump the persisted cumulative hop counter as part of THIS hop's
+            // snapshot, so it survives every re-drive and restart (the whole
+            // point — a livelock must not reset its budget by restarting or
+            // re-polling). Read-modify-write on the context object; the slot is
+            // engine bookkeeping (`_`-prefixed).
+            {
+                let prev = instance
+                    .context
+                    .get(CHAIN_HOPS_TOTAL_KEY)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if let Some(obj) = instance.context.as_object_mut() {
+                    obj.insert(CHAIN_HOPS_TOTAL_KEY.to_string(), json!(prev + 1));
+                }
+            }
 
             // Record-first: emit the transition record for this chain hop
             // BEFORE committing the snapshot. Deterministic transitions carry a

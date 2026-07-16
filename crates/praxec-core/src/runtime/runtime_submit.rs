@@ -1519,6 +1519,10 @@ impl WorkflowRuntime {
             .get("maxChainDepth")
             .and_then(Value::as_u64)
             .unwrap_or(50);
+        let livelock_budget = definition
+            .get("livelockHopBudget")
+            .and_then(Value::as_u64)
+            .unwrap_or(crate::runtime::runtime_chain::DEFAULT_LIVELOCK_HOP_BUDGET);
         let chain_outcome = self
             .run_deterministic_chain(
                 &definition,
@@ -1526,6 +1530,7 @@ impl WorkflowRuntime {
                 &request.principal,
                 &correlation_id,
                 max_depth,
+                livelock_budget,
             )
             .await?;
 
@@ -1668,6 +1673,32 @@ impl WorkflowRuntime {
                     }
                 };
                 Ok(DispatchOutcome::terminal(resp))
+            }
+            ChainOutcome::Quarantined { partial, reason } => {
+                // Liveness backstop — the run exceeded its cumulative hop budget
+                // without terminating. Cancel it (idempotent; wakes any
+                // suspended parent) so it cannot re-drive and burn the model,
+                // then respond terminal with the livelock reason (surfaced as a
+                // cancellation, mirroring `get`).
+                self.cancel(&partial.instance.id, &reason).await?;
+                let cancelled = self.store.load(&partial.instance.id).await?;
+                let mut response = self
+                    .response(
+                        &definition,
+                        &cancelled,
+                        StatusHint::Cancelled,
+                        Some(json!({
+                            "code": "LIVELOCK_QUARANTINE",
+                            "message": reason,
+                            "cancelled_reason": cancelled.cancelled_reason,
+                        })),
+                        &request.principal,
+                    )
+                    .await;
+                if !partial.steps.is_empty() {
+                    response["chain"] = serde_json::to_value(&partial.steps)?;
+                }
+                Ok(DispatchOutcome::terminal(response))
             }
         }
     }
@@ -1839,6 +1870,122 @@ mod tests {
         assert!(
             reloaded.context.get("_lock_wait").is_none(),
             "no _lock_wait should be persisted when the save failed"
+        );
+    }
+
+    // ---- FB-9: cumulative livelock hop budget ----------------------------
+
+    fn livelock_runtime(cfg: &serde_json::Value) -> (WorkflowRuntime, Arc<InMemoryWorkflowStore>) {
+        let definitions = Arc::new(ConfigDefinitionStore::from_config(cfg));
+        let store = Arc::new(InMemoryWorkflowStore::new());
+        let runtime = WorkflowRuntime::new(
+            definitions,
+            store.clone(),
+            Arc::new(EmptyRegistry),
+            Arc::new(DefaultGuardEvaluator::new()),
+            Arc::new(MemoryAuditSink::new()) as Arc<dyn AuditSink>,
+        );
+        (runtime, store)
+    }
+
+    async fn start_id(runtime: &WorkflowRuntime, def: &str) -> String {
+        let start = runtime
+            .start(StartWorkflow {
+                definition_id: def.into(),
+                input: json!({}),
+                principal: Principal::anonymous(),
+                run_env: crate::RunEnv::for_test(),
+                depth: 0,
+                parent: None,
+            })
+            .await
+            .expect("start should succeed");
+        start["workflow"]["id"].as_str().unwrap().to_string()
+    }
+
+    /// A never-terminating deterministic cycle a→b→a… must be quarantined once
+    /// its CUMULATIVE hop counter reaches `livelockHopBudget` — cancelled, not
+    /// left to spin. `maxChainDepth` is set high so the budget (not the
+    /// per-drive depth) is provably what fires.
+    #[tokio::test]
+    async fn a_livelock_cycle_is_quarantined_at_the_cumulative_budget() {
+        let cfg = json!({
+            "version": "1.0.0",
+            "workflows": { "cycle": {
+                "version": "1.0.0",
+                "initialState": "a",
+                "livelockHopBudget": 5,
+                "maxChainDepth": 1000,
+                "states": {
+                    "a": { "transitions": { "go":   { "target": "b", "actor": "deterministic" } } },
+                    "b": { "transitions": { "back": { "target": "a", "actor": "deterministic" } } }
+                }
+            }}
+        });
+        let (runtime, store) = livelock_runtime(&cfg);
+        let id = start_id(&runtime, "cycle").await;
+
+        let inst = store.load(&id).await.unwrap();
+        assert!(
+            inst.cancelled_at.is_some(),
+            "a livelock at budget must be cancelled (quarantined), got state {:?} cancelled={:?}",
+            inst.state,
+            inst.cancelled_at
+        );
+        assert!(
+            inst.cancelled_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("livelock_quarantine"),
+            "cancel reason must name the livelock quarantine, got {:?}",
+            inst.cancelled_reason
+        );
+        // Exactly the budget's worth of hops ran (fires at the top of the hop
+        // that would exceed it), and the counter is persisted — the basis for
+        // surviving re-drives and restart.
+        assert_eq!(
+            inst.context
+                .get("_chain_hops_total")
+                .and_then(Value::as_u64),
+            Some(5),
+            "the persisted cumulative hop counter must equal the budget at quarantine"
+        );
+    }
+
+    /// FALSE-POSITIVE GUARD: a legitimate run that reaches a terminal state in
+    /// FEWER hops than the budget must NOT be quarantined — it completes
+    /// normally. The counter runs (proving it's live) but never trips.
+    #[tokio::test]
+    async fn a_run_that_terminates_under_budget_is_not_quarantined() {
+        let cfg = json!({
+            "version": "1.0.0",
+            "workflows": { "line": {
+                "version": "1.0.0",
+                "initialState": "a",
+                "livelockHopBudget": 5,
+                "states": {
+                    "a": { "transitions": { "go": { "target": "b", "actor": "deterministic" } } },
+                    "b": { "transitions": { "go": { "target": "c", "actor": "deterministic" } } },
+                    "c": { "terminal": true }
+                }
+            }}
+        });
+        let (runtime, store) = livelock_runtime(&cfg);
+        let id = start_id(&runtime, "line").await;
+
+        let inst = store.load(&id).await.unwrap();
+        assert!(
+            inst.cancelled_at.is_none(),
+            "a run that terminates under budget must NOT be quarantined (state {:?})",
+            inst.state
+        );
+        assert_eq!(inst.state, "c", "the run must reach its terminal state");
+        assert_eq!(
+            inst.context
+                .get("_chain_hops_total")
+                .and_then(Value::as_u64),
+            Some(2),
+            "the counter must have run (2 hops) but stayed under the budget of 5"
         );
     }
 

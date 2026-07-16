@@ -1106,6 +1106,55 @@ async fn a_stalled_stream_is_caught_by_the_no_progress_watchdog_and_does_not_ret
     );
 }
 
+/// A factory whose `stream()` call NEVER RETURNS — the provider accepted the
+/// request but never produced the first frame (connect-but-no-token, the
+/// hang-prone-lead failure shape). Distinct from `StallingFactory`, which
+/// establishes the stream (`Ok` returns) and then pends: here the
+/// establishment await itself hangs, so it exercises the establishment bound,
+/// not the inter-event watchdog.
+struct HangingEstablishFactory {
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait]
+impl ProviderFactory for HangingEstablishFactory {
+    async fn stream(
+        &self,
+        _model: &str,
+        _turn: TurnRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, String>>, ExecutorError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        unreachable!("stream establishment must be bounded before it can return")
+    }
+}
+
+/// FB-8: stream ESTABLISHMENT must be bound by the same `stall_timeout` window
+/// as inter-event silence. Before the fix, `factory.stream().await` was
+/// un-timed — a connect-but-no-first-token provider was caught only by the
+/// whole-session wall (600s) and burned it once per model in the chain-walk.
+/// Now a hung establishment surfaces as `Timeout` at the 30s stall window and
+/// escalates after exactly one attempt.
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_never_establishes_is_caught_by_the_stall_window_not_the_session_wall() {
+    let factory = Arc::new(HangingEstablishFactory {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut s = session(vec![]); // no tools → tool setup skipped
+    s.timeout = Duration::from_secs(600); // total budget — must NOT be what fires
+    s.stall_timeout = Duration::from_secs(30); // the establishment/stall window
+    let runner = RigSessionRunner::new(factory.clone());
+    let result = runner.run(s).await;
+    assert!(
+        matches!(result, Err(ExecutorError::Timeout(30_000))),
+        "a stream that never establishes must time out at the 30s stall window, got {result:?}"
+    );
+    assert_eq!(
+        factory.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a hung establishment must escalate after one attempt, not retry in-session"
+    );
+}
+
 /// A hung MCP tool server must not wedge the run. `TOOL_CALL_TIMEOUT` bounds
 /// `host.call`, and a timeout is a NON-FATAL tool error: the model sees an
 /// "ERROR: … timed out" string as that tool's output and can still finish, so

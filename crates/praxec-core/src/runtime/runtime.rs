@@ -65,6 +65,15 @@ pub enum ChainOutcome {
         suspend: crate::model::StepSuspend,
         transition: String,
     },
+    /// Chain stopped because the run exceeded its cumulative livelock hop
+    /// budget (persisted across drives AND restarts) without reaching a
+    /// terminal state — a livelock. Distinct from `Failed`: this is a liveness
+    /// backstop, not an executor error, and the caller QUARANTINES the run
+    /// (cancels it) so it cannot re-drive and burn the model indefinitely.
+    Quarantined {
+        partial: ChainResult,
+        reason: String,
+    },
 }
 
 /// Accumulated state from a deterministic chain.
@@ -512,6 +521,34 @@ impl WorkflowRuntime {
             if is_terminal(def, &inst.state) {
                 continue; // succeeded / failed — resolved, nothing to reap
             }
+            // Livelock quarantine (FB-9): an instance that has already burned
+            // its full CUMULATIVE hop budget without terminating is a livelock.
+            // Quarantine it here — BEFORE the human/engine-wait skip below —
+            // because a livelocking auto-driven agent loop persists an
+            // `_agent_await` marker and would otherwise be SKIPPED and
+            // auto-resumed straight back into the burn (the exact FB-9 hole).
+            // The in-drive check in `run_deterministic_chain` normally trips
+            // first; this is the boot-time backstop for an instance that
+            // persisted over budget across a restart.
+            let livelock_budget = def
+                .get("livelockHopBudget")
+                .and_then(Value::as_u64)
+                .unwrap_or(crate::runtime::runtime_chain::DEFAULT_LIVELOCK_HOP_BUDGET);
+            let hops_total = inst
+                .context
+                .get(crate::runtime::runtime_chain::CHAIN_HOPS_TOTAL_KEY)
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if hops_total >= livelock_budget {
+                self.cancel(
+                    &inst.id,
+                    "livelock_quarantine: exceeded cumulative chain-hop budget \
+                     without terminating (reaped at startup)",
+                )
+                .await?;
+                reaped += 1;
+                continue;
+            }
             // Legitimately WAITING → never reap (mirrors the `get` derivation).
             let state_def = def.pointer(&format!("/states/{}", pointer_escape(&inst.state)));
             let awaiting_human = state_def
@@ -805,6 +842,10 @@ impl WorkflowRuntime {
             .get("maxChainDepth")
             .and_then(Value::as_u64)
             .unwrap_or(50);
+        let livelock_budget = definition
+            .get("livelockHopBudget")
+            .and_then(Value::as_u64)
+            .unwrap_or(crate::runtime::runtime_chain::DEFAULT_LIVELOCK_HOP_BUDGET);
         let chain_outcome = self
             .run_deterministic_chain(
                 &definition,
@@ -812,6 +853,7 @@ impl WorkflowRuntime {
                 &request.principal,
                 &correlation_id,
                 max_depth,
+                livelock_budget,
             )
             .await?;
 
@@ -943,6 +985,32 @@ impl WorkflowRuntime {
                         .await
                     }
                 }
+            }
+            ChainOutcome::Quarantined { partial, reason } => {
+                // Liveness backstop during `start` — the run exceeded its
+                // cumulative hop budget without terminating. Cancel it
+                // (idempotent; wakes any suspended parent) so it cannot re-drive
+                // and burn the model, then surface the cancellation with the
+                // livelock reason (mirrors how `get` reports a cancelled run).
+                self.cancel(&partial.instance.id, &reason).await?;
+                let cancelled = self.store.load(&partial.instance.id).await?;
+                let mut response = self
+                    .response(
+                        &definition,
+                        &cancelled,
+                        StatusHint::Cancelled,
+                        Some(json!({
+                            "code": "LIVELOCK_QUARANTINE",
+                            "message": reason,
+                            "cancelled_reason": cancelled.cancelled_reason,
+                        })),
+                        &request.principal,
+                    )
+                    .await;
+                if !partial.steps.is_empty() {
+                    response["chain"] = serde_json::to_value(&partial.steps)?;
+                }
+                Ok(response)
             }
         }
     }
@@ -1423,6 +1491,58 @@ mod reap_tests {
                 .unwrap()
                 .cancelled_at
                 .is_some()
+        );
+    }
+
+    /// FB-9: an instance that persisted OVER its cumulative hop budget while
+    /// carrying an `_agent_await` marker is quarantined at startup — even though
+    /// the engine-wait skip below would otherwise leave it alone. This is the
+    /// exact hole: a livelocking auto-driven agent loop parks `_agent_await` and
+    /// would auto-resume straight back into the burn across a restart. A
+    /// SECOND `_agent_await` instance that is UNDER budget is left alone,
+    /// proving only the over-budget one is reaped.
+    #[tokio::test]
+    async fn reap_quarantines_an_over_budget_agent_await_instance() {
+        let store = Arc::new(InMemoryWorkflowStore::new());
+
+        // Over budget (>= default 300) AND parked on `_agent_await` → quarantined.
+        let mut wedged = inst("wf_livelock", running_def(), "working");
+        wedged.context = json!({
+            "_agent_await": { "correlation_id": "x" },
+            "_chain_hops_total": 300
+        });
+        store.create(wedged).await.unwrap();
+
+        // Same `_agent_await` marker but UNDER budget → a legitimate parked
+        // agent session, left alone (the false-positive guard for reap).
+        let mut healthy = inst("wf_await", running_def(), "working");
+        healthy.context = json!({
+            "_agent_await": { "correlation_id": "y" },
+            "_chain_hops_total": 12
+        });
+        store.create(healthy).await.unwrap();
+
+        let rt = runtime(store.clone());
+        let reaped = rt.reap_orphaned_runs().await.unwrap();
+        assert_eq!(reaped, 1, "only the over-budget livelock is quarantined");
+
+        let livelock = store.load("wf_livelock").await.unwrap();
+        assert!(
+            livelock.cancelled_at.is_some(),
+            "the over-budget _agent_await instance must be quarantined"
+        );
+        assert!(
+            livelock
+                .cancelled_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("livelock_quarantine"),
+            "the reap reason must name the livelock quarantine, got {:?}",
+            livelock.cancelled_reason
+        );
+        assert!(
+            store.load("wf_await").await.unwrap().cancelled_at.is_none(),
+            "an under-budget parked agent session must be left alone"
         );
     }
 }
