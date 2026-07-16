@@ -125,14 +125,36 @@ pub struct McpConnection {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub url: Option<String>,
-    /// Per-connection inactivity ceiling (ms) for connect + each call. `None`
-    /// falls back to [`DEFAULT_IDLE_TIMEOUT_MS`].
+    /// Per-connection inactivity ceiling (ms) for each tool call. `None` falls
+    /// back to [`DEFAULT_IDLE_TIMEOUT_MS`].
     pub idle_timeout_ms: Option<u64>,
+    /// FB-7 — per-connection inactivity ceiling (ms) for the connect /
+    /// `initialize` phase specifically. A server that indexes a large repo on
+    /// cold start (e.g. `structureos`) can be *silent* for far longer than a
+    /// normal per-call idle window, so establishment gets its own knob. `None`
+    /// falls back to `idle_timeout_ms` (which itself falls back to
+    /// [`DEFAULT_IDLE_TIMEOUT_MS`]) — so raising just the startup budget does not
+    /// loosen the per-call idle bound, and setting neither preserves the 30s
+    /// default on both phases.
+    pub startup_timeout_ms: Option<u64>,
 }
 
 impl McpConnection {
+    /// Inactivity ceiling for each tool call.
     fn idle(&self) -> Duration {
         Duration::from_millis(self.idle_timeout_ms.unwrap_or(DEFAULT_IDLE_TIMEOUT_MS))
+    }
+
+    /// Inactivity ceiling for the connect / `initialize` phase. Defaults to the
+    /// per-call idle window when unset, so a connection that only sets
+    /// `idleTimeoutMs` bounds both phases uniformly (prior behavior), while a
+    /// slow cold-starting server can widen *just* establishment via
+    /// `startupTimeoutMs`.
+    fn startup(&self) -> Duration {
+        match self.startup_timeout_ms {
+            Some(ms) => Duration::from_millis(ms),
+            None => self.idle(),
+        }
     }
 }
 
@@ -160,6 +182,7 @@ impl McpConnections {
                 let env = crate::conn_util::json_object_to_string_map(conn.get("env"));
                 let url = conn.get("url").and_then(Value::as_str).map(str::to_string);
                 let idle_timeout_ms = conn.get("idleTimeoutMs").and_then(Value::as_u64);
+                let startup_timeout_ms = conn.get("startupTimeoutMs").and_then(Value::as_u64);
                 map.insert(
                     name.clone(),
                     McpConnection {
@@ -168,6 +191,7 @@ impl McpConnections {
                         env,
                         url,
                         idle_timeout_ms,
+                        startup_timeout_ms,
                     },
                 );
             }
@@ -264,11 +288,14 @@ impl RmcpToolCaller {
             crate::conn_util::connection_not_found_error("mcp", name, &self.connections.ungranted)
         })?;
         let idle = conn.idle();
+        // FB-7 — the connect/`initialize` phase is bounded by its own (possibly
+        // wider) startup window; each subsequent tool call uses `idle`.
+        let startup = conn.startup();
         let clock = ActivityClock::new();
 
         // Two transports, picked by which connection field is set. URL wins
         // when both are present (since URL implies a hosted server, not a
-        // process to launch). Both bound connect/`initialize` by the idle
+        // process to launch). Both bound connect/`initialize` by the startup
         // window so an unreachable or silent server can never hang establishment.
         let handler = RelayClientHandler::new(self.upstream.clone());
         let (service, child): (
@@ -279,15 +306,14 @@ impl RmcpToolCaller {
             // HTTP has no child stdio to tap, so the clock isn't byte-bumped:
             // the idle window acts as a connect timeout here.
             clock.mark();
-            let client =
-                with_idle_timeout(idle, &clock, ServiceExt::serve(handler.clone(), transport))
-                    .await
-                    .map_err(|e| {
-                        ExecutorError::Connection(format!("mcp http connect '{name}': {e}"))
-                    })?
-                    .map_err(|e| {
-                        ExecutorError::Connection(format!("mcp http init '{name}': {e}"))
-                    })?;
+            let client = with_idle_timeout(
+                startup,
+                &clock,
+                ServiceExt::serve(handler.clone(), transport),
+            )
+            .await
+            .map_err(|e| ExecutorError::Connection(format!("mcp http connect '{name}': {e}")))?
+            .map_err(|e| ExecutorError::Connection(format!("mcp http init '{name}': {e}")))?;
             (client, None)
         } else {
             let command = conn.command.as_deref().ok_or_else(|| {
@@ -350,7 +376,7 @@ impl RmcpToolCaller {
             let transport =
                 AsyncRwTransport::new_client(ActivityTracked::new(stdout, clock.clone()), stdin);
             clock.mark();
-            let client = with_idle_timeout(idle, &clock, ServiceExt::serve(handler, transport))
+            let client = with_idle_timeout(startup, &clock, ServiceExt::serve(handler, transport))
                 .await
                 .map_err(|e| {
                     ExecutorError::Connection(format!("mcp connect '{name}': {e} (idle timeout)"))
@@ -778,6 +804,85 @@ mod idle_wiring_tests {
             "must fire near the 300ms idle window, got {:?}",
             start.elapsed()
         );
+    }
+}
+
+#[cfg(test)]
+mod timeout_config_tests {
+    //! FB-7 — per-connection `idleTimeoutMs` (per-call) and `startupTimeoutMs`
+    //! (connect/`initialize`) plumbing, with the fallback ladder
+    //! `startup → idle → DEFAULT`.
+    use super::*;
+
+    #[test]
+    fn both_windows_default_to_30s_when_unset() {
+        let config = json!({
+            "connections": { "c": { "kind": "mcp", "command": "x" } }
+        });
+        let conns = McpConnections::from_config(&config);
+        let c = conns.get("c").expect("connection parsed");
+        assert_eq!(c.idle_timeout_ms, None);
+        assert_eq!(c.startup_timeout_ms, None);
+        assert_eq!(c.idle(), Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS));
+        assert_eq!(c.startup(), Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn idle_timeout_bounds_both_phases_when_startup_unset() {
+        // Prior behavior: a connection that sets only `idleTimeoutMs` bounds
+        // connect AND each call by that one window.
+        let config = json!({
+            "connections": { "c": { "kind": "mcp", "command": "x", "idleTimeoutMs": 5000 } }
+        });
+        let c = McpConnections::from_config(&config)
+            .get("c")
+            .cloned()
+            .unwrap();
+        assert_eq!(c.idle(), Duration::from_millis(5000));
+        assert_eq!(c.startup(), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn startup_timeout_widens_only_the_connect_phase() {
+        // A slow cold-starting server (structureos scan_repo) gets a long
+        // establishment budget WITHOUT loosening the per-call idle bound.
+        let config = json!({
+            "connections": {
+                "structureos": {
+                    "kind": "mcp",
+                    "command": "structureos",
+                    "startupTimeoutMs": 120_000
+                }
+            }
+        });
+        let c = McpConnections::from_config(&config)
+            .get("structureos")
+            .cloned()
+            .unwrap();
+        assert_eq!(c.startup_timeout_ms, Some(120_000));
+        assert_eq!(c.startup(), Duration::from_millis(120_000));
+        // per-call idle stays at the 30s default.
+        assert_eq!(c.idle(), Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn both_windows_independently_configurable() {
+        let config = json!({
+            "connections": {
+                "c": {
+                    "kind": "mcp",
+                    "command": "x",
+                    "idleTimeoutMs": 10_000,
+                    "startupTimeoutMs": 90_000
+                }
+            }
+        });
+        let c = McpConnections::from_config(&config)
+            .get("c")
+            .cloned()
+            .unwrap();
+        assert_eq!(c.idle(), Duration::from_millis(10_000));
+        assert_eq!(c.startup(), Duration::from_millis(90_000));
     }
 }
 

@@ -3,8 +3,12 @@
 //! [`build_discovery_index`] is the single seam BOTH gateway startup and gateway
 //! hot-reload construct their index through.
 //!
-//! Honors the `discovery.include` config knob (`["proxy", "workflows",
-//! "connections"]` by default for proxy + workflows, capped to those listed).
+//! Honors the `discovery.include` config knob. When unset it defaults to
+//! `["proxy", "workflows", "connections"]` — so a declared `connections:` entry
+//! (a wired MCP/CLI tool, already reachable by executor transitions and
+//! auto-driven agent leaves) is also discoverable via `praxec.query` search
+//! without extra config. An operator can still narrow the set by listing tokens
+//! explicitly (e.g. `["proxy", "workflows"]` to hide connections from search).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +41,7 @@ pub fn index_from_config(config: &Value) -> anyhow::Result<Vec<DiscoveryItem>> {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_else(|| vec!["proxy".into(), "workflows".into()]);
+        .unwrap_or_else(|| vec!["proxy".into(), "workflows".into(), "connections".into()]);
 
     // CMP-031 — validate include tokens against the known set. An unrecognized
     // token yields a partial/empty index that looks like a silent config bug;

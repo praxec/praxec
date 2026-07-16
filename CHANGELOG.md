@@ -8,7 +8,93 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
-## [Unreleased]
+## [0.0.23] — 2026-07-15 — dogfood ergonomics: writable code targets, worktree selectors, honest reload
+
+An ergonomics + fail-loud release driven entirely by dogfooding praxec as the
+implementation engine for a real external code repo (a C# checkout on a git
+worktree). Every change below closes a silent-drift or foot-gun that surfaced in
+one real setup+run session: `reload` that looked fine but didn't rewire the
+writable set, a writable code target forced to carry a definition manifest,
+worktree fan-out that forced pre-declaring every worktree, a connection reaped
+mid-scan by a fixed idle timeout, declared connections invisible to discovery,
+and `doctor` passing a config whose enabled feature had no model. The praise
+item (fail-closed honesty on an unresolved root) was preserved, not weakened —
+the theme is moving that same rejection *earlier* and making the happy paths
+ergonomic.
+
+### Fixed — `reload` now rewires the writable repo set (FB-1, dogfood find)
+
+`writable_repo_roots` was applied to the runtime only at serve startup, so
+`praxec.command { reload: true }` after declaring/changing a `writable: true`
+repo had **no effect** — the operator got a bare `"reloaded"`, then a run got an
+empty `$.run.repo_root` and died much later at the first file-leaf
+(`FILE_TOOL_ROOT_UNRESOLVED`): a silent, deferred, mislocated failure.
+
+- The runtime's writable set is now a hot-swappable slot (`Arc<RwLock<Vec<RepoRoot>>>`,
+  matching the `Swappable*` reload idiom); `reload_gated` re-derives it from the new
+  config and swaps it atomically with the definitions/executors — no restart.
+- A writable repo that no longer resolves (`RepoRoot::new`: path missing) drops the
+  reload to **repair-only** (`WRITABLE_REPO_INVALID`), keeping the previous set live —
+  never a half-swap, exactly like a contract-dirty edit.
+- The reload response now surfaces the resolved `writable_repos` (and audits them),
+  so the operator sees what runs can actually write to, not a bare `"reloaded"`.
+- (FB-1b) Confirmed + test-locked that `start`'s repo_root resolution already
+  fails fast (`REPO_ROOT_REQUIRED`) on an empty set at every boundary — the
+  earlier "empty root at start" symptom was the reload-not-rewiring bug above.
+### Fixed — `doctor`/preflight now fails loud when auto-drive has no model (dogfood find)
+
+Surfaced by dogfooding: a config with `praxec.agents.auto_drive: true` but no
+`gateway.models_yaml` passed `praxec doctor` with **`preflight: ok`** — then every
+auto-driven agent leaf would fail at runtime with no model, after burning setup
+and wall-clock. A silent fail-open on a runtime binding — the same class as a
+coding leaf handed an empty `repo_root`. Preflight now checks that, when
+auto-drive is enabled, its `auto_drive_affinity` (default `reasoning`) resolves
+to a concrete model through `gateway.models_yaml`; if it doesn't (key unset, file
+won't load, or no binding for the affinity) it fails with `AUTO_DRIVE_NO_MODEL`
+naming the affinity and the exact fix — the model analog of `REPO_ROOT_REQUIRED`.
+Generalizes `doctor` from "validate the artifacts present" to "validate the
+dependencies of enabled features."
+
+### Added — a writable code target no longer needs a `praxec.repo.yaml` (FB-2, dogfood find)
+
+`repos:` conflated "definition-providing pack" with "writable code target," so a
+real code repo (no praxec manifest) hard-failed at config load
+(`reading repo manifest <target>/praxec.repo.yaml: No such file or directory`) —
+the workaround was to plant a dummy manifest inside the checkout and git-exclude
+it, a foot-gun one `git add -A` away from a PR. A `repos:` entry may now set
+`definitions: false` (default `true`): it skips manifest + layout loading
+entirely but still registers the canonical path as a writable `repo_root`.
+Requires `writable: true` on the same entry (a non-writable, non-definition repo
+would be inert) — rejected loud otherwise.
+
+### Added — `start`'s `repoRoot` selector resolves worktrees under a declared root (FB-3, dogfood find)
+
+To run N parallel single-run flows on N git worktrees, the operator previously
+had to pre-declare all N as `writable: true` repos. A `start` `repoRoot` selector
+now also resolves to a **subpath of an already-declared writable root** (e.g. a
+worktree checkout under it), so one declaration + a per-call worktree path covers
+fan-out — matching the per-spawn `repoRoot` override `flow.drive-program` already
+threads. Containment is component-wise (`Path::starts_with`, not string-prefix,
+so `/repo-foo` is not "under" `/repo`); a path outside every declared root is
+rejected `REPO_ROOT_OUTSIDE_ALLOWLIST` and an unknown selector `REPO_ROOT_UNKNOWN`.
+Still an allowlist — never arbitrary free-text roots.
+
+### Fixed — declared `connections:` are indexed in the default discovery surface (FB-6, dogfood find)
+
+`discovery.include` defaulted to `["proxy", "workflows"]` while the docs promised
+connections were searchable — a doc-vs-code drift that left a declared `kind: mcp`
+connection absent from capability search (`praxec_query` returned no match for a
+tool that was configured). The default is now `["proxy", "workflows", "connections"]`,
+so declared connections are discoverable out of the box.
+
+### Added — per-connection `startupTimeoutMs` (FB-7, dogfood find)
+
+A slow deterministic MCP whose first output legitimately takes longer than the
+30 s idle timeout (a repo scan) was reaped mid-work
+(`idle for 30000ms with no activity`). A connection may now declare a distinct
+`startupTimeoutMs` bounding the connect/initialize phase separately from
+steady-state idle; resolution falls back `startupTimeoutMs → idleTimeoutMs → 30s`,
+so long-starting scanners aren't killed before they produce anything.
 
 ## [0.0.22] — 2026-07-15 — hardening release: scope parity, cross-repo routing, and invariant proofs
 

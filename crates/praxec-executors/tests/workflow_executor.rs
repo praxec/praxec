@@ -937,9 +937,17 @@ async fn repo_root_override_to_an_undeclared_repo_fails_fast() {
 /// existence (proves it can't be tricked by any real path on disk).
 #[tokio::test]
 async fn repo_root_override_to_existing_but_undeclared_dir_fails_fast() {
-    let repo_a = praxec_core::RepoRoot::for_test();
-    let existing = std::env::temp_dir().join("praxec_existing_undeclared_v22");
+    // The declared root and the "undeclared" dir must be genuine SIBLINGS (neither
+    // under the other): since FB-3, a subpath *under* a declared writable root is
+    // admitted (worktree support), so an "undeclared" dir that happened to sit
+    // under the declared root would (correctly) resolve. Declaration, not mere
+    // existence, is still the gate — but only for paths outside every declared root.
+    let base = std::env::temp_dir();
+    let declared_dir = base.join("praxec_fb3_declared_root");
+    let existing = base.join("praxec_fb3_undeclared_sibling");
+    std::fs::create_dir_all(&declared_dir).unwrap();
     std::fs::create_dir_all(&existing).unwrap();
+    let repo_a = praxec_core::RepoRoot::new(&declared_dir).unwrap();
     let existing_canon = std::fs::canonicalize(&existing).unwrap();
 
     let captured = Arc::new(std::sync::Mutex::new(CapturedEnv::default()));
