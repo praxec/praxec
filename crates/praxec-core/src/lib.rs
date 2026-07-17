@@ -26,6 +26,7 @@
 //! risk. Either refactor to release the guard first or upgrade to
 //! `parking_lot` (no poisoning).
 
+pub mod accounts;
 pub mod audit;
 pub mod binding;
 pub mod bus;

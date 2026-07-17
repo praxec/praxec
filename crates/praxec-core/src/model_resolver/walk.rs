@@ -173,7 +173,7 @@ impl Resolver {
         for (key, label) in candidate_keys(delegate) {
             if let Some(bindings) = self.file.overrides.get(&key) {
                 walked.push(format!("{label} (matched)"));
-                return Ok((Cow::Borrowed(bindings.as_slice()), label));
+                return Ok((Cow::Borrowed(bindings.members()), label));
             }
             if first_iteration && strict && asks_full {
                 // Strict mode + full delegate (affinity-tier) + first

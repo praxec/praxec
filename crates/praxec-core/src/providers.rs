@@ -54,6 +54,27 @@ impl Credentials {
             Credentials::Multi(vs) => vs.to_vec(),
         }
     }
+
+    /// Derive the env var name for a **named** account.
+    ///
+    /// Convention: `<PRIMARY_VAR>_<ACCOUNT>` where `ACCOUNT` is uppercased and
+    /// hyphens are replaced with underscores.  Returns `None` for keyless
+    /// (native/local) providers, which do not support named accounts.
+    ///
+    /// # Example
+    /// ```
+    /// use praxec_core::providers::{Credentials, ProviderId};
+    /// let creds = ProviderId::Anthropic.credentials();
+    /// assert_eq!(
+    ///     creds.account_env_var("work"),
+    ///     Some("ANTHROPIC_API_KEY_WORK".to_string())
+    /// );
+    /// assert_eq!(ProviderId::Ollama.credentials().account_env_var("any"), None);
+    /// ```
+    pub fn account_env_var(&self, account: &str) -> Option<String> {
+        self.primary()
+            .map(|base| format!("{}_{}", base, account.to_uppercase().replace('-', "_")))
+    }
 }
 
 /// Whether a provider is in every build or behind a cargo feature.
@@ -222,6 +243,28 @@ pub fn vendor_available(vendor: &str) -> bool {
     }
 }
 
+/// True if a **named** account on `provider` is reachable.
+///
+/// For keyless/native providers (ollama, llamacpp) this always returns `false`
+/// — named accounts are meaningless without credentials, and handing them out
+/// would silently ignore the account qualifier.
+///
+/// For API-key providers the env var `<PRIMARY_KEY>_<ACCOUNT_UPPER>` must be
+/// present.  See [`Credentials::account_env_var`] for the naming convention.
+///
+/// This generalizes [`vendor_available`] (which checks the *default* env var)
+/// to support N named accounts per provider.
+pub fn account_available(provider: &str, account: &str) -> bool {
+    match ProviderId::from_slug(provider) {
+        Some(p) => match p.credentials().account_env_var(account) {
+            // keyless provider — named accounts not supported
+            None => false,
+            Some(var) => std::env::var(&var).is_ok(),
+        },
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +344,56 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn account_env_var_derives_correct_name() {
+        assert_eq!(
+            ProviderId::Anthropic.credentials().account_env_var("work"),
+            Some("ANTHROPIC_API_KEY_WORK".to_string())
+        );
+        assert_eq!(
+            ProviderId::Openai.credentials().account_env_var("my-org"),
+            Some("OPENAI_API_KEY_MY_ORG".to_string())
+        );
+        assert_eq!(
+            ProviderId::Fireworks.credentials().account_env_var("prod"),
+            Some("FIREWORKS_API_KEY_PROD".to_string())
+        );
+    }
+
+    #[test]
+    fn keyless_providers_have_no_account_env_var() {
+        assert_eq!(
+            ProviderId::Ollama.credentials().account_env_var("any"),
+            None
+        );
+        assert_eq!(
+            ProviderId::Llamacpp.credentials().account_env_var("any"),
+            None
+        );
+    }
+
+    #[test]
+    fn account_available_returns_false_for_unknown_provider() {
+        assert!(!account_available("nonsense", "work"));
+    }
+
+    #[test]
+    fn account_available_returns_false_for_keyless_provider() {
+        // Keyless providers do not accept named accounts.
+        assert!(!account_available("ollama", "work"));
+        assert!(!account_available("llamacpp", "work"));
+    }
+
+    #[test]
+    fn account_available_respects_env_var() {
+        // Inject a synthetic env var for the test account and verify
+        // account_available picks it up (edition-2024 unsafe env; the test
+        // harness serialises env-touching tests on a single thread).
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY_TESTACCT", "sk-test") };
+        assert!(account_available("anthropic", "testacct"));
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY_TESTACCT") };
+        assert!(!account_available("anthropic", "testacct"));
     }
 }

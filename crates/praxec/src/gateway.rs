@@ -3168,11 +3168,12 @@ fn load_current_chains(
     let model_string = |b: &Binding| format!("{}:{}", b.provider.display_name(), b.model);
     let mut chains = std::collections::BTreeMap::new();
     for aff in affinities {
-        let bindings = mf
+        // overrides are Pool<Binding>, default is Vec<Binding>; unify to a slice.
+        let bindings: &[Binding] = mf
             .overrides
             .iter()
             .find(|(k, _)| k.to_string() == *aff)
-            .map(|(_, v)| v)
+            .map(|(_, v)| v.members())
             .unwrap_or(&mf.default);
         chains.insert(aff.clone(), bindings.iter().map(&model_string).collect());
     }
