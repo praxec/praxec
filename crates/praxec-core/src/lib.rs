@@ -57,6 +57,7 @@ pub mod overlay;
 pub mod path_safety;
 pub mod plan;
 pub mod pool_resolver;
+pub mod pool_router;
 pub mod ports;
 pub mod promotion;
 pub mod provider_keys;
