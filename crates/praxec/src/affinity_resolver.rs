@@ -89,37 +89,6 @@ impl AgentsYamlAffinityResolver {
     }
 }
 
-#[cfg(test)]
-mod pool_bridge_tests {
-    use super::*;
-    use praxec_core::accounts::AccountRegistry;
-    use praxec_core::pool_resolver::Constraints;
-
-    #[test]
-    fn resolve_pool_bridges_config_first_override() {
-        let r = AgentsYamlAffinityResolver::from_yaml_str(
-            "version: 1\n\
-             default:\n  - provider: { name: openai }\n    model: gpt-5\n\
-             overrides:\n  coding-frontier:\n    - provider: { name: anthropic }\n      model: claude-x\n",
-        )
-        .unwrap();
-        let spec = ModelRef::parse("coding-frontier").unwrap();
-        let pool = r
-            .resolve_pool(
-                &spec,
-                Constraints::default(),
-                &AccountRegistry::default(),
-                |_| true,
-                0.5,
-                0.15,
-            )
-            .expect("config-first override resolves to a pool");
-        assert_eq!(pool.len(), 1);
-        assert_eq!(pool[0].provider, "anthropic");
-        assert_eq!(pool[0].model, "claude-x");
-    }
-}
-
 #[cfg(feature = "llm-executor")]
 #[async_trait::async_trait]
 impl AffinityResolver for AgentsYamlAffinityResolver {
@@ -203,4 +172,35 @@ pub fn resolve_affinity_to_chain(resolver: &Resolver, affinity: &str) -> Vec<Str
 /// `tests/affinity_resolver.rs`.
 fn provider_prefix(p: &Provider) -> &'static str {
     p.display_name()
+}
+
+#[cfg(test)]
+mod pool_bridge_tests {
+    use super::*;
+    use praxec_core::accounts::AccountRegistry;
+    use praxec_core::pool_resolver::Constraints;
+
+    #[test]
+    fn resolve_pool_bridges_config_first_override() {
+        let r = AgentsYamlAffinityResolver::from_yaml_str(
+            "version: 1\n\
+             default:\n  - provider: { name: openai }\n    model: gpt-5\n\
+             overrides:\n  coding-frontier:\n    - provider: { name: anthropic }\n      model: claude-x\n",
+        )
+        .unwrap();
+        let spec = ModelRef::parse("coding-frontier").unwrap();
+        let pool = r
+            .resolve_pool(
+                &spec,
+                Constraints::default(),
+                &AccountRegistry::default(),
+                |_| true,
+                0.5,
+                0.15,
+            )
+            .expect("config-first override resolves to a pool");
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].provider, "anthropic");
+        assert_eq!(pool[0].model, "claude-x");
+    }
 }
