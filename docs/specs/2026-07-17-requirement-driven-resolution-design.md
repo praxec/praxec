@@ -1,6 +1,6 @@
 # Requirement-Driven Resolution + RouterPolicy Pools (praxec spec #2)
 
-**Status:** design, grounded in the current resolution spine (file:line cited)
+**Status:** design, grounded (file:line cited) + FMECA-vetted (iteration 1 — all risks Low)
 **Date:** 2026-07-17
 **Companion to:** `docs/specs/2026-07-16-multi-provider-load-distribution-design.md`
 (this spec is the praxec **consumer** side; the reliability primitive shipped
@@ -132,6 +132,37 @@ trait (`session.rs:177-191`) — the exact seam that today returns an ordered
    `(provider, model, account)` triad), plus a `strategy` (`ordered` |
    `distribute`) — instead of collapsing to one cost-ordered chain.
 
+**Fail-fast on an empty pool (R1).** If filtering yields no member, resolution
+returns `ResolutionError::Unsatisfiable { spec, reason }` naming the facet/
+constraint that emptied it (e.g. "no `local_only` model supports `effort: deep`").
+It **never** falls back to a default model — a silent default is exactly the
+agentic shortcut this design rejects.
+
+**`distribute` pools only within the value band (R2).** Even-spreading a
+cost-asymmetric pool would send load to expensive members, defeating the stance.
+So `distribute` balances **only members inside the ranking's marginal band ε**
+(`priorities.rs` ε, already "prefer stronger within ε"); members outside the band
+are *lower failover bands*, reached by `ordered` advance, never distribution
+targets. A cost-asymmetric requirement therefore distributes across near-equals
+and fails over across tiers — the "ordered not distribute for cost-asymmetric
+pools" guidance becomes a mechanism, not a doc note. (TRIZ: Local Quality —
+segment the pool by value band.)
+
+**Unreachable members are excluded (R5).** `account_available` (§4) drops members
+whose account env var is absent at pool-build (like a breaker-open member); if
+that empties the pool, R1 fires. Load-time warns on configured-but-unreachable
+accounts.
+
+**Effort capability is a complete filter (R4).** A member satisfies `effort: deep`
+only if BOTH its `ModelEntry.reasoning_levels` includes the mapped level AND its
+provider has an effort mapping in `tuning.rs` (`:144-193`). Missing catalog data ⇒
+**exclude** (conservative), never assume-support. A catalog-lint flags effort-tier
+models lacking `reasoning_levels`.
+
+**Deterministic pool order (R8).** Ranking ties break by a stable sort
+`(value desc, provider, model, account)` — so `ordered` failover order and tests
+are reproducible, never hashmap-iteration-dependent.
+
 **Config surface:** reuse the open `activity:` map (`config.rs:435`) and
 `overrides` — a capability/requirement key resolves to a **member set + strategy**,
 not just a `Vec<Binding>` chain. `ordered` preserves today's cost-ascending
@@ -154,14 +185,22 @@ dependency — `agents/src/breaker.rs:7`; failover hand-rolled at
 - `router.run(async |member| call_provider(member, effort_params).await)` — the
   **effort params live inside the run-closure** (`TurnRequest.reasoning` via
   `tuning.rs`), never in the crate. The crate stays domain-blind.
-- This **replaces** the hand-rolled escalation loop: `RouterPolicy` owns
-  health-filter, selection, advance-on-classified-transient (feed it praxec's
-  `FailureClass::is_infrastructure` as `advance_when`), and the park hint. The
-  per-member breaker keyed by the triad falls out of `Member` identity (no
+- `advance_when` is the **same** `FailureClass::is_infrastructure` function the
+  executor already uses (R7) — passed in, not reimplemented, so classification
+  can't drift between the router and the rest of praxec.
+- The per-member breaker keyed by the triad falls out of `Member` identity (no
   separate per-account breaker code — that was groups 3/4 of the companion spec,
   now subsumed).
-- Reactive throttle failover + even-distribution are then both properties of one
-  `RouterPolicy`, replacing two hand-rolled loops with one vetted primitive.
+- **Never a second load-balancer (R6).** `distribute` is served *only* by
+  `RouterPolicy`. The existing agent escalation loop (`executor.rs:492-587`) is a
+  *passive per-invocation planner*, deliberately off execution-policy
+  (`breaker.rs:7`). `ordered` migrates onto `RouterPolicy::first_healthy` **only
+  behind the byte-for-byte regression gate** (assertion 5); if the router's active
+  wrapper can't cleanly express the agent's per-invocation re-resolution, the
+  agent's `ordered` path stays the existing passive walk **unchanged** — it is not
+  a load balancer, so there is nothing to duplicate. Either way there is exactly
+  one distribution implementation and at most one failover implementation per
+  surface.
 
 ## 7. Where it slots in (SDLC)
 
@@ -203,18 +242,52 @@ the existing `agent`/`affinity`/`needs` XOR set (`agents/src/config.rs:18-68`,
    pool routing.
 9. `advance_when` = `FailureClass::is_infrastructure` — a content failure surfaces,
    an infrastructure failure advances (parity with `executor.rs` classification).
+10. Empty pool ⇒ `ResolutionError::Unsatisfiable` naming the facet — never a
+    default-model fallback (R1).
+11. `distribute` balances only within the value band ε; a cost-asymmetric pool
+    fails over across bands instead of spreading (R2).
+12. A bare `Vec<Binding>` in `activity:`/`overrides` still deserializes (as an
+    `ordered` pool); the `{members, strategy}` mapping also parses; a malformed
+    value errors with the dual-form message (R3).
+13. A model missing `reasoning_levels`, or a provider with no `tuning.rs` effort
+    mapping, is excluded from an `effort`-carrying pool — never assumed-capable (R4).
+14. Pool ordering is deterministic under ranking ties (R8); an unknown effort
+    grammar segment is a parse error, not a silent ignore (R9).
 
-## 10. Open decisions
+## 10. Decisions (resolved by the FMECA vet — §11)
 
-1. **Config shape for pools** — extend `activity:`/`overrides` values from
-   `Vec<Binding>` to `{members, strategy}`, or a new `pools:` map? (Lean: extend,
-   for backward-compat and one place to look.)
-2. **Account registry location** — on `ProviderDescriptor` (static) vs a separate
-   `accounts.yaml`/env-scan (dynamic, rate-of-change separation per the
-   data-in-config rule). Lean: separate, since accounts are operator/env data.
-3. **Replace vs wrap the escalation loop** — does `RouterPolicy` fully replace
-   `executor.rs:492-587`, or wrap it behind the trait so `ordered` stays on the old
-   path and only `distribute` uses RouterPolicy? (Lean: one path — RouterPolicy for
-   both, `ordered` = `first_healthy`, to avoid two failover implementations.)
-4. **FMECA vet** — run the reliability-engineering methodology on this spec (as we
-   did for 0.0.5) before the implementation plan.
+1. **Config shape for pools** — **RESOLVED: extend `activity:`/`overrides` with
+   dual-form serde (R3).** A bare `Vec<Binding>` deserializes as
+   `{members: <bindings>, strategy: ordered}` (backward-compatible with every
+   existing config); the mapping form `{members, strategy}` is explicit; a
+   malformed value yields an actionable dual-form error. One place to look, no
+   migration.
+2. **Account registry location** — **RESOLVED: separate `accounts.yaml` / env
+   scan**, not on `ProviderDescriptor`. Accounts are operator/environment data with
+   a different rate of change than the curated provider catalog (data-in-config
+   rule); secrets stay in env, referenced by name.
+3. **Replace vs wrap the escalation loop** — **RESOLVED (R6): never a second
+   load-balancer.** `distribute` is only `RouterPolicy`; `ordered` migrates onto
+   `RouterPolicy::first_healthy` only behind the byte-for-byte regression gate
+   (assertion 5), else the agent's passive walk stays unchanged. See §6.
+
+## 11. FMECA vet record (iteration 1, 2026-07-17)
+
+Vetted with the reliability-engineering methodology (FMECA → poka-yoke →
+prevent/detect/fail-fast → TRIZ-if-trade-off), 9 failure modes across UX / runtime
+/ architecture / delivery, **all reduced to residual Low in one iteration**. Key
+hardening folded into this spec:
+- **R1** empty pool ⇒ `ResolutionError::Unsatisfiable`, never a silent default.
+- **R2** (TRIZ Local Quality) `distribute` balances only within the value band ε;
+  cost-asymmetric members fail over, never spread — the guidance becomes a mechanism.
+- **R3** dual-form serde keeps every existing `activity:`/`overrides` config valid.
+- **R4** effort filter requires model `reasoning_levels` AND provider `tuning.rs`
+  mapping; missing data excludes, never assumes.
+- **R5** unreachable accounts are excluded at pool-build (⇒ R1 if it empties).
+- **R6** exactly one distribution impl; `ordered` migration regression-gated.
+- **R7** `advance_when` reuses the existing `is_infrastructure` (no drift).
+- **R8** deterministic pool tie-break; **R9** effort-grammar parse errors, no silent ignore.
+
+Systemic check — accuracy: no fabricated figures; complexity: additions are
+fail-fast guards + reuse of existing lens/ε, not new machinery; capability: the
+ordered-chain path is preserved (opt-in `distribute`), nothing removed.
