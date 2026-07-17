@@ -184,6 +184,7 @@ enum RawProvider {
     Ollama,
     Llamacpp,
     Bedrock,
+    Fireworks,
     Custom { endpoint: String },
 }
 
@@ -197,6 +198,7 @@ impl From<RawProvider> for Provider {
             RawProvider::Ollama => Provider::Known(ProviderId::Ollama),
             RawProvider::Llamacpp => Provider::Known(ProviderId::Llamacpp),
             RawProvider::Bedrock => Provider::Known(ProviderId::Bedrock),
+            RawProvider::Fireworks => Provider::Known(ProviderId::Fireworks),
             RawProvider::Custom { endpoint } => Provider::Custom { endpoint },
         }
     }
@@ -579,6 +581,18 @@ fn extract_between<'a>(haystack: &'a str, start: &str, end: &str) -> Option<&'a 
     let rest = &haystack[s..];
     let e = rest.find(end)?;
     Some(&rest[..e])
+}
+
+#[cfg(test)]
+mod provider_parse_tests {
+    use super::*;
+    use crate::providers::ProviderId;
+
+    #[test]
+    fn fireworks_provider_name_parses_to_known() {
+        let p: Provider = serde_yaml::from_str("name: fireworks").unwrap();
+        assert_eq!(p, Provider::Known(ProviderId::Fireworks));
+    }
 }
 
 #[cfg(test)]
