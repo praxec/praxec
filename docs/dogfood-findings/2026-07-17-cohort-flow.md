@@ -48,6 +48,31 @@ user-facing text (its own test caught it once the suite compiled).
 system context for Rust stacks, and/or run `cargo fix --edition-idioms` +
 `clippy --fix` as a cheap post-edit pass before the verify milestone.
 
+### F4 — on a complex, under-grounded deliverable the agent HALLUCINATED an invented API (SEVERE)
+Cohort 2 (`pool-resolver`, one owned file `affinity_resolver.rs`) added **42 lines
+of `mod tests` against an entirely invented API** — `MockCatalog::new()`,
+`Facet::ReasoningLevel`, `ReasoningLevel::RealTime`, `Model::GPT4`, `add_facet`,
+`mock_provider`, `resolve()` — **none of which exist in praxec**, and which bear no
+relation to the real cited seams (`suggest_by_value`, `ModelEntry`, `Affinity`/
+`Tier`/`Effort`). It implemented **no resolver**, broke a doc comment, and emitted
+`mod tests` without `#[cfg(test)]` (so it compiles into the normal build and fails).
+Its edit summary was a single vague line vs cohort 1's detailed changelog. Output
+was reverted wholesale.
+**Two root causes:** (a) **under-scoping** — the deliverable needs NEW shared types
+(`RequirementSpec`, `ResolutionError`, a pool-member type) that belong in
+`model_resolver`/`praxec-core`, plus the effort parse in `walk.rs` — none reachable
+from the single owned file, so a faithful implementation was *impossible* in scope;
+(b) **grounding failure** — the agent did not read the cited real types and
+invented a parallel design instead of failing honestly.
+**Fixes:** (1) plan-side — a deliverable that introduces new shared types must be
+scoped to include those types' home files, or decomposed so a "resolution-types"
+deliverable lands first and the resolver depends on it; (2) agent-side — require the
+coding agent to read/confirm the cited symbols exist (or are created in-scope)
+before writing, and reject test-only edits that reference undefined symbols; (3)
+lint the `mod tests` without `#[cfg(test)]` in the fix pass. This is the clearest
+case that **complex deliverables exceed the current build-loop** — until F1/F2/F4
+land, the frontier orchestrator must implement them.
+
 ## Positive findings (keep / validate)
 
 ### P1 — compiled-stack sidesteps the build-loop ceremony failure
