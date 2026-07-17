@@ -101,7 +101,8 @@ fn key_env_var(creds: Credentials, fallback: &str, account: Option<&str>) -> Str
 /// Read the resolved API key from the environment. A missing var yields the dummy
 /// `"praxec-test"` (mock/proxy endpoints need no real key).
 fn resolve_api_key(creds: Credentials, fallback: &str, account: Option<&str>) -> String {
-    std::env::var(key_env_var(creds, fallback, account)).unwrap_or_else(|_| "praxec-test".to_string())
+    std::env::var(key_env_var(creds, fallback, account))
+        .unwrap_or_else(|_| "praxec-test".to_string())
 }
 
 #[async_trait]
@@ -173,7 +174,11 @@ impl ProviderFactory for DefaultProviderFactory {
             // client (which still honors rig's native `OPENAI_BASE_URL`).
             Some(ProviderId::Openai) => match openai_base_override() {
                 Some(base) => {
-                    let key = resolve_api_key(ProviderId::Openai.credentials(), "OPENAI_API_KEY", account);
+                    let key = resolve_api_key(
+                        ProviderId::Openai.credentials(),
+                        "OPENAI_API_KEY",
+                        account,
+                    );
                     run!(openai_completions_client(&base, &key))
                 }
                 None => run!(openai::Client::from_env()),
@@ -353,7 +358,10 @@ mod tests {
             "FIREWORKS_API_KEY_MY_ORG"
         );
         // No account → the provider's primary var (unchanged behavior).
-        assert_eq!(key_env_var(creds, "OPENAI_API_KEY", None), "FIREWORKS_API_KEY");
+        assert_eq!(
+            key_env_var(creds, "OPENAI_API_KEY", None),
+            "FIREWORKS_API_KEY"
+        );
         // Keyless provider falls back (no primary to derive from).
         assert_eq!(
             key_env_var(Credentials::None, "OPENAI_API_KEY", Some("x")),

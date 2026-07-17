@@ -199,7 +199,6 @@ async fn build_provider_and_stream(
     response::drain_stream(stream).await
 }
 
-
 /// Extract the typed [`LlmErrorCode`] from an [`ExecutorError`] for the
 /// audit-emit path. Non-`Llm(_)` variants are mapped to
 /// [`LlmErrorCode::ProviderError`] — the audit log is operator-facing
