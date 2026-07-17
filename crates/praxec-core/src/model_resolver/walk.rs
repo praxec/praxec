@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use super::classify::FailureClass;
-use super::config::{Affinity, Binding, ModelsFile, OverrideKey, Tier};
+use super::config::{Affinity, Binding, Effort, ModelsFile, OverrideKey, Tier};
 
 // ── model reference (the policy form of a delegate: value) ──────────────────
 
@@ -39,6 +39,10 @@ use super::config::{Affinity, Binding, ModelsFile, OverrideKey, Tier};
 pub struct ModelRef {
     pub affinity: Option<Affinity>,
     pub tier: Option<Tier>,
+    /// Requested reasoning depth (R9). Parsed as an optional trailing
+    /// `-<effort>` segment: `coding-frontier-deep`, `coding-deep`. `None` for
+    /// the classic `<affinity>-<tier>` forms — fully backward-compatible.
+    pub effort: Option<Effort>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -46,9 +50,11 @@ pub enum ModelRefParseError {
     #[error("delegate string is empty")]
     Empty,
     #[error(
-        "delegate `{0}` does not parse as <affinity> | <tier> | <affinity>-<tier>; \
-         affinity ∈ {{coding, reasoning, prose, web-search, recon}}, \
-         tier ∈ {{frontier, standard, commoditized}}"
+        "delegate `{0}` does not parse as <affinity> | <tier> | <affinity>-<tier> \
+         | <..>-<effort>; \
+         affinity ∈ {{coding, reasoning, prose, web-search, recon, agentic}}, \
+         tier ∈ {{frontier, standard, commoditized}}, \
+         effort ∈ {{fast, medium, deep}}"
     )]
     Unknown(String),
 }
@@ -62,12 +68,29 @@ impl ModelRef {
         if raw.is_empty() {
             return Err(ModelRefParseError::Empty);
         }
+        // Strip an optional trailing `-<effort>` segment (R9). Only strips when
+        // the last segment is a known Effort, so `coding-frontier` (a tier) is
+        // untouched — the classic 2-segment forms parse exactly as before.
+        if let Some(idx) = raw.rfind('-') {
+            let (left, right) = (&raw[..idx], &raw[idx + 1..]);
+            if let Ok(effort) = Effort::from_str(right) {
+                let mut base = Self::parse_base(left)?;
+                base.effort = Some(effort);
+                return Ok(base);
+            }
+        }
+        Self::parse_base(raw)
+    }
+
+    /// Parse the `<affinity> | <tier> | <affinity>-<tier>` portion (no effort).
+    fn parse_base(raw: &str) -> Result<Self, ModelRefParseError> {
         if let Some(idx) = raw.rfind('-') {
             let (left, right) = (&raw[..idx], &raw[idx + 1..]);
             if let (Ok(a), Ok(t)) = (Affinity::from_str(left), Tier::from_str(right)) {
                 return Ok(ModelRef {
                     affinity: Some(a),
                     tier: Some(t),
+                    effort: None,
                 });
             }
         }
@@ -75,12 +98,14 @@ impl ModelRef {
             return Ok(ModelRef {
                 affinity: Some(a),
                 tier: None,
+                effort: None,
             });
         }
         if let Ok(t) = Tier::from_str(raw) {
             return Ok(ModelRef {
                 affinity: None,
                 tier: Some(t),
+                effort: None,
             });
         }
         Err(ModelRefParseError::Unknown(raw.to_string()))
@@ -89,11 +114,15 @@ impl ModelRef {
 
 impl fmt::Display for ModelRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.affinity, self.tier) {
-            (Some(a), Some(t)) => write!(f, "{a}-{t}"),
-            (Some(a), None) => write!(f, "{a}"),
-            (None, Some(t)) => write!(f, "{t}"),
-            (None, None) => f.write_str("(empty)"),
+        let base = match (self.affinity, self.tier) {
+            (Some(a), Some(t)) => format!("{a}-{t}"),
+            (Some(a), None) => format!("{a}"),
+            (None, Some(t)) => format!("{t}"),
+            (None, None) => "(empty)".to_string(),
+        };
+        match self.effort {
+            Some(e) => write!(f, "{base}-{e}"),
+            None => f.write_str(&base),
         }
     }
 }
