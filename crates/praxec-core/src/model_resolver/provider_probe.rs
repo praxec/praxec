@@ -23,8 +23,8 @@
 //! - **OpenRouter** — `GET /api/v1/models` with `Authorization: Bearer ...`
 //!   (OpenAI-compatible `data: [{id, ...}]` shape). Probed for real so a
 //!   dead key can't pass as healthy (PROBE-02).
-//! - **Ollama / llama.cpp / Bedrock / Custom** — skipped (no auth/listing
-//!   convention we can rely on).
+//! - **Ollama / llama.cpp / Bedrock / Fireworks / Custom** — skipped (no live
+//!   listing probe wired yet; a real Fireworks `/models` probe is a follow-up).
 //!
 //! Per-provider base URLs default to the const here and honor a
 //! `*_BASE_URL` env override so OpenAI-compatible / self-hosted gateways
@@ -54,8 +54,8 @@ pub enum ListingStatus {
     UnexpectedResponse,
     /// No API key in env; the binding is unprobeable without one.
     NoCredential,
-    /// Provider class (Ollama / llama.cpp / Bedrock / Custom) where we don't
-    /// implement a probe. Skipped, not failed.
+    /// Provider class (Ollama / llama.cpp / Bedrock / Fireworks / Custom) where
+    /// we don't implement a probe. Skipped, not failed.
     Skipped,
 }
 
@@ -196,10 +196,12 @@ pub async fn probe_binding(client: &reqwest::Client, binding: &Binding) -> (List
             )
             .await
         }
-        ProviderId::Ollama | ProviderId::Llamacpp | ProviderId::Bedrock => (
-            ListingStatus::Skipped,
-            "no live model-listing probe wired for this provider yet".into(),
-        ),
+        ProviderId::Ollama | ProviderId::Llamacpp | ProviderId::Bedrock | ProviderId::Fireworks => {
+            (
+                ListingStatus::Skipped,
+                "no live model-listing probe wired for this provider yet".into(),
+            )
+        }
     }
 }
 

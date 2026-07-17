@@ -161,6 +161,184 @@ impl FromStr for Tier {
     }
 }
 
+/// Requested reasoning depth. Closed enum — maps to the existing reasoning-
+/// tuning levels in `tuning.rs` so the *apply* path is unchanged; only the
+/// resolution *key* is new. Same versioning policy as `Affinity` / `Tier`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Effort {
+    Fast,
+    Medium,
+    Deep,
+}
+
+impl fmt::Display for Effort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Effort::Fast => "fast",
+            Effort::Medium => "medium",
+            Effort::Deep => "deep",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for Effort {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "fast" => Effort::Fast,
+            "medium" => Effort::Medium,
+            "deep" => Effort::Deep,
+            other => return Err(other.to_string()),
+        })
+    }
+}
+
+/// Distribution strategy for a pool of bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Strategy {
+    Ordered,
+    Distribute,
+}
+
+// ── pool (dual-form serde for activity:/overrides: values, R3) ──────────────
+
+/// A pool of bindings paired with a distribution strategy.
+///
+/// Dual-form serde (R3): a bare YAML list deserializes as
+/// `Pool { members: <list>, strategy: Ordered }` (backward-compatible with
+/// every existing config); the explicit mapping
+/// `{members: [...], strategy: "ordered"|"distribute"}` is also accepted.
+/// Any other shape is an actionable error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pool<T> {
+    pub members: Vec<T>,
+    pub strategy: Strategy,
+}
+
+impl<T> Pool<T> {
+    /// All members, by reference.
+    pub fn members(&self) -> &[T] {
+        &self.members
+    }
+
+    /// The distribution strategy.
+    pub fn strategy(&self) -> Strategy {
+        self.strategy
+    }
+}
+
+/// A `Pool` reads as its **ordered member list**: it `Deref`s to the member
+/// slice and `&Pool` iterates its members. Every consumer that reads
+/// `activity:`/`overrides:` as a binding list keeps working after the
+/// `Vec -> Pool` type change. Iteration is ALWAYS the members in declared order —
+/// the `distribute` strategy is never applied by iterating; only the router layer
+/// consults [`Pool::strategy`] to distribute. So a read-consumer can't be fooled
+/// into "distributing" by accident.
+impl<T> std::ops::Deref for Pool<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.members
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Pool<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.members.iter()
+    }
+}
+
+/// On-disk shape for a pool — raw bindings before provider-feature typing.
+#[derive(Debug, Clone)]
+struct RawPool {
+    members: Vec<RawBinding>,
+    strategy: Strategy,
+}
+
+impl<'de> Deserialize<'de> for RawPool {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::Sequence(seq) => {
+                let members: Vec<RawBinding> =
+                    serde_yaml::from_value(serde_yaml::Value::Sequence(seq))
+                        .map_err(serde::de::Error::custom)?;
+                Ok(RawPool {
+                    members,
+                    strategy: Strategy::Ordered,
+                })
+            }
+            serde_yaml::Value::Mapping(map) => {
+                let mut members: Option<Vec<RawBinding>> = None;
+                let mut strategy: Option<Strategy> = None;
+                for (k, v) in map {
+                    let key = match &k {
+                        serde_yaml::Value::String(s) => s.as_str(),
+                        _ => {
+                            return Err(serde::de::Error::custom(format!(
+                                "pool mapping key must be a string, got {:?}",
+                                k
+                            )));
+                        }
+                    };
+                    match key {
+                        "members" => {
+                            if members.is_some() {
+                                return Err(serde::de::Error::custom(
+                                    "duplicate key `members` in pool mapping",
+                                ));
+                            }
+                            members =
+                                Some(serde_yaml::from_value(v).map_err(serde::de::Error::custom)?);
+                        }
+                        "strategy" => {
+                            if strategy.is_some() {
+                                return Err(serde::de::Error::custom(
+                                    "duplicate key `strategy` in pool mapping",
+                                ));
+                            }
+                            strategy =
+                                Some(serde_yaml::from_value(v).map_err(serde::de::Error::custom)?);
+                        }
+                        other => {
+                            return Err(serde::de::Error::custom(format!(
+                                "unknown key `{other}` in pool mapping; expected only `members` and `strategy`"
+                            )));
+                        }
+                    }
+                }
+                let members = members.unwrap_or_default();
+                let strategy = strategy.unwrap_or(Strategy::Ordered);
+                Ok(RawPool { members, strategy })
+            }
+            _ => Err(serde::de::Error::custom(
+                "pool value must be a list of bindings or a {members, strategy} mapping",
+            )),
+        }
+    }
+}
+
+impl RawPool {
+    fn into_pool(self) -> Result<Pool<Binding>, ModelConfigError> {
+        let members = self
+            .members
+            .into_iter()
+            .map(RawBinding::into_binding)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Pool {
+            members,
+            strategy: self.strategy,
+        })
+    }
+}
+
 /// models.yaml `provider:` — a curated catalog member or the OpenAI-compatible
 /// custom-endpoint escape hatch.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -184,6 +362,7 @@ enum RawProvider {
     Ollama,
     Llamacpp,
     Bedrock,
+    Fireworks,
     Custom { endpoint: String },
 }
 
@@ -197,6 +376,7 @@ impl From<RawProvider> for Provider {
             RawProvider::Ollama => Provider::Known(ProviderId::Ollama),
             RawProvider::Llamacpp => Provider::Known(ProviderId::Llamacpp),
             RawProvider::Bedrock => Provider::Known(ProviderId::Bedrock),
+            RawProvider::Fireworks => Provider::Known(ProviderId::Fireworks),
             RawProvider::Custom { endpoint } => Provider::Custom { endpoint },
         }
     }
@@ -424,13 +604,13 @@ struct RawModelsFile {
     strict_specificity: bool,
     default: Vec<RawBinding>,
     #[serde(default)]
-    overrides: BTreeMap<OverrideKey, Vec<RawBinding>>,
-    /// OPEN activity-keyed chains (any string key, e.g. `review`,
+    overrides: BTreeMap<OverrideKey, RawPool>,
+    /// OPEN activity-keyed pools (any string key, e.g. `review`,
     /// `marketing-copy`) — lets a flow give any activity its own escalation
     /// path without a core change. Distinct from `overrides` (the closed
     /// affinity/tier keys), so OverrideKey stays Copy (no cascade).
     #[serde(default)]
-    activity: BTreeMap<String, Vec<RawBinding>>,
+    activity: BTreeMap<String, RawPool>,
 }
 
 #[derive(Debug, Clone)]
@@ -438,9 +618,9 @@ pub struct ModelsFile {
     pub version: u8,
     pub strict_specificity: bool,
     pub default: Vec<Binding>,
-    pub overrides: BTreeMap<OverrideKey, Vec<Binding>>,
-    /// Open activity-keyed chains (see [`RawModelsFile::activity`]).
-    pub activity: BTreeMap<String, Vec<Binding>>,
+    pub overrides: BTreeMap<OverrideKey, Pool<Binding>>,
+    /// Open activity-keyed pools (see [`RawModelsFile::activity`]).
+    pub activity: BTreeMap<String, Pool<Binding>>,
 }
 
 /// Forward-compat: the loader accepts only version 1. Higher versions
@@ -473,19 +653,13 @@ impl ModelsFile {
             .collect::<Result<Vec<_>, _>>()?;
         let mut overrides = BTreeMap::new();
         for (k, v) in raw.overrides {
-            let bindings = v
-                .into_iter()
-                .map(RawBinding::into_binding)
-                .collect::<Result<Vec<_>, _>>()?;
-            overrides.insert(k, bindings);
+            let pool = v.into_pool()?;
+            overrides.insert(k, pool);
         }
         let mut activity = BTreeMap::new();
         for (k, v) in raw.activity {
-            let bindings = v
-                .into_iter()
-                .map(RawBinding::into_binding)
-                .collect::<Result<Vec<_>, _>>()?;
-            activity.insert(k, bindings);
+            let pool = v.into_pool()?;
+            activity.insert(k, pool);
         }
         Ok(ModelsFile {
             version: raw.version,
@@ -579,6 +753,156 @@ fn extract_between<'a>(haystack: &'a str, start: &str, end: &str) -> Option<&'a 
     let rest = &haystack[s..];
     let e = rest.find(end)?;
     Some(&rest[..e])
+}
+
+#[cfg(test)]
+mod provider_parse_tests {
+    use super::*;
+    use crate::providers::ProviderId;
+
+    #[test]
+    fn fireworks_provider_name_parses_to_known() {
+        let p: Provider = serde_yaml::from_str("name: fireworks").unwrap();
+        assert_eq!(p, Provider::Known(ProviderId::Fireworks));
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn effort_from_str_and_display_roundtrip() {
+        assert_eq!(Effort::from_str("fast"), Ok(Effort::Fast));
+        assert_eq!(Effort::from_str("medium"), Ok(Effort::Medium));
+        assert_eq!(Effort::from_str("deep"), Ok(Effort::Deep));
+        assert_eq!(Effort::Fast.to_string(), "fast");
+        assert_eq!(Effort::Medium.to_string(), "medium");
+        assert_eq!(Effort::Deep.to_string(), "deep");
+    }
+
+    #[test]
+    fn effort_unknown_rejected() {
+        assert!(Effort::from_str("slow").is_err());
+        assert!(Effort::from_str("").is_err());
+    }
+
+    #[test]
+    fn effort_serde_kebab_case() {
+        let e: Effort = serde_yaml::from_str("fast").unwrap();
+        assert_eq!(e, Effort::Fast);
+        let e: Effort = serde_yaml::from_str("medium").unwrap();
+        assert_eq!(e, Effort::Medium);
+        let e: Effort = serde_yaml::from_str("deep").unwrap();
+        assert_eq!(e, Effort::Deep);
+    }
+}
+
+#[cfg(test)]
+mod strategy_tests {
+    use super::*;
+
+    #[test]
+    fn strategy_serde_kebab_case() {
+        let s: Strategy = serde_yaml::from_str("ordered").unwrap();
+        assert_eq!(s, Strategy::Ordered);
+        let s: Strategy = serde_yaml::from_str("distribute").unwrap();
+        assert_eq!(s, Strategy::Distribute);
+    }
+}
+
+#[cfg(test)]
+mod pool_serde_tests {
+    use super::*;
+
+    fn raw_pool_from_yaml(yaml: &str) -> Result<RawPool, String> {
+        serde_yaml::from_str::<RawPool>(yaml).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn bare_list_deserializes_as_ordered() {
+        let pool = raw_pool_from_yaml(
+            "- provider:\n    name: openai\n  model: gpt-4o\n- provider:\n    name: anthropic\n  model: claude-sonnet-4-20250514\n"
+        ).unwrap();
+        assert_eq!(pool.members.len(), 2);
+        assert_eq!(pool.strategy, Strategy::Ordered);
+    }
+
+    #[test]
+    fn mapping_with_strategy_distribute() {
+        let pool = raw_pool_from_yaml(
+            "members:\n  - provider:\n      name: openai\n    model: gpt-4o\nstrategy: distribute\n"
+        ).unwrap();
+        assert_eq!(pool.members.len(), 1);
+        assert_eq!(pool.strategy, Strategy::Distribute);
+    }
+
+    #[test]
+    fn mapping_without_strategy_defaults_to_ordered() {
+        let pool =
+            raw_pool_from_yaml("members:\n  - provider:\n      name: openai\n    model: gpt-4o\n")
+                .unwrap();
+        assert_eq!(pool.strategy, Strategy::Ordered);
+    }
+
+    #[test]
+    fn mapping_with_empty_members_and_no_strategy() {
+        let pool = raw_pool_from_yaml("members: []\n").unwrap();
+        assert_eq!(pool.members.len(), 0);
+        assert_eq!(pool.strategy, Strategy::Ordered);
+    }
+
+    #[test]
+    fn mapping_unknown_key_errors() {
+        let err = raw_pool_from_yaml(
+            "members:\n  - provider:\n      name: openai\n    model: gpt-4o\nextra: bad\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown key `extra`"), "got: {err}");
+    }
+
+    #[test]
+    fn mapping_with_ordered_strategy_explicit() {
+        let pool = raw_pool_from_yaml(
+            "members:\n  - provider:\n      name: openai\n    model: gpt-4o\nstrategy: ordered\n",
+        )
+        .unwrap();
+        assert_eq!(pool.members.len(), 1);
+        assert_eq!(pool.strategy, Strategy::Ordered);
+    }
+
+    #[test]
+    fn scalar_value_errors_with_dual_form_message() {
+        let err = raw_pool_from_yaml("not-a-sequence-or-mapping").unwrap_err();
+        assert!(
+            err.contains("pool value must be a list of bindings or a {members, strategy} mapping"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_list_deserializes_as_empty_ordered() {
+        let pool = raw_pool_from_yaml("[]\n").unwrap();
+        assert_eq!(pool.members.len(), 0);
+        assert_eq!(pool.strategy, Strategy::Ordered);
+    }
+
+    #[test]
+    fn into_pool_converts_raw_bindings() {
+        let raw = RawPool {
+            members: vec![RawBinding {
+                provider: Provider::Known(ProviderId::Openai),
+                model: "gpt-4o".to_string(),
+                features: None,
+            }],
+            strategy: Strategy::Distribute,
+        };
+        let pool: Pool<Binding> = raw.into_pool().unwrap();
+        assert_eq!(pool.members.len(), 1);
+        assert_eq!(pool.strategy, Strategy::Distribute);
+        assert_eq!(pool.members[0].model, "gpt-4o");
+    }
 }
 
 #[cfg(test)]

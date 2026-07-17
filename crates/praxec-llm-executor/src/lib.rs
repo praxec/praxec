@@ -23,6 +23,7 @@ pub mod caps;
 pub mod config;
 pub mod config_doctor;
 pub mod cost;
+pub mod pool_execution;
 pub mod prompt;
 pub mod provider_factory;
 pub mod response;

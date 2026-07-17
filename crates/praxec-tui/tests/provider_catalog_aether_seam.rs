@@ -1,17 +1,29 @@
-//! Boundary guard: every in-build catalog slug must be a token aether-llm's
-//! parser recognizes. Catches drift like the historical `google` vs `gemini`
-//! mismatch and any aether version bump that renames/drops a provider token.
+//! Boundary guard: every in-build **aether-served** catalog slug must be a
+//! token aether-llm's parser recognizes. Catches drift like the historical
+//! `google` vs `gemini` mismatch and any aether version bump that
+//! renames/drops a provider token.
+//!
+//! Rig-path-only fleet members (`WireStyle::OpenAiCompletions`, e.g. Fireworks)
+//! are deliberately **not** aether tokens — they are served by the governed rig
+//! completions client, never the TUI/aether parser — so they are skipped here.
+//! Skipping them is correct scoping, not a silenced failure: the
+//! `wire == OpenAiCompletions` marker is what makes them rig-only, and
+//! `providers::wire_style_and_base_url_agree_for_every_provider` pins that they
+//! carry the completions `base_url` the rig path builds from.
 
 use llm::LlmError;
-use praxec_core::providers::ProviderId;
+use praxec_core::providers::{ProviderId, WireStyle};
 
 #[tokio::test]
-async fn every_catalog_slug_is_an_aether_token() {
+async fn every_aether_served_slug_is_an_aether_token() {
     // Build aether's default parser (registers every built-in provider token).
     let parser = llm::parser::ModelProviderParser::default();
     for &p in ProviderId::ALL {
         if !p.available_in_build() {
             continue; // bedrock when its feature is off
+        }
+        if p.descriptor().wire == WireStyle::OpenAiCompletions {
+            continue; // rig-path-only fleet member — not routed through aether
         }
         let spec = format!("{}:probe-model", p.slug());
         let result = parser.parse(&spec).await;
