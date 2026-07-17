@@ -23,7 +23,7 @@
 use async_trait::async_trait;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use praxec_core::error::{ExecutorError, LlmErrorCode};
-use praxec_core::providers::{ProviderId, WireStyle};
+use praxec_core::providers::{Credentials, ProviderId, WireStyle};
 use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::{CompletionModel, GetTokenUsage, Message, ToolDefinition};
 use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
@@ -66,6 +66,20 @@ pub trait ProviderFactory: Send + Sync {
         model_str: &str,
         turn: TurnRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, String>>, ExecutorError>;
+
+    /// Account-aware streaming. Default: ignore `account` and delegate to
+    /// [`ProviderFactory::stream`] — so existing factories (and test mocks) are
+    /// unaffected. Factories that support named-account credentials (the
+    /// production [`DefaultProviderFactory`]) override this to select the
+    /// account's env key.
+    async fn stream_account(
+        &self,
+        model_str: &str,
+        _account: Option<&str>,
+        turn: TurnRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, String>>, ExecutorError> {
+        self.stream(model_str, turn).await
+    }
 }
 
 /// Production-default factory wiring rig's dedicated providers (anthropic,
@@ -75,11 +89,41 @@ pub trait ProviderFactory: Send + Sync {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultProviderFactory;
 
+/// The env var holding a provider's API key, honoring a named `account`
+/// (`<PRIMARY>_<ACCOUNT>`, e.g. `FIREWORKS_API_KEY_WORK`) when given; else the
+/// provider's primary var (or `fallback` for a keyless provider).
+fn key_env_var(creds: Credentials, fallback: &str, account: Option<&str>) -> String {
+    account
+        .and_then(|a| creds.account_env_var(a))
+        .unwrap_or_else(|| creds.primary().unwrap_or(fallback).to_string())
+}
+
+/// Read the resolved API key from the environment. A missing var yields the dummy
+/// `"praxec-test"` (mock/proxy endpoints need no real key).
+fn resolve_api_key(creds: Credentials, fallback: &str, account: Option<&str>) -> String {
+    std::env::var(key_env_var(creds, fallback, account)).unwrap_or_else(|_| "praxec-test".to_string())
+}
+
 #[async_trait]
 impl ProviderFactory for DefaultProviderFactory {
     async fn stream(
         &self,
         model_str: &str,
+        turn: TurnRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, String>>, ExecutorError> {
+        self.stream_account(model_str, None, turn).await
+    }
+
+    /// For providers whose key is read explicitly (the OpenAI-compatible fleet +
+    /// the OpenAI-base-override), `Some(account)` selects that named account's env
+    /// key via [`Credentials::account_env_var`] (`<PRIMARY>_<ACCOUNT>`); `None` =
+    /// the provider default. Dedicated `from_env` providers (anthropic/gemini/
+    /// openrouter/ollama) read a fixed env var via rig, so they ignore `account`
+    /// (per-account keys there need explicit-key construction — a follow-up).
+    async fn stream_account(
+        &self,
+        model_str: &str,
+        account: Option<&str>,
         turn: TurnRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, String>>, ExecutorError> {
         let (vendor, model) = model_str.split_once(':').ok_or_else(|| {
@@ -129,8 +173,7 @@ impl ProviderFactory for DefaultProviderFactory {
             // client (which still honors rig's native `OPENAI_BASE_URL`).
             Some(ProviderId::Openai) => match openai_base_override() {
                 Some(base) => {
-                    let key = std::env::var("OPENAI_API_KEY")
-                        .unwrap_or_else(|_| "praxec-test".to_string());
+                    let key = resolve_api_key(ProviderId::Openai.credentials(), "OPENAI_API_KEY", account);
                     run!(openai_completions_client(&base, &key))
                 }
                 None => run!(openai::Client::from_env()),
@@ -153,8 +196,7 @@ impl ProviderFactory for DefaultProviderFactory {
                         ),
                     ));
                 };
-                let key_env = d.credentials.primary().unwrap_or("OPENAI_API_KEY");
-                let key = std::env::var(key_env).unwrap_or_else(|_| "praxec-test".to_string());
+                let key = resolve_api_key(d.credentials, "OPENAI_API_KEY", account);
                 run!(openai_completions_client(base, &key))
             }
             _ => {
@@ -297,6 +339,27 @@ fn provider_factory_err(err: impl std::fmt::Display) -> ExecutorError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_env_var_honors_named_account() {
+        let creds = Credentials::Single("FIREWORKS_API_KEY");
+        // A named account derives `<PRIMARY>_<ACCOUNT>` (upper, hyphens→underscore).
+        assert_eq!(
+            key_env_var(creds, "OPENAI_API_KEY", Some("work")),
+            "FIREWORKS_API_KEY_WORK"
+        );
+        assert_eq!(
+            key_env_var(creds, "OPENAI_API_KEY", Some("my-org")),
+            "FIREWORKS_API_KEY_MY_ORG"
+        );
+        // No account → the provider's primary var (unchanged behavior).
+        assert_eq!(key_env_var(creds, "OPENAI_API_KEY", None), "FIREWORKS_API_KEY");
+        // Keyless provider falls back (no primary to derive from).
+        assert_eq!(
+            key_env_var(Credentials::None, "OPENAI_API_KEY", Some("x")),
+            "OPENAI_API_KEY"
+        );
+    }
 
     fn turn() -> TurnRequest {
         TurnRequest {

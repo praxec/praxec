@@ -199,6 +199,7 @@ async fn build_provider_and_stream(
     response::drain_stream(stream).await
 }
 
+
 /// Extract the typed [`LlmErrorCode`] from an [`ExecutorError`] for the
 /// audit-emit path. Non-`Llm(_)` variants are mapped to
 /// [`LlmErrorCode::ProviderError`] — the audit log is operator-facing
@@ -488,6 +489,17 @@ impl LlmExecutor {
         );
 
         // Stream + drain.
+        //
+        // NOTE (spec #2 execute-trigger): the opt-in pool path
+        // (`resolve_pool(config.affinity) → stream_over_pool(config.strategy)`)
+        // belongs here, gated on `config.strategy.is_some()`. It is blocked on an
+        // execution-policy 0.0.5 limitation: `RouterPolicy::run` takes
+        // `AsyncFnMut(&Id)`, whose future is not `Send` for all lifetimes, so it
+        // cannot be awaited inside this `#[async_trait] Executor::execute` (which
+        // requires a `Send` future). The fix is execution-policy 0.0.6 — `run`
+        // over an owned `Id: Clone` — after which this becomes a ~10-line branch.
+        // The plumbing is ready: `config.strategy`, `AffinityResolver::resolve_pool`,
+        // `pool_execution::stream_over_pool`, and per-account credential switching.
         let start = std::time::Instant::now();
         let drained_result =
             build_provider_and_stream(self.provider_factory.as_ref(), &model_str, turn).await;
