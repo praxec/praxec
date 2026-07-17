@@ -23,6 +23,7 @@ workspace = true
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+execution-policy = { workspace = true }
 futures = { workspace = true }
 jsonschema = { workspace = true }
 rusqlite = { workspace = true }

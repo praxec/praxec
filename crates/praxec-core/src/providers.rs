@@ -21,6 +21,8 @@ pub enum ProviderId {
     Ollama,
     Llamacpp,
     Bedrock,
+    /// Fireworks AI — US OpenAI-compatible open-weight host (first fleet member).
+    Fireworks,
 }
 
 /// What credential, if any, a provider needs in the environment.
@@ -52,6 +54,27 @@ impl Credentials {
             Credentials::Multi(vs) => vs.to_vec(),
         }
     }
+
+    /// Derive the env var name for a **named** account.
+    ///
+    /// Convention: `<PRIMARY_VAR>_<ACCOUNT>` where `ACCOUNT` is uppercased and
+    /// hyphens are replaced with underscores.  Returns `None` for keyless
+    /// (native/local) providers, which do not support named accounts.
+    ///
+    /// # Example
+    /// ```
+    /// use praxec_core::providers::{Credentials, ProviderId};
+    /// let creds = ProviderId::Anthropic.credentials();
+    /// assert_eq!(
+    ///     creds.account_env_var("work"),
+    ///     Some("ANTHROPIC_API_KEY_WORK".to_string())
+    /// );
+    /// assert_eq!(ProviderId::Ollama.credentials().account_env_var("any"), None);
+    /// ```
+    pub fn account_env_var(&self, account: &str) -> Option<String> {
+        self.primary()
+            .map(|base| format!("{}_{}", base, account.to_uppercase().replace('-', "_")))
+    }
 }
 
 /// Whether a provider is in every build or behind a cargo feature.
@@ -61,6 +84,22 @@ pub enum Availability {
     Feature(&'static str),
 }
 
+/// How a provider's client is constructed — which determines *which execution
+/// paths can serve it*. This is the single marker path-specific surfaces filter
+/// on (e.g. the aether/TUI parser seam skips rig-only fleet members).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireStyle {
+    /// Built via a dedicated rig client **and** recognized by aether-llm's
+    /// parser — served on both the governed (rig) path and the TUI (aether)
+    /// path. All of anthropic/openai/gemini/openrouter/ollama/llamacpp/bedrock.
+    Dedicated,
+    /// Built via the shared OpenAI-compatible **completions** client at
+    /// [`ProviderDescriptor::base_url`]. A **rig-path-only** fleet member
+    /// (Fireworks, …); aether-llm does not route it, so aether-facing surfaces
+    /// must skip it rather than treat it as an unknown-provider drift.
+    OpenAiCompletions,
+}
+
 /// Static metadata for one provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderDescriptor {
@@ -68,6 +107,13 @@ pub struct ProviderDescriptor {
     pub display: &'static str,
     pub credentials: Credentials,
     pub availability: Availability,
+    /// Base URL for the OpenAI-compatible **completions** path — the US
+    /// open-weight fleet (Fireworks, …) is built via one shared client at this
+    /// URL. `None` for providers built through their own dedicated rig client
+    /// (anthropic / openai / gemini / openrouter / ollama / …).
+    pub base_url: Option<&'static str>,
+    /// How this provider's client is built, and therefore which paths serve it.
+    pub wire: WireStyle,
 }
 
 const BEDROCK_VARS: &[&str] = &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"];
@@ -82,6 +128,7 @@ impl ProviderId {
         ProviderId::Ollama,
         ProviderId::Llamacpp,
         ProviderId::Bedrock,
+        ProviderId::Fireworks,
     ];
 
     /// The single authoring point. Adding a variant fails to compile here.
@@ -92,42 +139,64 @@ impl ProviderId {
                 display: "Anthropic",
                 credentials: Credentials::Single("ANTHROPIC_API_KEY"),
                 availability: Availability::Always,
+                base_url: None,
+                wire: WireStyle::Dedicated,
             },
             ProviderId::Openai => ProviderDescriptor {
                 slug: "openai",
                 display: "OpenAI",
                 credentials: Credentials::Single("OPENAI_API_KEY"),
                 availability: Availability::Always,
+                base_url: None,
+                wire: WireStyle::Dedicated,
             },
             ProviderId::Gemini => ProviderDescriptor {
                 slug: "gemini",
                 display: "Google Gemini",
                 credentials: Credentials::Single("GEMINI_API_KEY"),
                 availability: Availability::Always,
+                base_url: None,
+                wire: WireStyle::Dedicated,
             },
             ProviderId::Openrouter => ProviderDescriptor {
                 slug: "openrouter",
                 display: "OpenRouter",
                 credentials: Credentials::Single("OPENROUTER_API_KEY"),
                 availability: Availability::Always,
+                base_url: None,
+                wire: WireStyle::Dedicated,
             },
             ProviderId::Ollama => ProviderDescriptor {
                 slug: "ollama",
                 display: "Ollama",
                 credentials: Credentials::None,
                 availability: Availability::Always,
+                base_url: None,
+                wire: WireStyle::Dedicated,
             },
             ProviderId::Llamacpp => ProviderDescriptor {
                 slug: "llamacpp",
                 display: "llama.cpp",
                 credentials: Credentials::None,
                 availability: Availability::Always,
+                base_url: None,
+                wire: WireStyle::Dedicated,
             },
             ProviderId::Bedrock => ProviderDescriptor {
                 slug: "bedrock",
                 display: "AWS Bedrock",
                 credentials: Credentials::Multi(BEDROCK_VARS),
                 availability: Availability::Feature("bedrock"),
+                base_url: None,
+                wire: WireStyle::Dedicated,
+            },
+            ProviderId::Fireworks => ProviderDescriptor {
+                slug: "fireworks",
+                display: "Fireworks AI",
+                credentials: Credentials::Single("FIREWORKS_API_KEY"),
+                availability: Availability::Always,
+                base_url: Some("https://api.fireworks.ai/inference/v1"),
+                wire: WireStyle::OpenAiCompletions,
             },
         }
     }
@@ -174,6 +243,28 @@ pub fn vendor_available(vendor: &str) -> bool {
     }
 }
 
+/// True if a **named** account on `provider` is reachable.
+///
+/// For keyless/native providers (ollama, llamacpp) this always returns `false`
+/// — named accounts are meaningless without credentials, and handing them out
+/// would silently ignore the account qualifier.
+///
+/// For API-key providers the env var `<PRIMARY_KEY>_<ACCOUNT_UPPER>` must be
+/// present.  See [`Credentials::account_env_var`] for the naming convention.
+///
+/// This generalizes [`vendor_available`] (which checks the *default* env var)
+/// to support N named accounts per provider.
+pub fn account_available(provider: &str, account: &str) -> bool {
+    match ProviderId::from_slug(provider) {
+        Some(p) => match p.credentials().account_env_var(account) {
+            // keyless provider — named accounts not supported
+            None => false,
+            Some(var) => std::env::var(&var).is_ok(),
+        },
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,7 +274,7 @@ mod tests {
         for &p in ProviderId::ALL {
             assert_eq!(ProviderId::from_slug(p.slug()), Some(p), "{p:?}");
         }
-        assert_eq!(ProviderId::ALL.len(), 7);
+        assert_eq!(ProviderId::ALL.len(), 8);
     }
 
     #[test]
@@ -218,5 +309,91 @@ mod tests {
             ProviderId::Bedrock.available_in_build(),
             cfg!(feature = "bedrock")
         );
+    }
+
+    #[test]
+    fn fireworks_is_an_openai_compatible_fleet_member() {
+        let d = ProviderId::Fireworks.descriptor();
+        assert_eq!(d.slug, "fireworks");
+        assert_eq!(d.credentials.primary(), Some("FIREWORKS_API_KEY"));
+        assert_eq!(d.base_url, Some("https://api.fireworks.ai/inference/v1"));
+        assert_eq!(d.wire, WireStyle::OpenAiCompletions);
+        // Just a base URL — always compiled in; reachability is key-gated.
+        assert!(ProviderId::Fireworks.available_in_build());
+        assert_eq!(
+            ProviderId::from_slug("fireworks"),
+            Some(ProviderId::Fireworks)
+        );
+    }
+
+    /// The invariant path-specific surfaces rely on: an `OpenAiCompletions`
+    /// member carries a `base_url`, and a `Dedicated` member does not — so
+    /// `wire` and `base_url` can never disagree about how a provider is built.
+    #[test]
+    fn wire_style_and_base_url_agree_for_every_provider() {
+        for &p in ProviderId::ALL {
+            let d = p.descriptor();
+            match d.wire {
+                WireStyle::OpenAiCompletions => assert!(
+                    d.base_url.is_some(),
+                    "{p:?} is OpenAiCompletions but has no base_url"
+                ),
+                WireStyle::Dedicated => assert!(
+                    d.base_url.is_none(),
+                    "{p:?} is Dedicated but carries a completions base_url"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn account_env_var_derives_correct_name() {
+        assert_eq!(
+            ProviderId::Anthropic.credentials().account_env_var("work"),
+            Some("ANTHROPIC_API_KEY_WORK".to_string())
+        );
+        assert_eq!(
+            ProviderId::Openai.credentials().account_env_var("my-org"),
+            Some("OPENAI_API_KEY_MY_ORG".to_string())
+        );
+        assert_eq!(
+            ProviderId::Fireworks.credentials().account_env_var("prod"),
+            Some("FIREWORKS_API_KEY_PROD".to_string())
+        );
+    }
+
+    #[test]
+    fn keyless_providers_have_no_account_env_var() {
+        assert_eq!(
+            ProviderId::Ollama.credentials().account_env_var("any"),
+            None
+        );
+        assert_eq!(
+            ProviderId::Llamacpp.credentials().account_env_var("any"),
+            None
+        );
+    }
+
+    #[test]
+    fn account_available_returns_false_for_unknown_provider() {
+        assert!(!account_available("nonsense", "work"));
+    }
+
+    #[test]
+    fn account_available_returns_false_for_keyless_provider() {
+        // Keyless providers do not accept named accounts.
+        assert!(!account_available("ollama", "work"));
+        assert!(!account_available("llamacpp", "work"));
+    }
+
+    #[test]
+    fn account_available_respects_env_var() {
+        // Inject a synthetic env var for the test account and verify
+        // account_available picks it up (edition-2024 unsafe env; the test
+        // harness serialises env-touching tests on a single thread).
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY_TESTACCT", "sk-test") };
+        assert!(account_available("anthropic", "testacct"));
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY_TESTACCT") };
+        assert!(!account_available("anthropic", "testacct"));
     }
 }

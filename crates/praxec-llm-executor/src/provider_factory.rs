@@ -3,8 +3,10 @@
 //! The executor doesn't hard-code which provider to build for a
 //! `provider:model-id` string; construction is hoisted behind this trait.
 //! Production wires [`DefaultProviderFactory`] (anthropic / openai / gemini /
-//! openrouter / ollama via rig's typed clients); integration tests inject a mock
-//! that returns canned [`StreamEvent`] streams.
+//! openrouter / ollama via rig's typed clients, plus the US OpenAI-compatible
+//! fleet — Fireworks, … — via one shared completions client keyed on
+//! [`WireStyle::OpenAiCompletions`]); integration tests inject a mock that
+//! returns canned [`StreamEvent`] streams.
 //!
 //! rig has no dynamic provider client, so the factory matches the vendor to build
 //! the right typed client (the cockpit pattern). The factory maps rig's stream to
@@ -21,7 +23,7 @@
 use async_trait::async_trait;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use praxec_core::error::{ExecutorError, LlmErrorCode};
-use praxec_core::providers::ProviderId;
+use praxec_core::providers::{ProviderId, WireStyle};
 use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::{CompletionModel, GetTokenUsage, Message, ToolDefinition};
 use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
@@ -66,8 +68,9 @@ pub trait ProviderFactory: Send + Sync {
     ) -> Result<BoxStream<'static, Result<StreamEvent, String>>, ExecutorError>;
 }
 
-/// Production-default factory wiring rig's five providers (anthropic, openai,
-/// gemini, openrouter, ollama). An unknown provider returns a typed
+/// Production-default factory wiring rig's dedicated providers (anthropic,
+/// openai, gemini, openrouter, ollama) plus the OpenAI-compatible fleet
+/// (fireworks, …). An unknown provider returns a typed
 /// `LlmErrorCode::ProviderError`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DefaultProviderFactory;
@@ -116,30 +119,55 @@ impl ProviderFactory for DefaultProviderFactory {
             }};
         }
 
-        let stream: BoxStream<'static, Result<StreamEvent, String>> =
-            match ProviderId::from_slug(vendor) {
-                Some(ProviderId::Anthropic) => run!(anthropic::Client::from_env()),
-                // A base-URL override → an OpenAI-*compatible* endpoint (proxy / self-
-                // hosted / mock), which speaks **Chat Completions**, not the Responses
-                // API that api.openai.com uses. No override → the default Responses
-                // client (which still honors rig's native `OPENAI_BASE_URL`).
-                Some(ProviderId::Openai) => match openai_base_override() {
-                    Some(base) => run!(openai_completions_client(&base)),
-                    None => run!(openai::Client::from_env()),
-                },
-                Some(ProviderId::Gemini) => run!(gemini::Client::from_env()),
-                Some(ProviderId::Openrouter) => run!(openrouter::Client::from_env()),
-                Some(ProviderId::Ollama) => run!(ollama::Client::from_env()),
-                _ => {
+        let stream: BoxStream<'static, Result<StreamEvent, String>> = match ProviderId::from_slug(
+            vendor,
+        ) {
+            Some(ProviderId::Anthropic) => run!(anthropic::Client::from_env()),
+            // A base-URL override → an OpenAI-*compatible* endpoint (proxy / self-
+            // hosted / mock), which speaks **Chat Completions**, not the Responses
+            // API that api.openai.com uses. No override → the default Responses
+            // client (which still honors rig's native `OPENAI_BASE_URL`).
+            Some(ProviderId::Openai) => match openai_base_override() {
+                Some(base) => {
+                    let key = std::env::var("OPENAI_API_KEY")
+                        .unwrap_or_else(|_| "praxec-test".to_string());
+                    run!(openai_completions_client(&base, &key))
+                }
+                None => run!(openai::Client::from_env()),
+            },
+            Some(ProviderId::Gemini) => run!(gemini::Client::from_env()),
+            Some(ProviderId::Openrouter) => run!(openrouter::Client::from_env()),
+            Some(ProviderId::Ollama) => run!(ollama::Client::from_env()),
+            // US OpenAI-compatible fleet (Fireworks, …) — one shared
+            // completions client at the descriptor's base URL, keyed by the
+            // provider's own API key. Table-driven on `wire`: adding a fleet
+            // member is one descriptor row, with no new arm here.
+            Some(id) if id.descriptor().wire == WireStyle::OpenAiCompletions => {
+                let d = id.descriptor();
+                let Some(base) = d.base_url else {
                     return Err(ExecutorError::Llm(
                         LlmErrorCode::ProviderError,
                         format!(
-                            "LLM executor: provider '{vendor}' is not wired; supported: \
-                         anthropic, openai, gemini, openrouter, ollama"
+                            "LLM executor: provider '{}' is OpenAiCompletions but carries no base_url",
+                            d.slug
                         ),
                     ));
-                }
-            };
+                };
+                let key_env = d.credentials.primary().unwrap_or("OPENAI_API_KEY");
+                let key = std::env::var(key_env).unwrap_or_else(|_| "praxec-test".to_string());
+                run!(openai_completions_client(base, &key))
+            }
+            _ => {
+                return Err(ExecutorError::Llm(
+                    LlmErrorCode::ProviderError,
+                    format!(
+                        "LLM executor: provider '{vendor}' is not wired; supported: \
+                         anthropic, openai, gemini, openrouter, ollama, and the \
+                         OpenAI-compatible fleet (fireworks, …)"
+                    ),
+                ));
+            }
+        };
         Ok(stream)
     }
 }
@@ -161,16 +189,17 @@ fn pick_base(praxec: Option<String>, openai: Option<String>) -> Option<String> {
     praxec.or(openai).filter(|s| !s.is_empty())
 }
 
-/// Build a **Chat Completions** client at `base` — the OpenAI-compatible surface
-/// that proxies / self-hosted servers / mocks implement (unlike the Responses
-/// API). With a custom endpoint a real key is usually unnecessary, so
-/// `OPENAI_API_KEY` is optional (a dummy is used).
+/// Build a **Chat Completions** client at `base` with `key` — the OpenAI-
+/// compatible surface that proxies / self-hosted servers / mocks *and* the US
+/// open-weight fleet (Fireworks, …) implement (unlike the Responses API). The
+/// caller supplies the key so each fleet member authenticates with its own
+/// (`FIREWORKS_API_KEY`, …); a mock/proxy endpoint may pass a dummy.
 fn openai_completions_client(
     base: &str,
+    key: &str,
 ) -> Result<openai::CompletionsClient, rig::client::ProviderClientError> {
-    let key = std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| "praxec-test".to_string());
     openai::CompletionsClient::builder()
-        .api_key(&key)
+        .api_key(key)
         .base_url(base)
         .build()
         .map_err(Into::into)
@@ -341,6 +370,21 @@ mod tests {
             assert!(
                 !format!("{e:?}").contains("is not wired"),
                 "openrouter must route to a build: {e:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fireworks_routes_past_the_not_wired_check() {
+        // Fireworks is an OpenAI-compatible fleet member: it must route to a
+        // real completions build at its base URL, never the "is not wired" arm.
+        if let Err(e) = DefaultProviderFactory
+            .stream("fireworks:accounts/fireworks/models/qwen3-coder", turn())
+            .await
+        {
+            assert!(
+                !format!("{e:?}").contains("is not wired"),
+                "fireworks must route to a build: {e:?}"
             );
         }
     }

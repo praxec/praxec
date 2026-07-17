@@ -68,7 +68,7 @@ overrides:
     assert!(f.overrides.contains_key(&key_full));
     assert!(f.overrides.contains_key(&key_aff));
     assert!(f.overrides.contains_key(&key_tier));
-    assert_eq!(f.overrides[&key_full][0].model, "gpt-5");
+    assert_eq!(f.overrides[&key_full].members()[0].model, "gpt-5");
 }
 
 // ── FMECA U4 ────────────────────────────────────────────────────────────────

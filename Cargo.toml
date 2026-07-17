@@ -62,6 +62,10 @@ ratatui = "0.28"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
+# Reliability + load-balancing primitive (RouterPolicy/Pick/Meter). Separate
+# versioned repo; pinned by git tag so the dep resolves identically from the main
+# checkout and any worktree (a relative path dep can't satisfy both).
+execution-policy = { git = "https://github.com/matt-cochran/execution-policy.git", tag = "v0.0.5" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
