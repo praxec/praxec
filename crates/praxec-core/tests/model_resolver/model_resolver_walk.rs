@@ -45,6 +45,31 @@ fn delegate_parses_hyphenated_affinity() {
 }
 
 #[test]
+fn delegate_parses_trailing_effort_segment() {
+    // R9: `<affinity>-<tier>-<effort>`, `<affinity>-<effort>`, and a hyphenated
+    // affinity + effort all carry effort and round-trip through Display.
+    for s in ["coding-frontier-deep", "coding-deep", "web-search-fast"] {
+        let d = ModelRef::parse(s).unwrap_or_else(|e| panic!("{s} should parse: {e}"));
+        assert!(d.effort.is_some(), "{s} should carry effort");
+        assert_eq!(d.to_string(), s, "{s} should round-trip");
+    }
+}
+
+#[test]
+fn delegate_two_segment_tier_is_not_read_as_effort() {
+    // Back-compat: `coding-frontier` (a tier) must NOT be read as effort.
+    let d = ModelRef::parse("coding-frontier").expect("parses");
+    assert!(d.tier.is_some());
+    assert!(d.effort.is_none());
+}
+
+#[test]
+fn delegate_unknown_third_segment_is_a_parse_error() {
+    // R9: an unknown trailing segment is a hard error, never silently ignored.
+    assert!(ModelRef::parse("coding-frontier-garbage").is_err());
+}
+
+#[test]
 fn delegate_parses_hyphenated_affinity_with_tier() {
     let d = ModelRef::parse("web-search-frontier").expect("parses");
     assert!(d.affinity.is_some());

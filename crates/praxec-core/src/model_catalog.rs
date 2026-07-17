@@ -188,12 +188,7 @@ pub fn suggest_by_value<'a>(
     let floor = t.sufficient_intelligence;
 
     // value(m) = fit / blended_cost^β, cost floored to epsilon for local/free.
-    let value = |m: &ModelEntry| -> f64 {
-        let fit = m.fit(needs);
-        let blended = m.input_usd_per_million * w + m.output_usd_per_million * (1.0 - w);
-        let cost = if blended > 0.0 { blended } else { 1e-9 };
-        fit / cost.powf(price_sensitivity)
-    };
+    let value = |m: &ModelEntry| -> f64 { model_value(m, needs, w, price_sensitivity) };
 
     let candidates: Vec<&ModelEntry> = models
         .iter()
@@ -237,6 +232,86 @@ pub fn suggest_by_value<'a>(
                 }
             }
         })
+}
+
+/// `value(m) = fit(m, needs) / blended_cost(m)^β` — the shared value formula used
+/// by both [`suggest_by_value`] and [`pool_by_value`]. A non-positive blended cost
+/// (local/free) is floored to a tiny epsilon so it ranks on capability.
+fn model_value(
+    m: &ModelEntry,
+    needs: &[Affinity],
+    input_weight: f64,
+    price_sensitivity: f64,
+) -> f64 {
+    let fit = m.fit(needs);
+    let blended =
+        m.input_usd_per_million * input_weight + m.output_usd_per_million * (1.0 - input_weight);
+    let cost = if blended > 0.0 { blended } else { 1e-9 };
+    fit / cost.powf(price_sensitivity)
+}
+
+/// The ranked **value band** for a pool: the same value / capability-floor /
+/// marginal-band logic as [`suggest_by_value`], but returns the whole in-band set
+/// — the members a `distribute` strategy may balance across (R2). Ordered
+/// most-capable-first (so the head equals `suggest_by_value`'s pick and `ordered`
+/// failover is unchanged), with a total-order deterministic tie-break (R8):
+/// `(fit desc, intelligence desc, value desc, vendor asc, model asc)`.
+pub fn pool_by_value<'a>(
+    models: &'a [ModelEntry],
+    needs: &[Affinity],
+    available: impl Fn(&str) -> bool,
+    price_sensitivity: f64,
+    marginal_band: f64,
+) -> Vec<&'a ModelEntry> {
+    let t = crate::tuning::tuning();
+    let w = t.blended_price_input_weight;
+    let floor = t.sufficient_intelligence;
+
+    let candidates: Vec<&ModelEntry> = models
+        .iter()
+        .filter(|m| m.tools && available(&m.vendor))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let cleared: Vec<&ModelEntry> = candidates
+        .iter()
+        .copied()
+        .filter(|m| m.fit(needs) >= floor)
+        .collect();
+    let considered = if cleared.is_empty() {
+        &candidates
+    } else {
+        &cleared
+    };
+
+    let best_value = considered
+        .iter()
+        .map(|m| model_value(m, needs, w, price_sensitivity))
+        .fold(f64::MIN, f64::max);
+    let threshold = best_value * (1.0 - marginal_band);
+
+    let mut band: Vec<&ModelEntry> = considered
+        .iter()
+        .copied()
+        .filter(|m| model_value(m, needs, w, price_sensitivity) >= threshold)
+        .collect();
+    band.sort_by(|a, b| {
+        b.fit(needs)
+            .total_cmp(&a.fit(needs))
+            .then(b.intelligence.total_cmp(&a.intelligence))
+            .then(
+                model_value(b, needs, w, price_sensitivity).total_cmp(&model_value(
+                    a,
+                    needs,
+                    w,
+                    price_sensitivity,
+                )),
+            )
+            .then(a.vendor.cmp(&b.vendor))
+            .then(a.model.cmp(&b.model))
+    });
+    band
 }
 
 #[cfg(test)]
@@ -359,6 +434,47 @@ mod tests {
         ];
         let pick = suggest_by_value(&models, &[Affinity::Coding], |_| true, BETA, BAND).unwrap();
         assert_eq!(pick.model, "cheap");
+    }
+
+    #[test]
+    fn pool_by_value_returns_the_band_head_matches_suggest() {
+        // Two models within the marginal band → the pool contains both; the head
+        // is the most-capable (== suggest_by_value's single pick); order is stable.
+        let models = vec![
+            priced("cheaper-weaker", 60.0, 60.0, 1.0, 1.0),
+            priced("stronger", 64.0, 64.0, 1.15, 1.15),
+        ];
+        let pool = pool_by_value(&models, &[Affinity::Coding], |_| true, BETA, BAND);
+        assert_eq!(pool.len(), 2, "both within the value band");
+        let pick = suggest_by_value(&models, &[Affinity::Coding], |_| true, BETA, BAND).unwrap();
+        assert_eq!(
+            pool[0].model, pick.model,
+            "pool head == suggest_by_value pick"
+        );
+        assert_eq!(pool[0].model, "stronger");
+        let order2: Vec<_> = pool_by_value(&models, &[Affinity::Coding], |_| true, BETA, BAND)
+            .iter()
+            .map(|m| m.model.clone())
+            .collect();
+        let order1: Vec<_> = pool.iter().map(|m| m.model.clone()).collect();
+        assert_eq!(order1, order2, "deterministic order (R8)");
+    }
+
+    #[test]
+    fn pool_by_value_excludes_below_floor_and_unavailable() {
+        let models = vec![
+            priced("best", 80.0, 80.0, 1.0, 1.0),
+            priced("far-worse", 30.0, 30.0, 8.0, 8.0), // fit 30 < floor
+        ];
+        let pool = pool_by_value(&models, &[Affinity::Coding], |_| true, BETA, BAND);
+        assert!(
+            pool.iter().all(|m| m.model != "far-worse"),
+            "below-floor model excluded"
+        );
+        assert!(
+            pool_by_value(&models, &[Affinity::Coding], |_| false, BETA, BAND).is_empty(),
+            "no reachable vendor → empty pool"
+        );
     }
 
     #[test]

@@ -280,7 +280,7 @@ pub async fn verify_all_primary_bindings(resolver: &Resolver) -> Result<(), Vec<
         all.push(("default".to_string(), b));
     }
     for (key, list) in &file.overrides {
-        if let Some(b) = list.first() {
+        if let Some(b) = list.members().first() {
             all.push((key.to_string(), b));
         }
     }
