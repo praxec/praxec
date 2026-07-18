@@ -66,7 +66,9 @@ pub const DEFAULT_MAX_TURNS: u32 = 24;
 /// system prompt, the current turn's input, and the model's reply.
 pub const DEFAULT_MAX_HISTORY_BYTES: usize = 1024 * 1024;
 
-pub const TOOL_SETUP_TIMEOUT: Duration = Duration::from_secs(60); // Bounding tool setup to prevent hung server stalls
+// The tool-setup timeout is no longer a fixed const: it is per-session
+// (`AgentSession::tool_setup_timeout`), resolved from the step's
+// `tool_setup_seconds` override or `executor::DEFAULT_TOOL_SETUP_SECONDS` (60s).
 
 /// Per-call ceiling on a single MCP tool invocation. A hung tool server (no
 /// response, ever) would otherwise sit at 0 CPU inside `host.call().await` — a
@@ -439,12 +441,15 @@ impl RigSessionRunner {
         if let Some(host) = &self.tool_host {
             // Fail-fast: an unreachable declared connection aborts the run rather
             // than running the agent without a tool it was told it has.
-            let listed = tokio::time::timeout(TOOL_SETUP_TIMEOUT, host.tools(&session.tools))
+            // Per-session tool-setup bound: the step's `tool_setup_seconds`
+            // override or the 60s default (see `executor::resolve_tool_setup_timeout`).
+            let setup_timeout = session.tool_setup_timeout;
+            let listed = tokio::time::timeout(setup_timeout, host.tools(&session.tools))
                 .await
                 // `ExecutorError::Timeout` is milliseconds (its Display is "… ms");
                 // feed ms, not `.as_secs()`, so a 60s setup timeout doesn't print
                 // as "timeout after 60 ms" (the mislabel that seeded a bug report).
-                .map_err(|_| ExecutorError::Timeout(TOOL_SETUP_TIMEOUT.as_millis() as u64))??;
+                .map_err(|_| ExecutorError::Timeout(setup_timeout.as_millis() as u64))??;
             for (mut def, conn) in listed {
                 let real = def.name.clone();
                 let exposed = sanitize_tool_name(&real, &tool_conn);

@@ -63,6 +63,17 @@ pub struct AgentExecutorConfig {
     /// [`DEFAULT_STEP_BUDGET_SECONDS`].
     #[serde(default)]
     pub step_budget_seconds: Option<u64>,
+    /// Tool-setup (MCP `host.tools()` discovery/connection) bound, in seconds:
+    /// the maximum time to list every declared connection's tools BEFORE the
+    /// first model turn. A hung/slow tool server is bounded here rather than
+    /// stalling the run. Enforceable → an accepted knob; defaults to
+    /// [`DEFAULT_TOOL_SETUP_SECONDS`] and is clamped to the step's `max_seconds`
+    /// (a setup bound that outlived the wall would be dead code). This is the
+    /// **call-level override**: raise it for a step that connects to a slow or
+    /// heavily-loaded tool server (setup can exceed the 60s default on a loaded
+    /// box), leaving other steps at the default.
+    #[serde(default)]
+    pub tool_setup_seconds: Option<u64>,
     /// Reasoning-effort hint passed through to the Aether session.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
@@ -209,6 +220,23 @@ mod tests {
         .expect("valid");
         assert_eq!(c.model_binding(), ModelBinding::Agent("reviewer".into()));
         assert_eq!(c.owned_files, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn parses_tool_setup_seconds_call_level_override() {
+        // The call-level override for a slow/loaded tool server: an accepted,
+        // enforceable knob (unlike max_cost_usd), unset by default.
+        let c = AgentExecutorConfig::from_value(json!({
+            "affinity": "coding", "goal": "g", "tool_setup_seconds": 180
+        }))
+        .expect("tool_setup_seconds is an accepted knob");
+        assert_eq!(c.tool_setup_seconds, Some(180));
+
+        let default = AgentExecutorConfig::from_value(json!({
+            "affinity": "coding", "goal": "g"
+        }))
+        .expect("valid");
+        assert_eq!(default.tool_setup_seconds, None);
     }
 
     #[test]
