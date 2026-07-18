@@ -71,7 +71,8 @@ pub async fn stream_over_pool(
                 factory
                     .stream_account(&model, m.account.as_deref(), turn)
                     .await
-            }) as execution_policy::BoxFuture<'static, Result<TurnStream, ExecutorError>>
+            })
+                as execution_policy::BoxFuture<'static, Result<TurnStream, ExecutorError>>
         })
         .await
 }
