@@ -199,6 +199,24 @@ async fn build_provider_and_stream(
     response::drain_stream(stream).await
 }
 
+/// Map a pool [`RouterError`] onto the single downstream [`ExecutorError`] path.
+/// `Exhausted` carries the last member's error; all-cooling maps to a throttle
+/// signal; a non-finite selection score is a config bug (fail-fast).
+fn pool_router_error(
+    e: execution_policy::RouterError<praxec_core::pool_resolver::PoolMember, ExecutorError>,
+) -> ExecutorError {
+    use execution_policy::RouterError;
+    match e {
+        RouterError::Exhausted(inner) => inner,
+        RouterError::AllUnavailable { .. } => {
+            ExecutorError::RateLimited("all pool members are cooling behind their breakers".into())
+        }
+        RouterError::Score { id, value } => ExecutorError::Permanent(format!(
+            "pool selection produced a non-finite score ({value}) for member {id:?}"
+        )),
+    }
+}
+
 /// Extract the typed [`LlmErrorCode`] from an [`ExecutorError`] for the
 /// audit-emit path. Non-`Llm(_)` variants are mapped to
 /// [`LlmErrorCode::ProviderError`] — the audit log is operator-facing
@@ -489,45 +507,44 @@ impl LlmExecutor {
 
         // Stream + drain.
         //
-        // NOTE (spec #2 execute-trigger): the opt-in pool path
-        // (`resolve_pool(config.affinity) → stream_over_pool(config.strategy)`,
-        // gated on `config.strategy.is_some()`) is fully plumbed but not yet wired
-        // in as the branch here. Wiring it makes THIS `#[async_trait]
-        // Executor::execute` future fail to compile with "Send is not general
-        // enough" / "higher-ranked lifetime error".
-        //
-        // Root cause (confirmed 2026-07-17 against a local execution-policy
-        // build): the blocker is NOT merely `RouterPolicy::run(&Id)`. Switching
-        // `run` to an owned `Id: Clone` — verified end to end — is necessary but
-        // NOT sufficient. `RouterPolicy::run` composes the per-member
-        // `ExecutionPolicy` retry engine, whose `run_pipeline`/`drive` hold
-        // `&Plan` and `&CompiledConcurrency` borrows across the operation `.await`
-        // under a `for<'a> AsyncFnMut(Attempt<'a>)` HRTB. That quantifies those
-        // borrows as `Send` for every lifetime, which the compiler cannot prove
-        // in this nested `Send`-bounded context. A bare `policy.run(...)` spawns
-        // fine (single layer); nesting it inside the router's own future is what
-        // trips it.
-        //
-        // The real fix is an execution-policy 0.0.6 engine change: stop holding
-        // `&Plan`/`&CompiledConcurrency` across the op await under the HRTB (e.g.
-        // clone the owned `Arc<Semaphore>` + saturation policy up front, and pass
-        // owned/`Send + Sync` plan slices into `drive`), so the router future is
-        // `Send`-general. That is a deliberate engine refactor, not a local tweak.
-        //
-        // Plumbing that IS ready and green: `config.strategy`,
-        // `AffinityResolver::resolve_pool` (+ production bridge),
-        // `pool_execution::stream_over_pool`, `pool_router_error`, and per-account
-        // credential switching. Once 0.0.6 lands this becomes the small branch:
-        //   match config.strategy {
-        //     Some(s) => { let pool = self.affinity_resolver
-        //         .resolve_pool(config.affinity.as_ref()?).await?;
-        //         stream_over_pool(&pool, s, turn, Arc::clone(&self.provider_factory))
-        //           .await.map(|sv| sv.value).map_err(pool_router_error) }
-        //     None => build_provider_and_stream(..).await,
-        //   }
+        // Spec #2 execute-trigger: when the config opts into pool routing
+        // (`strategy:` set), resolve the `affinity:` requirement to a pool of
+        // `(provider, model, account)` members and stream over it with
+        // health-aware failover / weighted distribution (execution-policy's
+        // `RouterPolicy::run_boxed` — `Send`-general so it composes here). The
+        // served member's model becomes the audited `model_str`. Otherwise the
+        // single resolved `model_str` streams through the unchanged direct path
+        // (R6 — the ordered agent walk is untouched).
         let start = std::time::Instant::now();
-        let drained_result =
-            build_provider_and_stream(self.provider_factory.as_ref(), &model_str, turn).await;
+        let drained_result = match config.strategy {
+            Some(strategy) => {
+                let spec = config.affinity.as_ref().ok_or_else(|| {
+                    ExecutorError::Permanent(
+                        "LLM executor: `strategy:` requests pool routing but no \
+                         `affinity:` is set to describe the pool"
+                            .into(),
+                    )
+                })?;
+                let pool = self.affinity_resolver.resolve_pool(spec).await?;
+                match pool_execution::stream_over_pool(
+                    &pool,
+                    strategy,
+                    turn,
+                    Arc::clone(&self.provider_factory),
+                )
+                .await
+                {
+                    Ok(served) => {
+                        trace.model_str = served.target.model_string();
+                        response::drain_stream(served.value).await
+                    }
+                    Err(e) => Err(pool_router_error(e)),
+                }
+            }
+            None => {
+                build_provider_and_stream(self.provider_factory.as_ref(), &model_str, turn).await
+            }
+        };
         trace.latency_ms = start.elapsed().as_millis() as u64;
 
         // Pull the drained response (or a default + the stream-level
