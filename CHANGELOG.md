@@ -8,6 +8,66 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.25] — 2026-07-18 — multi-provider load distribution: route across a credentialed pool
+
+The headline release for the requirement-driven resolution work: an LLM step no
+longer names one model and one provider. It declares what it *needs* — an affinity
+(domain), an optional tier and thinking-effort — and the runtime resolves that to a
+**pool** of `(provider, model, account)` members, then routes the turn across them
+with health-aware failover or weighted distribution. When one provider throttles,
+the turn fails over to the next member behind its own circuit breaker; secrets never
+leave the environment. Built on the reliability primitives in the sibling
+`execution-policy` crate (v0.0.6) so the governance spine (caps / audit / typed
+failure) is unchanged.
+
+### Added — requirement-driven pool resolution (spec #2)
+
+A `kind: llm` (or agent) config can set `affinity:` (plus optional tier / `effort`)
+instead of a literal `model:`. The resolver walks the configured `models.yaml`
+first, then falls back to ranking the model catalog by value (fit / costᵝ within an
+ε band), and expands each fit to concrete `(provider, model, account)` members.
+Effort is two-faced — a capability *filter* (a member must support the requested
+reasoning level) and an applied *knob* (it rides in `turn.reasoning`). An
+unsatisfiable requirement fails loud (`ResolutionError::Unsatisfiable`), never a
+silent default.
+
+### Added — `strategy:` routing over the pool (the execute-trigger)
+
+Setting `strategy:` on the step turns on pool routing at the streaming step:
+
+- `ordered` — health-aware failover: try members in rank order, advancing to the
+  next only on a *classified transient* error (throttle / timeout); auth / author
+  bugs fail fast without burning the pool.
+- `distribute` — weighted least-in-flight over the value band, so load spreads
+  across equally-good members instead of hammering the top pick.
+
+Routing runs through `execution-policy`'s `RouterPolicy`, over an opaque member id
+(the crate stays domain-blind). The served member's model is what the audit log
+records. Without `strategy:`, the single resolved model streams through the
+unchanged direct path — the existing ordered agent walk is untouched.
+
+### Added — a US OpenAI-compatible provider fleet
+
+Fireworks plus a table-driven fleet of OpenAI-compatible providers (Together,
+Baseten, DeepInfra, Groq, Cerebras, SambaNova, Hyperbolic, Parasail): adding one is
+a single descriptor row (`base_url` + a typed `WireStyle`), all sharing one
+completions client. The fleet rides the `rig` core path and is config-gated.
+
+### Added — named accounts / per-account credentials
+
+A pool member can carry a named `account`, resolving to an account-specific API-key
+env var (`<PROVIDER>_API_KEY_<ACCOUNT>`, e.g. `FIREWORKS_API_KEY_WORK`) so one
+provider can be driven under several credentials. Accounts are named in config;
+**secrets stay in environment variables only** and are never inlined in YAML.
+
+### Added — configurable, call-level-overridable tool-setup timeout
+
+The MCP tool-setup phase (`host.tools()` discovery, run before the first model turn)
+was bounded by a hardcoded 60s. It is now a per-step `tool_setup_seconds` knob
+(default 60, clamped to the step wall): a step that talks to a slow or heavily
+loaded tool server can raise it while other steps keep the default. Scoped to the
+agent executor.
+
 ## [0.0.24] — 2026-07-16 — stall defense: no silent hangs, no runaway livelocks
 
 Two liveness backstops surfaced by dogfooding, closing the last places a governed
