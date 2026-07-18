@@ -62,10 +62,28 @@ pub const DEFAULT_STALL_SECONDS: u64 = 120;
 /// kneecapped, tight enough that a wedged step surfaces to a human in minutes
 /// instead of tens of minutes.
 pub const DEFAULT_STEP_BUDGET_SECONDS: u64 = 900;
+/// Default tool-setup (MCP `host.tools()`) timeout, in seconds, when a step omits
+/// `tool_setup_seconds`. Bounds the pre-turn tool discovery/connection phase so a
+/// hung or slow tool server surfaces as a loud `Timeout` rather than a silent
+/// stall. The historical hardcoded value; now a default rather than a `const`
+/// ceiling so an expensive step can raise it per-call.
+pub const DEFAULT_TOOL_SETUP_SECONDS: u64 = 60;
 /// Floor below which the remaining step budget is too small to be worth another
 /// model attempt — starting a run with a couple of seconds left would just
 /// manufacture a timeout. Below this, the walk stops and surfaces.
 const MIN_ATTEMPT_SECONDS: u64 = 15;
+
+/// Resolve the effective tool-setup timeout: the step's `tool_setup_seconds`
+/// override (call-level) or [`DEFAULT_TOOL_SETUP_SECONDS`], clamped to the step's
+/// resolved `max_seconds` (a setup bound longer than the whole wall is dead code
+/// — the wall would always fire first). Pure + total so it is directly unit-tested.
+pub(crate) fn resolve_tool_setup_timeout(cfg_seconds: Option<u64>, max_seconds: u64) -> Duration {
+    Duration::from_secs(
+        cfg_seconds
+            .unwrap_or(DEFAULT_TOOL_SETUP_SECONDS)
+            .min(max_seconds),
+    )
+}
 
 /// The durable `_agent_await` wait marker, read off the workflow context when
 /// it belongs to the transition being dispatched (transition-identity guarded,
@@ -243,6 +261,9 @@ impl AgentExecutor {
             .stall_seconds
             .unwrap_or(DEFAULT_STALL_SECONDS)
             .min(max_seconds);
+        // Tool-setup bound: the step's call-level override or the 60s default,
+        // clamped to this attempt's wall.
+        let tool_setup_timeout = resolve_tool_setup_timeout(cfg.tool_setup_seconds, max_seconds);
 
         // Render the leaf's tool connections against the blackboard + the
         // run-ambient root. A `file:<root>` whose root does NOT render absolute
@@ -279,6 +300,7 @@ impl AgentExecutor {
             reasoning_effort: cfg.reasoning_effort.clone(),
             timeout: Duration::from_secs(max_seconds),
             stall_timeout: Duration::from_secs(stall_seconds),
+            tool_setup_timeout,
             expected_output_keys: cfg.expected_output_keys.clone(),
             expected_output_types: cfg.expected_output_types.clone(),
             await_enabled: cfg.await_enabled,
@@ -595,6 +617,40 @@ mod tests {
     use crate::session::{AgentResult, AgentRunReport, AgentStatus};
     use praxec_core::model::WorkflowInstance;
     use serde_json::json;
+
+    #[test]
+    fn tool_setup_timeout_defaults_when_unset() {
+        // No `tool_setup_seconds` on the step → the 60s default, unaffected by a
+        // generous wall.
+        assert_eq!(
+            resolve_tool_setup_timeout(None, 600),
+            Duration::from_secs(DEFAULT_TOOL_SETUP_SECONDS)
+        );
+    }
+
+    #[test]
+    fn tool_setup_timeout_honors_call_level_override() {
+        // A step that knows its tool server is slow raises the bound per-call.
+        assert_eq!(
+            resolve_tool_setup_timeout(Some(180), 600),
+            Duration::from_secs(180)
+        );
+    }
+
+    #[test]
+    fn tool_setup_timeout_clamped_to_wall() {
+        // A setup bound longer than the whole wall is dead code (the wall fires
+        // first) → clamp to `max_seconds`, both for an explicit override and the
+        // default on a tiny wall.
+        assert_eq!(
+            resolve_tool_setup_timeout(Some(600), 30),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            resolve_tool_setup_timeout(None, 10),
+            Duration::from_secs(10)
+        );
+    }
 
     fn instance(definition: serde_json::Value) -> WorkflowInstance {
         WorkflowInstance {

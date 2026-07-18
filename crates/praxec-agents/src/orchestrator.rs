@@ -236,6 +236,9 @@ impl TransitionChooser for AgentChooser {
             // it, so the no-progress watchdog rides at the same bound (a separate
             // sub-timeout would add no signal here).
             stall_timeout: self.timeout,
+            // No tool connections on a decision call → setup is a no-op; the
+            // total timeout is the only bound that matters.
+            tool_setup_timeout: self.timeout,
             expected_output_keys: vec![],
             expected_output_types: Default::default(),
             // A decision call is one synchronous turn — never suspendable.
