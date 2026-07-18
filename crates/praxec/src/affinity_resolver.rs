@@ -63,7 +63,7 @@ impl AgentsYamlAffinityResolver {
     /// named-account registry. `beta`/`eps` are the caller's Stance value knobs;
     /// `available` reports provider reachability (the runtime passes
     /// [`praxec_core::providers::vendor_available`]).
-    pub fn resolve_pool(
+    pub fn resolve_pool_with(
         &self,
         spec: &ModelRef,
         constraints: praxec_core::pool_resolver::Constraints,
@@ -101,6 +101,25 @@ impl AffinityResolver for AgentsYamlAffinityResolver {
                 "LLM executor: affinity `{affinity}` could not be resolved against models.yaml"
             ))
         })
+    }
+
+    async fn resolve_pool(
+        &self,
+        spec: &ModelRef,
+    ) -> Result<Vec<praxec_core::pool_resolver::PoolMember>, ExecutorError> {
+        // First cut: an empty account registry (→ default-credential members);
+        // wiring the `accounts.yaml` path into the resolver is a config refinement.
+        // Default Stance value knobs (β=0.5, ε=0.15).
+        let accounts = praxec_core::accounts::AccountRegistry::default();
+        self.resolve_pool_with(
+            spec,
+            praxec_core::pool_resolver::Constraints::default(),
+            &accounts,
+            praxec_core::providers::vendor_available,
+            0.5,
+            0.15,
+        )
+        .map_err(|e| ExecutorError::Permanent(e.to_string()))
     }
 }
 
@@ -190,7 +209,7 @@ mod pool_bridge_tests {
         .unwrap();
         let spec = ModelRef::parse("coding-frontier").unwrap();
         let pool = r
-            .resolve_pool(
+            .resolve_pool_with(
                 &spec,
                 Constraints::default(),
                 &AccountRegistry::default(),

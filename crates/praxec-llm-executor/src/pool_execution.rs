@@ -58,7 +58,26 @@ pub async fn stream_over_pool(
         DefaultCore::new(),
     );
     router
-        .run(async |m: &PoolMember| factory.stream(&m.model_string(), turn.clone()).await)
+        .run(|m: &PoolMember| {
+            // Compute owned data from the member SYNCHRONOUSLY, then return an
+            // owned, explicitly-`Send`, `'static` boxed future — so nothing borrows
+            // the router-provided `&PoolMember` or the outer `factory` across the
+            // await. This keeps `run`'s future `Send` for all lifetimes (required
+            // by the async_trait executor). The member's account selects its env
+            // key on the factory (default factories ignore it).
+            let model = m.model_string();
+            let account = m.account.clone();
+            let turn = turn.clone();
+            let factory = std::sync::Arc::clone(&factory);
+            let fut: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<TurnStream, ExecutorError>> + Send>,
+            > = Box::pin(async move {
+                factory
+                    .stream_account(&model, account.as_deref(), turn)
+                    .await
+            });
+            fut
+        })
         .await
 }
 

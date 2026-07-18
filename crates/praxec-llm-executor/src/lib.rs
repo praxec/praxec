@@ -488,6 +488,43 @@ impl LlmExecutor {
         );
 
         // Stream + drain.
+        //
+        // NOTE (spec #2 execute-trigger): the opt-in pool path
+        // (`resolve_pool(config.affinity) → stream_over_pool(config.strategy)`,
+        // gated on `config.strategy.is_some()`) is fully plumbed but not yet wired
+        // in as the branch here. Wiring it makes THIS `#[async_trait]
+        // Executor::execute` future fail to compile with "Send is not general
+        // enough" / "higher-ranked lifetime error".
+        //
+        // Root cause (confirmed 2026-07-17 against a local execution-policy
+        // build): the blocker is NOT merely `RouterPolicy::run(&Id)`. Switching
+        // `run` to an owned `Id: Clone` — verified end to end — is necessary but
+        // NOT sufficient. `RouterPolicy::run` composes the per-member
+        // `ExecutionPolicy` retry engine, whose `run_pipeline`/`drive` hold
+        // `&Plan` and `&CompiledConcurrency` borrows across the operation `.await`
+        // under a `for<'a> AsyncFnMut(Attempt<'a>)` HRTB. That quantifies those
+        // borrows as `Send` for every lifetime, which the compiler cannot prove
+        // in this nested `Send`-bounded context. A bare `policy.run(...)` spawns
+        // fine (single layer); nesting it inside the router's own future is what
+        // trips it.
+        //
+        // The real fix is an execution-policy 0.0.6 engine change: stop holding
+        // `&Plan`/`&CompiledConcurrency` across the op await under the HRTB (e.g.
+        // clone the owned `Arc<Semaphore>` + saturation policy up front, and pass
+        // owned/`Send + Sync` plan slices into `drive`), so the router future is
+        // `Send`-general. That is a deliberate engine refactor, not a local tweak.
+        //
+        // Plumbing that IS ready and green: `config.strategy`,
+        // `AffinityResolver::resolve_pool` (+ production bridge),
+        // `pool_execution::stream_over_pool`, `pool_router_error`, and per-account
+        // credential switching. Once 0.0.6 lands this becomes the small branch:
+        //   match config.strategy {
+        //     Some(s) => { let pool = self.affinity_resolver
+        //         .resolve_pool(config.affinity.as_ref()?).await?;
+        //         stream_over_pool(&pool, s, turn, Arc::clone(&self.provider_factory))
+        //           .await.map(|sv| sv.value).map_err(pool_router_error) }
+        //     None => build_provider_and_stream(..).await,
+        //   }
         let start = std::time::Instant::now();
         let drained_result =
             build_provider_and_stream(self.provider_factory.as_ref(), &model_str, turn).await;
