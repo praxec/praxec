@@ -93,6 +93,12 @@ pub struct RunIdentity {
     pub transition: Option<String>,
 }
 
+/// Serde default for [`AgentSession::tool_setup_timeout`] — the historical 60s
+/// bound, applied when resuming a snapshot written before the field existed.
+fn default_tool_setup_timeout() -> Duration {
+    Duration::from_secs(crate::executor::DEFAULT_TOOL_SETUP_SECONDS)
+}
+
 /// Everything needed to run one isolated agent session.
 ///
 /// Serde derives exist for exactly one reason: P12 R1.4 persists the session
@@ -118,6 +124,18 @@ pub struct AgentSession {
     /// the whole `timeout`. A stall escalates the chain-walk to the next model
     /// (it does NOT re-run the same hung model). See the runner's drain loop.
     pub stall_timeout: Duration,
+    /// Wall-clock bound on pre-turn tool setup — the MCP `host.tools()`
+    /// discovery/connection call that lists every declared connection's tools
+    /// before the first model turn. A hung or slow tool server is bounded here
+    /// (surfacing a loud `Timeout`) rather than stalling the run. Resolved from
+    /// the step's `tool_setup_seconds` override or the 60s default, clamped to
+    /// `timeout`. See [`crate::executor::resolve_tool_setup_timeout`].
+    ///
+    /// `#[serde(default)]`: a session snapshot persisted (P12 R1.4) BEFORE this
+    /// field existed resumes with the historical 60s bound — the exact behavior
+    /// it ran under — rather than failing to deserialize.
+    #[serde(default = "default_tool_setup_timeout")]
+    pub tool_setup_timeout: Duration,
     /// The top-level keys the agent's `output` object must contain — the
     /// "criteria" the runner uses to (a) validate a salvaged JSON text answer
     /// before accepting it, and (b) phrase precise in-session feedback when the
@@ -320,5 +338,27 @@ mod tests {
         assert_eq!(r.status, AgentStatus::Failed);
         assert_eq!(r.output, serde_json::Value::Null);
         assert!(r.internal_monologue.is_none());
+    }
+
+    #[test]
+    fn session_snapshot_without_tool_setup_timeout_resumes_at_default() {
+        // A session persisted (P12 R1.4) before `tool_setup_timeout` existed must
+        // still deserialize on resume — falling back to the historical 60s bound
+        // it ran under, not a serde error.
+        let s: AgentSession = serde_json::from_value(json!({
+            "model": "anthropic:claude-sonnet-4-6",
+            "system_prompt": null,
+            "user_prompt": "do the thing",
+            "tools": ["conn"],
+            "reasoning_effort": null,
+            "timeout": { "secs": 600, "nanos": 0 },
+            "stall_timeout": { "secs": 120, "nanos": 0 },
+            "expected_output_keys": [],
+            "expected_output_types": {},
+            "await_enabled": false,
+            "identity": {}
+        }))
+        .expect("legacy snapshot without tool_setup_timeout must deserialize");
+        assert_eq!(s.tool_setup_timeout, Duration::from_secs(60));
     }
 }

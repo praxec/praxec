@@ -57,8 +57,23 @@ pub async fn stream_over_pool(
         is_transient,
         DefaultCore::new(),
     );
+    // `run_boxed` (execution-policy ≥ 0.0.6) takes an OWNED `PoolMember` and a
+    // concrete `BoxFuture<'static>` op, so the whole `run_boxed` future stays
+    // `Send` for all lifetimes — it composes inside the `#[async_trait]`
+    // `LlmExecutor::execute` (which borrows `&self`). The member's `account`
+    // selects its env key on the factory (default factories ignore it).
     router
-        .run(async |m: &PoolMember| factory.stream(&m.model_string(), turn.clone()).await)
+        .run_boxed(move |m: PoolMember| {
+            let turn = turn.clone();
+            let factory = std::sync::Arc::clone(&factory);
+            Box::pin(async move {
+                let model = m.model_string();
+                factory
+                    .stream_account(&model, m.account.as_deref(), turn)
+                    .await
+            })
+                as execution_policy::BoxFuture<'static, Result<TurnStream, ExecutorError>>
+        })
         .await
 }
 

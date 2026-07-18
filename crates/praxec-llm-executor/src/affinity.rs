@@ -17,6 +17,22 @@ use praxec_core::error::ExecutorError;
 #[async_trait]
 pub trait AffinityResolver: Send + Sync {
     async fn resolve(&self, affinity: &str) -> Result<String, ExecutorError>;
+
+    /// Resolve a behavior requirement (`affinity`/`tier`/`effort`) to a POOL of
+    /// `(provider, model, account)` members for load-balanced routing (spec #2).
+    /// Default: **not supported** — the production `models.yaml` resolver
+    /// overrides it. Keeps the pool path opt-in without breaking existing
+    /// resolvers (a `strategy:` config with a non-pool resolver fails loud here).
+    async fn resolve_pool(
+        &self,
+        _spec: &praxec_core::model_resolver::ModelRef,
+    ) -> Result<Vec<praxec_core::pool_resolver::PoolMember>, ExecutorError> {
+        Err(ExecutorError::Permanent(
+            "LLM executor: `strategy:` requested pool routing, but the injected \
+             resolver does not support it"
+                .into(),
+        ))
+    }
 }
 
 /// Default — affinity is not wired. Fails loud (preserves pre-D9 behavior).

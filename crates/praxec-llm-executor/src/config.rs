@@ -12,6 +12,7 @@
 //!   `max_cost_usd`.
 //! - D8 (cost map): `model` name → USD/token table.
 
+use praxec_core::model_resolver::config::Strategy;
 use praxec_core::model_resolver::{Affinity, ModelRef};
 use serde::Deserialize;
 
@@ -30,6 +31,14 @@ pub struct LlmExecutorConfig {
     /// (poka-yoke; checked at `praxec check` via the doctor).
     #[serde(default)]
     pub affinity: Option<ModelRef>,
+
+    /// Opt-in **pool routing** (spec #2). When set together with `affinity:`, the
+    /// step resolves a *pool* of `(provider, model, account)` members for the
+    /// requirement and load-balances across them via a `RouterPolicy`:
+    /// `ordered` = health-aware failover, `distribute` = weighted least-in-flight.
+    /// Unset = the classic single-model path (unchanged).
+    #[serde(default)]
+    pub strategy: Option<Strategy>,
 
     /// What this step **needs** — a list of [`Affinity`] capabilities (e.g.
     /// `needs: [coding, agentic]`). The model suggestor ranks candidates by their

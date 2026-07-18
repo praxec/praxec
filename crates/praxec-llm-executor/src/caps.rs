@@ -363,6 +363,7 @@ mod tests {
         LlmExecutorConfig {
             model: Some("openai:gpt-5".into()),
             affinity: None,
+            strategy: None,
             needs: vec![],
             prompt_template: "x".into(),
             max_iterations: 3,

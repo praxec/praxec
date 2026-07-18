@@ -131,6 +131,7 @@ fn session(tools: Vec<String>) -> AgentSession {
         reasoning_effort: None,
         timeout: Duration::from_secs(5),
         stall_timeout: Duration::from_secs(5),
+        tool_setup_timeout: Duration::from_secs(60),
         expected_output_keys: Vec::new(),
         expected_output_types: Default::default(),
         await_enabled: false,
@@ -1014,8 +1015,12 @@ async fn tools_declared_without_a_host_fail_fast() {
     );
 }
 
-#[tokio::test]
-async fn test_tool_setup_timeout() {
+// The runner honors the PER-SESSION `tool_setup_timeout` (not a fixed const), so
+// a step can raise it for a slow/loaded tool server. Uses a 2s bound distinct
+// from the 60s default to prove the configured value is what fires, and paused
+// time so a hung host resolves instantly instead of waiting the real bound.
+#[tokio::test(start_paused = true)]
+async fn tool_setup_timeout_honors_session_value() {
     /// A ToolHost that hangs indefinitely when tools() is called.
     struct HangingToolHost;
 
@@ -1025,7 +1030,7 @@ async fn test_tool_setup_timeout() {
             &self,
             _connections: &[String],
         ) -> Result<Vec<(ToolDefinition, String)>, ExecutorError> {
-            // Hang forever (3600s, well beyond the 60s timeout)
+            // Hang far beyond any configured setup bound.
             sleep(Duration::from_secs(3600)).await;
             unreachable!()
         }
@@ -1040,8 +1045,10 @@ async fn test_tool_setup_timeout() {
         user_prompt: "do the thing".into(),
         tools: vec!["conn".into()],
         reasoning_effort: None,
-        timeout: Duration::from_secs(5),
-        stall_timeout: Duration::from_secs(5),
+        timeout: Duration::from_secs(30),
+        stall_timeout: Duration::from_secs(30),
+        // Call-level override: bound tool setup at 2s for this run.
+        tool_setup_timeout: Duration::from_secs(2),
         expected_output_keys: Vec::new(),
         expected_output_types: Default::default(),
         await_enabled: false,
@@ -1050,10 +1057,10 @@ async fn test_tool_setup_timeout() {
     let runner = RigSessionRunner::new(Arc::new(ScriptedFactory::new(vec![])))
         .with_tool_host(Arc::new(HangingToolHost));
     let result = runner.run(session).await;
-    // `ExecutorError::Timeout` is milliseconds (Display "… ms"), matching every
-    // other construction site (reliability/pipeline/parallel/executor). A 60s
-    // setup timeout is 60_000 ms — previously this asserted the mislabeled `60`.
-    assert!(matches!(result, Err(ExecutorError::Timeout(60_000))));
+    // `ExecutorError::Timeout` is milliseconds (Display "… ms"). The configured
+    // 2s setup bound is 2_000 ms — proving the session value fires, not the 60s
+    // default nor the 30s overall wall.
+    assert!(matches!(result, Err(ExecutorError::Timeout(2_000))));
 }
 
 /// A factory whose stream hangs forever without ever yielding an event —

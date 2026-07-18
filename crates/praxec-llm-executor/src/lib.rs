@@ -199,6 +199,24 @@ async fn build_provider_and_stream(
     response::drain_stream(stream).await
 }
 
+/// Map a pool [`RouterError`] onto the single downstream [`ExecutorError`] path.
+/// `Exhausted` carries the last member's error; all-cooling maps to a throttle
+/// signal; a non-finite selection score is a config bug (fail-fast).
+fn pool_router_error(
+    e: execution_policy::RouterError<praxec_core::pool_resolver::PoolMember, ExecutorError>,
+) -> ExecutorError {
+    use execution_policy::RouterError;
+    match e {
+        RouterError::Exhausted(inner) => inner,
+        RouterError::AllUnavailable { .. } => {
+            ExecutorError::RateLimited("all pool members are cooling behind their breakers".into())
+        }
+        RouterError::Score { id, value } => ExecutorError::Permanent(format!(
+            "pool selection produced a non-finite score ({value}) for member {id:?}"
+        )),
+    }
+}
+
 /// Extract the typed [`LlmErrorCode`] from an [`ExecutorError`] for the
 /// audit-emit path. Non-`Llm(_)` variants are mapped to
 /// [`LlmErrorCode::ProviderError`] — the audit log is operator-facing
@@ -488,9 +506,45 @@ impl LlmExecutor {
         );
 
         // Stream + drain.
+        //
+        // Spec #2 execute-trigger: when the config opts into pool routing
+        // (`strategy:` set), resolve the `affinity:` requirement to a pool of
+        // `(provider, model, account)` members and stream over it with
+        // health-aware failover / weighted distribution (execution-policy's
+        // `RouterPolicy::run_boxed` — `Send`-general so it composes here). The
+        // served member's model becomes the audited `model_str`. Otherwise the
+        // single resolved `model_str` streams through the unchanged direct path
+        // (R6 — the ordered agent walk is untouched).
         let start = std::time::Instant::now();
-        let drained_result =
-            build_provider_and_stream(self.provider_factory.as_ref(), &model_str, turn).await;
+        let drained_result = match config.strategy {
+            Some(strategy) => {
+                let spec = config.affinity.as_ref().ok_or_else(|| {
+                    ExecutorError::Permanent(
+                        "LLM executor: `strategy:` requests pool routing but no \
+                         `affinity:` is set to describe the pool"
+                            .into(),
+                    )
+                })?;
+                let pool = self.affinity_resolver.resolve_pool(spec).await?;
+                match pool_execution::stream_over_pool(
+                    &pool,
+                    strategy,
+                    turn,
+                    Arc::clone(&self.provider_factory),
+                )
+                .await
+                {
+                    Ok(served) => {
+                        trace.model_str = served.target.model_string();
+                        response::drain_stream(served.value).await
+                    }
+                    Err(e) => Err(pool_router_error(e)),
+                }
+            }
+            None => {
+                build_provider_and_stream(self.provider_factory.as_ref(), &model_str, turn).await
+            }
+        };
         trace.latency_ms = start.elapsed().as_millis() as u64;
 
         // Pull the drained response (or a default + the stream-level

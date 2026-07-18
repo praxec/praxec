@@ -55,6 +55,38 @@ impl AgentsYamlAffinityResolver {
             ),
         })
     }
+
+    /// Resolve a behavior requirement (`affinity`/`tier`/`effort` in `spec`) to a
+    /// pool of `(provider, model, account)` members — the production wiring of
+    /// [`praxec_core::pool_resolver::resolve_pool`] over this loaded `models.yaml`
+    /// (config-first), the active model catalog (value-ranking fallback), and the
+    /// named-account registry. `beta`/`eps` are the caller's Stance value knobs;
+    /// `available` reports provider reachability (the runtime passes
+    /// [`praxec_core::providers::vendor_available`]).
+    pub fn resolve_pool_with(
+        &self,
+        spec: &ModelRef,
+        constraints: praxec_core::pool_resolver::Constraints,
+        accounts: &praxec_core::accounts::AccountRegistry,
+        available: impl Fn(&str) -> bool,
+        beta: f64,
+        eps: f64,
+    ) -> Result<
+        Vec<praxec_core::pool_resolver::PoolMember>,
+        praxec_core::pool_resolver::ResolutionError,
+    > {
+        let catalog = praxec_core::model_catalog::model_catalog();
+        praxec_core::pool_resolver::resolve_pool(
+            spec,
+            &constraints,
+            &self.resolver,
+            &catalog.models,
+            accounts,
+            available,
+            beta,
+            eps,
+        )
+    }
 }
 
 #[cfg(feature = "llm-executor")]
@@ -69,6 +101,25 @@ impl AffinityResolver for AgentsYamlAffinityResolver {
                 "LLM executor: affinity `{affinity}` could not be resolved against models.yaml"
             ))
         })
+    }
+
+    async fn resolve_pool(
+        &self,
+        spec: &ModelRef,
+    ) -> Result<Vec<praxec_core::pool_resolver::PoolMember>, ExecutorError> {
+        // First cut: an empty account registry (→ default-credential members);
+        // wiring the `accounts.yaml` path into the resolver is a config refinement.
+        // Default Stance value knobs (β=0.5, ε=0.15).
+        let accounts = praxec_core::accounts::AccountRegistry::default();
+        self.resolve_pool_with(
+            spec,
+            praxec_core::pool_resolver::Constraints::default(),
+            &accounts,
+            praxec_core::providers::vendor_available,
+            0.5,
+            0.15,
+        )
+        .map_err(|e| ExecutorError::Permanent(e.to_string()))
     }
 }
 
@@ -140,4 +191,35 @@ pub fn resolve_affinity_to_chain(resolver: &Resolver, affinity: &str) -> Vec<Str
 /// `tests/affinity_resolver.rs`.
 fn provider_prefix(p: &Provider) -> &'static str {
     p.display_name()
+}
+
+#[cfg(test)]
+mod pool_bridge_tests {
+    use super::*;
+    use praxec_core::accounts::AccountRegistry;
+    use praxec_core::pool_resolver::Constraints;
+
+    #[test]
+    fn resolve_pool_bridges_config_first_override() {
+        let r = AgentsYamlAffinityResolver::from_yaml_str(
+            "version: 1\n\
+             default:\n  - provider: { name: openai }\n    model: gpt-5\n\
+             overrides:\n  coding-frontier:\n    - provider: { name: anthropic }\n      model: claude-x\n",
+        )
+        .unwrap();
+        let spec = ModelRef::parse("coding-frontier").unwrap();
+        let pool = r
+            .resolve_pool_with(
+                &spec,
+                Constraints::default(),
+                &AccountRegistry::default(),
+                |_| true,
+                0.5,
+                0.15,
+            )
+            .expect("config-first override resolves to a pool");
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool[0].provider, "anthropic");
+        assert_eq!(pool[0].model, "claude-x");
+    }
 }
