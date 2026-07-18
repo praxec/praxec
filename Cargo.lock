@@ -2458,8 +2458,8 @@ dependencies = [
 
 [[package]]
 name = "execution-policy"
-version = "0.0.5"
-source = "git+https://github.com/matt-cochran/execution-policy.git?tag=v0.0.5#ac0f08a9e785bc2a6e59c0febd2d8f1effc32170"
+version = "0.0.6"
+source = "git+https://github.com/matt-cochran/execution-policy.git?tag=v0.0.6#46fdfc0956c8b5bdf647e8f541256d7da09afa97"
 dependencies = [
  "tokio",
 ]
