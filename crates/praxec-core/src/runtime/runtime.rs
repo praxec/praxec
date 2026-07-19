@@ -669,13 +669,21 @@ impl WorkflowRuntime {
         // run_id, reject duplicates with a structured error. Stores that
         // return Ok(None) by trait default opt out of the check; their
         // runtime sees no constraint (best-effort safety net).
-        if let Some(run_id) = &request.run_env.run_id {
-            if let Some(existing_workflow_id) = self.store.find_by_run_id(run_id).await? {
-                return Err(RuntimeError::RunIdAlreadyRunning {
-                    run_id: run_id.clone(),
-                    existing_workflow_id,
+        //
+        // ROOT runs only. A sub-workflow (`parent.is_some()`) inherits its
+        // parent's run_id so run correlation survives the spawn — it is the same
+        // run, not a duplicate start. Without this exemption every spawn would be
+        // rejected against its own parent once every root run carries a minted
+        // run_id (mirrors the store-layer exemption in `create`).
+        if request.parent.is_none() {
+            if let Some(run_id) = &request.run_env.run_id {
+                if let Some(existing_workflow_id) = self.store.find_by_run_id(run_id).await? {
+                    return Err(RuntimeError::RunIdAlreadyRunning {
+                        run_id: run_id.clone(),
+                        existing_workflow_id,
+                    }
+                    .into());
                 }
-                .into());
             }
         }
 
@@ -785,8 +793,22 @@ impl WorkflowRuntime {
                 ctx.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
+        let instance_id = format!("wf_{}", Uuid::new_v4().simple());
+        // Run identity is TOTAL. `run_id` is caller-supplied and optional (the
+        // MCP handler forwards an optional argument; the headless orchestrator
+        // passes None), so anything keyed on per-run identity had nothing to key
+        // on for a large class of legitimate runs.
+        //
+        // Mint the instance id when the caller supplies none — ELIMINATE the
+        // absent case rather than fail on it later. A caller-supplied id keeps
+        // its dedup semantics (the store enforces run_id uniqueness); absence
+        // means "no dedup requested", not "no identity".
+        let mut run_env = request.run_env;
+        if run_env.run_id.is_none() {
+            run_env.run_id = Some(instance_id.clone());
+        }
         let instance = WorkflowInstance {
-            id: format!("wf_{}", Uuid::new_v4().simple()),
+            id: instance_id,
             definition_id: request.definition_id.clone(),
             definition_version,
             definition: definition.clone(),
@@ -799,7 +821,7 @@ impl WorkflowRuntime {
             // correlation) on the instance so every downstream audit event and
             // every executor inherits them, and a sub-workflow spawn propagates
             // the same root/identity to the child.
-            run_env: request.run_env,
+            run_env,
             depth: request.depth,
             cancelled_at: None,
             cancelled_reason: None,

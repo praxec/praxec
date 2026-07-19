@@ -53,10 +53,21 @@ impl SqliteWorkflowStore {
             )",
             [],
         )?;
+        // run_id uniqueness identifies a RUN (a tree) and only its ROOT
+        // establishes it. A sub-workflow inherits the parent's run_id so
+        // correlation survives the spawn, so children (`$.parent` present) are
+        // EXCLUDED from the constraint — otherwise every spawn would violate it
+        // once every root run carries a minted run_id. `$.parent IS NULL` holds
+        // for a root whether serde omits the field or writes an explicit null.
+        // Drop-then-create (not IF NOT EXISTS): an older DB may hold the prior,
+        // childless predicate, and the index is derived data — recreating is
+        // lossless.
+        conn.execute("DROP INDEX IF EXISTS idx_workflows_run_id", [])?;
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_run_id \
+            "CREATE UNIQUE INDEX idx_workflows_run_id \
              ON workflows (json_extract(instance, '$.run_env.run_id')) \
-             WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL",
+             WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL \
+               AND json_extract(instance, '$.parent') IS NULL",
             [],
         )?;
         Ok(Self {
@@ -75,10 +86,21 @@ impl SqliteWorkflowStore {
             )",
             [],
         )?;
+        // run_id uniqueness identifies a RUN (a tree) and only its ROOT
+        // establishes it. A sub-workflow inherits the parent's run_id so
+        // correlation survives the spawn, so children (`$.parent` present) are
+        // EXCLUDED from the constraint — otherwise every spawn would violate it
+        // once every root run carries a minted run_id. `$.parent IS NULL` holds
+        // for a root whether serde omits the field or writes an explicit null.
+        // Drop-then-create (not IF NOT EXISTS): an older DB may hold the prior,
+        // childless predicate, and the index is derived data — recreating is
+        // lossless.
+        conn.execute("DROP INDEX IF EXISTS idx_workflows_run_id", [])?;
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_workflows_run_id \
+            "CREATE UNIQUE INDEX idx_workflows_run_id \
              ON workflows (json_extract(instance, '$.run_env.run_id')) \
-             WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL",
+             WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL \
+               AND json_extract(instance, '$.parent') IS NULL",
             [],
         )?;
         Ok(Self {

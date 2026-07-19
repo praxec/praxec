@@ -44,7 +44,12 @@ impl WorkflowStore for InMemoryWorkflowStore {
         if g.contains_key(&instance.id) {
             bail!("workflow id collision: {}", instance.id);
         }
-        if let Some(rid) = &instance.run_env.run_id {
+        // Uniqueness identifies a RUN (a tree), and only its ROOT establishes it.
+        // A sub-workflow inherits the parent's run_id so correlation survives the
+        // spawn; it is the SAME run, not a duplicate start, so children
+        // (`parent.is_some()`) are exempt. Without this, every sub-workflow spawn
+        // would fail once every root run carries a minted run_id.
+        if let (Some(rid), None) = (&instance.run_env.run_id, &instance.parent) {
             // Hold the run_id index lock across the check AND the insert so the
             // uniqueness check is atomic: two concurrent creates with the same
             // run_id can't both pass the check (closing the start-path TOCTOU).
