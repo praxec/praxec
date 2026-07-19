@@ -647,6 +647,47 @@ impl WorkflowRuntime {
                     &instance.definition_id,
                     &self.auto_drive_affinity,
                 );
+                // Per-state tool scoping (role separation). `auto_drive_tools` is
+                // gateway-wide — every auto-driven leaf gets every connection — so
+                // an exploring agent and a fixing agent have identical reach. A
+                // state may declare its own `tools:`, which REPLACES the global set
+                // for that leaf. Entries are templated per-leaf by AgentExecutor,
+                // so `file:{{ $.run.repo_root }}/tests` scopes a writer to one
+                // subtree and the fixer physically cannot address the approved test.
+                //
+                // Absent → the global set, byte-identical to before: the key is
+                // absent in every shipped definition, so this is purely additive.
+                //
+                // An empty-but-present list is an ERROR, not "no tools". A leaf with
+                // an empty toolbelt cannot act, so it burns its whole step budget
+                // producing nothing — the failure that once made the meta pack
+                // unusable. Fail at composition, before the budget is spent.
+                let state_tools: Option<Vec<String>> = match definition.pointer(&format!(
+                    "/states/{}/tools",
+                    pointer_escape(&instance.state)
+                )) {
+                    None => None,
+                    Some(Value::Array(a)) if !a.is_empty() => Some(
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect(),
+                    ),
+                    Some(other) => {
+                        return Err(anyhow!(
+                            "AUTO_DRIVE_STATE_TOOLS_INVALID: state '{}' of '{}' declares \
+                             `tools: {other}` — it must be a NON-EMPTY array of connection \
+                             names (or `file:<abs-root>` entries). Omit the key entirely to \
+                             inherit the gateway-wide auto-drive tool set.",
+                            instance.state,
+                            instance.definition_id
+                        ));
+                    }
+                };
+                // One binding, used by BOTH the executor config and the audit
+                // payload — they cannot drift, so an audit never reports reach the
+                // leaf did not have.
+                let leaf_tools: &Vec<String> =
+                    state_tools.as_ref().unwrap_or(&self.auto_drive_tools);
                 // Per-task reasoning effort: a loop/mission can set
                 // $.context.effort_override (or seed $.input.effort_override) to
                 // force a thinking level for this step (e.g. "xhigh"); else the
@@ -657,7 +698,7 @@ impl WorkflowRuntime {
                     "kind": "agent",
                     "affinity": auto_affinity_tier,
                     "goal": goal_text,
-                    "tools": self.auto_drive_tools,
+                    "tools": leaf_tools,
                     "expected_output_keys": required_keys,
                     "expected_output_types": expected_output_types,
                     // Fail-fast bound: a non-converging auto-driven agent should
@@ -679,7 +720,7 @@ impl WorkflowRuntime {
                             "state": instance.state,
                             "affinity": auto_affinity_tier,
                             "max_seconds": self.auto_drive_max_seconds,
-                            "tools": self.auto_drive_tools,
+                            "tools": leaf_tools,
                         })),
                 )
                 .await;

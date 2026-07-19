@@ -217,6 +217,221 @@ async fn agent_completed_carries_cost_telemetry() {
     assert_eq!(p["affinity"], "reasoning");
 }
 
+// ---------------------------------------------------------------------------
+// Per-state tool scoping (role separation).
+//
+// `auto_drive_tools` is a GATEWAY-WIDE set handed to every auto-driven leaf, so
+// an exploring agent and a fixing agent see the same toolbelt. That defeats role
+// separation: the whole point of a promotion loop is that the fixer CANNOT reach
+// the approved test. A state may therefore declare its own `tools:`, which
+// REPLACES the global set for that leaf — mirroring the per-state `affinity:`
+// override directly above it in the composer.
+// ---------------------------------------------------------------------------
+
+/// A definition whose single agent state declares `tools` (verbatim value under
+/// the state key, so a test can supply an empty array or a non-array too).
+fn agent_state_with_tools(tools: serde_json::Value) -> serde_json::Value {
+    let mut state = json!({
+        "goal": "Explore.",
+        "transitions": {
+            "submit": {
+                "target": "done",
+                "actor": "agent",
+                "executor": { "kind": "noop" },
+                "output": { "verdict": "$.arguments.verdict" }
+            }
+        }
+    });
+    state["tools"] = tools;
+    json!({
+        "version": "1.0.0",
+        "workflows": {
+            "pipeline": {
+                "initialState": "s",
+                "states": { "s": state, "done": { "terminal": true } }
+            }
+        }
+    })
+}
+
+/// A state's `tools:` REPLACES the gateway-wide auto-drive set, so an exploring
+/// leaf can be given browser access without also handing it the filesystem.
+#[tokio::test]
+async fn state_tools_replace_the_global_auto_drive_set() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        agent_state_with_tools(json!(["browser_chrome_1"])),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(
+        true,
+        "reasoning",
+        vec![
+            "browser_chrome_1".into(),
+            "github_mcp".into(),
+            "file:/repo".into(),
+        ],
+        180,
+    );
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+
+    let config = exec
+        .config_for_kind("agent")
+        .expect("the agent executor was invoked");
+    assert_eq!(
+        config["tools"],
+        json!(["browser_chrome_1"]),
+        "the state's `tools:` must REPLACE the global set, not merge with it"
+    );
+}
+
+/// Regression fence: a state WITHOUT `tools:` inherits the gateway-wide set
+/// exactly as before. This must pass on the pre-change tree — it is what makes
+/// the feature additive and every shipped pack behave bit-identically.
+#[tokio::test]
+async fn state_without_tools_inherits_the_global_set() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        linear_chain_stops_at_agent(),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(
+        true,
+        "reasoning",
+        vec!["github_mcp".into(), "file:/repo".into()],
+        180,
+    );
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+
+    let config = exec
+        .config_for_kind("agent")
+        .expect("the agent executor was invoked");
+    assert_eq!(
+        config["tools"],
+        json!(["github_mcp", "file:/repo"]),
+        "absent `tools:` must inherit the global auto-drive set unchanged"
+    );
+}
+
+/// `tools: []` is an AUTHORING ERROR, not "no tools". A leaf handed an empty
+/// toolbelt cannot act, so it burns its entire step budget producing nothing —
+/// the failure class that once made the whole meta pack unusable. Fail fast at
+/// composition instead, naming the fix.
+#[tokio::test]
+async fn empty_state_tools_is_rejected_not_treated_as_no_tools() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        agent_state_with_tools(json!([])),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec!["github_mcp".into()], 180);
+    let err = runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .expect_err("an empty `tools:` must fail the run, not silently disarm the agent");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("AUTO_DRIVE_STATE_TOOLS_INVALID"),
+        "error must name the typed code so an author can find it, got: {msg}"
+    );
+    assert!(
+        exec.config_for_kind("agent").is_none(),
+        "the agent must NOT be dispatched with an empty toolbelt"
+    );
+}
+
+/// A non-array `tools:` is the same authoring mistake in a different shape and
+/// must fail identically — never fall through to the global set, which would
+/// silently grant more reach than the author asked for.
+#[tokio::test]
+async fn non_array_state_tools_is_rejected() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        agent_state_with_tools(json!("browser_chrome_1")),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec!["github_mcp".into()], 180);
+    let err = runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .expect_err("a scalar `tools:` must fail the run");
+    assert!(err.to_string().contains("AUTO_DRIVE_STATE_TOOLS_INVALID"));
+}
+
+/// Observability must not lie about reach: the `agent.invoked` audit event
+/// records the EFFECTIVE tool set, not the gateway-wide one. Otherwise an audit
+/// of a scoped run reports tools the leaf never had.
+#[tokio::test]
+async fn agent_invoked_audit_records_the_effective_tool_set() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, audit) = build_runtime_with_executor(
+        agent_state_with_tools(json!(["browser_chrome_1"])),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(
+        true,
+        "reasoning",
+        vec!["github_mcp".into(), "file:/repo".into()],
+        180,
+    );
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+
+    let invoked = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "agent.invoked")
+        .expect("an agent.invoked event must be recorded");
+    assert_eq!(
+        invoked.payload["tools"],
+        json!(["browser_chrome_1"]),
+        "the audit payload must carry the effective set, or observability lies"
+    );
+}
+
 /// Degrade gracefully: an uncatalogued model leaves `cost_usd: null` on the
 /// audit event (mirrors the llm-executor's degrade-to-None) — never an error,
 /// and the tokens are still recorded.

@@ -34,12 +34,22 @@ impl FileEditToolHost {
     }
 }
 
-/// Resolve `rel` under `root`, refusing absolute paths and any `..` escape.
-/// Delegates to the shared [`praxec_core::path_safety::resolve_under`] (one
-/// traversal guard, also used by the `path_grounding` gate) and preserves this
-/// host's `FILE_TOOL_PATH_ESCAPE:` error prefix.
+/// Resolve `rel` under `root`, refusing absolute paths, any `..` escape, and any
+/// symlink that leaves the root.
+///
+/// Delegates to the shared
+/// [`praxec_core::path_safety::resolve_under_no_symlink_escape`] and preserves
+/// this host's `FILE_TOOL_PATH_ESCAPE:` error prefix.
+///
+/// The filesystem-aware variant is REQUIRED here, not the lexical one: this host
+/// is the mechanism behind per-state tool scoping, so `file:<repo>/src` is a
+/// security boundary. A link inside the root pointing outside it is lexically
+/// clean, and following it would let an agent confined to `src/` write to
+/// `tests/` — silently voiding the test-immutability guarantee the promotion
+/// loop rests on. Reads are guarded identically: a read-only reviewer that can
+/// follow a link out of scope is not scoped either.
 fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    praxec_core::path_safety::resolve_under(root, rel)
+    praxec_core::path_safety::resolve_under_no_symlink_escape(root, rel)
         .map_err(|e| format!("FILE_TOOL_PATH_ESCAPE: {e}"))
 }
 
@@ -573,6 +583,59 @@ mod tests {
             !root.path().parent().unwrap().join("escape.rs").exists(),
             "nothing written outside the root"
         );
+    }
+
+    /// A symlink INSIDE the root pointing OUTSIDE it contains no `..` and is not
+    /// absolute, so a purely lexical guard waves it through and the write lands
+    /// outside the declared scope. That defeats role separation at its root: an
+    /// agent confined to `<repo>/src` reaches `<repo>/tests` through one `ln -s`,
+    /// and the approved regression test stops being immutable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_symlink_outside_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+
+        let host = super::FileEditToolHost::new();
+        let err = host
+            .call(
+                root.to_str().unwrap(),
+                "write_file",
+                &json!({ "path": "escape/pwned.rs", "content": "x" }).to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("PATH_ESCAPE"), "{err}");
+        assert!(
+            !outside.join("pwned.rs").exists(),
+            "nothing may be written outside the root through a symlink"
+        );
+    }
+
+    /// Containment, not link-freedom: a symlink that stays inside the root cannot
+    /// widen the agent's reach, so refusing it would break legitimate in-repo
+    /// links for no security gain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_symlink_inside_root_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+
+        let host = super::FileEditToolHost::new();
+        host.call(
+            root.to_str().unwrap(),
+            "write_file",
+            &json!({ "path": "alias/ok.rs", "content": "x" }).to_string(),
+        )
+        .await
+        .expect("an in-root symlink is legitimate");
+        assert!(root.join("real/ok.rs").exists());
     }
 
     #[tokio::test]
