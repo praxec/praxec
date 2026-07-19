@@ -116,6 +116,17 @@ struct DispatchOutcome {
     next_transition: Option<NextTransition>,
 }
 
+/// A held repo-lock lease: which files, and under whose holder string.
+///
+/// Returned by [`WorkflowRuntime::acquire_owned_files`] and consumed by
+/// [`WorkflowRuntime::release_lease`]. Existing as a value (rather than the
+/// caller re-deriving the file list and holder at release time) is the
+/// poka-yoke: the release cannot disagree with the acquire about what is held.
+pub(crate) struct LockLease {
+    files: Vec<std::path::PathBuf>,
+    holder: String,
+}
+
 impl DispatchOutcome {
     /// Build an outcome with no chain continuation — used by every
     /// `dispatch_once` exit path except the successful executor-result
@@ -264,6 +275,38 @@ impl WorkflowRuntime {
         files: &[std::path::PathBuf],
         conflict: &crate::repo_locks::LockConflict,
     ) -> anyhow::Result<DispatchOutcome> {
+        let resp = self
+            .park_on_lock(
+                definition,
+                instance,
+                transition,
+                expected_version,
+                principal,
+                files,
+                conflict,
+            )
+            .await?;
+        Ok(DispatchOutcome::terminal(resp))
+    }
+
+    /// Durably park a run that could not acquire its declared `owned_files`,
+    /// returning the `waiting_on_lock` response.
+    ///
+    /// Shared by BOTH dispatch paths: the submit gate (via `suspend_on_lock`)
+    /// and the deterministic chain's auto-drive gate. One parking routine means
+    /// contention behaves identically however the leaf was reached — a chain
+    /// leaf cannot quietly proceed on a resource a submit leaf would wait for.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn park_on_lock(
+        &self,
+        definition: &Value,
+        instance: &WorkflowInstance,
+        transition: &str,
+        expected_version: u64,
+        principal: &Principal,
+        files: &[std::path::PathBuf],
+        conflict: &crate::repo_locks::LockConflict,
+    ) -> anyhow::Result<Value> {
         let mut next = instance.clone();
         let blocked_by: Vec<Value> = conflict
             .conflicts
@@ -310,7 +353,7 @@ impl WorkflowRuntime {
                     .with_payload(json!({ "files": files_as_strings(files) })),
             )
             .await;
-        let resp = self
+        Ok(self
             .response(
                 definition,
                 &saved,
@@ -318,8 +361,69 @@ impl WorkflowRuntime {
                 None,
                 principal,
             )
+            .await)
+    }
+
+    /// Acquire an executor's declared `owned_files`, if any.
+    ///
+    /// `Ok(None)` = nothing held (no lock space configured, or the executor
+    /// declares no files) — the caller proceeds and releases nothing.
+    /// `Ok(Some(lease))` = held; the caller MUST pass it to [`release_lease`].
+    /// `Err((files, conflict))` = contention; the caller decides how to park,
+    /// because the two dispatch paths return different types.
+    ///
+    /// Extracted so the submit gate and the chain's auto-drive gate share ONE
+    /// acquire rule. They diverged before: the chain synthesized its agent
+    /// config and dispatched directly, so a declared lease was silently inert.
+    pub(crate) async fn acquire_owned_files(
+        &self,
+        executor_config: &Value,
+        instance: &WorkflowInstance,
+    ) -> Result<Option<LockLease>, (Vec<std::path::PathBuf>, crate::repo_locks::LockConflict)> {
+        let files = crate::repo_locks::owned_files_in(executor_config);
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let Some(locks) = self.repo_locks.clone() else {
+            return Ok(None);
+        };
+        let holder = format!("wf:{}", instance.id);
+        if let Err(conflict) = locks.acquire(&files, &holder, LOCK_TTL).await {
+            return Err((files, conflict));
+        }
+        let _ = self
+            .audit
+            .record(
+                instance
+                    .audit_event("lock.acquired")
+                    .with_payload(json!({ "files": files_as_strings(&files) })),
+            )
             .await;
-        Ok(DispatchOutcome::terminal(resp))
+        Ok(Some(LockLease { files, holder }))
+    }
+
+    /// Release a lease taken by [`acquire_owned_files`] and wake the FIFO-first
+    /// waiter whose files just freed. Call on BOTH the success and error paths —
+    /// a lease held past a failed executor strands every waiter behind it.
+    pub(crate) async fn release_lease(
+        &self,
+        lease: Option<LockLease>,
+        instance: &WorkflowInstance,
+    ) {
+        let Some(lease) = lease else { return };
+        let Some(locks) = self.repo_locks.clone() else {
+            return;
+        };
+        locks.release(&lease.files, &lease.holder).await;
+        let _ = self
+            .audit
+            .record(
+                instance
+                    .audit_event("lock.released")
+                    .with_payload(json!({ "files": files_as_strings(&lease.files) })),
+            )
+            .await;
+        self.resume_ready_locks().await;
     }
 
     /// P2 — durably suspend the transition on a sub-workflow wait. A
@@ -999,34 +1103,23 @@ impl WorkflowRuntime {
             // Repo write-exclusion gate (SPEC: global file locks). Acquire this
             // transition's owned_files before executing; on contention durably
             // suspend (waiting_on_lock); release the moment execution returns.
-            let lock_files = crate::repo_locks::owned_files_in(executor_config);
-            let lock_holder = format!("wf:{}", instance.id);
-            if let Some(locks) = self.repo_locks.clone() {
-                if !lock_files.is_empty() {
-                    if let Err(conflict) = locks.acquire(&lock_files, &lock_holder, LOCK_TTL).await
-                    {
-                        return self
-                            .suspend_on_lock(
-                                &definition,
-                                &instance,
-                                &request.transition,
-                                request.expected_version,
-                                &request.principal,
-                                &lock_files,
-                                &conflict,
-                            )
-                            .await;
-                    }
-                    let _ = self
-                        .audit
-                        .record(
-                            instance
-                                .audit_event("lock.acquired")
-                                .with_payload(json!({ "files": files_as_strings(&lock_files) })),
+            // Shares one acquire/release rule with the chain's auto-drive gate.
+            let lease = match self.acquire_owned_files(executor_config, &instance).await {
+                Ok(lease) => lease,
+                Err((lock_files, conflict)) => {
+                    return self
+                        .suspend_on_lock(
+                            &definition,
+                            &instance,
+                            &request.transition,
+                            request.expected_version,
+                            &request.principal,
+                            &lock_files,
+                            &conflict,
                         )
                         .await;
                 }
-            }
+            };
 
             let exec_started = std::time::Instant::now();
             let exec_result = execute_with_reliability(
@@ -1042,21 +1135,7 @@ impl WorkflowRuntime {
             .await;
 
             // Release the lock the instant execution returns — success OR error.
-            if let Some(locks) = self.repo_locks.clone() {
-                if !lock_files.is_empty() {
-                    locks.release(&lock_files, &lock_holder).await;
-                    let _ = self
-                        .audit
-                        .record(
-                            instance
-                                .audit_event("lock.released")
-                                .with_payload(json!({ "files": files_as_strings(&lock_files) })),
-                        )
-                        .await;
-                    // Auto-resume the FIFO-first waiter whose files just freed.
-                    self.resume_ready_locks().await;
-                }
-            }
+            self.release_lease(lease, &instance).await;
 
             match exec_result {
                 Ok(result) => {
@@ -1632,6 +1711,28 @@ impl WorkflowRuntime {
                 // workflow in a broken state; do not chain further LLM
                 // turns. The captured next_transition (if any) is
                 // intentionally dropped here.
+                Ok(DispatchOutcome::terminal(response))
+            }
+            ChainOutcome::WaitingOnLock {
+                partial,
+                transition,
+                files,
+                conflict,
+            } => {
+                // Chain path — an auto-driven leaf could not acquire its declared
+                // owned_files. Park on the SAME routine the direct-submit gate
+                // uses; the LockScheduler re-drives when the resource frees.
+                let response = self
+                    .park_on_lock(
+                        &definition,
+                        &partial.instance,
+                        &transition,
+                        partial.instance.version,
+                        &request.principal,
+                        &files,
+                        &conflict,
+                    )
+                    .await?;
                 Ok(DispatchOutcome::terminal(response))
             }
             ChainOutcome::Suspended {

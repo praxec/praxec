@@ -65,6 +65,21 @@ pub enum ChainOutcome {
         suspend: crate::model::StepSuspend,
         transition: String,
     },
+    /// Chain stopped because an auto-driven leaf could not acquire its declared
+    /// `owned_files` — another holder owns the resource.
+    ///
+    /// Deliberately DISTINCT from [`ChainOutcome::Suspended`]: that means an
+    /// executor ran and parked itself; this means the leaf never started. And
+    /// distinct from [`ChainOutcome::Failed`]: contention is the expected steady
+    /// state under fan-out, not an error. The caller durably records the wait
+    /// and enqueues on the `LockScheduler`, so the run resumes when the resource
+    /// frees rather than proceeding on a resource it does not hold.
+    WaitingOnLock {
+        partial: ChainResult,
+        transition: String,
+        files: Vec<std::path::PathBuf>,
+        conflict: crate::repo_locks::LockConflict,
+    },
     /// Chain stopped because the run exceeded its cumulative livelock hop
     /// budget (persisted across drives AND restarts) without reaching a
     /// terminal state — a livelock. Distinct from `Failed`: this is a liveness
@@ -985,6 +1000,27 @@ impl WorkflowRuntime {
                         .await
                     }
                 }
+            }
+            ChainOutcome::WaitingOnLock {
+                partial,
+                transition,
+                files,
+                conflict,
+            } => {
+                // An auto-driven leaf could not acquire its declared owned_files.
+                // Park durably on the SAME routine the submit gate uses, so a
+                // chain leaf and a submit leaf behave identically under
+                // contention, and the LockScheduler re-drives us when it frees.
+                self.park_on_lock(
+                    &definition,
+                    &partial.instance,
+                    &transition,
+                    partial.instance.version,
+                    &request.principal,
+                    &files,
+                    &conflict,
+                )
+                .await
             }
             ChainOutcome::Quarantined { partial, reason } => {
                 // Liveness backstop during `start` — the run exceeded its

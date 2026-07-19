@@ -708,6 +708,40 @@ impl WorkflowRuntime {
                 if let Some(e) = &effort {
                     agent_config["reasoning_effort"] = json!(e);
                 }
+                // Repo write-exclusion gate on the AUTO-DRIVE path.
+                //
+                // Read `owned_files` from the DECLARED executor (`def`), not the
+                // synthesized `agent_config` — the synthetic config is built from
+                // scratch and never carries the author's declaration, which is
+                // precisely why this gate was inert here while the submit path
+                // enforced it.
+                //
+                // Acquire BEFORE `agent.invoked` is recorded: a run that parks
+                // must not leave an invocation event for an agent that never ran.
+                let declared_executor = def.get("executor").cloned().unwrap_or_else(|| json!({}));
+                let lease = match self
+                    .acquire_owned_files(&declared_executor, &instance)
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err((files, conflict)) => {
+                        // Contention is expected under fan-out, not an error:
+                        // park durably and let the scheduler re-drive us when the
+                        // resource frees. Proceeding here would run two leaves
+                        // against one exclusive resource, each believing it holds
+                        // it — the silent-corruption case this gate prevents.
+                        return Ok(ChainOutcome::WaitingOnLock {
+                            transition: name,
+                            files,
+                            conflict,
+                            partial: ChainResult {
+                                instance,
+                                steps,
+                                evidence: accumulated_evidence,
+                            },
+                        });
+                    }
+                };
                 // Observability: emit a start event so a live `audit tail` shows
                 // exactly which agent step is running (and pinpoints a hang).
                 let agent_started = std::time::Instant::now();
@@ -725,7 +759,7 @@ impl WorkflowRuntime {
                 )
                 .await;
                 let policy = ReliabilityPolicy::from_value(def.get("reliability"))?;
-                match execute_with_reliability(
+                let exec_result = execute_with_reliability(
                     self.executors.as_ref(),
                     &self.audit,
                     &instance,
@@ -735,8 +769,11 @@ impl WorkflowRuntime {
                     &policy,
                     correlation_id,
                 )
-                .await
-                {
+                .await;
+                // Release the instant execution returns — success OR error. A
+                // lease held past a failed leaf strands every waiter behind it.
+                self.release_lease(lease, &instance).await;
+                match exec_result {
                     Ok(result) => {
                         // Per-call cost telemetry (value-based model selection):
                         // fold the agent's realized tokens + USD cost into the

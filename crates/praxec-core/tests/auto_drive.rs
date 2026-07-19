@@ -432,6 +432,172 @@ async fn agent_invoked_audit_records_the_effective_tool_set() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The repo write-exclusion gate on the AUTO-DRIVE path.
+//
+// `owned_files` is honored in `dispatch_once` (the submit path) only. The
+// deterministic chain synthesizes its own agent config and calls
+// `execute_with_reliability` directly, so an auto-driven leaf declaring
+// `owned_files` took NO lock at all — the declaration was silently inert.
+//
+// That matters beyond repo files: a shared, stateful resource (a browser whose
+// `select_page` pointer is global to its server process) is exactly what
+// `owned_files` exists to serialize. A lease that is never taken is worse than
+// no lease, because the declaration reads as protection.
+// ---------------------------------------------------------------------------
+
+/// An auto-drivable agent transition whose declared executor owns a file.
+fn auto_drivable_owning(file: &str) -> serde_json::Value {
+    json!({
+        "version": "1.0.0",
+        "workflows": {
+            "pipeline": {
+                "initialState": "s",
+                "states": {
+                    "s": {
+                        "goal": "Explore.",
+                        "transitions": {
+                            "submit": {
+                                "target": "done",
+                                "actor": "agent",
+                                "executor": { "kind": "noop", "owned_files": [file] },
+                                "output": { "verdict": "$.arguments.verdict" }
+                            }
+                        }
+                    },
+                    "done": { "terminal": true }
+                }
+            }
+        }
+    })
+}
+
+/// The auto-drive path must ACQUIRE the transition's declared `owned_files`
+/// before invoking the agent — the same gate the submit path applies.
+#[tokio::test]
+async fn auto_driven_leaf_with_owned_files_acquires_the_lock() {
+    use praxec_core::repo_locks::{RepoLockSpace, RepoLocks};
+    use std::sync::Arc;
+
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, audit) = build_runtime_with_executor(
+        auto_drivable_owning("browser/slot-1"),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let locks: Arc<dyn RepoLocks> = Arc::new(RepoLockSpace::new());
+    let runtime = runtime
+        .with_auto_drive_agents(true, "reasoning", vec![], 180)
+        .with_repo_locks(locks);
+
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+
+    let events = audit.snapshot();
+    assert!(
+        events.iter().any(|e| e.event_type == "lock.acquired"),
+        "the auto-drive path must acquire declared owned_files, or the lease is inert"
+    );
+    assert!(
+        events.iter().any(|e| e.event_type == "lock.released"),
+        "and release them once the leaf returns"
+    );
+}
+
+/// The safety property: when the declared file is already held by ANOTHER
+/// workflow, the auto-driven agent must NOT run. Executing anyway is the silent
+/// corruption this gate exists to prevent — two runs driving one shared
+/// resource, each believing it holds it exclusively.
+#[tokio::test]
+async fn auto_driven_leaf_blocked_by_a_foreign_holder_does_not_execute() {
+    use praxec_core::repo_locks::{RepoLockSpace, RepoLocks};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        auto_drivable_owning("browser/slot-1"),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let locks: Arc<dyn RepoLocks> = Arc::new(RepoLockSpace::new());
+    locks
+        .acquire(
+            &[std::path::PathBuf::from("browser/slot-1")],
+            "wf:someone_else",
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+
+    let runtime = runtime
+        .with_auto_drive_agents(true, "reasoning", vec![], 180)
+        .with_repo_locks(locks);
+
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        exec.config_for_kind("agent").is_none(),
+        "the agent must NOT be dispatched while another holder owns the declared file"
+    );
+}
+
+/// A leaf that declares no `owned_files` takes no lock — the gate must not
+/// serialize ordinary agent work. (Regression fence for the hoist.)
+#[tokio::test]
+async fn auto_driven_leaf_without_owned_files_takes_no_lock() {
+    use praxec_core::repo_locks::{RepoLockSpace, RepoLocks};
+    use std::sync::Arc;
+
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, audit) = build_runtime_with_executor(
+        linear_chain_stops_at_agent(),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let locks: Arc<dyn RepoLocks> = Arc::new(RepoLockSpace::new());
+    let runtime = runtime
+        .with_auto_drive_agents(true, "reasoning", vec![], 180)
+        .with_repo_locks(locks);
+
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        !audit
+            .snapshot()
+            .iter()
+            .any(|e| e.event_type == "lock.acquired"),
+        "an undeclared leaf must not take a lock — the gate is opt-in via owned_files"
+    );
+    assert!(exec.config_for_kind("agent").is_some(), "and it still runs");
+}
+
 /// Degrade gracefully: an uncatalogued model leaves `cost_usd: null` on the
 /// audit event (mirrors the llm-executor's degrade-to-None) — never an error,
 /// and the tokens are still recorded.
