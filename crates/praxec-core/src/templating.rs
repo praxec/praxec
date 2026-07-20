@@ -80,6 +80,18 @@ pub(crate) fn resolve_template_path(path: &str, instance: &WorkflowInstance) -> 
     if path == "$.run.repo_root" {
         return instance.run_env.repo_root.as_str().to_string();
     }
+    // Run-scoped exclusive-pool lease: `$.run.leased.<pool>` → the connection
+    // leased for that pool this run. This is what a browser-touching state's
+    // `tools: ["{{ $.run.leased.browser }}"]` renders against. Unset (the flow
+    // did not declare the pool, or the lease was not acquired) stubs like any
+    // other unresolved token, and A0's FILE_TOOL_ROOT_UNRESOLVED / the empty
+    // toolbelt guard catches a leaf dispatched with an unresolved tool.
+    if let Some(pool) = path.strip_prefix("$.run.leased.") {
+        return match instance.run_env.leased_member(pool) {
+            Some(member) => member.to_string(),
+            None => format!("({pool}: unset)"),
+        };
+    }
 
     // SPEC §17.x — `$.praxec.authoring.*` resolves against the snapshot's
     // stamped `_authoringPrefs`. This is gateway-level operator preferences
@@ -158,5 +170,30 @@ mod tests {
         let inst = instance();
         let rendered = render_template("{{ $.run.repo_root.x }}", &inst);
         assert_ne!(rendered, inst.run_env.repo_root.as_str());
+    }
+
+    /// A browser-touching state renders its leased connection via
+    /// `{{ $.run.leased.<pool> }}` — the run-scoped pool lease, so `tools:`
+    /// points at the exact server process this run holds.
+    #[test]
+    fn templating_resolves_a_run_pool_lease() {
+        let mut inst = instance();
+        inst.run_env
+            .leased
+            .insert("browser".into(), "browser_chrome_2".into());
+        assert_eq!(
+            render_template("{{ $.run.leased.browser }}", &inst),
+            "browser_chrome_2"
+        );
+    }
+
+    /// An undeclared / unacquired pool stubs like any other unresolved token —
+    /// it never silently renders empty (which A0's toolbelt guards would then
+    /// reject at dispatch rather than run a leaf with no browser).
+    #[test]
+    fn templating_stubs_an_unleased_pool() {
+        let inst = instance();
+        let rendered = render_template("{{ $.run.leased.browser }}", &inst);
+        assert_eq!(rendered, "(browser: unset)");
     }
 }

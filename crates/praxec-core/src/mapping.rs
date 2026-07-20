@@ -262,6 +262,14 @@ pub fn read_in_scopes(
         }
         _ => {}
     }
+    // Run-scoped exclusive-pool lease: `$.run.leased.<pool>` → the leased
+    // connection name. Resolves only when the run env is supplied (executor
+    // context); a load-time caller passes `None` and gets an unresolved read.
+    if let Some(pool) = expr.strip_prefix("$.run.leased.") {
+        return run_env
+            .and_then(|e| e.leased_member(pool))
+            .map(|m| Value::String(m.to_string()));
+    }
     if let Some(path) = expr.strip_prefix("$.arguments.") {
         return resolve_path_with_projection(arguments, path);
     }
