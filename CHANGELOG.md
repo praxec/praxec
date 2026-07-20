@@ -30,6 +30,22 @@ covered by a stability commitment.
   it too (`AUTO_DRIVE_STATE_REASONING_EFFORT_INVALID`), but V32 moves the failure to
   `praxec check` — before the human gate and before any lease is taken.
 
+### Fixed — an unresolvable script reference no longer passes `praxec check`
+
+- **`SCRIPT_SUBJECT_UNKNOWN`** — a `kind: script` executor naming a subject that no
+  `scripts:` entry defines is an authoring typo, but `stamp_scripts_library` skipped
+  it silently. `praxec check` reported `validation: ok` and the run failed much later
+  with `SCRIPT_NOT_IN_SNAPSHOT` — an error whose own text blames collection and points
+  straight back at the skip. The gate every workflow pack relies on had a blind spot
+  on exactly the reference it exists to check. Found while dogfooding the browser-E2E
+  QA family: a typo'd script subject validated green, and the only way to prove a new
+  script loaded at all was to corrupt its YAML.
+- Same poka-yoke class as V32 — a reference that resolves to nothing must fail at
+  load, before the human gate and before any lease is taken. All unresolvable
+  references across all workflows are reported in one error (matching the writable-
+  repo-root change below), naming the workflow, the subject, and the declared
+  subjects so the typo is obvious.
+
 ### Changed
 
 - Boot now reports **every** unresolvable `writable: true` repo root in one error

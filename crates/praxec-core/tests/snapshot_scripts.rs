@@ -243,3 +243,96 @@ scripts:
         "relative file:// must be rewritten to absolute; got: {top_uri}"
     );
 }
+
+// ── Unknown subject fails at LOAD, not at run ─────────────────────────────
+
+/// A `kind: script` executor naming a subject that no `scripts:` entry
+/// defines is an authoring typo. `stamp_scripts_library` used to skip it
+/// silently (`if let Some(entry) = full_library.get(subject)`), so
+/// `praxec check` reported `validation: ok` and the run failed much later
+/// with `SCRIPT_NOT_IN_SNAPSHOT` — whose own message blames collection,
+/// pointing straight back here.
+///
+/// This is the same poka-yoke class as V32: a reference that resolves to
+/// nothing must fail at load, before the human gate and before any lease.
+#[test]
+fn unknown_script_subject_is_rejected_at_load() {
+    let yaml = r#"
+version: "1.0.0"
+scripts:
+  build.cargo.release:
+    verb: build
+    lifecycle: stable
+    body: |
+      cargo build --release --locked
+workflows:
+  demo:
+    initialState: build
+    states:
+      build:
+        transitions:
+          run:
+            target: done
+            executor:
+              kind: script
+              subject: build.cargo.releas
+      done: { terminal: true }
+"#;
+    let err = resolve_str(yaml).expect_err("a typo'd script subject must not load");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("SCRIPT_SUBJECT_UNKNOWN"),
+        "must carry the coded error; got: {msg}"
+    );
+    assert!(
+        msg.contains("build.cargo.releas"),
+        "must name the unresolvable subject; got: {msg}"
+    );
+    assert!(
+        msg.contains("demo"),
+        "must name the workflow it was referenced from; got: {msg}"
+    );
+    assert!(
+        msg.contains("build.cargo.release"),
+        "must list the declared subjects so the typo is obvious; got: {msg}"
+    );
+}
+
+/// Fence: the happy path is untouched — a workflow whose subjects all
+/// resolve still loads and still gets its library stamped.
+#[test]
+fn every_declared_script_subject_still_resolves() {
+    let yaml = r#"
+version: "1.0.0"
+scripts:
+  build.one:
+    verb: build
+    lifecycle: stable
+    body: "echo one"
+  verify.two:
+    verb: verify
+    lifecycle: stable
+    body: "echo two"
+workflows:
+  demo:
+    initialState: s
+    states:
+      s:
+        transitions:
+          x:
+            target: t
+            executor: { kind: script, subject: build.one }
+      t:
+        transitions:
+          y:
+            target: done
+            executor: { kind: script, subject: verify.two }
+      done: { terminal: true }
+"#;
+    let resolved = resolve_str(yaml).expect("all subjects resolve → loads");
+    let lib = resolved
+        .pointer("/workflows/demo/_scriptsLibrary")
+        .expect("library stamped");
+    assert!(lib.get("build.one").is_some());
+    assert!(lib.get("verify.two").is_some());
+}

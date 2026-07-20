@@ -2520,7 +2520,10 @@ fn stamp_scripts_library(config: &mut Value) -> anyhow::Result<()> {
         .pointer_mut("/workflows")
         .and_then(Value::as_object_mut)
     {
-        for def in workflows.values_mut() {
+        // Every unresolvable subject across every workflow, so an operator
+        // fixes them in one pass rather than one load-failure per typo.
+        let mut unknown: Vec<(String, String)> = Vec::new();
+        for (workflow_id, def) in workflows.iter_mut() {
             let Some(obj) = def.as_object_mut() else {
                 continue;
             };
@@ -2530,13 +2533,37 @@ fn stamp_scripts_library(config: &mut Value) -> anyhow::Result<()> {
             }
             let mut scoped = Map::new();
             for subject in &referenced {
-                if let Some(entry) = full_library.get(subject) {
-                    scoped.insert(subject.clone(), entry.clone());
+                match full_library.get(subject) {
+                    Some(entry) => {
+                        scoped.insert(subject.clone(), entry.clone());
+                    }
+                    // A referenced subject that no `scripts:` entry defines is
+                    // an authoring typo. Skipping it silently produced a green
+                    // `praxec check` and deferred the failure to the run, where
+                    // it surfaces as SCRIPT_NOT_IN_SNAPSHOT — an error whose own
+                    // text blames collection and points straight back here.
+                    None => unknown.push((workflow_id.clone(), subject.clone())),
                 }
             }
             if !scoped.is_empty() {
                 obj.insert("_scriptsLibrary".into(), Value::Object(scoped));
             }
+        }
+        if !unknown.is_empty() {
+            unknown.sort();
+            let declared: Vec<&str> = full_library.keys().map(String::as_str).collect();
+            let refs = unknown
+                .iter()
+                .map(|(wf, subj)| format!("workflow '{wf}' → script '{subj}'"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!(
+                "SCRIPT_SUBJECT_UNKNOWN: {} script reference(s) name a subject that no \
+                 `scripts:` entry defines: {refs}. Declared subjects are {declared:?}. \
+                 Fix the typo or add the missing `scripts:` entry — an unresolvable \
+                 reference must fail here, not mid-run.",
+                unknown.len()
+            );
         }
     }
     Ok(())
