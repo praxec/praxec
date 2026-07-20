@@ -80,6 +80,15 @@ pub(crate) fn resolve_template_path(path: &str, instance: &WorkflowInstance) -> 
     if path == "$.run.repo_root" {
         return instance.run_env.repo_root.as_str().to_string();
     }
+    // Run-scoped evidence dir — engine-created, so a probe/screenshot path
+    // assembled from it always has an existing parent.
+    if path == "$.run.artifacts_dir" {
+        return instance
+            .run_env
+            .artifacts_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "(artifacts_dir: unset)".to_string());
+    }
     // Run-scoped exclusive-pool lease: `$.run.leased.<pool>` → the connection
     // leased for that pool this run. This is what a browser-touching state's
     // `tools: ["{{ $.run.leased.browser }}"]` renders against. Unset (the flow
@@ -195,5 +204,19 @@ mod tests {
         let inst = instance();
         let rendered = render_template("{{ $.run.leased.browser }}", &inst);
         assert_eq!(rendered, "(browser: unset)");
+    }
+
+    /// `$.run.artifacts_dir` renders to `<repo_root>/.praxec/artifacts/<run_ref>`
+    /// — the engine-created evidence dir a probe/screenshot path is built from.
+    #[test]
+    fn templating_resolves_the_run_artifacts_dir() {
+        let mut inst = instance();
+        inst.run_env.run_ref = Some("wf_abc".into());
+        let rendered = render_template("{{ $.run.artifacts_dir }}", &inst);
+        assert!(
+            rendered.ends_with(".praxec/artifacts/wf_abc"),
+            "got: {rendered}"
+        );
+        assert!(rendered.starts_with(inst.run_env.repo_root.as_str()));
     }
 }

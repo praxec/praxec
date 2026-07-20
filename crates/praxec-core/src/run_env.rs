@@ -184,6 +184,17 @@ impl RunEnv {
         self.leased.get(pool).map(String::as_str)
     }
 
+    /// The run-scoped evidence directory: `<repo_root>/.praxec/artifacts/<run_ref>`.
+    /// Derived (not stored) so it is always consistent with the root + identity;
+    /// the engine `create_dir_all`s it at the run boundary, so a tool that only
+    /// WRITES a file under it never fails on a missing parent. `None` before
+    /// `run_ref` is minted (load-time/validation callers).
+    pub fn artifacts_dir(&self) -> Option<std::path::PathBuf> {
+        self.run_ref
+            .as_ref()
+            .map(|r| self.repo_root.as_path().join(".praxec/artifacts").join(r))
+    }
+
     /// Test-only environment (see [`RepoRoot::for_test`] for why this is not
     /// `#[cfg(test)]`).
     #[doc(hidden)]

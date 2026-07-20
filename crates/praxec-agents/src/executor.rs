@@ -282,8 +282,12 @@ impl AgentExecutor {
             .map(|t| render_template(t, &request.workflow))
             .collect();
         if let Some(bad) = tools.iter().find(|t| {
-            t.strip_prefix(crate::file_tools::FILE_CONNECTION_PREFIX)
-                .is_some_and(|root| !std::path::Path::new(root).is_absolute())
+            // Both a read-write `file:` and a read-only `file-ro:` root must be
+            // absolute — an unresolved template on either is a mis-threaded leaf.
+            let root = t
+                .strip_prefix(crate::file_tools::FILE_RO_CONNECTION_PREFIX)
+                .or_else(|| t.strip_prefix(crate::file_tools::FILE_CONNECTION_PREFIX));
+            root.is_some_and(|r| !std::path::Path::new(r).is_absolute())
         }) {
             return Err(ExecutorError::Permanent(format!(
                 "FILE_TOOL_ROOT_UNRESOLVED: agent-leaf tool `{bad}` did not resolve to an absolute \
