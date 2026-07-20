@@ -27,6 +27,15 @@ pub(crate) use crate::runtime::runtime_schema::{
 /// Configurable per-runtime via [`WorkflowRuntime::with_max_chained_llm_turns`].
 pub const DEFAULT_MAX_CHAINED_LLM_TURNS: u32 = 32;
 
+/// TTL for a run-scoped exclusive-pool lease. Generous, because it is REFRESHED
+/// on every chain hop and dispatch (see `refresh_run_leases`) — it only needs to
+/// outlast a single in-flight step (an auto-driven agent bounded by
+/// `auto_drive_max_seconds`, worst case tens of minutes), and the refresh covers
+/// multi-step runs. A too-short TTL would reap a live holder and let a second run
+/// seize its browser mid-exploration (the C2 heartbeat gap); a background
+/// heartbeat task is avoided by refreshing on progress instead.
+const POOL_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 // ---------------------------------------------------------------------------
 // Deterministic chaining types
 // ---------------------------------------------------------------------------
@@ -64,6 +73,21 @@ pub enum ChainOutcome {
         partial: ChainResult,
         suspend: crate::model::StepSuspend,
         transition: String,
+    },
+    /// Chain stopped because an auto-driven leaf could not acquire its declared
+    /// `owned_files` — another holder owns the resource.
+    ///
+    /// Deliberately DISTINCT from [`ChainOutcome::Suspended`]: that means an
+    /// executor ran and parked itself; this means the leaf never started. And
+    /// distinct from [`ChainOutcome::Failed`]: contention is the expected steady
+    /// state under fan-out, not an error. The caller durably records the wait
+    /// and enqueues on the `LockScheduler`, so the run resumes when the resource
+    /// frees rather than proceeding on a resource it does not hold.
+    WaitingOnLock {
+        partial: ChainResult,
+        transition: String,
+        files: Vec<std::path::PathBuf>,
+        conflict: crate::repo_locks::LockConflict,
     },
     /// Chain stopped because the run exceeded its cumulative livelock hop
     /// budget (persisted across drives AND restarts) without reaching a
@@ -184,6 +208,17 @@ pub struct WorkflowRuntime {
     /// wrappers' `RwLock<Arc<…>>` idiom. Reads (per run `start`) take a read
     /// lock; a reload takes a write lock via [`set_writable_repo_roots`].
     pub(crate) writable_repo_roots: Arc<std::sync::RwLock<Vec<crate::run_env::RepoRoot>>>,
+    /// Exclusive-resource pools: `pool name -> member lock-keys`, derived from
+    /// the config's `connections:` (each `exclusive: true` mcp connection tagged
+    /// with a `pool:`). A flow declaring `exclusive_pools: [browser]` leases ONE
+    /// member of `browser` at the run boundary (`acquire_any`), so many runs
+    /// distribute across the pool's server processes without colliding on any
+    /// one process's global `select_page` pointer. Empty → no pools; a flow that
+    /// declares one then fails fast (no member to lease). Hot-swappable like
+    /// `writable_repo_roots` so a reload re-derives it. No browser knowledge in
+    /// core: the engine leases exclusive resources; config says which exist.
+    pub(crate) exclusive_pools:
+        Arc<std::sync::RwLock<std::collections::BTreeMap<String, Vec<std::path::PathBuf>>>>,
 }
 
 impl WorkflowRuntime {
@@ -211,7 +246,214 @@ impl WorkflowRuntime {
             auto_drive_tools: Vec::new(),
             auto_drive_max_seconds: 180,
             writable_repo_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
+            exclusive_pools: Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
         }
+    }
+
+    /// Wire the config-derived exclusive-resource pools (pool name → member
+    /// connection lock-keys). The gateway groups `exclusive: true` connections by
+    /// their `pool:` and passes the map here.
+    pub fn with_exclusive_pools(
+        mut self,
+        pools: std::collections::BTreeMap<String, Vec<std::path::PathBuf>>,
+    ) -> Self {
+        self.exclusive_pools = Arc::new(std::sync::RwLock::new(pools));
+        self
+    }
+
+    /// Hot-swap the exclusive-pool map from a re-derived config (reload). Takes
+    /// `&self` so every cloned handle sees the swap (shared `Arc<RwLock>`).
+    pub fn set_exclusive_pools(
+        &self,
+        pools: std::collections::BTreeMap<String, Vec<std::path::PathBuf>>,
+    ) {
+        *self
+            .exclusive_pools
+            .write()
+            .expect("LOCK_POISONED: exclusive_pools") = pools;
+    }
+
+    /// Members of a declared pool (empty if the pool is unknown).
+    pub(crate) fn pool_members(&self, pool: &str) -> Vec<std::path::PathBuf> {
+        self.exclusive_pools
+            .read()
+            .expect("LOCK_POISONED: exclusive_pools")
+            .get(pool)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The pools a definition declares it needs (`exclusive_pools: [name, ...]`).
+    fn declared_exclusive_pools(definition: &Value) -> Vec<String> {
+        definition
+            .get("exclusive_pools")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Lock holder for a run's pool leases — keyed on `run_ref` (the run TREE's
+    /// stable identity), not the instance, so every instance of the run (root +
+    /// sub-workflows) shares one lease and a child's activity refreshes it.
+    /// `run_ref` is engine-minted at the root boundary and always present here.
+    fn run_lease_holder(run_env: &crate::run_env::RunEnv) -> Option<String> {
+        run_env.run_ref.as_deref().map(|r| format!("run:{r}"))
+    }
+
+    /// Acquire one member of each pool the definition declares and is not already
+    /// leased for this run, binding the winner into `run_env.leased`. ROOT runs
+    /// only — a sub-workflow inherits the root's leases and never re-acquires
+    /// (pool leasing is a run-level concern; the browser-touching caps are
+    /// children and must reach the SAME leased server process).
+    ///
+    /// Fail-fast on exhaustion (`Err`): the pool is a hard capacity bound, and a
+    /// typed `POOL_EXHAUSTED` lets the caller (a parallel sweep) retry — never a
+    /// silent share of a busy slot. Partial acquisitions are rolled back so a
+    /// failed start leaves nothing held.
+    async fn acquire_run_leases(
+        &self,
+        definition: &Value,
+        run_env: &mut crate::run_env::RunEnv,
+        is_root: bool,
+    ) -> anyhow::Result<()> {
+        if !is_root {
+            return Ok(());
+        }
+        let pools = Self::declared_exclusive_pools(definition);
+        if pools.is_empty() {
+            return Ok(());
+        }
+        let (Some(locks), Some(holder)) =
+            (self.repo_locks.clone(), Self::run_lease_holder(run_env))
+        else {
+            // No lock space wired, or no run identity — cannot lease. A flow that
+            // declared a pool needs both; fail rather than run unleased.
+            bail!(
+                "POOL_LEASE_UNAVAILABLE: definition declares `exclusive_pools: {pools:?}` but the \
+                 gateway has no repo-lock space wired, so exclusive access cannot be serialized."
+            );
+        };
+        let mut acquired: Vec<std::path::PathBuf> = Vec::new();
+        for pool in pools {
+            if run_env.leased.contains_key(&pool) {
+                continue; // already held for this run (inherited or prior)
+            }
+            let members = self.pool_members(&pool);
+            if members.is_empty() {
+                self.release_members(&locks, &acquired, &holder).await;
+                bail!(
+                    "POOL_UNDECLARED: definition needs exclusive pool '{pool}' but no connection \
+                     declares `pool: {pool}` (with `exclusive: true`). Declare the pool's members \
+                     in the gateway config."
+                );
+            }
+            match locks.acquire_any(&members, &holder, POOL_LEASE_TTL).await {
+                Ok(member) => {
+                    // The lock key IS the connection name (see gateway wiring).
+                    let conn = member.to_string_lossy().into_owned();
+                    // Observability: the pool lease is otherwise held invisibly.
+                    // Keyed on the run's identity (run_ref = root instance id).
+                    let _ = self
+                        .audit
+                        .record(
+                            crate::audit::AuditEvent::new("lock.acquired")
+                                .with_workflow(run_env.run_ref.clone().unwrap_or_default())
+                                .with_payload(json!({
+                                    "kind": "exclusive_pool",
+                                    "pool": pool,
+                                    "member": conn,
+                                })),
+                        )
+                        .await;
+                    run_env.leased.insert(pool, conn);
+                    acquired.push(member);
+                }
+                Err(conflict) => {
+                    self.release_members(&locks, &acquired, &holder).await;
+                    let busy: Vec<String> = conflict
+                        .conflicts
+                        .iter()
+                        .map(|(f, h)| format!("{}={h}", f.to_string_lossy()))
+                        .collect();
+                    bail!(
+                        "POOL_EXHAUSTED: every member of exclusive pool '{pool}' is busy \
+                         ({}). This is a capacity bound, not a failure — retry, or add pool \
+                         members. Nothing was leased for this run.",
+                        busy.join(", ")
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn release_members(
+        &self,
+        locks: &Arc<dyn crate::repo_locks::RepoLocks>,
+        members: &[std::path::PathBuf],
+        holder: &str,
+    ) {
+        if !members.is_empty() {
+            locks.release(members, holder).await;
+        }
+    }
+
+    /// Release every pool member leased for this run. ROOT terminal/cancel only —
+    /// a sub-workflow terminating must NOT free a slot the still-running root
+    /// holds. Idempotent (release of an unheld key is a no-op); the lease TTL is
+    /// the backstop if a terminal path is ever missed. Wakes any any-of waiter.
+    pub(crate) async fn release_run_leases(&self, instance: &WorkflowInstance) {
+        if instance.parent.is_some() || instance.run_env.leased.is_empty() {
+            return;
+        }
+        let (Some(locks), Some(holder)) = (
+            self.repo_locks.clone(),
+            Self::run_lease_holder(&instance.run_env),
+        ) else {
+            return;
+        };
+        let members: Vec<std::path::PathBuf> = instance
+            .run_env
+            .leased
+            .values()
+            .map(std::path::PathBuf::from)
+            .collect();
+        self.release_members(&locks, &members, &holder).await;
+        let _ = self
+            .audit
+            .record(instance.audit_event("lock.released").with_payload(json!({
+                "kind": "exclusive_pool",
+                "members": instance.run_env.leased.values().cloned().collect::<Vec<_>>(),
+            })))
+            .await;
+        self.resume_ready_locks().await;
+    }
+
+    /// Refresh the TTL on this run's pool leases so a long run keeps its slot.
+    /// Holder-keyed, so a call from ANY instance of the run (root or a
+    /// browser-driving child) keeps the shared lease alive — no background task.
+    pub(crate) async fn refresh_run_leases(&self, instance: &WorkflowInstance) {
+        if instance.run_env.leased.is_empty() {
+            return;
+        }
+        let (Some(locks), Some(holder)) = (
+            self.repo_locks.clone(),
+            Self::run_lease_holder(&instance.run_env),
+        ) else {
+            return;
+        };
+        let members: Vec<std::path::PathBuf> = instance
+            .run_env
+            .leased
+            .values()
+            .map(std::path::PathBuf::from)
+            .collect();
+        locks.heartbeat(&members, &holder).await;
     }
 
     /// Wire the config-declared writable repo roots (from `/praxec/_writableRepos`)
@@ -482,6 +724,9 @@ impl WorkflowRuntime {
                 "version_at_cancel": saved.version,
             }));
         self.record_or_self_event(event).await;
+        // A cancelled root run must free its pool leases (root-gated + idempotent)
+        // so a waiting parallel run gets the slot without waiting out the TTL.
+        self.release_run_leases(&saved).await;
         // P2 (Task C liveness) — a cancelled child is finalized even though its
         // `state` stays non-terminal. If it was spawned by a `kind: workflow`
         // transition, the suspended parent must be woken to fail-propagate (the
@@ -654,13 +899,21 @@ impl WorkflowRuntime {
         // run_id, reject duplicates with a structured error. Stores that
         // return Ok(None) by trait default opt out of the check; their
         // runtime sees no constraint (best-effort safety net).
-        if let Some(run_id) = &request.run_env.run_id {
-            if let Some(existing_workflow_id) = self.store.find_by_run_id(run_id).await? {
-                return Err(RuntimeError::RunIdAlreadyRunning {
-                    run_id: run_id.clone(),
-                    existing_workflow_id,
+        //
+        // ROOT runs only. A sub-workflow (`parent.is_some()`) inherits its
+        // parent's run_id so run correlation survives the spawn — it is the same
+        // run, not a duplicate start. Without this exemption every spawn would be
+        // rejected against its own parent once every root run carries a minted
+        // run_id (mirrors the store-layer exemption in `create`).
+        if request.parent.is_none() {
+            if let Some(run_id) = &request.run_env.run_id {
+                if let Some(existing_workflow_id) = self.store.find_by_run_id(run_id).await? {
+                    return Err(RuntimeError::RunIdAlreadyRunning {
+                        run_id: run_id.clone(),
+                        existing_workflow_id,
+                    }
+                    .into());
                 }
-                .into());
             }
         }
 
@@ -770,8 +1023,45 @@ impl WorkflowRuntime {
                 ctx.entry(k.clone()).or_insert_with(|| v.clone());
             }
         }
+        let instance_id = format!("wf_{}", Uuid::new_v4().simple());
+        // Run identity is TOTAL. `run_id` is caller-supplied and optional (the
+        // MCP handler forwards an optional argument; the headless orchestrator
+        // passes None), so anything keyed on per-run identity had nothing to key
+        // on for a large class of legitimate runs.
+        //
+        // Mint the instance id when the caller supplies none — ELIMINATE the
+        // absent case rather than fail on it later. A caller-supplied id keeps
+        // its dedup semantics (the store enforces run_id uniqueness); absence
+        // means "no dedup requested", not "no identity".
+        let mut run_env = request.run_env;
+        // Stamp the ROOT run's internal identity (`run_ref`) — always present,
+        // inherited verbatim by sub-workflows, the holder key for pool leases.
+        // Distinct from `run_id` (optional caller correlation, left untouched so
+        // the §20.2 audit contract — null when unsupplied — holds). Root only: a
+        // child (`parent.is_some()`) inherits the root's `run_ref` via `run_env`
+        // and must not overwrite it.
+        if request.parent.is_none() {
+            run_env.run_ref = Some(instance_id.clone());
+        }
+        // Create the run-scoped evidence dir at the boundary, so a downstream tool
+        // that only WRITES a file under `$.run.artifacts_dir` never fails on a
+        // missing parent (the engine owns its existence, not a `kind: script`
+        // step — portable across OSes). Best-effort: a probe/screenshot write
+        // fails loudly on its own if this could not be created.
+        if let Some(dir) = run_env.artifacts_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+        }
+        // Run-scoped exclusive-pool lease (collision-free parallel runs). A root
+        // run leases one member of each pool its definition declares BEFORE the
+        // instance exists, so `$.run.leased.<pool>` is bound for the first
+        // browser-touching state and no two runs share one server process's
+        // global page pointer. Fail-fast on exhaustion — nothing is created, so
+        // the caller sees a clean typed error and can retry. Sub-workflows
+        // (`parent.is_some()`) inherit the root's leases via `run_env` and skip.
+        self.acquire_run_leases(&definition, &mut run_env, request.parent.is_none())
+            .await?;
         let instance = WorkflowInstance {
-            id: format!("wf_{}", Uuid::new_v4().simple()),
+            id: instance_id,
             definition_id: request.definition_id.clone(),
             definition_version,
             definition: definition.clone(),
@@ -784,7 +1074,7 @@ impl WorkflowRuntime {
             // correlation) on the instance so every downstream audit event and
             // every executor inherits them, and a sub-workflow spawn propagates
             // the same root/identity to the child.
-            run_env: request.run_env,
+            run_env,
             depth: request.depth,
             cancelled_at: None,
             cancelled_reason: None,
@@ -860,6 +1150,10 @@ impl WorkflowRuntime {
         match chain_outcome {
             ChainOutcome::Completed(result) => {
                 if is_terminal(&definition, &result.instance.state) {
+                    // The run finished in this start() drive — free its pool
+                    // leases now so a waiting parallel run gets the slot promptly
+                    // (TTL is only the backstop). Root-gated + idempotent.
+                    self.release_run_leases(&result.instance).await;
                     self.audit
                         .record(
                             result
@@ -913,6 +1207,8 @@ impl WorkflowRuntime {
                 error_class,
                 failed_transition,
             } => {
+                // A failed root mission will not continue — free its pool leases.
+                self.release_run_leases(&partial.instance).await;
                 let mut response = self
                     .response(
                         &definition,
@@ -985,6 +1281,27 @@ impl WorkflowRuntime {
                         .await
                     }
                 }
+            }
+            ChainOutcome::WaitingOnLock {
+                partial,
+                transition,
+                files,
+                conflict,
+            } => {
+                // An auto-driven leaf could not acquire its declared owned_files.
+                // Park durably on the SAME routine the submit gate uses, so a
+                // chain leaf and a submit leaf behave identically under
+                // contention, and the LockScheduler re-drives us when it frees.
+                self.park_on_lock(
+                    &definition,
+                    &partial.instance,
+                    &transition,
+                    partial.instance.version,
+                    &request.principal,
+                    &files,
+                    &conflict,
+                )
+                .await
             }
             ChainOutcome::Quarantined { partial, reason } => {
                 // Liveness backstop during `start` — the run exceeded its

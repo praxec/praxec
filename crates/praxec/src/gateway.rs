@@ -767,6 +767,7 @@ async fn build_runtime_for_orchestrate(
     .with_evidence(evidence)
     .with_writable_repo_roots(writable_repo_roots_from_config(config)?)
     .with_repo_locks(repo_locks)
+    .with_exclusive_pools(exclusive_pools_from_config(config))
     .with_lock_scheduler(lock_scheduler)
     .with_auto_drive_agents(
         config
@@ -931,6 +932,7 @@ async fn build_oneshot_server(
     .with_evidence(evidence)
     .with_writable_repo_roots(writable_repo_roots_from_config(config)?)
     .with_repo_locks(repo_locks)
+    .with_exclusive_pools(exclusive_pools_from_config(config))
     .with_lock_scheduler(lock_scheduler)
     .with_auto_drive_agents(
         config
@@ -1578,6 +1580,10 @@ async fn reload_gated(
             // the definitions/executors above. Now `reload: true` rewires run
             // repo_root resolution without a restart.
             runtime.set_writable_repo_roots(new_writable_roots);
+            // Re-derive exclusive-resource pools from the new connections, atomic
+            // with the swaps above, so a reload can add/resize a browser pool
+            // without a restart.
+            runtime.set_exclusive_pools(exclusive_pools_from_config(&new_config));
             // #14 Fork C — a clean reload REOPENS the full surface: clear any
             // repair-only gate the prior (dirty) config had set.
             *repair_gate.write().expect("LOCK_POISONED: repair_gate") = None;
@@ -1742,6 +1748,46 @@ fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<Vec<RepoRoo
         }
     }
     Ok(out)
+}
+
+/// Derive the exclusive-resource pools from `connections:` — every `kind: mcp`
+/// connection with `exclusive: true` and a `pool:` name, grouped by pool. The
+/// member lock-key IS the connection name, so a leased member resolves through
+/// `$.run.leased.<pool>` straight to the connection a browser leaf uses.
+///
+/// This is the ONLY place browser/pool policy enters the runtime — from
+/// operator config, never Rust constants. The engine leases exclusive resources;
+/// config declares which connections are exclusive and how they pool.
+fn exclusive_pools_from_config(
+    config: &Value,
+) -> std::collections::BTreeMap<String, Vec<std::path::PathBuf>> {
+    let mut pools: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> =
+        std::collections::BTreeMap::new();
+    if let Some(conns) = config.pointer("/connections").and_then(Value::as_object) {
+        for (name, spec) in conns {
+            let is_mcp = spec.get("kind").and_then(Value::as_str) == Some("mcp");
+            let is_exclusive = spec
+                .get("exclusive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !is_mcp || !is_exclusive {
+                continue;
+            }
+            // A pool name groups interchangeable members; default to the
+            // connection's own name (a singleton pool) when unset, so a lone
+            // exclusive connection is still leasable.
+            let pool = spec
+                .get("pool")
+                .and_then(Value::as_str)
+                .unwrap_or(name)
+                .to_string();
+            pools
+                .entry(pool)
+                .or_default()
+                .push(std::path::PathBuf::from(name));
+        }
+    }
+    pools
 }
 
 /// SPEC §8.4 — when `praxec.authoring.write_enabled` is set, overlay an

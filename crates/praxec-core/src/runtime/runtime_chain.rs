@@ -403,6 +403,13 @@ impl WorkflowRuntime {
         let mut accumulated_evidence: Vec<Evidence> = Vec::new();
 
         loop {
+            // Keep this run's exclusive-pool leases alive while it is making
+            // progress: a long auto-driven chain (several agent steps in one
+            // drive) must not have its browser slot reaped mid-run. Holder-keyed
+            // and cheap (no-op when the run holds no lease); this is the
+            // refresh-on-progress that replaces a background heartbeat task.
+            self.refresh_run_leases(&instance).await;
+
             // Stop: terminal state
             if is_terminal(definition, &instance.state) {
                 break;
@@ -647,6 +654,47 @@ impl WorkflowRuntime {
                     &instance.definition_id,
                     &self.auto_drive_affinity,
                 );
+                // Per-state tool scoping (role separation). `auto_drive_tools` is
+                // gateway-wide — every auto-driven leaf gets every connection — so
+                // an exploring agent and a fixing agent have identical reach. A
+                // state may declare its own `tools:`, which REPLACES the global set
+                // for that leaf. Entries are templated per-leaf by AgentExecutor,
+                // so `file:{{ $.run.repo_root }}/tests` scopes a writer to one
+                // subtree and the fixer physically cannot address the approved test.
+                //
+                // Absent → the global set, byte-identical to before: the key is
+                // absent in every shipped definition, so this is purely additive.
+                //
+                // An empty-but-present list is an ERROR, not "no tools". A leaf with
+                // an empty toolbelt cannot act, so it burns its whole step budget
+                // producing nothing — the failure that once made the meta pack
+                // unusable. Fail at composition, before the budget is spent.
+                let state_tools: Option<Vec<String>> = match definition.pointer(&format!(
+                    "/states/{}/tools",
+                    pointer_escape(&instance.state)
+                )) {
+                    None => None,
+                    Some(Value::Array(a)) if !a.is_empty() => Some(
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect(),
+                    ),
+                    Some(other) => {
+                        return Err(anyhow!(
+                            "AUTO_DRIVE_STATE_TOOLS_INVALID: state '{}' of '{}' declares \
+                             `tools: {other}` — it must be a NON-EMPTY array of connection \
+                             names (or `file:<abs-root>` entries). Omit the key entirely to \
+                             inherit the gateway-wide auto-drive tool set.",
+                            instance.state,
+                            instance.definition_id
+                        ));
+                    }
+                };
+                // One binding, used by BOTH the executor config and the audit
+                // payload — they cannot drift, so an audit never reports reach the
+                // leaf did not have.
+                let leaf_tools: &Vec<String> =
+                    state_tools.as_ref().unwrap_or(&self.auto_drive_tools);
                 // Per-task reasoning effort: a loop/mission can set
                 // $.context.effort_override (or seed $.input.effort_override) to
                 // force a thinking level for this step (e.g. "xhigh"); else the
@@ -657,7 +705,7 @@ impl WorkflowRuntime {
                     "kind": "agent",
                     "affinity": auto_affinity_tier,
                     "goal": goal_text,
-                    "tools": self.auto_drive_tools,
+                    "tools": leaf_tools,
                     "expected_output_keys": required_keys,
                     "expected_output_types": expected_output_types,
                     // Fail-fast bound: a non-converging auto-driven agent should
@@ -667,6 +715,40 @@ impl WorkflowRuntime {
                 if let Some(e) = &effort {
                     agent_config["reasoning_effort"] = json!(e);
                 }
+                // Repo write-exclusion gate on the AUTO-DRIVE path.
+                //
+                // Read `owned_files` from the DECLARED executor (`def`), not the
+                // synthesized `agent_config` — the synthetic config is built from
+                // scratch and never carries the author's declaration, which is
+                // precisely why this gate was inert here while the submit path
+                // enforced it.
+                //
+                // Acquire BEFORE `agent.invoked` is recorded: a run that parks
+                // must not leave an invocation event for an agent that never ran.
+                let declared_executor = def.get("executor").cloned().unwrap_or_else(|| json!({}));
+                let lease = match self
+                    .acquire_owned_files(&declared_executor, &instance)
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err((files, conflict)) => {
+                        // Contention is expected under fan-out, not an error:
+                        // park durably and let the scheduler re-drive us when the
+                        // resource frees. Proceeding here would run two leaves
+                        // against one exclusive resource, each believing it holds
+                        // it — the silent-corruption case this gate prevents.
+                        return Ok(ChainOutcome::WaitingOnLock {
+                            transition: name,
+                            files,
+                            conflict,
+                            partial: ChainResult {
+                                instance,
+                                steps,
+                                evidence: accumulated_evidence,
+                            },
+                        });
+                    }
+                };
                 // Observability: emit a start event so a live `audit tail` shows
                 // exactly which agent step is running (and pinpoints a hang).
                 let agent_started = std::time::Instant::now();
@@ -679,12 +761,12 @@ impl WorkflowRuntime {
                             "state": instance.state,
                             "affinity": auto_affinity_tier,
                             "max_seconds": self.auto_drive_max_seconds,
-                            "tools": self.auto_drive_tools,
+                            "tools": leaf_tools,
                         })),
                 )
                 .await;
                 let policy = ReliabilityPolicy::from_value(def.get("reliability"))?;
-                match execute_with_reliability(
+                let exec_result = execute_with_reliability(
                     self.executors.as_ref(),
                     &self.audit,
                     &instance,
@@ -694,8 +776,11 @@ impl WorkflowRuntime {
                     &policy,
                     correlation_id,
                 )
-                .await
-                {
+                .await;
+                // Release the instant execution returns — success OR error. A
+                // lease held past a failed leaf strands every waiter behind it.
+                self.release_lease(lease, &instance).await;
+                match exec_result {
                     Ok(result) => {
                         // Per-call cost telemetry (value-based model selection):
                         // fold the agent's realized tokens + USD cost into the

@@ -260,7 +260,22 @@ pub fn read_in_scopes(
         "$.run.repo_root" => {
             return run_env.map(|e| Value::String(e.repo_root.as_str().to_string()));
         }
+        // Run-scoped evidence dir (engine-created). Resolves only with a run env
+        // and a minted run_ref; a load-time caller gets an unresolved read.
+        "$.run.artifacts_dir" => {
+            return run_env
+                .and_then(|e| e.artifacts_dir())
+                .map(|p| Value::String(p.to_string_lossy().into_owned()));
+        }
         _ => {}
+    }
+    // Run-scoped exclusive-pool lease: `$.run.leased.<pool>` → the leased
+    // connection name. Resolves only when the run env is supplied (executor
+    // context); a load-time caller passes `None` and gets an unresolved read.
+    if let Some(pool) = expr.strip_prefix("$.run.leased.") {
+        return run_env
+            .and_then(|e| e.leased_member(pool))
+            .map(|m| Value::String(m.to_string()));
     }
     if let Some(path) = expr.strip_prefix("$.arguments.") {
         return resolve_path_with_projection(arguments, path);

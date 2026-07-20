@@ -330,36 +330,55 @@ impl Executor for WorkflowExecutor {
                         );
                 }
 
-                let start_resp = runtime
-                    .start(StartWorkflow {
-                        definition_id: definition_id.clone(),
-                        input: sub_input,
-                        principal: Principal::anonymous(),
-                        // Inherit the parent's run-ambient env (or the routed
-                        // repo when a `repoRoot` override is set — see
-                        // `child_run_env` above). The run/trace correlation must
-                        // survive the spawn (the former `trace_id: None,
-                        // run_id: None` here silently reset correlation at every
-                        // sub-workflow boundary). Inheritance is what makes a
-                        // coding leaf get the real root with zero hand-threaded
-                        // `repo_path`.
-                        run_env: child_run_env,
-                        // Stamp the child one level deeper than this parent so
-                        // the recursion guard sees an accurate depth even when
-                        // the child is driven on a different task.
-                        depth: child_depth,
-                        // P2 (Task C) — link the child back to THIS parent
-                        // transition. When the child terminates, the runtime
-                        // re-drives the parent's pending transition (re-entering
-                        // the reuse path above), which sees the child terminal
-                        // and advances. Only the SPAWN path links — the reuse
-                        // path re-checks an already-linked child.
-                        parent: Some(ParentLink {
-                            workflow_id: request.workflow.id.clone(),
-                            transition: request.transition.clone().unwrap_or_default(),
-                        }),
-                    })
+                let sw = StartWorkflow {
+                    definition_id: definition_id.clone(),
+                    input: sub_input,
+                    principal: Principal::anonymous(),
+                    // Inherit the parent's run-ambient env (or the routed repo
+                    // when a `repoRoot` override is set — see `child_run_env`
+                    // above). The run/trace correlation (and any pool lease) must
+                    // survive the spawn: the former `trace_id: None, run_id: None`
+                    // here silently reset correlation at every sub-workflow
+                    // boundary. Inheritance is what makes a coding leaf get the
+                    // real root — and a browser leaf the run's leased slot — with
+                    // zero hand-threaded plumbing.
+                    run_env: child_run_env,
+                    // Stamp the child one level deeper so the recursion guard sees
+                    // an accurate depth even when driven on a different task.
+                    depth: child_depth,
+                    // P2 (Task C) — link the child back to THIS parent transition.
+                    // When the child terminates, the runtime re-drives the parent's
+                    // pending transition (re-entering the reuse path above), which
+                    // sees the child terminal and advances. Only the SPAWN path
+                    // links — the reuse path re-checks an already-linked child.
+                    parent: Some(ParentLink {
+                        workflow_id: request.workflow.id.clone(),
+                        transition: request.transition.clone().unwrap_or_default(),
+                    }),
+                };
+                // Drive the child on a FRESH task. A `kind: workflow` transition
+                // spawns a child by calling `runtime.start`, which synchronously
+                // drives the child's OWN deterministic chain — which may spawn
+                // again. A cyclic graph therefore recurses `start → chain →
+                // execute → start`; on ONE stack that accumulates a large async
+                // frame per level and overflows (debug builds) BEFORE the depth
+                // guard fires at MAX_WORKFLOW_DEPTH — the guard becomes a
+                // correctness fiction and the process aborts instead of failing
+                // fast. `Box::pin` only moved SUSPENDED state to the heap;
+                // synchronous polling still grew the stack per level, so it was a
+                // marginal fix that this branch's own lease/refresh additions
+                // pushed back over the edge. A dedicated task gives each level a
+                // FRESH stack, so recursion depth no longer maps to stack depth
+                // and the depth guard is what actually stops it. Cost: one task
+                // spawn per sub-workflow — negligible against a leaf's LLM latency.
+                let rt = runtime.clone();
+                let start_resp = tokio::spawn(async move { rt.start(sw).await })
                     .await
+                    .map_err(|e| {
+                        ExecutorError::Permanent(format!(
+                            "SUBWORKFLOW_TASK_PANIC: sub-workflow drive task failed: {e}"
+                        ))
+                    })?
                     .map_err(|e| {
                         if use_block.is_some() {
                             let kind = "cap_start_failed";

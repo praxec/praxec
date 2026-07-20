@@ -26,20 +26,39 @@ const WRITE_FILE_MAX_OVERWRITE_LINES: usize = 300;
 /// A stateless file-edit tool host. The repo root is supplied per-call as the
 /// `connection` string, so the host holds no per-session state.
 #[derive(Default)]
-pub struct FileEditToolHost;
+pub struct FileEditToolHost {
+    /// When true, expose ONLY read tools and reject every mutating call — the
+    /// backing for a `file-ro:<root>` connection (a genuinely read-only reviewer
+    /// role, so "reviewer" is enforced, not merely conventional).
+    read_only: bool,
+}
 
 impl FileEditToolHost {
     pub fn new() -> Self {
-        Self
+        Self { read_only: false }
+    }
+
+    pub fn new_read_only() -> Self {
+        Self { read_only: true }
     }
 }
 
-/// Resolve `rel` under `root`, refusing absolute paths and any `..` escape.
-/// Delegates to the shared [`praxec_core::path_safety::resolve_under`] (one
-/// traversal guard, also used by the `path_grounding` gate) and preserves this
-/// host's `FILE_TOOL_PATH_ESCAPE:` error prefix.
+/// Resolve `rel` under `root`, refusing absolute paths, any `..` escape, and any
+/// symlink that leaves the root.
+///
+/// Delegates to the shared
+/// [`praxec_core::path_safety::resolve_under_no_symlink_escape`] and preserves
+/// this host's `FILE_TOOL_PATH_ESCAPE:` error prefix.
+///
+/// The filesystem-aware variant is REQUIRED here, not the lexical one: this host
+/// is the mechanism behind per-state tool scoping, so `file:<repo>/src` is a
+/// security boundary. A link inside the root pointing outside it is lexically
+/// clean, and following it would let an agent confined to `src/` write to
+/// `tests/` — silently voiding the test-immutability guarantee the promotion
+/// loop rests on. Reads are guarded identically: a read-only reviewer that can
+/// follow a link out of scope is not scoped either.
 fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    praxec_core::path_safety::resolve_under(root, rel)
+    praxec_core::path_safety::resolve_under_no_symlink_escape(root, rel)
         .map_err(|e| format!("FILE_TOOL_PATH_ESCAPE: {e}"))
 }
 
@@ -138,9 +157,14 @@ impl ToolHost for FileEditToolHost {
     ) -> Result<Vec<(ToolDefinition, String)>, ExecutorError> {
         let mut out = Vec::with_capacity(connections.len() * 2);
         for conn in connections {
-            out.push((write_file_def(), conn.clone()));
+            // Read-only host omits the mutating tools entirely — the reviewer
+            // never even sees write_file/edit_file, so it cannot be prompted into
+            // one.
+            if !self.read_only {
+                out.push((write_file_def(), conn.clone()));
+                out.push((edit_file_def(), conn.clone()));
+            }
             out.push((read_file_def(), conn.clone()));
-            out.push((edit_file_def(), conn.clone()));
             out.push((search_file_def(), conn.clone()));
             out.push((read_range_def(), conn.clone()));
         }
@@ -148,6 +172,15 @@ impl ToolHost for FileEditToolHost {
     }
 
     async fn call(&self, connection: &str, name: &str, arguments: &str) -> Result<String, String> {
+        // Read-only host: refuse a mutating call even if the model somehow named
+        // one. Belt to the tools()-omission suspenders — the reviewer role is
+        // enforced, not merely unexposed.
+        if self.read_only && matches!(name, "write_file" | "edit_file") {
+            return Err(format!(
+                "FILE_TOOL_READ_ONLY: '{name}' is a mutating tool on a `file-ro:` (read-only) \
+                 root; this role may only read (read_file/search_file/read_range)."
+            ));
+        }
         let root = Path::new(connection);
         let args: Value = serde_json::from_str(arguments)
             .map_err(|e| format!("FILE_TOOL_BAD_ARGS: invalid JSON: {e}"))?;
@@ -282,14 +315,18 @@ impl ToolHost for FileEditToolHost {
 /// Connection-name prefix that routes a tool call to the scoped file host; the
 /// remainder is the repo root. e.g. `file:/home/me/markdown-mcp`.
 pub const FILE_CONNECTION_PREFIX: &str = "file:";
+/// A read-only file root: exposes read tools only, rejects writes. A reviewer
+/// scoped `file-ro:<root>` is enforced read-only, not merely trusted to be.
+pub const FILE_RO_CONNECTION_PREFIX: &str = "file-ro:";
 
-/// Routes tool calls by connection: `file:<root>` connections go to a
-/// [`FileEditToolHost`] (scoped at `<root>`), everything else to the wrapped MCP
-/// host. Lets one runner serve both the engine MCP tools and scoped file-edit
-/// tools — the in-process trusted coding agent's toolbelt.
+/// Routes tool calls by connection: `file:<root>` → a read-write
+/// [`FileEditToolHost`]; `file-ro:<root>` → a read-only one; everything else →
+/// the wrapped MCP host. Lets one runner serve the engine MCP tools plus scoped
+/// file tools — the in-process agent's toolbelt.
 pub struct CompositeToolHost {
     mcp: Arc<dyn ToolHost>,
     files: FileEditToolHost,
+    files_ro: FileEditToolHost,
 }
 
 impl CompositeToolHost {
@@ -297,6 +334,7 @@ impl CompositeToolHost {
         Self {
             mcp,
             files: FileEditToolHost::new(),
+            files_ro: FileEditToolHost::new_read_only(),
         }
     }
 }
@@ -308,15 +346,25 @@ impl ToolHost for CompositeToolHost {
         connections: &[String],
     ) -> Result<Vec<(ToolDefinition, String)>, ExecutorError> {
         let mut mcp_conns: Vec<String> = Vec::new();
-        let mut file_conns: Vec<(String, String)> = Vec::new();
+        // (original connection string, absolute root, read_only)
+        let mut file_conns: Vec<(String, String, bool)> = Vec::new();
         for c in connections {
+            // `file-ro:` is checked first — it is a distinct prefix (its 5th char
+            // is `-`, not `:`), so order is not strictly required, but keeping the
+            // read-only case explicit avoids any future ambiguity.
+            if let Some(root) = c.strip_prefix(FILE_RO_CONNECTION_PREFIX) {
+                if Path::new(root).is_absolute() {
+                    file_conns.push((c.clone(), root.to_string(), true));
+                }
+                continue;
+            }
             match c.strip_prefix(FILE_CONNECTION_PREFIX) {
                 // Only an ABSOLUTE root is a real repo. An empty/unresolved
                 // (`{{…}}`) or relative root — e.g. a non-coding leaf where
                 // `repo_path` didn't resolve — exposes NO file tools, so a
                 // relative path can never fall back to the server's cwd.
                 Some(root) if Path::new(root).is_absolute() => {
-                    file_conns.push((c.clone(), root.to_string()))
+                    file_conns.push((c.clone(), root.to_string(), false))
                 }
                 Some(_) => {}
                 None => mcp_conns.push(c.clone()),
@@ -327,8 +375,13 @@ impl ToolHost for CompositeToolHost {
         } else {
             self.mcp.tools(&mcp_conns).await?
         };
-        for (orig, root) in file_conns {
-            for (def, _root) in self.files.tools(&[root]).await? {
+        for (orig, root, read_only) in file_conns {
+            let host = if read_only {
+                &self.files_ro
+            } else {
+                &self.files
+            };
+            for (def, _root) in host.tools(&[root]).await? {
                 out.push((def, orig.clone()));
             }
         }
@@ -336,6 +389,16 @@ impl ToolHost for CompositeToolHost {
     }
 
     async fn call(&self, connection: &str, name: &str, arguments: &str) -> Result<String, String> {
+        if let Some(root) = connection.strip_prefix(FILE_RO_CONNECTION_PREFIX) {
+            return if Path::new(root).is_absolute() {
+                self.files_ro.call(root, name, arguments).await
+            } else {
+                Err(format!(
+                    "FILE_TOOL_ROOT_INVALID: '{root}' is not an absolute repo root (unresolved or \
+                     relative)"
+                ))
+            };
+        }
         match connection.strip_prefix(FILE_CONNECTION_PREFIX) {
             Some(root) if Path::new(root).is_absolute() => {
                 self.files.call(root, name, arguments).await
@@ -573,6 +636,109 @@ mod tests {
             !root.path().parent().unwrap().join("escape.rs").exists(),
             "nothing written outside the root"
         );
+    }
+
+    /// A symlink INSIDE the root pointing OUTSIDE it contains no `..` and is not
+    /// absolute, so a purely lexical guard waves it through and the write lands
+    /// outside the declared scope. That defeats role separation at its root: an
+    /// agent confined to `<repo>/src` reaches `<repo>/tests` through one `ln -s`,
+    /// and the approved regression test stops being immutable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_symlink_outside_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+
+        let host = super::FileEditToolHost::new();
+        let err = host
+            .call(
+                root.to_str().unwrap(),
+                "write_file",
+                &json!({ "path": "escape/pwned.rs", "content": "x" }).to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("PATH_ESCAPE"), "{err}");
+        assert!(
+            !outside.join("pwned.rs").exists(),
+            "nothing may be written outside the root through a symlink"
+        );
+    }
+
+    /// Containment, not link-freedom: a symlink that stays inside the root cannot
+    /// widen the agent's reach, so refusing it would break legitimate in-repo
+    /// links for no security gain.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_symlink_inside_root_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+
+        let host = super::FileEditToolHost::new();
+        host.call(
+            root.to_str().unwrap(),
+            "write_file",
+            &json!({ "path": "alias/ok.rs", "content": "x" }).to_string(),
+        )
+        .await
+        .expect("an in-root symlink is legitimate");
+        assert!(root.join("real/ok.rs").exists());
+    }
+
+    /// A read-only host exposes ONLY read tools — the reviewer role never even
+    /// sees write_file/edit_file. (`CompositeToolHost` routes `file-ro:` here.)
+    #[tokio::test]
+    async fn file_ro_host_exposes_only_read_tools() {
+        let host = super::FileEditToolHost::new_read_only();
+        let tools = host.tools(&["/repo".to_string()]).await.unwrap();
+        let names: Vec<&str> = tools.iter().map(|(d, _)| d.name.as_str()).collect();
+        assert!(names.contains(&"read_file") && names.contains(&"search_file"));
+        assert!(
+            !names.contains(&"write_file") && !names.contains(&"edit_file"),
+            "a read-only root must not expose mutating tools, got: {names:?}"
+        );
+    }
+
+    /// Even if a mutating call is named directly, a `file-ro:` root refuses it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_ro_root_rejects_a_write_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = super::FileEditToolHost::new_read_only();
+        let err = host
+            .call(
+                tmp.path().to_str().unwrap(),
+                "write_file",
+                &json!({ "path": "x.rs", "content": "x" }).to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("FILE_TOOL_READ_ONLY"), "{err}");
+        assert!(!tmp.path().join("x.rs").exists());
+    }
+
+    /// Reads still work on a read-only root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_ro_root_allows_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.rs"), "hello").unwrap();
+        let host = super::FileEditToolHost::new_read_only();
+        let out = host
+            .call(
+                tmp.path().to_str().unwrap(),
+                "read_file",
+                &json!({ "path": "f.rs" }).to_string(),
+            )
+            .await
+            .expect("read is allowed read-only");
+        assert!(out.contains("hello"));
     }
 
     #[tokio::test]
