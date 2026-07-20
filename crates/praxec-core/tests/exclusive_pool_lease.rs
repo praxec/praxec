@@ -174,6 +174,49 @@ async fn a_finished_runs_slot_is_reusable() {
         .expect("the sole slot must be free again after the first run finished");
 }
 
+/// The pool lease is OBSERVABLE: acquiring a member emits a `lock.acquired`
+/// audit event naming the pool + member (and `lock.released` on terminal).
+/// Without this the lease is held invisibly — a live run drove a browser with no
+/// audit trail of which slot it held (found in the simuli dogfood).
+#[tokio::test]
+async fn a_pool_lease_emits_acquire_and_release_audit_events() {
+    use praxec_core::audit::MemoryAuditSink;
+
+    let locks: Arc<dyn RepoLocks> = Arc::new(RepoLockSpace::new());
+    let store = Arc::new(InMemoryWorkflowStore::new());
+    let audit = Arc::new(MemoryAuditSink::new());
+    let mut pools: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    pools.insert("browser".into(), vec![PathBuf::from("browser_chrome_1")]);
+    let runtime = WorkflowRuntime::new(
+        Arc::new(ConfigDefinitionStore::from_config(
+            &browser_flow_autoterminal(),
+        )),
+        store,
+        Arc::new(EmptyRegistry),
+        Arc::new(DefaultGuardEvaluator::new()),
+        audit.clone() as Arc<dyn AuditSink>,
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()])
+    .with_repo_locks(locks)
+    .with_exclusive_pools(pools);
+
+    // Auto-terminal flow: the run leases at start and releases at terminal, both
+    // within this call.
+    start(&runtime).await.unwrap();
+
+    let events = audit.snapshot();
+    let acquired = events
+        .iter()
+        .find(|e| e.event_type == "lock.acquired")
+        .expect("a pool lease must emit lock.acquired");
+    assert_eq!(acquired.payload["pool"], "browser");
+    assert_eq!(acquired.payload["member"], "browser_chrome_1");
+    assert!(
+        events.iter().any(|e| e.event_type == "lock.released"),
+        "and lock.released when the run terminates"
+    );
+}
+
 /// A flow that declares a pool with no configured members fails fast — an
 /// authoring/config error surfaced at run start, not a silent unleased run.
 #[tokio::test]

@@ -2292,8 +2292,9 @@ fn check_arg_scope(id: &str, loc: &str, value: &Value, out: &mut Vec<Diagnostic>
         out.push(Diagnostic::Error(format!(
             "UNRESOLVABLE_EXECUTOR_ARG_SCOPE: workflow '{id}' {loc}: operand '{s}' names no \
              resolvable scope — executor args resolve against `$.context.*`, `$.arguments.*`, \
-             `$.workflow.input.*`, `$.run.repo_root`, and `$.run.leased.*` only (note: `$.input.*` \
-             is NOT `$.workflow.input.*`). It would reach the tool as a literal or a null (SPEC §5.3, V29)"
+             `$.workflow.input.*`, `$.run.repo_root`, `$.run.artifacts_dir`, and `$.run.leased.*` \
+             only (note: `$.input.*` is NOT `$.workflow.input.*`). It would reach the tool as a \
+             literal or a null (SPEC §5.3, V29)"
         )));
     }
 }
@@ -2327,7 +2328,11 @@ fn is_resolvable_use_input_scope(s: &str) -> bool {
     // read_in_scopes resolves it; this keeps the validator in parity.
     matches!(
         s,
-        "$.arguments" | "$.context" | "$.workflow.input" | "$.run.repo_root"
+        "$.arguments"
+            | "$.context"
+            | "$.workflow.input"
+            | "$.run.repo_root"
+            | "$.run.artifacts_dir"
     ) || s.starts_with("$.context.")
         || s.starts_with("$.arguments.")
         || s.starts_with("$.workflow.input.")

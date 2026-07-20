@@ -119,6 +119,25 @@ async fn a_caller_supplied_run_id_is_preserved() {
     );
 }
 
+/// The run-scoped artifacts dir EXISTS after start — the engine creates it at
+/// the boundary so a probe/screenshot write never fails on a missing parent.
+#[tokio::test]
+async fn the_run_artifacts_dir_exists_after_start() {
+    let (runtime, store) = runtime_with_store();
+    let id = start_with(&runtime, praxec_core::RunEnv::for_test()).await;
+    let saved = store.load(&id).await.unwrap();
+    let dir = saved
+        .run_env
+        .artifacts_dir()
+        .expect("artifacts_dir resolves once run_ref is minted");
+    assert!(
+        dir.is_dir(),
+        "engine must create the artifacts dir at the run boundary: {}",
+        dir.display()
+    );
+    assert!(dir.ends_with(format!(".praxec/artifacts/{id}")));
+}
+
 /// Two runs get DISTINCT `run_ref`s. A shared constant would collapse per-run
 /// resource isolation into one bucket.
 #[tokio::test]

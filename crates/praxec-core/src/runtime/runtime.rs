@@ -356,6 +356,20 @@ impl WorkflowRuntime {
                 Ok(member) => {
                     // The lock key IS the connection name (see gateway wiring).
                     let conn = member.to_string_lossy().into_owned();
+                    // Observability: the pool lease is otherwise held invisibly.
+                    // Keyed on the run's identity (run_ref = root instance id).
+                    let _ = self
+                        .audit
+                        .record(
+                            crate::audit::AuditEvent::new("lock.acquired")
+                                .with_workflow(run_env.run_ref.clone().unwrap_or_default())
+                                .with_payload(json!({
+                                    "kind": "exclusive_pool",
+                                    "pool": pool,
+                                    "member": conn,
+                                })),
+                        )
+                        .await;
                     run_env.leased.insert(pool, conn);
                     acquired.push(member);
                 }
@@ -410,6 +424,13 @@ impl WorkflowRuntime {
             .map(std::path::PathBuf::from)
             .collect();
         self.release_members(&locks, &members, &holder).await;
+        let _ = self
+            .audit
+            .record(instance.audit_event("lock.released").with_payload(json!({
+                "kind": "exclusive_pool",
+                "members": instance.run_env.leased.values().cloned().collect::<Vec<_>>(),
+            })))
+            .await;
         self.resume_ready_locks().await;
     }
 
@@ -1021,6 +1042,14 @@ impl WorkflowRuntime {
         // and must not overwrite it.
         if request.parent.is_none() {
             run_env.run_ref = Some(instance_id.clone());
+        }
+        // Create the run-scoped evidence dir at the boundary, so a downstream tool
+        // that only WRITES a file under `$.run.artifacts_dir` never fails on a
+        // missing parent (the engine owns its existence, not a `kind: script`
+        // step — portable across OSes). Best-effort: a probe/screenshot write
+        // fails loudly on its own if this could not be created.
+        if let Some(dir) = run_env.artifacts_dir() {
+            let _ = std::fs::create_dir_all(&dir);
         }
         // Run-scoped exclusive-pool lease (collision-free parallel runs). A root
         // run leases one member of each pool its definition declares BEFORE the
