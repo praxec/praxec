@@ -700,7 +700,51 @@ impl WorkflowRuntime {
                 // force a thinking level for this step (e.g. "xhigh"); else the
                 // provider default. Set only when present so the kind:agent config
                 // (deny_unknown_fields, reasoning_effort: Option) stays clean.
-                let effort = auto_effort(&instance.context, &instance.input);
+                //
+                // Per-STATE reasoning effort completes the trio with `affinity:`
+                // and `tools:`: a state that is the hardest reasoning step of a
+                // loop (a diagnosis leaf) can raise its own thinking budget
+                // without a core change or a gateway-wide default bump.
+                // Precedence, mirroring `auto_affinity`: state declaration >
+                // context/input override > the global `ReasoningTuning
+                // .default_effort` applied downstream by the runner.
+                //
+                // Absent → the key is untouched and behavior is bit-identical:
+                // no shipped definition declares it, so this is purely additive.
+                //
+                // An unknown level is an ERROR, not a default. The
+                // `ReasoningTuning` accessors deliberately fall back to `medium`
+                // for an unrecognized level, so a typo (`xhig`) would silently
+                // become a no-op cap and the author would never learn. Validate
+                // against the level vocabulary DERIVED from the tuning maps —
+                // never a string list hard-coded here — so an operator who adds
+                // a level to the maps gets it accepted with no Rust change.
+                let state_effort: Option<String> = match definition.pointer(&format!(
+                    "/states/{}/reasoning_effort",
+                    pointer_escape(&instance.state)
+                )) {
+                    None => None,
+                    // `medium` IS accepted: it is a real key of the shipped maps
+                    // and means "provider default — do not cap this step", a
+                    // meaningful declaration even though `reasoning_params`
+                    // emits nothing for it. Accepted by rule, not by accident.
+                    Some(Value::String(s)) if crate::tuning::is_known_effort(s) => {
+                        Some(s.trim().to_lowercase())
+                    }
+                    Some(other) => {
+                        return Err(anyhow!(
+                            "AUTO_DRIVE_STATE_REASONING_EFFORT_INVALID: state '{}' of '{}' \
+                             declares `reasoning_effort: {other}` — it must be one of {:?}. \
+                             Omit the key entirely to inherit the run's effort override, or \
+                             the configured default.",
+                            instance.state,
+                            instance.definition_id,
+                            crate::tuning::known_effort_levels()
+                        ));
+                    }
+                };
+                let effort =
+                    state_effort.or_else(|| auto_effort(&instance.context, &instance.input));
                 let mut agent_config = json!({
                     "kind": "agent",
                     "affinity": auto_affinity_tier,
@@ -752,17 +796,26 @@ impl WorkflowRuntime {
                 // Observability: emit a start event so a live `audit tail` shows
                 // exactly which agent step is running (and pinpoints a hang).
                 let agent_started = std::time::Instant::now();
+                let mut invoked_payload = json!({
+                    "transition": name,
+                    "state": instance.state,
+                    "affinity": auto_affinity_tier,
+                    "max_seconds": self.auto_drive_max_seconds,
+                    "tools": leaf_tools,
+                });
+                // Same parity rule as `tools` above: record the EFFECTIVE effort
+                // the leaf actually ran with, from the same binding the executor
+                // config was built from, so an audit of a raised-effort step can
+                // never report the gateway default. Omitted when unset, matching
+                // the config, so absent-key runs stay byte-identical.
+                if let Some(e) = &effort {
+                    invoked_payload["reasoning_effort"] = json!(e);
+                }
                 self.record_or_self_event(
                     instance
                         .audit_event("agent.invoked")
                         .with_correlation(correlation_id)
-                        .with_payload(json!({
-                            "transition": name,
-                            "state": instance.state,
-                            "affinity": auto_affinity_tier,
-                            "max_seconds": self.auto_drive_max_seconds,
-                            "tools": leaf_tools,
-                        })),
+                        .with_payload(invoked_payload),
                 )
                 .await;
                 let policy = ReliabilityPolicy::from_value(def.get("reliability"))?;

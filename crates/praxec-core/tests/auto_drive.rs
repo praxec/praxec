@@ -254,6 +254,254 @@ fn agent_state_with_tools(tools: serde_json::Value) -> serde_json::Value {
     })
 }
 
+fn agent_state_with_reasoning_effort(effort: serde_json::Value) -> serde_json::Value {
+    let mut state = json!({
+        "goal": "Diagnose.",
+        "transitions": {
+            "submit": {
+                "target": "done",
+                "actor": "agent",
+                "executor": { "kind": "noop" },
+                "output": { "verdict": "$.arguments.verdict" }
+            }
+        }
+    });
+    state["reasoning_effort"] = effort;
+    json!({
+        "version": "1.0.0",
+        "workflows": {
+            "pipeline": {
+                "initialState": "s",
+                "states": { "s": state, "done": { "terminal": true } }
+            }
+        }
+    })
+}
+
+/// The motivating case: a diagnosis state is the hardest reasoning step in a
+/// loop, so it must be able to raise its OWN effort. A state's declared
+/// `reasoning_effort:` wins over the context/input-derived override, exactly as
+/// a state's `affinity:` wins over `affinity_override`.
+#[tokio::test]
+async fn state_reasoning_effort_overrides_the_context_derived_effort() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        agent_state_with_reasoning_effort(json!("xhigh")),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec!["github_mcp".into()], 180);
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            // The loop-level override says "minimal"; the state says "xhigh".
+            input: json!({ "effort_override": "minimal" }),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+
+    let config = exec
+        .config_for_kind("agent")
+        .expect("the agent executor was invoked");
+    assert_eq!(
+        config["reasoning_effort"], "xhigh",
+        "the state's own declaration must win over the context-derived effort"
+    );
+}
+
+/// The regression fence. An absent `reasoning_effort:` must be BIT-IDENTICAL to
+/// today: the context/input-derived effort applies, and when there is none the
+/// key is omitted entirely so the `kind: agent` config (deny_unknown_fields,
+/// `reasoning_effort: Option`) stays exactly as it was.
+#[tokio::test]
+async fn state_without_reasoning_effort_is_bit_identical() {
+    // (a) no declaration anywhere → the key is absent from the composed config.
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        linear_chain_stops_at_agent(),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec![], 180);
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+    let config = exec
+        .config_for_kind("agent")
+        .expect("the agent executor was invoked");
+    assert!(
+        config.get("reasoning_effort").is_none(),
+        "no declaration and no override must leave the key absent, got: {config}"
+    );
+
+    // (b) no state declaration but a context override → the override still wins,
+    // proving the new branch did not shadow the existing path.
+    let exec2 = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime2, _audit2) = build_runtime_with_executor(
+        linear_chain_stops_at_agent(),
+        exec2.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime2 = runtime2.with_auto_drive_agents(true, "reasoning", vec![], 180);
+    runtime2
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({ "effort_override": "high" }),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        exec2
+            .config_for_kind("agent")
+            .expect("invoked")
+            .get("reasoning_effort"),
+        Some(&json!("high")),
+        "an absent state declaration must leave the context-derived path untouched"
+    );
+}
+
+/// A typo must NOT silently become the default. The `ReasoningTuning` accessors
+/// fall back to `medium` for an unknown level, so an unvalidated `xhig` would
+/// quietly become a no-op cap and the author would never learn — the exact
+/// silent-degrade class this engine exists to remove.
+#[tokio::test]
+async fn invalid_state_reasoning_effort_is_rejected_not_defaulted() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        agent_state_with_reasoning_effort(json!("xhig")),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec!["github_mcp".into()], 180);
+    let err = runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .expect_err("an unknown effort level must fail the run, not default");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("AUTO_DRIVE_STATE_REASONING_EFFORT_INVALID"),
+        "error must name the typed code so an author can find it, got: {msg}"
+    );
+    assert!(
+        msg.contains("xhigh"),
+        "error must name the legal values, got: {msg}"
+    );
+    assert!(
+        exec.config_for_kind("agent").is_none(),
+        "the agent must NOT be dispatched with an unresolvable effort"
+    );
+}
+
+/// The same authoring mistake in a different shape (wrong JSON type) must fail
+/// identically — never fall through to the default, which would silently grant
+/// a different thinking budget than the author asked for.
+#[tokio::test]
+async fn non_string_state_reasoning_effort_is_rejected() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        agent_state_with_reasoning_effort(json!(3)),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec!["github_mcp".into()], 180);
+    let err = runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .expect_err("a non-string `reasoning_effort:` must fail the run");
+    assert!(
+        err.to_string()
+            .contains("AUTO_DRIVE_STATE_REASONING_EFFORT_INVALID")
+    );
+}
+
+/// `medium` is accepted DELIBERATELY: it is a real key of the shipped tuning
+/// maps and means "provider default — do not cap this step", which is a
+/// meaningful declaration even though `reasoning_params` emits nothing for it.
+/// Accepting it by rule, not by accident.
+#[tokio::test]
+async fn medium_state_reasoning_effort_is_accepted_as_an_explicit_provider_default() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        agent_state_with_reasoning_effort(json!("medium")),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec!["github_mcp".into()], 180);
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .expect("`medium` is a legal declared level");
+    assert_eq!(
+        exec.config_for_kind("agent").expect("invoked")["reasoning_effort"],
+        "medium"
+    );
+}
+
+/// Observability must not lie about thinking budget either: the `agent.invoked`
+/// event records the EFFECTIVE effort, for the same reason it records the
+/// effective tool set — an audit of a raised-effort step must not report the
+/// gateway default.
+#[tokio::test]
+async fn agent_invoked_audit_records_the_effective_reasoning_effort() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, audit) = build_runtime_with_executor(
+        agent_state_with_reasoning_effort(json!("xhigh")),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec!["github_mcp".into()], 180);
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+    let invoked = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| e.event_type == "agent.invoked")
+        .expect("an agent.invoked event must be recorded");
+    assert_eq!(
+        invoked.payload["reasoning_effort"], "xhigh",
+        "the audit must record the effort the leaf actually ran with"
+    );
+}
+
 /// A state's `tools:` REPLACES the gateway-wide auto-drive set, so an exploring
 /// leaf can be given browser access without also handing it the filesystem.
 #[tokio::test]

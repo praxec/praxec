@@ -1734,18 +1734,32 @@ async fn build_hot_components(
 /// fast (the mandatory-repo precondition).
 fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<Vec<RepoRoot>> {
     let mut out = Vec::new();
+    // Accumulate EVERY invalid root before failing. Short-circuiting on the
+    // first one costs the operator a reboot per broken path to discover the
+    // next; the fail-fast is the same, the diagnostic is one pass.
+    let mut invalid: Vec<String> = Vec::new();
     if let Some(arr) = config
         .pointer("/praxec/_writableRepos")
         .and_then(Value::as_array)
     {
         for e in arr {
             if let Some(root) = e.pointer("/root").and_then(Value::as_str) {
-                let rr = RepoRoot::new(root).map_err(|err| {
-                    anyhow::anyhow!("declared writable repo root `{root}` is invalid: {err}")
-                })?;
-                out.push(rr);
+                match RepoRoot::new(root) {
+                    Ok(rr) => out.push(rr),
+                    Err(err) => {
+                        invalid.push(format!("`{root}` is invalid: {err}"));
+                    }
+                }
             }
         }
+    }
+    if !invalid.is_empty() {
+        return Err(anyhow::anyhow!(
+            "declared writable repo root(s) unresolvable ({} of {}): {}",
+            invalid.len(),
+            invalid.len() + out.len(),
+            invalid.join("; ")
+        ));
     }
     Ok(out)
 }
@@ -4099,6 +4113,146 @@ mod tests {
                 .contains(&"discovery.index_degraded".to_string()),
             "embeddings off → lexical is the configured answer, not a degrade"
         );
+    }
+
+    /// Refusing to BOOT on a bad writable repo is correct fail-fast. Bricking a
+    /// RUNNING gateway on one would be a different failure class — an operator's
+    /// config edit silently costing every governed capability. This proves the
+    /// reload is gated: a bad new config drops to repair-only, audits, and keeps
+    /// the last-good definitions serving.
+    #[tokio::test]
+    async fn a_reload_with_an_unresolvable_writable_repo_keeps_the_last_good_config_live() {
+        use praxec_core::hot_reload::{
+            SwappableDefinitionStore, SwappableDiscoveryIndex, SwappableExecutorRegistry,
+            SwappableRegistry,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut good_config = cache_flow_config();
+        good_config["praxec"]["_writableRepos"] =
+            json!([{ "root": repo.display().to_string(), "push": false }]);
+
+        let cfg_path = dir.path().join("praxec.yaml");
+        std::fs::write(&cfg_path, serde_json::to_string(&good_config).unwrap()).unwrap();
+
+        let overlays = GatewayOverlays::default();
+        let config = crate::gateway_config::load_config(&cfg_path).unwrap();
+        let runtime = build_runtime_for_orchestrate(&config, &overlays)
+            .await
+            .expect("runtime");
+        let audit_sink = praxec_core::audit::MemoryAuditSink::new();
+        let audit: Arc<dyn praxec_core::audit::AuditSink> = Arc::new(audit_sink.clone());
+        let embedder: Arc<dyn praxec_core::embeddings::EmbeddingProvider> =
+            Arc::new(praxec_core::embeddings::NoopEmbedder);
+        let (defs, execs, discovery, registry, handle) =
+            build_hot_components(&config, &audit, &embedder, None)
+                .await
+                .expect("components build");
+        handle.set_runtime((*runtime).clone());
+        let swappable_defs = Arc::new(SwappableDefinitionStore::new(defs));
+        let swappable_execs = Arc::new(SwappableExecutorRegistry::new(execs));
+        let swappable_discovery = Arc::new(SwappableDiscoveryIndex::new(discovery));
+        let swappable_registry = Arc::new(SwappableRegistry::new(registry));
+
+        // The operator adds a workflow AND points a writable repo at a path that
+        // does not exist (a stale/deleted checkout — the dogfooding case).
+        let mut broken = good_config.clone();
+        broken["workflows"]["ship"] = json!({
+            "title": "Ship", "description": "release the build",
+            "initialState": "ready", "states": { "ready": {} }
+        });
+        broken["praxec"]["_writableRepos"] =
+            json!([{ "root": "/definitely/not/here", "push": false }]);
+        std::fs::write(&cfg_path, serde_json::to_string(&broken).unwrap()).unwrap();
+
+        let repair_gate: praxec_mcp_server::RepairGateSlot = Arc::new(std::sync::RwLock::new(None));
+        let upstream: Arc<dyn praxec_executors::UpstreamElicitor> = Arc::new(
+            super::ProgressElicitor::new(praxec_mcp_server::ProgressPeer::default()),
+        );
+        let outcome = reload_gated(
+            &swappable_defs,
+            &swappable_execs,
+            &swappable_discovery,
+            &swappable_registry,
+            &cfg_path,
+            &audit,
+            &runtime,
+            &overlays.registrars,
+            &repair_gate,
+            &upstream,
+        )
+        .await;
+
+        assert_eq!(
+            outcome["status"], "repair_only",
+            "a bad writable repo must gate the reload, not brick the gateway: {outcome}"
+        );
+        assert_eq!(outcome["reason"], "writable_repo_invalid");
+        // The live index still answers from the LAST-GOOD config: the new
+        // workflow was never swapped in, so the gateway kept serving.
+        let hits = swappable_discovery
+            .search(praxec_core::discovery::SearchRequest {
+                query: "release".into(),
+                kind: None,
+                limit: 10,
+            })
+            .await
+            .expect("the last-good index is still live and answering");
+        assert!(
+            !hits.iter().any(|h| h.item.id == "ship"),
+            "the rejected config must NOT have been swapped in: {hits:?}"
+        );
+        assert!(
+            audit_sink
+                .event_types()
+                .contains(&"config.reload_repair_only".to_string()),
+            "the rejected reload must be audited, not silent"
+        );
+        assert!(
+            repair_gate.read().unwrap().is_some(),
+            "the repair gate must be armed so the operator is told what to fix"
+        );
+    }
+
+    /// Boot fail-fast is CORRECT (a run's root must be real, not a hopeful
+    /// string) — but it must be maximally diagnostic. Reporting only the first
+    /// bad root costs the operator one reboot per broken path; report them ALL
+    /// so they are fixed in one pass.
+    #[test]
+    fn boot_reports_every_invalid_writable_repo_root_not_just_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().display().to_string();
+        let config = json!({
+            "praxec": { "_writableRepos": [
+                { "root": "/nope/one" },
+                { "root": good },
+                { "root": "/nope/two" }
+            ]}
+        });
+        let err = super::writable_repo_roots_from_config(&config)
+            .expect_err("an unresolvable declared root must fail the boot");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/nope/one") && msg.contains("/nope/two"),
+            "every invalid root must be named in one error, got: {msg}"
+        );
+        assert!(
+            !msg.contains(&good),
+            "a resolvable root must not be reported as invalid, got: {msg}"
+        );
+    }
+
+    /// The all-valid path is unchanged — the regression fence for the boot rule.
+    #[test]
+    fn boot_accepts_a_fully_resolvable_writable_repo_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = json!({
+            "praxec": { "_writableRepos": [{ "root": dir.path().display().to_string() }] }
+        });
+        let roots = super::writable_repo_roots_from_config(&config).expect("all roots resolve");
+        assert_eq!(roots.len(), 1);
     }
 
     /// #9 — `sync` reads the config's `repos:`, skips non-git local paths and

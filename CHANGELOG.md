@@ -8,6 +8,35 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [Unreleased]
+
+### Added — per-state `reasoning_effort:`
+
+- **Per-state `reasoning_effort:`** completes the per-state trio with `affinity:` and
+  `tools:`. A state that is the hardest reasoning step of a loop (a diagnosis leaf)
+  can now raise its own thinking budget from its capability YAML, without a core
+  change or a gateway-wide default bump. Precedence: **state declaration** >
+  `$.context`/`$.input.effort_override` > the configured `ReasoningTuning
+  .default_effort` (which ships as `"low"`). An absent key is bit-identical to
+  before, so this is purely additive.
+- The effective effort is recorded on the `agent.invoked` audit event, the same
+  parity rule that already applies to the effective `tools:` set — an audit of a
+  raised-effort step can never report the gateway default.
+- **V32 `UNKNOWN_REASONING_EFFORT`** — a load-time poka-yoke. The `ReasoningTuning`
+  accessors deliberately fall back to `medium` for an unrecognized level, so an
+  unvalidated typo (`xhig`) would silently become a no-op cap. The level vocabulary
+  is **derived from the `tuning.reasoning` maps**, never hard-coded in Rust, so an
+  operator who adds a level gets it accepted with no code change. The runtime rejects
+  it too (`AUTO_DRIVE_STATE_REASONING_EFFORT_INVALID`), but V32 moves the failure to
+  `praxec check` — before the human gate and before any lease is taken.
+
+### Changed
+
+- Boot now reports **every** unresolvable `writable: true` repo root in one error
+  instead of short-circuiting on the first, so an operator fixes them in a single
+  pass rather than one reboot per broken path. The fail-fast itself is unchanged: a
+  run's root must be real, not a hopeful string.
+
 ## [0.0.26] — 2026-07-20 — browser E2E substrate: collision-free parallel runs across a leased pool
 
 Enables running many browser-automation checks **in parallel across many projects
