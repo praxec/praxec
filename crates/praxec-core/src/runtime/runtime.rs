@@ -261,6 +261,18 @@ impl WorkflowRuntime {
         self
     }
 
+    /// Hot-swap the exclusive-pool map from a re-derived config (reload). Takes
+    /// `&self` so every cloned handle sees the swap (shared `Arc<RwLock>`).
+    pub fn set_exclusive_pools(
+        &self,
+        pools: std::collections::BTreeMap<String, Vec<std::path::PathBuf>>,
+    ) {
+        *self
+            .exclusive_pools
+            .write()
+            .expect("LOCK_POISONED: exclusive_pools") = pools;
+    }
+
     /// Members of a declared pool (empty if the pool is unknown).
     pub(crate) fn pool_members(&self, pool: &str) -> Vec<std::path::PathBuf> {
         self.exclusive_pools
