@@ -123,7 +123,262 @@ pub fn validate_workflows(config: &Value) -> Vec<Diagnostic> {
         validate_one_workflow(id, def, &skill_subjects, &ctx, strict, &mut diagnostics);
     }
 
+    // Cross-definition rules — run once over the whole registry.
+    validate_no_reference_cycles(workflows, &mut diagnostics);
+    validate_exclusive_leases(config, workflows, &mut diagnostics);
+
     diagnostics
+}
+
+/// Collect every `definitionId` a definition references via `kind: workflow`,
+/// anywhere in its body (states, parallel branches, pipeline steps).
+fn collect_workflow_refs(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if map.get("kind").and_then(Value::as_str) == Some("workflow") {
+                if let Some(t) = map.get("definitionId").and_then(Value::as_str) {
+                    out.push(t.to_string());
+                }
+            }
+            for child in map.values() {
+                collect_workflow_refs(child, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                collect_workflow_refs(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Reject a cycle in the `kind: workflow` reference graph. A cycle there is what
+/// the runtime depth guard's own error calls "likely an authoring bug": unlike a
+/// within-workflow loop (`while:`/back-edges, bounded by `max_iterations` + the
+/// livelock budget), cross-workflow recursion has no declared bound and can
+/// stack-recurse until the runtime guard trips.
+///
+/// The escape hatch mirrors `while:`→`max_iterations`: an INTENTIONAL cycle is
+/// allowed when a definition on it declares `recursive: true` (opt-in; the
+/// runtime `MAX_WORKFLOW_DEPTH` guard bounds it). This demotes that runtime guard
+/// from primary control to defense-in-depth, and makes an ACCIDENTAL cycle a
+/// load error instead of a runtime surprise.
+fn validate_no_reference_cycles(
+    workflows: &serde_json::Map<String, Value>,
+    out: &mut Vec<Diagnostic>,
+) {
+    // Adjacency over refs that resolve within the loaded set (an unresolved ref
+    // is V22's concern and cannot form a cycle here). `recursive: true` on a node
+    // marks it as an intentional recursion anchor.
+    let mut adj: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut recursive: HashSet<&str> = HashSet::new();
+    for (id, def) in workflows {
+        let mut refs = Vec::new();
+        collect_workflow_refs(def, &mut refs);
+        refs.retain(|t| workflows.contains_key(t));
+        adj.insert(id.as_str(), refs);
+        if def.get("recursive").and_then(Value::as_bool) == Some(true) {
+            recursive.insert(id.as_str());
+        }
+    }
+
+    // Iterative DFS with grey/black coloring; a grey re-visit is a back-edge.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color {
+        Grey,
+        Black,
+    }
+    let mut color: HashMap<&str, Color> = HashMap::new();
+    let mut reported: HashSet<String> = HashSet::new();
+
+    for start in workflows.keys() {
+        if color.contains_key(start.as_str()) {
+            continue;
+        }
+        // Explicit stack of (node, path-from-root) so a found cycle can name its
+        // members and check any node on it for the recursive opt-out.
+        let mut stack: Vec<(&str, Vec<&str>)> = vec![(start.as_str(), vec![start.as_str()])];
+        while let Some((node, path)) = stack.pop() {
+            match color.get(node) {
+                Some(Color::Black) => continue,
+                Some(Color::Grey) => {} // being expanded; fall through to children
+                None => {
+                    color.insert(node, Color::Grey);
+                }
+            }
+            let mut all_children_done = true;
+            for target in adj.get(node).into_iter().flatten() {
+                match color.get(target.as_str()) {
+                    Some(Color::Grey) => {
+                        // Back-edge → cycle. The cycle is the path suffix from
+                        // `target` plus the edge back to it.
+                        let cyc_start = path.iter().position(|n| *n == target.as_str());
+                        let cycle: Vec<&str> = match cyc_start {
+                            Some(i) => path[i..].to_vec(),
+                            None => vec![node, target.as_str()],
+                        };
+                        if cycle.iter().any(|n| recursive.contains(n)) {
+                            continue; // intentional, opted-in
+                        }
+                        let mut names: Vec<&str> = cycle.clone();
+                        names.push(target.as_str());
+                        let key = {
+                            let mut s = cycle.clone();
+                            s.sort_unstable();
+                            s.join("|")
+                        };
+                        if reported.insert(key) {
+                            out.push(Diagnostic::Error(format!(
+                                "CYCLE_DETECTED: the `kind: workflow` reference graph has a cycle \
+                                 [{}] — cross-workflow recursion with no declared bound. If this is \
+                                 intentional, mark a definition on the cycle `recursive: true` (the \
+                                 runtime depth guard then bounds it); otherwise break the cycle \
+                                 (SPEC §3, mirrors `while:`→`max_iterations`).",
+                                names.join(" → ")
+                            )));
+                        }
+                    }
+                    Some(Color::Black) => {}
+                    None => {
+                        all_children_done = false;
+                        // Re-push node to finalize after children, then the child.
+                        stack.push((node, path.clone()));
+                        let mut child_path = path.clone();
+                        child_path.push(target.as_str());
+                        stack.push((target.as_str(), child_path));
+                        break;
+                    }
+                }
+            }
+            if all_children_done {
+                color.insert(node, Color::Black);
+            }
+        }
+    }
+}
+
+/// V31 — an exclusive resource may be reached ONLY through its run-scoped pool
+/// lease. A browser MCP server has one global page pointer per process, so
+/// concurrent unleased access silently cross-contaminates (and corrupts any
+/// reproduction measurement taken through it). This is generic: the engine knows
+/// only "exclusive resources must be leased"; config declares which connections
+/// are `exclusive: true` and how they `pool:`.
+///
+/// Two rejected shapes, one required shape:
+///   - direct `connection: <exclusive>` on a `kind: mcp` transition — bypasses
+///     the lease → UNLEASED_EXCLUSIVE_ACCESS.
+///   - a literal `<exclusive>` connection name in a state's `tools:` — same.
+///   - `{{ $.run.leased.<pool> }}` in `tools:` WITHOUT the flow declaring
+///     `exclusive_pools: [<pool>]` — the lease is never acquired, so the token
+///     is unbound → UNLEASED_EXCLUSIVE_ACCESS.
+///
+/// The sanctioned shape — `tools: ["{{ $.run.leased.<pool> }}"]` in a flow that
+/// declares `exclusive_pools: [<pool>]` — passes.
+fn validate_exclusive_leases(
+    config: &Value,
+    workflows: &serde_json::Map<String, Value>,
+    out: &mut Vec<Diagnostic>,
+) {
+    // Build: exclusive connection name → its pool.
+    let mut conn_pool: HashMap<&str, String> = HashMap::new();
+    if let Some(conns) = config.pointer("/connections").and_then(Value::as_object) {
+        for (name, spec) in conns {
+            let is_mcp = spec.get("kind").and_then(Value::as_str) == Some("mcp");
+            let excl = spec
+                .get("exclusive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if is_mcp && excl {
+                let pool = spec
+                    .get("pool")
+                    .and_then(Value::as_str)
+                    .unwrap_or(name)
+                    .to_string();
+                conn_pool.insert(name.as_str(), pool);
+            }
+        }
+    }
+    if conn_pool.is_empty() {
+        return; // no exclusive resources declared — nothing to govern
+    }
+
+    for (id, def) in workflows {
+        let declared: HashSet<String> = def
+            .get("exclusive_pools")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let Some(states) = def.get("states").and_then(Value::as_object) else {
+            continue;
+        };
+        for (state_name, state_def) in states {
+            // State `tools:` — the auto-drive tool scope (A0).
+            if let Some(tools) = state_def.get("tools").and_then(Value::as_array) {
+                for t in tools.iter().filter_map(Value::as_str) {
+                    // A leased-pool reference: must have the pool declared.
+                    if let Some(pool) = leased_pool_token(t) {
+                        if !declared.contains(pool) {
+                            out.push(Diagnostic::Error(format!(
+                                "UNLEASED_EXCLUSIVE_ACCESS: workflow '{id}' state '{state_name}' \
+                                 tool `{t}` leases pool '{pool}', but the flow does not declare \
+                                 `exclusive_pools: [{pool}]` — the lease is never acquired and the \
+                                 token resolves unbound (V31)."
+                            )));
+                        }
+                    } else if let Some(pool) = conn_pool.get(t) {
+                        // A literal exclusive connection name — bypasses the lease.
+                        out.push(Diagnostic::Error(format!(
+                            "UNLEASED_EXCLUSIVE_ACCESS: workflow '{id}' state '{state_name}' names \
+                             exclusive connection `{t}` (pool '{pool}') literally in `tools:`. Reach \
+                             it through the run-scoped lease — declare `exclusive_pools: [{pool}]` \
+                             and use `tools: [\"{{{{ $.run.leased.{pool} }}}}\"]` (V31)."
+                        )));
+                    }
+                }
+            }
+            // Transition mcp `connection:` — a direct exclusive reference bypasses
+            // the lease entirely.
+            let Some(transitions) = state_def.get("transitions").and_then(Value::as_object) else {
+                continue;
+            };
+            for (t_name, t_def) in transitions {
+                let exec = t_def.get("executor");
+                let is_mcp =
+                    exec.and_then(|e| e.get("kind")).and_then(Value::as_str) == Some("mcp");
+                if !is_mcp {
+                    continue;
+                }
+                if let Some(conn) = exec
+                    .and_then(|e| e.get("connection"))
+                    .and_then(Value::as_str)
+                {
+                    if let Some(pool) = conn_pool.get(conn) {
+                        out.push(Diagnostic::Error(format!(
+                            "UNLEASED_EXCLUSIVE_ACCESS: workflow '{id}' state '{state_name}' \
+                             transition '{t_name}' calls exclusive connection `{conn}` (pool \
+                             '{pool}') directly via `kind: mcp`, bypassing the run-scoped lease. \
+                             An exclusive resource must be reached through a leased agent tool \
+                             (`{{{{ $.run.leased.{pool} }}}}`), not a hardcoded connection (V31)."
+                        )));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// If `tool` is a `{{ $.run.leased.<pool> }}` token, return `<pool>`.
+fn leased_pool_token(tool: &str) -> Option<&str> {
+    let t = tool.trim();
+    let inner = t.strip_prefix("{{")?.strip_suffix("}}")?.trim();
+    inner.strip_prefix("$.run.leased.")
 }
 
 /// Parse a guard expression of the exact shape `$.some.path == 'literal'`
@@ -2037,8 +2292,8 @@ fn check_arg_scope(id: &str, loc: &str, value: &Value, out: &mut Vec<Diagnostic>
         out.push(Diagnostic::Error(format!(
             "UNRESOLVABLE_EXECUTOR_ARG_SCOPE: workflow '{id}' {loc}: operand '{s}' names no \
              resolvable scope — executor args resolve against `$.context.*`, `$.arguments.*`, \
-             `$.workflow.input.*`, and `$.run.repo_root` only (note: `$.input.*` is NOT \
-             `$.workflow.input.*`). It would reach the tool as a literal or a null (SPEC §5.3, V29)"
+             `$.workflow.input.*`, `$.run.repo_root`, and `$.run.leased.*` only (note: `$.input.*` \
+             is NOT `$.workflow.input.*`). It would reach the tool as a literal or a null (SPEC §5.3, V29)"
         )));
     }
 }
@@ -2076,6 +2331,10 @@ fn is_resolvable_use_input_scope(s: &str) -> bool {
     ) || s.starts_with("$.context.")
         || s.starts_with("$.arguments.")
         || s.starts_with("$.workflow.input.")
+        // `$.run.leased.<pool>` is run-ambient like `$.run.repo_root` — the
+        // engine binds the leased connection at the run boundary, so it resolves
+        // at spawn time and in executor args. read_in_scopes resolves it; parity.
+        || s.starts_with("$.run.leased.")
 }
 
 /// Reject a `$.`-rooted scope operand written with surrounding whitespace.
@@ -5007,5 +5266,195 @@ mod tests {
             }}
         });
         assert!(v30_errors(&config).is_empty());
+    }
+
+    // --- reference-graph cycle poka-yoke ------------------------------------
+
+    fn errors_with(config: &Value, code: &str) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains(code))
+            .collect()
+    }
+
+    fn wf_ref(_from: &str, to: &str) -> Value {
+        json!({
+            "initialState": "s",
+            "states": {
+                "s": { "transitions": { "call": {
+                    "target": "done", "actor": "deterministic",
+                    "executor": { "kind": "workflow", "definitionId": to }
+                }}},
+                "done": { "terminal": true }
+            }
+        })
+    }
+
+    /// A cycle in the `kind: workflow` reference graph is an authoring bug (the
+    /// runtime depth guard's own words) and is rejected at load.
+    #[test]
+    fn a_reference_cycle_is_rejected() {
+        let config = json!({ "workflows": {
+            "flow.a": wf_ref("flow.a", "flow.b"),
+            "flow.b": wf_ref("flow.b", "flow.a"),
+        }});
+        assert!(
+            !errors_with(&config, "CYCLE_DETECTED").is_empty(),
+            "a two-node reference cycle must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_self_reference_is_rejected() {
+        let config = json!({ "workflows": { "flow.r": wf_ref("flow.r", "flow.r") } });
+        assert!(!errors_with(&config, "CYCLE_DETECTED").is_empty());
+    }
+
+    /// The escape hatch mirrors `while:`→`max_iterations`: an intentional cycle
+    /// is allowed when a definition on it opts in with `recursive: true` (the
+    /// runtime depth guard bounds it). Accidental cycles still fail.
+    #[test]
+    fn a_recursive_marker_allows_the_cycle() {
+        let mut r = wf_ref("flow.r", "flow.r");
+        r["recursive"] = json!(true);
+        let config = json!({ "workflows": { "flow.r": r } });
+        assert!(
+            errors_with(&config, "CYCLE_DETECTED").is_empty(),
+            "an explicit recursive: true opts out of the cycle rejection"
+        );
+    }
+
+    #[test]
+    fn a_dag_reference_graph_has_no_cycle_error() {
+        let config = json!({ "workflows": {
+            "flow.a": wf_ref("flow.a", "flow.b"),
+            "flow.b": json!({
+                "initialState": "s",
+                "states": { "s": { "terminal": true } }
+            }),
+        }});
+        assert!(errors_with(&config, "CYCLE_DETECTED").is_empty());
+    }
+
+    // --- V31 — exclusive-resource must be leased -----------------------------
+
+    fn browser_conn(pool: &str) -> Value {
+        json!({ "kind": "mcp", "command": "npx", "exclusive": true, "pool": pool })
+    }
+
+    /// A leased browser state: references the pool via the run-ambient lease AND
+    /// declares the pool. This is the sanctioned shape and must pass.
+    #[test]
+    fn a_properly_leased_browser_state_passes_v31() {
+        let config = json!({
+            "connections": { "browser_chrome_1": browser_conn("browser") },
+            "workflows": { "flow.explore": {
+                "exclusive_pools": ["browser"],
+                "initialState": "exploring",
+                "states": {
+                    "exploring": {
+                        "tools": ["{{ $.run.leased.browser }}"],
+                        "transitions": { "go": {
+                            "target": "done", "actor": "agent", "executor": { "kind": "noop" }
+                        }}
+                    },
+                    "done": { "terminal": true }
+                }
+            }}
+        });
+        assert!(
+            errors_with(&config, "UNLEASED_EXCLUSIVE_ACCESS").is_empty(),
+            "a leased + declared browser state is the sanctioned shape"
+        );
+    }
+
+    /// Referencing the pool lease WITHOUT declaring `exclusive_pools` is rejected
+    /// — the lease would never be acquired, so `$.run.leased.browser` is unbound.
+    #[test]
+    fn leased_reference_without_pool_declaration_is_rejected() {
+        let config = json!({
+            "connections": { "browser_chrome_1": browser_conn("browser") },
+            "workflows": { "flow.explore": {
+                "initialState": "exploring",
+                "states": {
+                    "exploring": {
+                        "tools": ["{{ $.run.leased.browser }}"],
+                        "transitions": { "go": {
+                            "target": "done", "actor": "agent", "executor": { "kind": "noop" }
+                        }}
+                    },
+                    "done": { "terminal": true }
+                }
+            }}
+        });
+        assert!(!errors_with(&config, "UNLEASED_EXCLUSIVE_ACCESS").is_empty());
+    }
+
+    /// Naming an exclusive connection LITERALLY in `tools:` bypasses the lease —
+    /// rejected. You must reach it through the pool lease.
+    #[test]
+    fn a_literal_exclusive_connection_in_tools_is_rejected() {
+        let config = json!({
+            "connections": { "browser_chrome_1": browser_conn("browser") },
+            "workflows": { "flow.explore": {
+                "exclusive_pools": ["browser"],
+                "initialState": "exploring",
+                "states": {
+                    "exploring": {
+                        "tools": ["browser_chrome_1"],
+                        "transitions": { "go": {
+                            "target": "done", "actor": "agent", "executor": { "kind": "noop" }
+                        }}
+                    },
+                    "done": { "terminal": true }
+                }
+            }}
+        });
+        assert!(!errors_with(&config, "UNLEASED_EXCLUSIVE_ACCESS").is_empty());
+    }
+
+    /// A direct `kind: mcp` transition to an exclusive connection also bypasses
+    /// the lease and is rejected.
+    #[test]
+    fn a_direct_mcp_connection_to_an_exclusive_resource_is_rejected() {
+        let config = json!({
+            "connections": { "browser_chrome_1": browser_conn("browser") },
+            "workflows": { "flow.explore": {
+                "exclusive_pools": ["browser"],
+                "initialState": "probing",
+                "states": {
+                    "probing": {
+                        "transitions": { "probe": {
+                            "target": "done", "actor": "deterministic",
+                            "executor": { "kind": "mcp", "connection": "browser_chrome_1", "tool": "list_pages" }
+                        }}
+                    },
+                    "done": { "terminal": true }
+                }
+            }}
+        });
+        assert!(!errors_with(&config, "UNLEASED_EXCLUSIVE_ACCESS").is_empty());
+    }
+
+    /// A non-exclusive connection is untouched by V31.
+    #[test]
+    fn a_non_exclusive_connection_is_not_governed_by_v31() {
+        let config = json!({
+            "connections": { "github_mcp": { "kind": "mcp", "command": "gh" } },
+            "workflows": { "flow.x": {
+                "initialState": "s",
+                "states": {
+                    "s": {
+                        "tools": ["github_mcp"],
+                        "transitions": { "go": {
+                            "target": "done", "actor": "agent", "executor": { "kind": "noop" }
+                        }}
+                    },
+                    "done": { "terminal": true }
+                }
+            }}
+        });
+        assert!(errors_with(&config, "UNLEASED_EXCLUSIVE_ACCESS").is_empty());
     }
 }

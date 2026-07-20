@@ -51,6 +51,41 @@ pub trait RepoLocks: Send + Sync {
         ttl: Duration,
     ) -> Result<(), LockConflict>;
 
+    /// Atomically lock **exactly one** free member of `candidates` for `holder`,
+    /// returning which one. The pool analogue of [`acquire`](Self::acquire).
+    ///
+    /// `acquire` is all-or-nothing over an EXACT set — right for files, where a
+    /// transition needs precisely the files it edits. A pool is the opposite
+    /// shape: its members are interchangeable, the caller needs any one, and
+    /// requesting the whole set would serialize the pool to a single slot.
+    ///
+    /// On exhaustion returns a [`LockConflict`] naming EVERY holder, so an
+    /// operator sees what the pool is busy with rather than one arbitrary
+    /// blocker. An empty `candidates` list is a config error and also fails —
+    /// returning `Ok` there would report "no slot" as success and let the caller
+    /// proceed holding nothing.
+    ///
+    /// Default impl is a linear first-fit over `acquire`, which inherits its
+    /// atomicity: each probe either takes that single member or takes nothing.
+    async fn acquire_any(
+        &self,
+        candidates: &[PathBuf],
+        holder: &str,
+        ttl: Duration,
+    ) -> Result<PathBuf, LockConflict> {
+        let mut conflicts: Vec<(PathBuf, String)> = Vec::new();
+        for candidate in candidates {
+            match self
+                .acquire(std::slice::from_ref(candidate), holder, ttl)
+                .await
+            {
+                Ok(()) => return Ok(candidate.clone()),
+                Err(c) => conflicts.extend(c.conflicts),
+            }
+        }
+        Err(LockConflict { conflicts })
+    }
+
     /// Release `files` held by `holder`. Files held by a different holder are
     /// left untouched.
     async fn release(&self, files: &[PathBuf], holder: &str);
@@ -247,6 +282,58 @@ mod tests {
     async fn acquire_free_files_succeeds() {
         let space = RepoLockSpace::new();
         assert!(space.acquire(&[p("a")], "h1", ttl()).await.is_ok());
+    }
+
+    // --- acquire_any: pool acquisition ------------------------------------
+    //
+    // `acquire` is all-or-nothing over an EXACT set, which is right for files
+    // (a transition needs precisely the files it edits). A pool of
+    // interchangeable slots is the opposite shape: the caller needs ANY ONE
+    // free member, and asking for the whole pool would serialize it to nothing.
+
+    #[tokio::test]
+    async fn acquire_any_takes_one_free_slot_from_the_pool() {
+        let space = RepoLockSpace::new();
+        let got = space
+            .acquire_any(&[p("slot-1"), p("slot-2")], "h1", ttl())
+            .await
+            .expect("a free pool must grant one slot");
+        assert!(got == p("slot-1") || got == p("slot-2"));
+        // EXACTLY one slot is taken — not the whole pool.
+        assert_eq!(held_files(&space).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn acquire_any_skips_a_held_slot_and_takes_the_free_one() {
+        let space = RepoLockSpace::new();
+        space.acquire(&[p("slot-1")], "other", ttl()).await.unwrap();
+        let got = space
+            .acquire_any(&[p("slot-1"), p("slot-2")], "h1", ttl())
+            .await
+            .expect("one slot is free");
+        assert_eq!(got, p("slot-2"));
+    }
+
+    #[tokio::test]
+    async fn acquire_any_fails_when_every_slot_is_held() {
+        let space = RepoLockSpace::new();
+        space.acquire(&[p("slot-1")], "o1", ttl()).await.unwrap();
+        space.acquire(&[p("slot-2")], "o2", ttl()).await.unwrap();
+        let err = space
+            .acquire_any(&[p("slot-1"), p("slot-2")], "h1", ttl())
+            .await
+            .expect_err("an exhausted pool must not grant");
+        // The conflict names EVERY holder, so the operator can see what the
+        // pool is busy with rather than one arbitrary blocker.
+        assert_eq!(err.conflicts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn acquire_any_on_an_empty_candidate_list_fails_rather_than_granting() {
+        // An empty pool is an authoring/config error. Returning Ok here would
+        // hand back "no slot" as success and let the caller proceed unleased.
+        let space = RepoLockSpace::new();
+        assert!(space.acquire_any(&[], "h1", ttl()).await.is_err());
     }
 
     #[tokio::test]

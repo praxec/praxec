@@ -143,16 +143,45 @@ pub struct RunEnv {
     /// SPEC §20.2 trace id, same lifecycle as `run_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// The ROOT run's stable internal identity, set at the run boundary and
+    /// inherited verbatim by every sub-workflow. Distinct from `run_id` (which is
+    /// OPTIONAL caller-supplied correlation, SPEC §20.2, and stays null when the
+    /// caller supplies none — an audit contract): `run_ref` is engine-minted,
+    /// always present, and identifies the run TREE. It is the holder key for
+    /// run-scoped exclusive-pool leases, so the root and its browser-touching
+    /// child caps share one lease. Never surfaced as a correlation field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_ref: Option<String>,
+    /// Run-scoped exclusive-pool leases: `pool name -> leased connection name`.
+    ///
+    /// A flow declaring `exclusive_pools: [browser]` leases one member of the
+    /// `browser` pool at the run boundary; the winner lands here and resolves as
+    /// `$.run.leased.browser`, so a browser-touching state uses
+    /// `tools: ["{{ $.run.leased.browser }}"]`. Run-ambient (not context) so it
+    /// survives a sub-workflow spawn — the browser-touching caps are CHILDREN of
+    /// the exploring flow and must reach the same leased server process, or they
+    /// would collide on that process's global `select_page` pointer.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub leased: std::collections::BTreeMap<String, String>,
 }
 
 impl RunEnv {
-    /// Construct from a validated root plus optional correlation ids.
+    /// Construct from a validated root plus optional correlation ids. Leases are
+    /// empty at construction — they are acquired at the run boundary (or
+    /// inherited from a parent on spawn), never passed in by a caller.
     pub fn new(repo_root: RepoRoot, run_id: Option<String>, trace_id: Option<String>) -> Self {
         Self {
             repo_root,
             run_id,
             trace_id,
+            run_ref: None,
+            leased: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// The connection leased for `pool` this run, if any.
+    pub fn leased_member(&self, pool: &str) -> Option<&str> {
+        self.leased.get(pool).map(String::as_str)
     }
 
     /// Test-only environment (see [`RepoRoot::for_test`] for why this is not
@@ -163,6 +192,8 @@ impl RunEnv {
             repo_root: RepoRoot::for_test(),
             run_id: None,
             trace_id: None,
+            run_ref: None,
+            leased: std::collections::BTreeMap::new(),
         }
     }
 }

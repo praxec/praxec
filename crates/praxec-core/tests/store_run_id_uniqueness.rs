@@ -1,13 +1,30 @@
 //! Atomic run_id uniqueness at the store layer (async-safety prerequisite):
 //! two creates with the same run_id → exactly one succeeds.
 
-use praxec_core::model::WorkflowInstance;
+use praxec_core::model::{ParentLink, WorkflowInstance};
 use praxec_core::ports::WorkflowStore;
 use praxec_core::store::InMemoryWorkflowStore;
 use praxec_core::store::SqliteWorkflowStore;
 use serde_json::json;
 
 fn instance(id: &str, run_id: &str) -> WorkflowInstance {
+    instance_with_parent(id, run_id, None)
+}
+
+/// A child instance shares its parent's `run_id` (run correlation must survive
+/// the sub-workflow spawn) and carries a `parent` link.
+fn child_instance(id: &str, run_id: &str, parent_id: &str) -> WorkflowInstance {
+    instance_with_parent(
+        id,
+        run_id,
+        Some(ParentLink {
+            workflow_id: parent_id.to_string(),
+            transition: "call".into(),
+        }),
+    )
+}
+
+fn instance_with_parent(id: &str, run_id: &str, parent: Option<ParentLink>) -> WorkflowInstance {
     WorkflowInstance {
         id: id.to_string(),
         definition_id: "d".into(),
@@ -26,7 +43,7 @@ fn instance(id: &str, run_id: &str) -> WorkflowInstance {
         cancelled_at: None,
         cancelled_reason: None,
         depth: 0,
-        parent: None,
+        parent,
     }
 }
 
@@ -51,4 +68,34 @@ async fn sqlite_create_enforces_run_id_uniqueness() {
 async fn in_memory_create_enforces_run_id_uniqueness() {
     let store = InMemoryWorkflowStore::new();
     assert_one_wins(&store).await;
+}
+
+/// run_id identifies a RUN (a tree of instances), and only its ROOT establishes
+/// uniqueness. A sub-workflow inherits the parent's run_id so correlation
+/// survives the spawn — creating it must NOT be rejected as a duplicate start.
+///
+/// Regression fence for run-id minting: once every root run gets a run_id, every
+/// sub-workflow spawn inherits one, and without this exemption every spawn would
+/// fail RUN_ID_ALREADY_RUNNING.
+async fn assert_child_shares_run_id(store: &dyn WorkflowStore) {
+    store
+        .create(instance("wf_root", "run-1"))
+        .await
+        .expect("root create");
+    store
+        .create(child_instance("wf_child", "run-1", "wf_root"))
+        .await
+        .expect("a child sharing the parent's run_id is the same run, not a duplicate");
+}
+
+#[tokio::test]
+async fn sqlite_child_may_share_the_parent_run_id() {
+    let store = SqliteWorkflowStore::open_in_memory().expect("sqlite");
+    assert_child_shares_run_id(&store).await;
+}
+
+#[tokio::test]
+async fn in_memory_child_may_share_the_parent_run_id() {
+    let store = InMemoryWorkflowStore::new();
+    assert_child_shares_run_id(&store).await;
 }

@@ -219,6 +219,11 @@
           "type": "integer",
           "minimum": 1,
           "description": "FB-7 — inactivity ceiling in ms for the connect/`initialize` phase specifically. Lets a server that indexes a large repo on cold start (e.g. structureos) get a wider establishment budget without loosening the per-call `idleTimeoutMs`. Defaults to `idleTimeoutMs` (which defaults to 30000)."
+        },
+        "exclusive": {
+          "type": "boolean",
+          "default": false,
+          "description": "The connection backs a resource with GLOBAL MUTABLE STATE (a browser whose selected-page pointer is per-server-process; a serial port; a shared test DB). Concurrent unleased access silently cross-contaminates. When true, any state reaching this connection MUST declare the lease in `owned_files` (validator rule V31 / UNLEASED_BROWSER_ACCESS). Declared on the RESOURCE, not in a separate operator list, so the constraint cannot drift from the thing it governs. No browser knowledge in core: the engine enforces 'exclusive resources must be leased'; config declares which resources are exclusive."
         }
       }
     },
