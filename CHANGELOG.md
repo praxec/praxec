@@ -8,6 +8,59 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.26] — 2026-07-20 — browser E2E substrate: collision-free parallel runs across a leased pool
+
+Enables running many browser-automation checks **in parallel across many projects
+without collisions** — an architectural guarantee, with **zero browser knowledge in
+the engine** (it enforces "exclusive resources must be leased"; config declares which
+connections are exclusive via `exclusive: true` + `pool:`). A browser MCP server has
+one global page pointer per process, so two runs sharing a connection silently corrupt
+each other and any reproduction measurement taken through them; the run-scoped pool
+lease gives each run its own server process. Proven live against a real app (simuli):
+`flow.qa.explore` drove the browser end-to-end, with the tool-surface role split
+(charter=file-only, survey/probe=leased-browser) observed in the audit.
+
+### Added — run-scoped exclusive-pool lease
+
+- A connection may declare `exclusive: true` + `pool: <name>`. A flow declares
+  `exclusive_pools: [<name>]`; the runtime leases ONE member at the run boundary
+  (`acquire_any`), binds it to the run-ambient `$.run.leased.<pool>` (which survives
+  sub-workflow spawn), and releases on terminal/cancel. A browser state reaches it via
+  `tools: ["{{ $.run.leased.browser }}"]`. Two concurrent runs get DISTINCT members;
+  an exhausted pool fails fast (`POOL_EXHAUSTED`), never shares. The gateway derives
+  the pool map from `connections:` (and on reload).
+- **V31 `UNLEASED_EXCLUSIVE_ACCESS`** — a load-time poka-yoke: an exclusive resource
+  may be reached ONLY through its lease. A direct `kind: mcp` connection, a literal
+  exclusive connection in `tools:`, or a leased reference without the pool declared
+  are all rejected.
+- **`CYCLE_DETECTED`** — the `kind: workflow` reference graph must be acyclic (escape
+  hatch: `recursive: true`, mirroring `while:`→`max_iterations`). This demotes the
+  runtime depth guard to defense-in-depth.
+- **Per-state `tools:`** — a state may replace the gateway-wide auto-drive tool set,
+  scoping an agent leaf's reach (e.g. a fixer to `file:.../src`, a test-author to
+  `file:.../tests`). Absent → the global set, unchanged.
+- **`file-ro:<root>`** — a genuinely read-only file root (read tools only; a mutating
+  call is rejected, not merely unexposed) for reviewer-style roles.
+- **`$.run.artifacts_dir`** — a run-scoped evidence dir, engine-created at the run
+  boundary so a probe/screenshot write never fails on a missing parent.
+- **`run_ref`** — an engine-minted, always-present run-tree identity (the pool-lease
+  holder key), separate from the optional caller-supplied `run_id` correlation, so the
+  SPEC §20.2 audit contract is preserved.
+- The pool lease emits `lock.acquired` / `lock.released` audit events.
+
+### Fixed
+
+- **`owned_files` was inert on the auto-drive chain path** — the lock gate existed only
+  on the submit path, so an auto-driven agent leaf declaring `owned_files` took no lock.
+  Hoisted to a shared acquire/release + `park_on_lock` + `ChainOutcome::WaitingOnLock`.
+- **Symlink write-escape** — the file-tool root guard was purely lexical, so a symlink
+  inside a root pointing outside it escaped confinement (a live hole). Now
+  filesystem-aware (canonicalise + `symlink_metadata`), enforcing containment.
+- **Sub-workflow recursion** now drives each child on a fresh `tokio::task`, so a cyclic
+  graph fails fast at the depth guard instead of a debug-build stack abort.
+- **`acquire_any` N>1 starvation** — the scheduler's readiness predicate was all-of;
+  pool waiters now carry an any-of `AcquireMode` (the bug was invisible at pool size 1).
+
 ## [0.0.25] — 2026-07-18 — multi-provider load distribution: route across a credentialed pool
 
 The headline release for the requirement-driven resolution work: an LLM step no
