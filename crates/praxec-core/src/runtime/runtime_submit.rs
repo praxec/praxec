@@ -1616,6 +1616,9 @@ impl WorkflowRuntime {
         match chain_outcome {
             ChainOutcome::Completed(result) => {
                 if is_terminal(&definition, &result.instance.state) {
+                    // Root run reached terminal via submit (e.g. after a human
+                    // gate) — free its pool leases promptly. Root-gated + idempotent.
+                    self.release_run_leases(&result.instance).await;
                     self.audit
                         .record(
                             result
@@ -1673,6 +1676,8 @@ impl WorkflowRuntime {
                 error_class,
                 failed_transition,
             } => {
+                // A failed root mission will not continue — free its pool leases.
+                self.release_run_leases(&partial.instance).await;
                 let mut response = self
                     .response(
                         &definition,

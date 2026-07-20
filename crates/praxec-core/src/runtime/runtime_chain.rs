@@ -403,6 +403,13 @@ impl WorkflowRuntime {
         let mut accumulated_evidence: Vec<Evidence> = Vec::new();
 
         loop {
+            // Keep this run's exclusive-pool leases alive while it is making
+            // progress: a long auto-driven chain (several agent steps in one
+            // drive) must not have its browser slot reaped mid-run. Holder-keyed
+            // and cheap (no-op when the run holds no lease); this is the
+            // refresh-on-progress that replaces a background heartbeat task.
+            self.refresh_run_leases(&instance).await;
+
             // Stop: terminal state
             if is_terminal(definition, &instance.state) {
                 break;
