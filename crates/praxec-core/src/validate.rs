@@ -126,6 +126,7 @@ pub fn validate_workflows(config: &Value) -> Vec<Diagnostic> {
     // Cross-definition rules — run once over the whole registry.
     validate_no_reference_cycles(workflows, &mut diagnostics);
     validate_exclusive_leases(config, workflows, &mut diagnostics);
+    validate_reasoning_efforts(workflows, &mut diagnostics);
 
     diagnostics
 }
@@ -253,6 +254,47 @@ fn validate_no_reference_cycles(
             }
             if all_children_done {
                 color.insert(node, Color::Black);
+            }
+        }
+    }
+}
+
+/// V32 — a state's declared `reasoning_effort:` must be a level this build
+/// understands.
+///
+/// The runtime rejects an unknown level loudly
+/// (`AUTO_DRIVE_STATE_REASONING_EFFORT_INVALID`), but that fires mid-run, after
+/// the operator has approved the run and after a lease may already be held.
+/// Catching it at `praxec check` moves the failure before the human gate, which
+/// is where an authoring typo belongs.
+///
+/// The legal vocabulary is DERIVED from the `tuning.reasoning` maps
+/// ([`crate::tuning::known_effort_levels`]), never hard-coded here — an operator
+/// who adds a level to the maps gets it accepted with no Rust change.
+fn validate_reasoning_efforts(
+    workflows: &serde_json::Map<String, Value>,
+    out: &mut Vec<Diagnostic>,
+) {
+    for (id, def) in workflows {
+        let Some(states) = def.get("states").and_then(Value::as_object) else {
+            continue;
+        };
+        for (state_name, state_def) in states {
+            // Absent → nothing to check; this is the regression fence for every
+            // shipped state, none of which declares the key.
+            let Some(declared) = state_def.get("reasoning_effort") else {
+                continue;
+            };
+            let ok = declared
+                .as_str()
+                .is_some_and(crate::tuning::is_known_effort);
+            if !ok {
+                out.push(Diagnostic::Error(format!(
+                    "UNKNOWN_REASONING_EFFORT: workflow '{id}' state '{state_name}' declares \
+                     `reasoning_effort: {declared}` — it must be one of {:?}. Omit the key to \
+                     inherit the run's effort override, or the configured default (V32).",
+                    crate::tuning::known_effort_levels()
+                )));
             }
         }
     }
@@ -5340,6 +5382,73 @@ mod tests {
             }),
         }});
         assert!(errors_with(&config, "CYCLE_DETECTED").is_empty());
+    }
+
+    // --- V32 — declared reasoning effort must be a known level ----------------
+
+    fn flow_with_state_effort(effort: Value) -> Value {
+        let mut state = json!({
+            "transitions": { "go": {
+                "target": "done", "actor": "agent", "executor": { "kind": "noop" }
+            }}
+        });
+        state["reasoning_effort"] = effort;
+        json!({
+            "workflows": { "flow.diagnose": {
+                "initialState": "diagnosing",
+                "states": { "diagnosing": state, "done": { "terminal": true } }
+            }}
+        })
+    }
+
+    /// A level drawn from the tuning maps is the sanctioned shape and passes.
+    #[test]
+    fn a_known_state_reasoning_effort_passes_v32() {
+        for level in ["xhigh", "low", "medium", "none"] {
+            let config = flow_with_state_effort(json!(level));
+            assert!(
+                errors_with(&config, "UNKNOWN_REASONING_EFFORT").is_empty(),
+                "`{level}` is a key of the shipped tuning maps and must pass"
+            );
+        }
+    }
+
+    /// A state with no declaration is untouched — the regression fence for the
+    /// thousands of shipped states that never declare the key.
+    #[test]
+    fn a_state_without_reasoning_effort_is_untouched_by_v32() {
+        let config = json!({
+            "workflows": { "flow.diagnose": {
+                "initialState": "diagnosing",
+                "states": {
+                    "diagnosing": { "transitions": { "go": {
+                        "target": "done", "actor": "agent", "executor": { "kind": "noop" }
+                    }}},
+                    "done": { "terminal": true }
+                }
+            }}
+        });
+        assert!(errors_with(&config, "UNKNOWN_REASONING_EFFORT").is_empty());
+    }
+
+    /// A typo must fail at `praxec check` — BEFORE the human gate and before any
+    /// lease is taken — not mid-run after the operator has already approved.
+    #[test]
+    fn an_unknown_state_reasoning_effort_is_rejected_at_load() {
+        let config = flow_with_state_effort(json!("xhig"));
+        let errs = errors_with(&config, "UNKNOWN_REASONING_EFFORT");
+        assert_eq!(errs.len(), 1, "expected one V32 error: {errs:?}");
+        assert!(
+            errs[0].contains("diagnosing") && errs[0].contains("xhigh"),
+            "the error must name the state and the legal values: {errs:?}"
+        );
+    }
+
+    /// The same mistake in a different shape (wrong JSON type) fails identically.
+    #[test]
+    fn a_non_string_state_reasoning_effort_is_rejected_at_load() {
+        let config = flow_with_state_effort(json!(3));
+        assert!(!errors_with(&config, "UNKNOWN_REASONING_EFFORT").is_empty());
     }
 
     // --- V31 — exclusive-resource must be leased -----------------------------
