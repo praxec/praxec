@@ -297,11 +297,12 @@ impl WorkflowRuntime {
             .unwrap_or_default()
     }
 
-    /// Lock holder for a run's pool leases — keyed on the RUN, not the instance,
-    /// so every instance of the run (root + sub-workflows) shares one lease and a
-    /// child's activity refreshes it. `run_id` is total (minted at start).
+    /// Lock holder for a run's pool leases — keyed on `run_ref` (the run TREE's
+    /// stable identity), not the instance, so every instance of the run (root +
+    /// sub-workflows) shares one lease and a child's activity refreshes it.
+    /// `run_ref` is engine-minted at the root boundary and always present here.
     fn run_lease_holder(run_env: &crate::run_env::RunEnv) -> Option<String> {
-        run_env.run_id.as_deref().map(|r| format!("run:{r}"))
+        run_env.run_ref.as_deref().map(|r| format!("run:{r}"))
     }
 
     /// Acquire one member of each pool the definition declares and is not already
@@ -1012,8 +1013,14 @@ impl WorkflowRuntime {
         // its dedup semantics (the store enforces run_id uniqueness); absence
         // means "no dedup requested", not "no identity".
         let mut run_env = request.run_env;
-        if run_env.run_id.is_none() {
-            run_env.run_id = Some(instance_id.clone());
+        // Stamp the ROOT run's internal identity (`run_ref`) — always present,
+        // inherited verbatim by sub-workflows, the holder key for pool leases.
+        // Distinct from `run_id` (optional caller correlation, left untouched so
+        // the §20.2 audit contract — null when unsupplied — holds). Root only: a
+        // child (`parent.is_some()`) inherits the root's `run_ref` via `run_env`
+        // and must not overwrite it.
+        if request.parent.is_none() {
+            run_env.run_ref = Some(instance_id.clone());
         }
         // Run-scoped exclusive-pool lease (collision-free parallel runs). A root
         // run leases one member of each pool its definition declares BEFORE the

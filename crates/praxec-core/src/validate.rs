@@ -5278,7 +5278,7 @@ mod tests {
             .collect()
     }
 
-    fn wf_ref(from: &str, to: &str) -> Value {
+    fn wf_ref(_from: &str, to: &str) -> Value {
         json!({
             "initialState": "s",
             "states": {

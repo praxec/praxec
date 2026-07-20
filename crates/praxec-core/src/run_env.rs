@@ -143,6 +143,15 @@ pub struct RunEnv {
     /// SPEC §20.2 trace id, same lifecycle as `run_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// The ROOT run's stable internal identity, set at the run boundary and
+    /// inherited verbatim by every sub-workflow. Distinct from `run_id` (which is
+    /// OPTIONAL caller-supplied correlation, SPEC §20.2, and stays null when the
+    /// caller supplies none — an audit contract): `run_ref` is engine-minted,
+    /// always present, and identifies the run TREE. It is the holder key for
+    /// run-scoped exclusive-pool leases, so the root and its browser-touching
+    /// child caps share one lease. Never surfaced as a correlation field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_ref: Option<String>,
     /// Run-scoped exclusive-pool leases: `pool name -> leased connection name`.
     ///
     /// A flow declaring `exclusive_pools: [browser]` leases one member of the
@@ -165,6 +174,7 @@ impl RunEnv {
             repo_root,
             run_id,
             trace_id,
+            run_ref: None,
             leased: std::collections::BTreeMap::new(),
         }
     }
@@ -182,6 +192,7 @@ impl RunEnv {
             repo_root: RepoRoot::for_test(),
             run_id: None,
             trace_id: None,
+            run_ref: None,
             leased: std::collections::BTreeMap::new(),
         }
     }

@@ -1,15 +1,11 @@
-//! Run identity is TOTAL: every started run has a `run_id`.
+//! Run identity is TOTAL via `run_ref` — the engine-minted internal identity of
+//! the run TREE — WITHOUT polluting `run_id` (optional caller correlation).
 //!
-//! `RunEnv.run_id` is caller-supplied and optional — the MCP handler passes it
-//! through from an optional argument, and the headless orchestrator hardcodes
-//! `None`. Anything downstream that needs a per-run identity (evidence paths,
-//! per-run resource isolation) therefore had no identity to key on for a large
-//! class of legitimate runs.
-//!
-//! The fix is to ELIMINATE the absent case rather than fail on it: mint the
-//! instance id as the run id when the caller supplies none. A caller-supplied id
-//! keeps its dedup semantics (the store enforces run_id uniqueness); absence
-//! means "no dedup requested", not "no identity".
+//! `RunEnv.run_id` is caller-supplied and optional (SPEC §20.2 correlation);
+//! anything downstream needing a per-run identity for RESOURCE isolation (pool
+//! leases) uses `run_ref` instead, which the engine stamps at the root boundary
+//! and every sub-workflow inherits. This keeps the audit contract ("run_id null
+//! when the caller supplies none") intact while giving the lease a total key.
 
 use std::sync::Arc;
 
@@ -78,25 +74,29 @@ async fn start_with(runtime: &WorkflowRuntime, run_env: praxec_core::RunEnv) -> 
         .to_string()
 }
 
-/// A run started without a caller-supplied `run_id` still has one afterwards.
-/// This is what makes `$.run.run_id` a total scope rather than one that resolves
-/// on the MCP path and vanishes under `praxec orchestrate`.
+/// A run started without a caller-supplied `run_id` gets a total `run_ref` (the
+/// internal identity the pool lease keys on) while `run_id` stays None — the
+/// §20.2 audit contract is preserved, and per-run isolation still has an identity.
 #[tokio::test]
-async fn a_run_started_without_a_run_id_still_gets_one() {
+async fn a_run_gets_a_run_ref_but_run_id_stays_caller_controlled() {
     let (runtime, store) = runtime_with_store();
     // RunEnv::for_test() carries run_id: None — the orchestrator's exact shape.
     let id = start_with(&runtime, praxec_core::RunEnv::for_test()).await;
 
     let saved = store.load(&id).await.unwrap();
     assert_eq!(
-        saved.run_env.run_id.as_deref(),
+        saved.run_env.run_ref.as_deref(),
         Some(id.as_str()),
-        "an absent run_id must be minted from the instance id, not left None"
+        "run_ref must be minted from the root instance id (total identity)"
+    );
+    assert!(
+        saved.run_env.run_id.is_none(),
+        "run_id is caller correlation and must stay None when unsupplied"
     );
 }
 
-/// A caller-supplied `run_id` is preserved verbatim — minting must not clobber
-/// it, or the store's run_id-uniqueness dedup silently stops working.
+/// A caller-supplied `run_id` is preserved verbatim — `run_ref` minting is
+/// separate and must not touch the correlation id or its dedup semantics.
 #[tokio::test]
 async fn a_caller_supplied_run_id_is_preserved() {
     let (runtime, store) = runtime_with_store();
@@ -113,22 +113,25 @@ async fn a_caller_supplied_run_id_is_preserved() {
         Some("caller-chosen-run"),
         "a supplied run_id is the caller's dedup key and must survive"
     );
+    assert!(
+        saved.run_env.run_ref.is_some(),
+        "run_ref is minted regardless"
+    );
 }
 
-/// Two runs started with no supplied id get DISTINCT identities. If minting
-/// produced a shared constant, per-run isolation keyed on it would silently
-/// collapse into one shared bucket.
+/// Two runs get DISTINCT `run_ref`s. A shared constant would collapse per-run
+/// resource isolation into one bucket.
 #[tokio::test]
-async fn two_unidentified_runs_get_distinct_run_ids() {
+async fn two_runs_get_distinct_run_refs() {
     let (runtime, store) = runtime_with_store();
     let a = start_with(&runtime, praxec_core::RunEnv::for_test()).await;
     let b = start_with(&runtime, praxec_core::RunEnv::for_test()).await;
 
-    let ra = store.load(&a).await.unwrap().run_env.run_id;
-    let rb = store.load(&b).await.unwrap().run_env.run_id;
+    let ra = store.load(&a).await.unwrap().run_env.run_ref;
+    let rb = store.load(&b).await.unwrap().run_env.run_ref;
     assert!(ra.is_some() && rb.is_some());
     assert_ne!(
         ra, rb,
-        "minted run ids must be per-run, not a shared constant"
+        "minted run refs must be per-run, not a shared constant"
     );
 }
