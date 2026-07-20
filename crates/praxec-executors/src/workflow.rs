@@ -330,11 +330,23 @@ impl Executor for WorkflowExecutor {
                         );
                 }
 
-                let start_resp = runtime
-                    .start(StartWorkflow {
-                        definition_id: definition_id.clone(),
-                        input: sub_input,
-                        principal: Principal::anonymous(),
+                // `Box::pin` the recursive drive. A `kind: workflow` transition
+                // spawns a child by calling `runtime.start`, which synchronously
+                // drives the child's OWN deterministic chain — which may spawn
+                // again. A cyclic graph therefore recurses `start → chain →
+                // execute → start` on one stack until the depth guard fires at
+                // MAX_WORKFLOW_DEPTH. Left inline, each level embeds the child's
+                // whole `start` state machine into this executor's future, so the
+                // live stack grows by a large frame per level and overflows in a
+                // debug build BEFORE the guard is reached (the guard becomes a
+                // correctness fiction). Boxing moves each level's state machine to
+                // the heap, so per-level stack is one thin poll frame and the
+                // guard is what actually stops the recursion — fail-fast, not
+                // fatal-abort. Costs one heap alloc per sub-workflow spawn.
+                let start_resp = Box::pin(runtime.start(StartWorkflow {
+                    definition_id: definition_id.clone(),
+                    input: sub_input,
+                    principal: Principal::anonymous(),
                         // Inherit the parent's run-ambient env (or the routed
                         // repo when a `repoRoot` override is set — see
                         // `child_run_env` above). The run/trace correlation must
@@ -354,13 +366,13 @@ impl Executor for WorkflowExecutor {
                         // the reuse path above), which sees the child terminal
                         // and advances. Only the SPAWN path links — the reuse
                         // path re-checks an already-linked child.
-                        parent: Some(ParentLink {
-                            workflow_id: request.workflow.id.clone(),
-                            transition: request.transition.clone().unwrap_or_default(),
-                        }),
-                    })
-                    .await
-                    .map_err(|e| {
+                    parent: Some(ParentLink {
+                        workflow_id: request.workflow.id.clone(),
+                        transition: request.transition.clone().unwrap_or_default(),
+                    }),
+                }))
+                .await
+                .map_err(|e| {
                         if use_block.is_some() {
                             let kind = "cap_start_failed";
                             let audit = self.audit.clone();
