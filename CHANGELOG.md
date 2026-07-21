@@ -10,6 +10,23 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+## [0.0.27] — 2026-07-20 — dogfood hardening: three load-time poka-yokes
+
+The follow-up release to v0.0.26's browser E2E substrate. Running that substrate
+against real applications surfaced defects in the engine as well as the workflow
+pack; this is the engine half. Every change here moves a failure **earlier** — from
+mid-run to load time, or from one-at-a-time to all-at-once — and none of them
+changes what is legal, so upgrading is behaviour-preserving for a config that was
+already correct.
+
+One correction worth recording, because it was the campaign's own headline finding:
+the multi-model stall was attributed to unplumbed reasoning bounds. That diagnosis
+was **wrong**. Reasoning effort has been plumbed end-to-end and capped at `"low"` by
+default since v0.0.15 (`ReasoningTuning.default_effort`, pinned by a test), so the
+stall has **no confirmed root cause** and should not be considered resolved by this
+release. The per-state knob below is a real ergonomic gap that the campaign exposed —
+it is not the stall fix.
+
 ### Added — per-state `reasoning_effort:`
 
 - **Per-state `reasoning_effort:`** completes the per-state trio with `affinity:` and
