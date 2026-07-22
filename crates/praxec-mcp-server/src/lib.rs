@@ -375,10 +375,20 @@ impl PraxecServer {
             }
         };
 
+        // Fail-fast fence: never push a form that cannot resolve the gate
+        // (defect-marked projection, or a declared schema no elicitation
+        // answer could satisfy). The pull handle remains for those.
+        let (message, requested_schema) = match elicit::plan(&gate) {
+            elicit::FormPlan::Push { message, schema } => (message, schema),
+            elicit::FormPlan::Skip { reason } => {
+                tracing::warn!(reason = %reason, "elicitation push skipped; returning parked result");
+                return Ok(result);
+            }
+        };
         let params = CreateElicitationRequestParams::FormElicitationParams {
             meta: None,
-            message: elicit::message(&gate),
-            requested_schema: elicit::form_schema(&gate),
+            message,
+            requested_schema,
         };
         let elicited = match peer.create_elicitation(params).await {
             Ok(elicited) => elicited,
