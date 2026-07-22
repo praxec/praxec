@@ -172,6 +172,56 @@ pub fn resolve_value(
                     Value::String(result)
                 }
 
+                // `{ pick: { from, by, eq } }` — the FIRST element of the
+                // `from` array whose `by` dot-path equals the resolved `eq`
+                // (serde_json `Value` equality — a string `eq` matches string
+                // element keys, a numeric `eq` matches numeric ones; numbers
+                // are NOT string-rendered). `from` and `eq` resolve like any
+                // other operand: path strings or literals. No match, a
+                // non-array `from`, or a malformed declaration resolve to
+                // `Value::Null` (FALLBACK-05 — this function stays
+                // infallible). The governed fail-fast fence lives at the
+                // submit-time choice guard (CHOICE_MISMATCH), NOT here: the
+                // guard proves the chosen key is in-set before a gate submit
+                // ever reaches this operator.
+                "pick" => {
+                    let Some(decl) = args.as_object() else {
+                        return Value::Null;
+                    };
+                    let (Some(from_spec), Some(by), Some(eq_spec)) = (
+                        decl.get("from"),
+                        decl.get("by").and_then(Value::as_str),
+                        decl.get("eq"),
+                    ) else {
+                        return Value::Null;
+                    };
+                    let from = resolve_value(
+                        from_spec,
+                        arguments,
+                        context,
+                        workflow_input,
+                        executor_output,
+                        run_env,
+                    );
+                    let Some(items) = from.as_array() else {
+                        return Value::Null;
+                    };
+                    let eq = resolve_value(
+                        eq_spec,
+                        arguments,
+                        context,
+                        workflow_input,
+                        executor_output,
+                        run_env,
+                    );
+                    let by_pointer = crate::guards::path_to_pointer(by);
+                    items
+                        .iter()
+                        .find(|element| element.pointer(&by_pointer) == Some(&eq))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                }
+
                 _ => spec.clone(),
             }
         }
@@ -406,6 +456,69 @@ mod tests {
                 "read_in_scopes disagrees with predicate for `{expr}`"
             );
         }
+    }
+
+    /// Resolve a `pick` spec against a candidates array in context and a
+    /// chosen id in arguments — the shape the HITL choice gates use.
+    fn pick(spec: Value, context: Value, arguments: Value) -> Value {
+        resolve_value(&spec, &arguments, &context, &json!({}), &json!({}), None)
+    }
+
+    #[test]
+    fn pick_selects_the_matching_element() {
+        let ctx = json!({ "candidates": [
+            { "id": "a", "name": "Alpha" },
+            { "id": "b", "name": "Beta" },
+        ]});
+        let spec = json!({ "pick": {
+            "from": "$.context.candidates", "by": "id", "eq": "$.arguments.chosen_id"
+        }});
+        let got = pick(spec, ctx, json!({ "chosen_id": "b" }));
+        assert_eq!(got, json!({ "id": "b", "name": "Beta" }));
+    }
+
+    #[test]
+    fn pick_no_match_is_null() {
+        let ctx = json!({ "candidates": [{ "id": "a" }] });
+        let spec = json!({ "pick": {
+            "from": "$.context.candidates", "by": "id", "eq": "$.arguments.chosen_id"
+        }});
+        assert_eq!(pick(spec, ctx, json!({ "chosen_id": "z" })), Value::Null);
+    }
+
+    #[test]
+    fn pick_over_non_array_is_null() {
+        let spec = json!({ "pick": {
+            "from": "$.context.candidates", "by": "id", "eq": "a"
+        }});
+        // Non-array and absent `from` both coalesce to null.
+        for ctx in [json!({ "candidates": "not-an-array" }), json!({})] {
+            assert_eq!(pick(spec.clone(), ctx, json!({})), Value::Null);
+        }
+        // A malformed declaration (missing `by`) is null too — never a panic.
+        let malformed = json!({ "pick": { "from": "$.context.candidates", "eq": "a" } });
+        assert_eq!(
+            pick(
+                malformed,
+                json!({ "candidates": [{ "id": "a" }] }),
+                json!({})
+            ),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn pick_operands_may_be_paths_or_literals() {
+        // Literal `from` array + literal `eq`.
+        let spec = json!({ "pick": {
+            "from": [{ "id": "a" }, { "id": "b" }], "by": "id", "eq": "b"
+        }});
+        assert_eq!(pick(spec, json!({}), json!({})), json!({ "id": "b" }));
+        // Path `from` + literal numeric `eq` — Value equality, no string
+        // rendering of numbers.
+        let ctx = json!({ "candidates": [{ "id": 1 }, { "id": 2 }] });
+        let spec = json!({ "pick": { "from": "$.context.candidates", "by": "id", "eq": 2 } });
+        assert_eq!(pick(spec, ctx, json!({})), json!({ "id": 2 }));
     }
 
     /// Adversarial: `$.run.repo_root` is a single leaf, matched EXACTLY — a

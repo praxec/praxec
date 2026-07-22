@@ -10,6 +10,65 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+### Added — HITL elicitation context: human gates that carry their own decision context
+
+A human gate used to park a mission with whatever prompt happened to be around and
+hope the operator knew why they were being asked. This branch makes the gate itself
+carry everything the decision needs — the question, the evidence, and the option
+set — and makes the validator prove at **load time** that it always can. The full
+contract, including the migration recipe for pack authors, is in
+[`docs/hitl-elicitation.md`](docs/hitl-elicitation.md).
+
+- **Prompt-source chain (E1).** A parked gate resolves its prompt through a fixed
+  chain: the transition's `prompt`/`goal`/`title` → the instance context's `prompt`
+  string (the caller-seeded convention) → the enclosing state's `goal`, rendered
+  through the same template renderer as state guidance. **V33
+  `HUMAN_GATE_NO_PROMPT_SOURCE`** rejects at load any transition-level
+  `actor: human` gate with no statically-guaranteed link — a transition prompt key,
+  a state `goal`, or a required-or-defaulted string `prompt` input (whose
+  input→context seeding guarantees `$.context.prompt`). The now-unreachable runtime
+  fallback is not deleted but instrumented: a firing on fresh config is reported as
+  a validator↔runtime parity breach.
+- **`presents:` (E2).** A gate transition declares which `$.context.<key>` values
+  the operator sees alongside the question — a projection, not a context dump.
+  Resolution is **all-or-nothing**: a malformed pointer, an unresolvable key, or a
+  projection over the byte budget defect-marks the gate (`PRESENTS_UNRESOLVED`)
+  rather than showing a partial view. **V34 `INVALID_PRESENTS`** rejects at load a
+  malformed declaration, a pointer to a context key nothing in the workflow can
+  have written, or a `presents:` on a non-human transition (a dead declaration).
+- **`choices:` (E3).** A gate transition declares a typed option set drawn from a
+  live context array (`{ field, from, value, title? }`); the elicitation form
+  renders it as a titled single-select enum, and the chosen value is submitted as a
+  plain string argument. **V35 `INVALID_CHOICES`** checks the declaration at load
+  through the same parser the runtime uses, so the validator can never accept a
+  shape the runtime rejects. The **`pick` output-mapping operator** selects the
+  array element the chosen key names, preserving downstream `chosen: object`
+  contracts while the human answers with a string. The **`CHOICE_MISMATCH` submit
+  guard** rejects any submission whose choice is not among the live options — on
+  the push (elicitation resume) and pull (hand-typed) paths alike, through the same
+  parser/resolver pair the gate-time projection uses, so what was offered and what
+  is accepted can never disagree. That guard is also what makes `pick`'s no-match
+  Null unreachable for governed gate submits.
+- **V36 `ELICITATION_INCOMPATIBLE_GATE` (Warning).** The "Accept can never
+  succeed" smell: a human gate whose `inputSchema` requires a non-primitive
+  property no elicitation form can collect — including the partially-doomed shape
+  where `choices:` is declared but the schema *also* requires a non-primitive
+  beyond the choice field. A Warning rather than an Error because pull-only object
+  gates (resolved via CLI/approvals with full JSON arguments) are legitimate.
+- **FormPlan push/skip fence.** Form construction now makes an explicit push/skip
+  decision: a defect-marked gate, or a declared schema whose required fields no
+  elicitation answer could satisfy, is **never pushed** as a form whose Accept is
+  doomed — the mission stays parked with its pull handle and the reason. Presented
+  context renders as labeled blocks under a per-value budget; an over-budget value
+  is truncated with a self-announcing marker naming where the full value lives
+  (`pending_human.presented`), never silently clipped.
+- **First elicitation round-trip test coverage.** The push → answer → governed
+  submit → advance loop is exercised end-to-end in tests rather than assumed.
+- **`drop_prompt_source` mutation operator.** Deletes every prompt-source link of
+  a human gate at once — transition keys, state `goal`, and the `prompt` input
+  declaration — and the harness asserts V33 kills the mutant. V33's guarantee is
+  measured, not assumed.
+
 ## [0.0.27] — 2026-07-20 — dogfood hardening: three load-time poka-yokes
 
 The follow-up release to v0.0.26's browser E2E substrate. Running that substrate
