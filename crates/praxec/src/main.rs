@@ -260,7 +260,15 @@ mod agent {
             }
             let runner: Arc<dyn AgentSessionRunner> = Arc::new(rig_runner);
             let resolver = build_agent_model_resolver(&ctx.config);
-            let mut agent_executor = AgentExecutor::new(runner, resolver);
+            // Observability — per-attempt telemetry: hand the executor the
+            // same gateway audit sink so every model attempt of a chain-walk
+            // lands one `agent.model_attempt` event (model, outcome class,
+            // duration, attempt index) under the step's workflow id +
+            // correlation. Without it a failed walk leaves only the step
+            // boundaries and an operator cannot tell a provider outage from
+            // a hang-prone lead model.
+            let mut agent_executor =
+                AgentExecutor::new(runner, resolver).with_audit_sink(ctx.audit.clone());
 
             // ADR-0007 — enable the untrusted branch when a sandbox is usable on
             // this host, sharing the runtime's RepoLocks authority so
