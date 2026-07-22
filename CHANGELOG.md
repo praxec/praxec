@@ -8,7 +8,7 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
-## [Unreleased]
+## [0.0.28] — 2026-07-22 — HITL elicitation context: gates that carry their own decision context
 
 ### Added — HITL elicitation context: human gates that carry their own decision context
 
@@ -68,6 +68,30 @@ contract, including the migration recipe for pack authors, is in
   a human gate at once — transition keys, state `goal`, and the `prompt` input
   declaration — and the harness asserts V33 kills the mutant. V33's guarantee is
   measured, not assumed.
+
+### Fixed — failure-path hardening from the same dogfood run (#95)
+
+The program that built this release was executed *through* praxec + CPM, and its
+failure telemetry closed three engine defects along the way:
+
+- **`AGENT_CHAIN_EXHAUSTED` terminal classification.** A model chain that
+  exhausts its wall across attempts no longer surfaces as the last attempt's
+  clamped `timeout after Nms` — the typed terminal error leads with the walk
+  summary: every model tried, each attempt's failure class and duration, wall
+  consumed vs budget. Single-model chains keep genuine timeout semantics.
+- **`agent.model_attempt` audit telemetry.** One event per finished model
+  attempt, stamped with the child workflow id + correlation, so a failed run's
+  audit stream shows *which* models were tried and how each ended — provider
+  outage and hang-prone lead are now distinguishable from the operator's seat.
+- **Cancelled children leave their parent recoverable.** `_subworkflow_wait`
+  was only cleared on the success path, so a cancelled child was resurrected on
+  every re-fire and the parent was permanently stuck. The dead wait is now
+  consumed (version-checked, audited) and the next submit spawns a fresh child.
+- **`purpose: ask` channels are not approval gates.** The SPEC §29
+  `enable_human_ask` injected self-loops are exempt from V33 (their prompt is
+  the agent's question, carried by the required AgentAwait marker) and are no
+  longer surfaced as promptless pseudo-approvals in the pending list — both
+  sides of the validator↔runtime parity fence, with fence tests.
 
 ## [0.0.27] — 2026-07-20 — dogfood hardening: three load-time poka-yokes
 
