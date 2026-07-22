@@ -377,11 +377,28 @@ impl PraxecServer {
 
         // Fail-fast fence: never push a form that cannot resolve the gate
         // (defect-marked projection, or a declared schema no elicitation
-        // answer could satisfy). The pull handle remains for those.
+        // answer could satisfy). The pull handle remains for those. Severity
+        // split: a DEFECT-marked gate (`PRESENTS_UNRESOLVED`/
+        // `CHOICES_UNRESOLVED` — the definition declared decision context the
+        // live instance could not project) is an authoring/runtime defect, so
+        // it logs at ERROR; a doomed-form skip (a legitimate pull-only gate
+        // this client just cannot answer) logs at WARN. Both hand back the
+        // parked result untouched — byte-identical to the no-capability path.
         let (message, requested_schema) = match elicit::plan(&gate) {
             elicit::FormPlan::Push { message, schema } => (message, schema),
             elicit::FormPlan::Skip { reason } => {
-                tracing::warn!(reason = %reason, "elicitation push skipped; returning parked result");
+                if gate.defect.is_some() {
+                    tracing::error!(
+                        workflow_id = %gate.workflow_id,
+                        transition = %gate.transition,
+                        reason = %reason,
+                        "elicitation push skipped on a defect-marked gate \
+                         (authoring/runtime defect — the declared presents/choices \
+                         did not project); returning parked result"
+                    );
+                } else {
+                    tracing::warn!(reason = %reason, "elicitation push skipped; returning parked result");
+                }
                 return Ok(result);
             }
         };
@@ -1185,4 +1202,84 @@ fn human_principal(base: &Principal) -> Principal {
         principal.subject = "elicited-human".to_string();
     }
     principal
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use praxec_core::hitl::{HitlSource, PendingHumanGate};
+
+    fn gate() -> PendingHumanGate {
+        PendingHumanGate {
+            workflow_id: "wf_42".into(),
+            definition_id: "cap.gate.human-pick-shape".into(),
+            state: "picking".into(),
+            expected_version: 7,
+            transition: "pick".into(),
+            prompt: Some("Pick one.".into()),
+            input_schema: None,
+            presented: None,
+            choices: None,
+            defect: None,
+            source: HitlSource::HumanGate,
+            since: Utc::now(),
+        }
+    }
+
+    /// g6 — the resume submit is built from the gate's own resolve handle:
+    /// EXACTLY `workflowId` + `expectedVersion` + `transition` from the gate,
+    /// plus the human's elicited content passed through VERBATIM as
+    /// `arguments`. Nothing added, nothing renamed — the wire shape is the
+    /// same `praxec.command` submit shape the pull path uses.
+    #[test]
+    fn build_gate_submit_wires_id_version_transition_arguments() {
+        let elicited = json!({ "chosen_id": "b", "rationale": "clean seams" });
+        let request = build_gate_submit(&gate(), elicited);
+        assert_eq!(request.name.as_ref(), TOOL_COMMAND);
+        let args = Value::Object(request.arguments.expect("submit carries arguments"));
+        assert_eq!(
+            args,
+            json!({
+                "workflowId": "wf_42",
+                "expectedVersion": 7,
+                "transition": "pick",
+                "arguments": { "chosen_id": "b", "rationale": "clean seams" }
+            }),
+            "the submit must be exactly the gate's resolve handle + the \
+             elicited content as arguments"
+        );
+    }
+
+    /// g6 — an anonymous caller who accepted the form IS the human channel:
+    /// the resume principal gains [`Principal::HUMAN_ROLE`] and the
+    /// `elicited-human` subject. An already-human principal is idempotent —
+    /// no duplicate role, subject preserved.
+    #[test]
+    fn human_principal_elevates_anonymous_to_elicited_human() {
+        let elevated = human_principal(&Principal::anonymous());
+        assert!(elevated.is_human(), "must pass the `actor: human` gate");
+        assert_eq!(elevated.subject, "elicited-human");
+        assert_eq!(elevated.roles, vec![Principal::HUMAN_ROLE.to_string()]);
+        assert!(elevated.permissions.is_empty(), "no permission escalation");
+
+        // Idempotence: elevating an already-human principal changes nothing.
+        let named_human = Principal {
+            subject: "matt".to_string(),
+            roles: vec![Principal::HUMAN_ROLE.to_string()],
+            permissions: vec![],
+        };
+        let unchanged = human_principal(&named_human);
+        assert_eq!(unchanged.subject, "matt", "a real subject is preserved");
+        assert_eq!(
+            unchanged.roles,
+            vec![Principal::HUMAN_ROLE.to_string()],
+            "the human role must not be duplicated"
+        );
+
+        // The elevated-anonymous output is itself a fixed point.
+        let twice = human_principal(&elevated);
+        assert_eq!(twice.subject, elevated.subject);
+        assert_eq!(twice.roles, elevated.roles);
+    }
 }
