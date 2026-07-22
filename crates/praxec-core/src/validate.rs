@@ -598,6 +598,11 @@ fn validate_one_workflow(
     // produces: every field the reduce requires must be satisfiable from the
     // fan-in envelope of worker outputs, so a mis-wired map-reduce cannot load.
     validate_parallel_edges(id, def, out);
+    // E1–E3 (HITL elicitation context) — V33 a human gate must have a
+    // statically-guaranteed prompt source; V34/V35 `presents:`/`choices:`
+    // declarations must be well-formed and resolvable; V36 warns on a gate
+    // whose required schema can never be satisfied by a push-elicitation form.
+    validate_human_gate_elicitation(id, def, out);
 
     let Some(initial_state) = def.get("initialState").and_then(Value::as_str) else {
         out.push(Diagnostic::Error(format!(
@@ -1329,6 +1334,400 @@ fn compute_writers_into(
         }
     }
     writers
+}
+
+/// V33–V36 — the human-gate elicitation rules (E1–E3). Tier-agnostic; walks
+/// `states.*.transitions.*`.
+///
+/// SCOPE PARITY FENCE (V33): these rules govern EXACTLY transition-level
+/// `actor: human` transitions — the same predicate `hitl.rs::pending_gate`
+/// (via `human_transition`) keys on to surface a gate. A state-level
+/// `actor: human` marker alone never parks a mission (pending_gate reads only
+/// the transition's own `actor`), so it is deliberately OUT of scope here:
+/// widening the validator past the runtime predicate would reject definitions
+/// the runtime never gates on, and narrowing it would let a real gate load
+/// promptless. The `validate_clean_implies_runtime_prompt_parity` test proves
+/// the two sides agree on every shipped fixture/example.
+fn validate_human_gate_elicitation(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
+    let Some(states) = def.get("states").and_then(Value::as_object) else {
+        return;
+    };
+    let reachable = reachable_context_keys(def, states);
+    let prompt_input_guaranteed = has_guaranteed_prompt_input(def);
+
+    for (state_name, state_def) in states {
+        let Some(transitions) = state_def.get("transitions").and_then(Value::as_object) else {
+            continue;
+        };
+        let state_goal_present = state_def
+            .get("goal")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        for (t_name, t_def) in transitions {
+            let is_human = t_def.get("actor").and_then(Value::as_str) == Some("human");
+            v34_presents(id, state_name, t_name, t_def, is_human, &reachable, out);
+            v35_choices(id, state_name, t_name, t_def, is_human, &reachable, out);
+            if !is_human {
+                continue;
+            }
+            v33_prompt_source(
+                id,
+                state_name,
+                t_name,
+                t_def,
+                state_goal_present,
+                prompt_input_guaranteed,
+                out,
+            );
+            v36_elicitation_compatibility(id, state_name, t_name, t_def, out);
+        }
+    }
+}
+
+/// V33 — a human gate must have at least one STATICALLY-GUARANTEED prompt
+/// source, mirroring the runtime prompt chain in `hitl.rs::pending_gate`
+/// (transition `prompt`/`goal`/`title` → context `prompt` → state `goal`).
+/// Order-insensitive: existence of ANY link suffices; the runtime picks the
+/// first.
+fn v33_prompt_source(
+    id: &str,
+    state_name: &str,
+    t_name: &str,
+    t_def: &Value,
+    state_goal_present: bool,
+    prompt_input_guaranteed: bool,
+    out: &mut Vec<Diagnostic>,
+) {
+    let transition_key = ["prompt", "goal", "title"].into_iter().any(|k| {
+        t_def
+            .get(k)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    });
+    if transition_key || state_goal_present || prompt_input_guaranteed {
+        return;
+    }
+    out.push(Diagnostic::Error(format!(
+        "HUMAN_GATE_NO_PROMPT_SOURCE: workflow '{id}' state '{state_name}' transition \
+         '{t_name}' is a human gate with no statically-guaranteed prompt source — the \
+         operator would be asked to decide with zero context. Declare `prompt:`/`goal:`/\
+         `title:` on the transition, a `goal:` on the state, or a string workflow input \
+         named `prompt` that is required or defaulted (input→context seeding then \
+         guarantees it lands in `$.context.prompt`) (V33)."
+    )));
+}
+
+/// True when the workflow declares an input named `prompt` (in `inputs:` or
+/// `snippet.inputs`) whose presence in `$.context` at gate time is GUARANTEED:
+/// it must be required or carry a `default` (input→context seeding writes every
+/// resolved input into initial context), AND be string-typed with a string
+/// default — a non-string `prompt` would be seeded but skipped by the runtime
+/// chain's `Value::as_str` filter, silently breaking parity.
+fn has_guaranteed_prompt_input(def: &Value) -> bool {
+    [def.pointer("/inputs"), def.pointer("/snippet/inputs")]
+        .into_iter()
+        .flatten()
+        .filter_map(|inputs| inputs.get("prompt"))
+        .filter_map(Value::as_object)
+        .any(|spec| {
+            let guaranteed = spec.get("required").and_then(Value::as_bool) == Some(true)
+                || spec.contains_key("default");
+            let string_typed = match spec.get("type") {
+                None => true, // untyped: the schema does not forbid a string
+                Some(t) => t.as_str() == Some("string"),
+            };
+            let string_default = match spec.get("default") {
+                None => true,
+                Some(d) => d.as_str().is_some_and(|s| !s.trim().is_empty()),
+            };
+            guaranteed && string_typed && string_default
+        })
+}
+
+/// V34 — a declared `presents:` must be an array of `$.context.<key>` strings
+/// whose head keys are statically reachable; on a non-human transition it is a
+/// dead declaration (nothing ever surfaces it) and equally an Error.
+fn v34_presents(
+    id: &str,
+    state_name: &str,
+    t_name: &str,
+    t_def: &Value,
+    is_human: bool,
+    reachable: &HashSet<String>,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(presents) = t_def.get("presents") else {
+        return;
+    };
+    let loc = format!("workflow '{id}' state '{state_name}' transition '{t_name}'");
+    if !is_human {
+        out.push(Diagnostic::Error(format!(
+            "INVALID_PRESENTS: {loc} declares `presents:` but is not `actor: human` — only a \
+             human gate surfaces presented context, so the declaration is dead. Move it to the \
+             human gate transition or delete it (V34)."
+        )));
+        return;
+    }
+    let Some(entries) = presents.as_array() else {
+        out.push(Diagnostic::Error(format!(
+            "INVALID_PRESENTS: {loc}: `presents` must be an array of \"$.context.<key>\" \
+             strings, got {} (V34).",
+            json_type_name(presents)
+        )));
+        return;
+    };
+    for entry in entries {
+        let Some(pointer) = entry.as_str() else {
+            out.push(Diagnostic::Error(format!(
+                "INVALID_PRESENTS: {loc}: presents entry {entry} is not a string (V34)."
+            )));
+            continue;
+        };
+        let Some(key) = single_context_key(pointer) else {
+            out.push(Diagnostic::Error(format!(
+                "INVALID_PRESENTS: {loc}: presents entry '{pointer}' must be \
+                 \"$.context.<key>\" with a single key segment (V34)."
+            )));
+            continue;
+        };
+        if !reachable.contains(key) {
+            out.push(Diagnostic::Error(format!(
+                "INVALID_PRESENTS: {loc}: presents entry '{pointer}' names context key \
+                 '{key}', which nothing in this workflow can have written (not a declared \
+                 input, initialContext key, transition/onEnter output, or use.outputs \
+                 binding) — the gate would be defect-marked at runtime (V34)."
+            )));
+        }
+    }
+}
+
+/// V35 — a declared `choices:` must parse (via the single-source-of-truth
+/// `hitl::transition_choices`), name a `type: string` inputSchema property as
+/// its `field`, and draw `from` a reachable `$.context.<key>`; on a non-human
+/// transition it is dead and an Error.
+fn v35_choices(
+    id: &str,
+    state_name: &str,
+    t_name: &str,
+    t_def: &Value,
+    is_human: bool,
+    reachable: &HashSet<String>,
+    out: &mut Vec<Diagnostic>,
+) {
+    if t_def.get("choices").is_none() {
+        return;
+    }
+    let loc = format!("workflow '{id}' state '{state_name}' transition '{t_name}'");
+    if !is_human {
+        out.push(Diagnostic::Error(format!(
+            "INVALID_CHOICES: {loc} declares `choices:` but is not `actor: human` — only a \
+             human gate renders a choice form, so the declaration is dead (V35)."
+        )));
+        return;
+    }
+    // Single source of truth: the SAME parser gate-time projection and the
+    // submit-time choice guard use — the validator can never accept a shape
+    // the runtime rejects.
+    let Some(decl) = crate::hitl::transition_choices(t_def) else {
+        out.push(Diagnostic::Error(format!(
+            "INVALID_CHOICES: {loc}: malformed `choices` declaration — expected \
+             {{ field, from, value, title? }} with string values (V35)."
+        )));
+        return;
+    };
+    let field_is_string_prop = t_def
+        .pointer(&format!(
+            "/inputSchema/properties/{}/type",
+            pointer_escape(&decl.field)
+        ))
+        .and_then(Value::as_str)
+        == Some("string");
+    if !field_is_string_prop {
+        out.push(Diagnostic::Error(format!(
+            "INVALID_CHOICES: {loc}: `choices.field` '{}' must name a `type: string` \
+             property of this transition's `inputSchema` — the chosen enum value is \
+             submitted as that string argument (V35).",
+            decl.field
+        )));
+    }
+    match single_context_key(&decl.from) {
+        None => {
+            out.push(Diagnostic::Error(format!(
+                "INVALID_CHOICES: {loc}: `choices.from` '{}' must be \"$.context.<key>\" \
+                 with a single key segment (V35).",
+                decl.from
+            )));
+        }
+        Some(key) if !reachable.contains(key) => {
+            out.push(Diagnostic::Error(format!(
+                "INVALID_CHOICES: {loc}: `choices.from` '{}' names context key '{key}', \
+                 which nothing in this workflow can have written — the option list could \
+                 never resolve and the gate would be defect-marked at runtime (V35).",
+                decl.from
+            )));
+        }
+        Some(_) => {}
+    }
+}
+
+/// V36 (Warning) — the "Accept can never succeed" smell, two shapes:
+///
+/// 1. NO `choices:`: the `inputSchema` contains a non-primitive
+///    (object/array) property AND a non-empty `required:`. A push-elicitation
+///    form can only collect primitives, so its accepted answer fails the
+///    submit's schema validation every time.
+/// 2. WITH `choices:`: the schema additionally REQUIRES a non-primitive
+///    property beyond `choices.field`. The rendered choice form collects only
+///    the choice field (plus optional primitive extras like a rationale), so
+///    its accepted answer cannot satisfy that other required property —
+///    partially-doomed.
+///
+/// Warning, not Error: pull-only object gates (resolved via CLI/approvals
+/// with full JSON arguments) are legitimate.
+fn v36_elicitation_compatibility(
+    id: &str,
+    state_name: &str,
+    t_name: &str,
+    t_def: &Value,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Some(schema) = t_def.get("inputSchema") else {
+        return;
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if required.is_empty() {
+        return;
+    }
+    let props = schema.get("properties").and_then(Value::as_object);
+    let is_non_primitive = |name: &str| {
+        props
+            .and_then(|p| p.get(name))
+            .and_then(|p| p.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "object" || t == "array")
+    };
+    if t_def.get("choices").is_none() {
+        let non_primitive: Vec<&str> = props
+            .map(|props| {
+                props
+                    .iter()
+                    .filter(|(_, p)| {
+                        matches!(
+                            p.get("type").and_then(Value::as_str),
+                            Some("object") | Some("array")
+                        )
+                    })
+                    .map(|(k, _)| k.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if non_primitive.is_empty() {
+            return;
+        }
+        out.push(Diagnostic::Warning(format!(
+            "ELICITATION_INCOMPATIBLE_GATE: workflow '{id}' state '{state_name}' transition \
+             '{t_name}' has non-primitive inputSchema propert(ies) [{}] alongside a non-empty \
+             `required:` and no `choices:` — a push-elicitation form can only collect \
+             primitives, so an elicited answer can never satisfy the submit's schema \
+             (\"Accept can never succeed\"). Declare `choices:` (+ a `pick` output) to make \
+             the gate push-resolvable, or accept pull-only resolution (V36).",
+            non_primitive.join(", ")
+        )));
+        return;
+    }
+    // A malformed `choices:` is V35's Error; nothing sound to cross-check here.
+    let Some(decl) = crate::hitl::transition_choices(t_def) else {
+        return;
+    };
+    for name in required
+        .iter()
+        .filter(|n| **n != decl.field && is_non_primitive(n))
+    {
+        out.push(Diagnostic::Warning(format!(
+            "ELICITATION_INCOMPATIBLE_GATE: workflow '{id}' state '{state_name}' transition \
+             '{t_name}' declares `choices:` but its inputSchema also requires non-primitive \
+             property '{name}' — required property '{name}' cannot be collected by the choice \
+             form (it renders only '{field}' plus optional primitive extras), so an elicited \
+             answer can never satisfy the submit's schema. Derive '{name}' via an `output:` \
+             mapping (e.g. a `pick` over the choice) instead of requiring it as an argument \
+             (V36).",
+            field = decl.field
+        )));
+    }
+}
+
+/// The single context key a `$.context.<key>` pointer names, or `None` when it
+/// is not exactly one segment. Validator-side twin of the private
+/// `hitl.rs::presents_key` (kept in lockstep by construction — both reject
+/// nested paths and indexing; the parity proof test walks every shipped gate
+/// through BOTH sides).
+fn single_context_key(pointer: &str) -> Option<&str> {
+    let key = pointer.strip_prefix("$.context.")?;
+    (!key.is_empty() && !key.contains('.') && !key.contains('[')).then_some(key)
+}
+
+/// The union scan of context keys ANY path through the workflow could have
+/// written by the time a gate parks: declared `inputs:`/`snippet.inputs` keys
+/// (input→context seeding) ∪ `initialContext` keys ∪ every transition
+/// `output:` mapping key ∪ every `use.outputs` host-path (`$.context.<key>`)
+/// binding ∪ every `onEnter.output` key (onEnter writes land in context before
+/// any transition fires — `compute_writers_into` seeds them identically, so
+/// excluding them here would false-flag a gate presenting an onEnter-written
+/// key). Deliberately order-insensitive and permissive: reachability on SOME
+/// path, not ALL paths — presence is proven, sequencing is the runtime
+/// projection's job (a gate whose key is absent at park time defect-marks).
+fn reachable_context_keys(def: &Value, states: &serde_json::Map<String, Value>) -> HashSet<String> {
+    let mut keys: HashSet<String> = HashSet::new();
+    for inputs in [def.pointer("/inputs"), def.pointer("/snippet/inputs")] {
+        if let Some(obj) = inputs.and_then(Value::as_object) {
+            keys.extend(obj.keys().cloned());
+        }
+    }
+    if let Some(obj) = def.get("initialContext").and_then(Value::as_object) {
+        keys.extend(obj.keys().cloned());
+    }
+    for state_def in states.values() {
+        if let Some(obj) = state_def
+            .pointer("/onEnter/output")
+            .and_then(Value::as_object)
+        {
+            keys.extend(obj.keys().cloned());
+        }
+        let Some(ts) = state_def.get("transitions").and_then(Value::as_object) else {
+            continue;
+        };
+        for t_def in ts.values() {
+            if let Some(obj) = t_def.get("output").and_then(Value::as_object) {
+                keys.extend(obj.keys().cloned());
+            }
+            if let Some(obj) = t_def
+                .pointer("/executor/use/outputs")
+                .and_then(Value::as_object)
+            {
+                for host_path in obj.keys() {
+                    if let Some(tail) = host_path.strip_prefix("$.context.") {
+                        keys.insert(tail.to_string());
+                    }
+                }
+            }
+        }
+        // A state-level onEnter `kind: workflow` binding writes context too.
+        if let Some(obj) = state_def
+            .pointer("/onEnter/executor/use/outputs")
+            .and_then(Value::as_object)
+        {
+            for host_path in obj.keys() {
+                if let Some(tail) = host_path.strip_prefix("$.context.") {
+                    keys.insert(tail.to_string());
+                }
+            }
+        }
+    }
+    keys
 }
 
 fn validate_guard_kinds(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
@@ -3090,9 +3489,14 @@ fn check_mapping_object(
 }
 
 /// The `$.`-rooted string operands a write-mapping value carries: the value
-/// itself when it is a bare path string, or the string operands inside a
-/// single-key arithmetic operator array (`{ add: ["$.context.n", 1] }`). Literals
-/// and nested non-operator objects carry none.
+/// itself when it is a bare path string, the string operands inside a
+/// single-key arithmetic operator array (`{ add: ["$.context.n", 1] }`), or a
+/// `pick` operator's `from`/`eq` operands (both resolve through
+/// `mapping::resolve_value`, so a typo'd scope coalesces to Null exactly like
+/// an arithmetic operand). `pick.by` is EXCLUDED: it is an element-relative
+/// dot-path (`"id"`, `"meta.key"`) applied inside each array element, not a
+/// scope-rooted read — V27's resolvable-scope rule does not apply to it.
+/// Literals and nested non-operator objects carry none.
 fn write_operand_strings(spec: &Value) -> Vec<&str> {
     match spec {
         Value::String(s) => vec![s.as_str()],
@@ -3102,6 +3506,15 @@ fn write_operand_strings(spec: &Value) -> Vec<&str> {
                 "add" | "subtract" | "multiply" | "divide" | "concat" => args
                     .as_array()
                     .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default(),
+                "pick" => args
+                    .as_object()
+                    .map(|decl| {
+                        ["from", "eq"]
+                            .into_iter()
+                            .filter_map(|k| decl.get(k).and_then(Value::as_str))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 _ => Vec::new(),
             }
@@ -5570,5 +5983,662 @@ mod tests {
             }}
         });
         assert!(errors_with(&config, "UNLEASED_EXCLUSIVE_ACCESS").is_empty());
+    }
+
+    // --- V33–V36 — human-gate elicitation rules (E1–E3) ----------------------
+
+    /// Diagnostics of Warning severity whose message carries `code`
+    /// (`errors_with` is severity-blind; V36 tests must prove Warning-ness).
+    fn warnings_with(config: &Value, code: &str) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| !d.is_error())
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains(code))
+            .collect()
+    }
+
+    /// A single-gate workflow under a `Tier::Other` id (so only the
+    /// tier-agnostic rules under test fire): the `pick` transition carries the
+    /// given extra keys, the gating state optionally a `goal`, and the
+    /// workflow definition any extra top-level keys (`inputs`, `snippet`,
+    /// `initialContext`, …).
+    fn gate_config(transition_extra: Value, state_goal: Option<&str>, def_extra: Value) -> Value {
+        let mut transition = json!({ "target": "done", "actor": "human" });
+        if let Value::Object(extra) = transition_extra {
+            for (k, v) in extra {
+                transition[k.as_str()] = v;
+            }
+        }
+        let mut state = json!({ "transitions": { "pick": transition } });
+        if let Some(goal) = state_goal {
+            state["goal"] = json!(goal);
+        }
+        let mut wf = json!({
+            "initialState": "gating",
+            "states": { "gating": state, "done": { "terminal": true } }
+        });
+        if let Value::Object(extra) = def_extra {
+            for (k, v) in extra {
+                wf[k.as_str()] = v;
+            }
+        }
+        json!({ "workflows": { "demo": wf } })
+    }
+
+    /// The original dogfood defect: a human gate with NO prompt source parks
+    /// the mission behind an opaque "waiting on you to 'pick'" push. V33 moves
+    /// that failure to `praxec check`.
+    #[test]
+    fn a_human_gate_with_no_prompt_source_is_rejected_at_load() {
+        let config = gate_config(json!({}), None, json!({}));
+        let errs = errors_with(&config, "HUMAN_GATE_NO_PROMPT_SOURCE");
+        assert_eq!(errs.len(), 1, "expected one V33 error: {errs:?}");
+        assert!(
+            errs[0].contains("gating") && errs[0].contains("pick"),
+            "the error must name the state and transition: {errs:?}"
+        );
+    }
+
+    /// Any one transition-level key of the runtime prompt chain satisfies V33.
+    /// A whitespace-only value does NOT — it would surface a blank prompt.
+    #[test]
+    fn a_transition_prompt_goal_or_title_satisfies_v33() {
+        for key in ["prompt", "goal", "title"] {
+            let config = gate_config(json!({ key: "Pick the shape" }), None, json!({}));
+            assert!(
+                errors_with(&config, "HUMAN_GATE_NO_PROMPT_SOURCE").is_empty(),
+                "transition `{key}` is a prompt source"
+            );
+        }
+        let config = gate_config(json!({ "prompt": "   " }), None, json!({}));
+        assert!(!errors_with(&config, "HUMAN_GATE_NO_PROMPT_SOURCE").is_empty());
+    }
+
+    /// The enclosing STATE's `goal` is the runtime chain's last link.
+    #[test]
+    fn a_state_goal_satisfies_v33() {
+        let config = gate_config(json!({}), Some("Pick a shape for the change"), json!({}));
+        assert!(errors_with(&config, "HUMAN_GATE_NO_PROMPT_SOURCE").is_empty());
+    }
+
+    /// A declared `prompt` input that is required (or defaulted) is seeded into
+    /// `$.context.prompt` at start (input→context seeding), so the runtime
+    /// chain's context link is statically guaranteed. Both declaration homes
+    /// (`inputs:` and `snippet.inputs`) count.
+    #[test]
+    fn a_required_prompt_input_satisfies_v33() {
+        let config = gate_config(
+            json!({}),
+            None,
+            json!({ "inputs": { "prompt": { "type": "string", "required": true } } }),
+        );
+        assert!(errors_with(&config, "HUMAN_GATE_NO_PROMPT_SOURCE").is_empty());
+        let config = gate_config(
+            json!({}),
+            None,
+            json!({ "snippet": { "inputs": {
+                "prompt": { "type": "string", "default": "Pick one" } } } }),
+        );
+        assert!(errors_with(&config, "HUMAN_GATE_NO_PROMPT_SOURCE").is_empty());
+    }
+
+    /// An input named `prompt` that is neither required nor defaulted may
+    /// simply never arrive — not a static guarantee. Likewise a non-string
+    /// `prompt` (the runtime chain's `Value::as_str` filter would skip it).
+    #[test]
+    fn an_optional_promptless_input_does_not_satisfy_v33() {
+        let config = gate_config(
+            json!({}),
+            None,
+            json!({ "inputs": { "prompt": { "type": "string" } } }),
+        );
+        assert!(!errors_with(&config, "HUMAN_GATE_NO_PROMPT_SOURCE").is_empty());
+        let config = gate_config(
+            json!({}),
+            None,
+            json!({ "inputs": { "prompt": { "type": "object", "default": {} } } }),
+        );
+        assert!(!errors_with(&config, "HUMAN_GATE_NO_PROMPT_SOURCE").is_empty());
+    }
+
+    /// V33 scope parity fence: only transition-level `actor: human` is a gate
+    /// (`hitl::pending_gate` keys on exactly that); deterministic/agent/default
+    /// actors are untouched even with no prompt anywhere.
+    #[test]
+    fn a_non_human_transition_is_out_of_v33_scope() {
+        for extra in [
+            json!({ "actor": "deterministic", "executor": { "kind": "noop" } }),
+            json!({ "actor": "agent", "executor": { "kind": "noop" } }),
+        ] {
+            let config = gate_config(extra, None, json!({}));
+            assert!(errors_with(&config, "HUMAN_GATE_NO_PROMPT_SOURCE").is_empty());
+        }
+    }
+
+    /// `presents:` on a non-human transition is a dead declaration — nothing
+    /// ever surfaces it — and is rejected rather than silently ignored.
+    #[test]
+    fn presents_on_a_non_human_transition_is_rejected() {
+        let config = gate_config(
+            json!({ "actor": "deterministic", "executor": { "kind": "noop" },
+                    "presents": ["$.context.candidates"] }),
+            Some("goal"),
+            json!({ "snippet": { "inputs": { "candidates": { "type": "array" } } } }),
+        );
+        let errs = errors_with(&config, "INVALID_PRESENTS");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("not `actor: human`"), "{errs:?}");
+    }
+
+    /// A presents head key nothing in the workflow can have written would
+    /// defect-mark the gate at runtime; rejected at load instead.
+    #[test]
+    fn an_unreachable_presents_head_key_is_rejected() {
+        let config = gate_config(
+            json!({ "title": "Pick", "presents": ["$.context.nope"] }),
+            None,
+            json!({}),
+        );
+        let errs = errors_with(&config, "INVALID_PRESENTS");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("nope"), "{errs:?}");
+    }
+
+    /// The V34 shape matrix: non-array, non-string entry, nested path, wrong
+    /// scope, empty key — each a distinct load error.
+    #[test]
+    fn presents_shape_violations_are_rejected() {
+        for presents in [
+            json!("$.context.candidates"), // not an array
+            json!([42]),                   // entry not a string
+            json!(["$.context.a.b"]),      // nested path — not a single segment
+            json!(["$.workflow.input.x"]), // wrong scope root
+            json!(["$.context."]),         // empty key
+            json!(["$.context.items[0]"]), // indexing
+        ] {
+            let config = gate_config(
+                json!({ "title": "Pick", "presents": presents }),
+                None,
+                json!({ "initialContext": { "a": 1, "items": [] } }),
+            );
+            assert!(
+                !errors_with(&config, "INVALID_PRESENTS").is_empty(),
+                "shape {presents} must be rejected"
+            );
+        }
+    }
+
+    /// Every leg of the reachability union scan admits a presents head key:
+    /// declared inputs, initialContext, a transition `output:` key anywhere in
+    /// the workflow, and a `use.outputs` host-path binding.
+    #[test]
+    fn every_union_scan_source_makes_a_presents_key_reachable() {
+        let config = json!({ "workflows": { "demo": {
+            "initialState": "gathering",
+            "snippet": { "inputs": { "candidates": { "type": "array", "required": true } } },
+            "initialContext": { "seeded": "yes" },
+            "states": {
+                "gathering": { "transitions": { "gather": {
+                    "target": "gating", "actor": "deterministic",
+                    "executor": { "kind": "workflow", "definitionId": "cap.child",
+                                  "use": { "outputs": { "$.context.child_out": "res" } } },
+                    "output": { "notes": "$.output.res" }
+                }}},
+                "gating": {
+                    "transitions": { "pick": {
+                        "target": "done", "actor": "human", "title": "Pick",
+                        "presents": ["$.context.candidates", "$.context.seeded",
+                                     "$.context.notes", "$.context.child_out"]
+                    }}
+                },
+                "done": { "terminal": true }
+            }
+        }}});
+        assert!(
+            errors_with(&config, "INVALID_PRESENTS").is_empty(),
+            "all four union-scan sources must be admitted: {:?}",
+            errors_with(&config, "INVALID_PRESENTS")
+        );
+    }
+
+    /// `choices.field` must name a `type: string` inputSchema property on the
+    /// SAME transition — the chosen enum value is submitted as that string.
+    #[test]
+    fn choices_field_must_be_a_string_property() {
+        let choices = json!({ "field": "chosen_id", "from": "$.context.candidates",
+                              "value": "id" });
+        let inputs = json!({ "snippet": { "inputs": {
+            "candidates": { "type": "array", "required": true } } } });
+        // Object-typed field — the E3 defect shape — rejected.
+        let config = gate_config(
+            json!({ "title": "Pick", "choices": choices,
+                    "inputSchema": { "type": "object",
+                        "properties": { "chosen_id": { "type": "object" } } } }),
+            None,
+            inputs.clone(),
+        );
+        let errs = errors_with(&config, "INVALID_CHOICES");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("chosen_id"), "{errs:?}");
+        // No inputSchema at all — equally rejected.
+        let config = gate_config(
+            json!({ "title": "Pick", "choices": choices }),
+            None,
+            inputs.clone(),
+        );
+        assert!(!errors_with(&config, "INVALID_CHOICES").is_empty());
+        // String-typed field — the sanctioned contract shape — passes.
+        let config = gate_config(
+            json!({ "title": "Pick", "choices": choices,
+                    "inputSchema": { "type": "object", "required": ["chosen_id"],
+                        "properties": { "chosen_id": { "type": "string" } } } }),
+            None,
+            inputs,
+        );
+        assert!(
+            errors_with(&config, "INVALID_CHOICES").is_empty(),
+            "{:?}",
+            errors_with(&config, "INVALID_CHOICES")
+        );
+    }
+
+    /// A declaration `hitl::transition_choices` cannot parse (the single
+    /// source of truth both the gate projection and the submit guard use) is
+    /// rejected at load, not defect-marked at gate time.
+    #[test]
+    fn a_malformed_choices_declaration_is_rejected() {
+        for choices in [
+            json!({ "field": "chosen_id", "from": "$.context.candidates" }), // no value
+            json!({ "field": 42, "from": "$.context.candidates", "value": "id" }),
+            json!("not-an-object"),
+        ] {
+            let config = gate_config(
+                json!({ "title": "Pick", "choices": choices }),
+                None,
+                json!({ "snippet": { "inputs": { "candidates": { "type": "array" } } } }),
+            );
+            assert!(
+                errors_with(&config, "INVALID_CHOICES")
+                    .iter()
+                    .any(|m| m.contains("malformed")),
+                "malformed declaration must be rejected"
+            );
+        }
+    }
+
+    /// `choices.from` must be a single-segment `$.context.<key>` naming a
+    /// reachable key; and `choices:` on a non-human transition is dead.
+    #[test]
+    fn choices_scope_violations_are_rejected() {
+        let schema = json!({ "type": "object",
+            "properties": { "chosen_id": { "type": "string" } } });
+        // Unreachable key.
+        let config = gate_config(
+            json!({ "title": "Pick", "inputSchema": schema,
+                    "choices": { "field": "chosen_id", "from": "$.context.nope",
+                                 "value": "id" } }),
+            None,
+            json!({}),
+        );
+        assert!(
+            errors_with(&config, "INVALID_CHOICES")
+                .iter()
+                .any(|m| m.contains("nope"))
+        );
+        // Wrong scope root.
+        let config = gate_config(
+            json!({ "title": "Pick", "inputSchema": schema,
+                    "choices": { "field": "chosen_id", "from": "$.arguments.candidates",
+                                 "value": "id" } }),
+            None,
+            json!({}),
+        );
+        assert!(!errors_with(&config, "INVALID_CHOICES").is_empty());
+        // Dead declaration on a non-human transition.
+        let config = gate_config(
+            json!({ "actor": "deterministic", "executor": { "kind": "noop" },
+                    "choices": { "field": "chosen_id", "from": "$.context.candidates",
+                                 "value": "id" } }),
+            Some("goal"),
+            json!({ "snippet": { "inputs": { "candidates": { "type": "array" } } } }),
+        );
+        assert!(
+            errors_with(&config, "INVALID_CHOICES")
+                .iter()
+                .any(|m| m.contains("not `actor: human`"))
+        );
+    }
+
+    /// The "Accept can never succeed" smell: a required non-primitive argument
+    /// with no `choices:` — a push-elicitation form can only collect
+    /// primitives. Warning (pull-only object gates are legitimate), never an
+    /// Error.
+    #[test]
+    fn an_incompatible_required_schema_without_choices_warns_v36() {
+        let schema = json!({ "type": "object", "required": ["chosen"],
+            "properties": { "chosen": { "type": "object" },
+                            "rationale": { "type": "string" } } });
+        let config = gate_config(
+            json!({ "title": "Pick", "inputSchema": schema }),
+            None,
+            json!({}),
+        );
+        let warns = warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains("gating") && warns[0].contains("pick") && warns[0].contains("chosen"),
+            "the warning must name state, transition, and offending property: {warns:?}"
+        );
+        assert!(
+            validate_workflows(&config)
+                .iter()
+                .filter(|d| d.is_error())
+                .all(|d| !d.message().contains("ELICITATION_INCOMPATIBLE_GATE")),
+            "V36 must be a Warning, never an Error"
+        );
+        // Declaring `choices:` (the remediation) clears the smell.
+        let config = gate_config(
+            json!({ "title": "Pick",
+                    "inputSchema": { "type": "object", "required": ["chosen_id"],
+                        "properties": { "chosen_id": { "type": "string" } } },
+                    "choices": { "field": "chosen_id", "from": "$.context.candidates",
+                                 "value": "id" } }),
+            None,
+            json!({ "snippet": { "inputs": { "candidates": { "type": "array" } } } }),
+        );
+        assert!(warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE").is_empty());
+        // No required — pull-optional object argument — no smell.
+        let config = gate_config(
+            json!({ "title": "Pick",
+                    "inputSchema": { "type": "object",
+                        "properties": { "chosen": { "type": "object" } } } }),
+            None,
+            json!({}),
+        );
+        assert!(warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE").is_empty());
+        // All-primitive required schema (the human-signoff shape) — no smell.
+        let config = gate_config(
+            json!({ "title": "Sign off",
+                    "inputSchema": { "type": "object", "required": ["decision"],
+                        "properties": { "decision": { "type": "string" } } } }),
+            None,
+            json!({}),
+        );
+        assert!(warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE").is_empty());
+    }
+
+    /// The partially-doomed shape: a gate WITH `choices:` whose schema also
+    /// REQUIRES a non-primitive property beyond `choices.field` — the choice
+    /// form (choice field + optional primitive extras) can never satisfy it.
+    #[test]
+    fn a_choices_gate_with_extra_required_object_property_warns_v36() {
+        let choices = json!({ "field": "chosen_id", "from": "$.context.candidates",
+                              "value": "id" });
+        let inputs = json!({ "snippet": { "inputs": {
+            "candidates": { "type": "array", "required": true } } } });
+        let config = gate_config(
+            json!({ "title": "Pick", "choices": choices,
+                    "inputSchema": { "type": "object",
+                        "required": ["chosen_id", "chosen"],
+                        "properties": { "chosen_id": { "type": "string" },
+                                        "chosen": { "type": "object" } } } }),
+            None,
+            inputs.clone(),
+        );
+        let warns = warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE");
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(
+            warns[0].contains("required property 'chosen' cannot be collected"),
+            "the warning must carry the partially-doomed detail: {warns:?}"
+        );
+        assert!(
+            validate_workflows(&config)
+                .iter()
+                .filter(|d| d.is_error())
+                .all(|d| !d.message().contains("ELICITATION_INCOMPATIBLE_GATE")),
+            "V36 stays a Warning in the choices-declared shape too"
+        );
+        // A required PRIMITIVE extra (the rationale-string shape) is
+        // collectible by the choice form — no smell. A non-REQUIRED object
+        // extra is equally fine (derived via `output:`, never elicited).
+        let config = gate_config(
+            json!({ "title": "Pick", "choices": choices,
+                    "inputSchema": { "type": "object",
+                        "required": ["chosen_id", "rationale"],
+                        "properties": { "chosen_id": { "type": "string" },
+                                        "rationale": { "type": "string" },
+                                        "chosen": { "type": "object" } } } }),
+            None,
+            inputs,
+        );
+        assert!(
+            warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE").is_empty(),
+            "{:?}",
+            warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE")
+        );
+    }
+
+    /// The three unremediated fixture gates carry exactly the V36 smell; the
+    /// warning must name each precisely (g7 remediates them; this pins the
+    /// target list). `cap.gate.human-signoff` is all-primitive and must NOT
+    /// warn.
+    #[test]
+    fn v36_warns_on_the_three_unremediated_fixture_gates() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for (rel, state, transition) in [
+            (
+                "tests/fixtures/praxec-meta/capabilities/cap.gate.human-pick-shape.yaml",
+                "awaiting_human",
+                "pick",
+            ),
+            (
+                "tests/fixtures/praxec-meta/capabilities/cap.gate.human-approve-plan.yaml",
+                "awaiting_human",
+                "approve",
+            ),
+            (
+                "tests/fixtures/cognitive-architectures/capabilities/cap.gate.human-disambiguate.yaml",
+                "awaiting_human",
+                "pick",
+            ),
+        ] {
+            let config = crate::config::load_resolved(manifest.join(rel))
+                .unwrap_or_else(|e| panic!("fixture '{rel}' must load: {e}"));
+            // Regression fence: the NEW error rules must not fire on any of
+            // these unremediated fixtures — V36 is deliberately the only new
+            // diagnostic they earn, and it is a Warning. (approve-plan carries
+            // PRE-existing standalone errors — `$.input.*` scopes, V6 — which
+            // are out of this deliverable's scope and not asserted on.)
+            for code in [
+                "HUMAN_GATE_NO_PROMPT_SOURCE",
+                "INVALID_PRESENTS",
+                "INVALID_CHOICES",
+            ] {
+                assert!(
+                    errors_with(&config, code).is_empty(),
+                    "fixture '{rel}' must not trip {code}: {:?}",
+                    errors_with(&config, code)
+                );
+            }
+            let warns = warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE");
+            assert_eq!(warns.len(), 1, "'{rel}' must warn exactly once: {warns:?}");
+            assert!(
+                warns[0].contains(state) && warns[0].contains(transition),
+                "'{rel}' warning must name state '{state}' + transition '{transition}': {warns:?}"
+            );
+        }
+        // The all-primitive gate fixture is compatible and silent.
+        let config = crate::config::load_resolved(manifest.join(
+            "tests/fixtures/cognitive-architectures/capabilities/cap.gate.human-signoff.yaml",
+        ))
+        .expect("human-signoff fixture must load");
+        assert!(warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE").is_empty());
+    }
+
+    /// V27 descends into `pick` operands: a typo'd scope in `from`/`eq` would
+    /// silently coalesce to Null at runtime (the g3 author's flagged blind
+    /// spot). `by` is element-relative and exempt.
+    #[test]
+    fn v27_checks_pick_operator_operands() {
+        // Typo'd `from` scope.
+        let d = v27_errors(&output_mapping_workflow(json!({
+            "chosen": { "pick": { "from": "$.contxt.candidates", "by": "id",
+                                  "eq": "$.arguments.chosen_id" } }
+        })));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("$.contxt.candidates"), "{}", d[0]);
+        // Typo'd `eq` scope.
+        let d = v27_errors(&output_mapping_workflow(json!({
+            "chosen": { "pick": { "from": "$.context.candidates", "by": "id",
+                                  "eq": "$.argments.chosen_id" } }
+        })));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("$.argments.chosen_id"), "{}", d[0]);
+        // The contract shape passes; `by` (element-relative dot-path) and a
+        // literal `eq` are never scope-checked.
+        let d = v27_errors(&output_mapping_workflow(json!({
+            "chosen": { "pick": { "from": "$.context.candidates", "by": "meta.key",
+                                  "eq": "literal-id" } }
+        })));
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    // --- FMECA FM-1 — validator↔runtime prompt parity proof ------------------
+
+    /// Recursively collect every YAML file under `dir`.
+    fn collect_yaml_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_yaml_files(&path, out);
+            } else if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e == "yaml" || e == "yml")
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    /// A minimally-instantiated context per input→context seeding:
+    /// `initialContext` verbatim (it wins over inputs, mirroring runtime.rs),
+    /// then every declared input — its `default` when present, a placeholder
+    /// when required, absent otherwise.
+    fn seeded_context(def: &Value) -> Value {
+        let mut ctx = match def.get("initialContext") {
+            Some(Value::Object(o)) => Value::Object(o.clone()),
+            _ => json!({}),
+        };
+        let obj = ctx.as_object_mut().expect("seeded context is an object");
+        for inputs in [def.pointer("/inputs"), def.pointer("/snippet/inputs")] {
+            let Some(map) = inputs.and_then(Value::as_object) else {
+                continue;
+            };
+            for (name, spec) in map {
+                if obj.contains_key(name) {
+                    continue; // initialContext wins (runtime.rs seeding rule)
+                }
+                if let Some(default) = spec.get("default") {
+                    obj.insert(name.clone(), default.clone());
+                } else if spec.get("required").and_then(Value::as_bool) == Some(true) {
+                    obj.insert(name.clone(), json!(format!("<{name}>")));
+                }
+            }
+        }
+        ctx
+    }
+
+    /// FMECA FM-1 — the parity proof: for EVERY shipped example/fixture
+    /// workflow that validates clean, every transition-level human gate must
+    /// resolve `Some(prompt)` through the runtime chain
+    /// (`hitl::pending_gate`) on a minimally-instantiated instance. This pins
+    /// V33's static rule to the runtime behavior it promises: validate-clean
+    /// ⇒ no operator ever sees a promptless gate. A drift on EITHER side
+    /// (validator loosened, runtime chain reordered/narrowed) fails here.
+    #[test]
+    fn validate_clean_implies_runtime_prompt_parity() {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        let mut yamls = Vec::new();
+        collect_yaml_files(&workspace.join("examples"), &mut yamls);
+        collect_yaml_files(&manifest.join("tests/fixtures"), &mut yamls);
+        assert!(!yamls.is_empty(), "corpus must not be empty");
+
+        let mut gates_checked = 0usize;
+        for path in yamls {
+            // Not every YAML is a loadable gateway config (skills, scripts,
+            // repo manifests, include fragments) — those are out of corpus.
+            let Ok(config) = crate::config::load_resolved(&path) else {
+                continue;
+            };
+            // The proof covers exactly the validate-CLEAN population; a
+            // config the validator rejects never loads, so parity is moot.
+            if validate_workflows(&config).iter().any(Diagnostic::is_error) {
+                continue;
+            }
+            let Some(workflows) = config.pointer("/workflows").and_then(Value::as_object) else {
+                continue;
+            };
+            for (wf_id, def) in workflows {
+                let Some(states) = def.get("states").and_then(Value::as_object) else {
+                    continue;
+                };
+                for (state_name, state_def) in states {
+                    let has_human_transition = state_def
+                        .get("transitions")
+                        .and_then(Value::as_object)
+                        .is_some_and(|ts| {
+                            ts.values()
+                                .any(|t| t.get("actor").and_then(Value::as_str) == Some("human"))
+                        });
+                    if !has_human_transition {
+                        continue;
+                    }
+                    let instance = crate::model::WorkflowInstance {
+                        id: "wf_parity".into(),
+                        definition_id: wf_id.clone(),
+                        definition_version: "0".into(),
+                        definition: def.clone(),
+                        state: state_name.clone(),
+                        version: 1,
+                        input: json!({}),
+                        context: seeded_context(def),
+                        started_at: chrono::Utc::now(),
+                        run_env: crate::RunEnv::for_test(),
+                        cancelled_at: None,
+                        cancelled_reason: None,
+                        depth: 0,
+                        parent: None,
+                    };
+                    let gate = crate::hitl::pending_gate(&instance).unwrap_or_else(|| {
+                        panic!(
+                            "{}: workflow '{wf_id}' state '{state_name}' has a human \
+                             transition but no pending gate",
+                            path.display()
+                        )
+                    });
+                    assert!(
+                        gate.prompt.is_some(),
+                        "PARITY BROKEN: {} workflow '{wf_id}' state '{state_name}' \
+                         validates clean but the runtime chain resolves NO prompt",
+                        path.display()
+                    );
+                    gates_checked += 1;
+                }
+            }
+        }
+        assert!(
+            gates_checked >= 5,
+            "the parity proof must exercise real shipped gates, checked only {gates_checked}"
+        );
     }
 }
