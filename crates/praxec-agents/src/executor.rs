@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use uuid::Uuid;
 
+use praxec_core::audit::{AuditEvent, AuditSink};
 use praxec_core::error::ExecutorError;
 use praxec_core::model::{Evidence, ExecuteRequest, ExecuteResult, ExecutorTelemetry};
 use praxec_core::model_resolver::FailureClass;
@@ -73,6 +74,14 @@ pub const DEFAULT_TOOL_SETUP_SECONDS: u64 = 60;
 /// manufacture a timeout. Below this, the walk stops and surfaces.
 const MIN_ATTEMPT_SECONDS: u64 = 15;
 
+/// The audit `event_type` emitted when ONE model attempt of a step's
+/// chain-walk ends — success, suspend, or classified failure. Payload:
+/// `{ attempt_index, model, outcome, error, duration_ms, transition }`,
+/// stamped with the step's workflow id + correlation so an operator tailing
+/// the audit stream can tell a provider outage from a hang-prone lead model
+/// per attempt, not just per step (v0.0.28 dogfood defect 2).
+pub const AGENT_MODEL_ATTEMPT_EVENT: &str = "agent.model_attempt";
+
 /// Resolve the effective tool-setup timeout: the step's `tool_setup_seconds`
 /// override (call-level) or [`DEFAULT_TOOL_SETUP_SECONDS`], clamped to the step's
 /// resolved `max_seconds` (a setup bound longer than the whole wall is dead code
@@ -83,6 +92,74 @@ pub(crate) fn resolve_tool_setup_timeout(cfg_seconds: Option<u64>, max_seconds: 
             .unwrap_or(DEFAULT_TOOL_SETUP_SECONDS)
             .min(max_seconds),
     )
+}
+
+/// Resolve one attempt's effective `(max_seconds, stall_seconds)` windows: the
+/// step's configured (or default) wall clamped to the ceiling AND to what's
+/// left of the step budget (`wall_cap`), then the stall window clamped to that
+/// wall (a stall bound outliving the wall would be dead code). Extracted from
+/// [`AgentExecutor::run_one`] so the chain-walk loop records the SAME clamped
+/// windows in its attempt log that the attempt actually ran under.
+pub(crate) fn effective_attempt_windows(
+    cfg: &AgentExecutorConfig,
+    wall_cap: Duration,
+) -> (u64, u64) {
+    let max_seconds = cfg
+        .max_seconds
+        .unwrap_or(DEFAULT_MAX_SECONDS)
+        .min(MAX_SECONDS_CEILING)
+        .min(wall_cap.as_secs());
+    // Stall window: never larger than the total budget (a stall bound that
+    // outlived the wall would be dead code — the total timeout would always
+    // fire first).
+    let stall_seconds = cfg
+        .stall_seconds
+        .unwrap_or(DEFAULT_STALL_SECONDS)
+        .min(max_seconds);
+    (max_seconds, stall_seconds)
+}
+
+/// One finished model attempt of a step's chain-walk — the evidence unit the
+/// terminal `AGENT_CHAIN_EXHAUSTED` / `AGENT_STEP_BUDGET_EXHAUSTED` errors
+/// summarize so an exhausted step never surfaces as just the last attempt's
+/// clamped timeout (v0.0.28 dogfood defect 1).
+struct AttemptRecord {
+    model: String,
+    /// The attempt's [`FailureClass`] (Debug form, e.g. `NetworkTimeout`,
+    /// `RateLimit429`, `Capability`) — derived from the typed classifier,
+    /// never hand-written.
+    outcome: String,
+    /// The attempt's error Display (e.g. `timeout after 74000 ms`).
+    error: String,
+    duration: Duration,
+    /// The CLAMPED wall this attempt actually ran under.
+    wall_seconds: u64,
+    /// The CLAMPED stall window this attempt actually ran under.
+    stall_seconds: u64,
+}
+
+/// Render the walk's attempt log for a terminal error message:
+/// `[1/2] model → Class after Ns (wall Ns, stall Ns): error; [2/2] …`.
+fn walk_summary(attempts: &[AttemptRecord]) -> String {
+    let n = attempts.len();
+    attempts
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            format!(
+                "[{}/{}] {} → {} after {}s (wall {}s, stall {}s): {}",
+                i + 1,
+                n,
+                a.model,
+                a.outcome,
+                a.duration.as_secs(),
+                a.wall_seconds,
+                a.stall_seconds,
+                a.error,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The durable `_agent_await` wait marker, read off the workflow context when
@@ -124,6 +201,11 @@ pub struct AgentExecutor {
     /// ADR-0007 untrusted branch — `None` until `with_untrusted_support`.
     sandbox: Option<Arc<dyn SandboxProvider>>,
     locks: Option<Arc<dyn RepoLocks>>,
+    /// Per-attempt observability — `None` until `with_audit_sink`. When wired,
+    /// every model attempt of the chain-walk lands one
+    /// [`AGENT_MODEL_ATTEMPT_EVENT`] in the audit stream (emit-only; a sink
+    /// failure never affects the run — mirrors the runner's heartbeat).
+    audit: Option<Arc<dyn AuditSink>>,
 }
 
 impl AgentExecutor {
@@ -134,7 +216,50 @@ impl AgentExecutor {
             breaker: BreakerRegistry::default(),
             sandbox: None,
             locks: None,
+            audit: None,
         }
+    }
+
+    /// Observability (v0.0.28 dogfood defect 2) — wire the gateway audit sink
+    /// so every model attempt of a chain-walk emits one
+    /// [`AGENT_MODEL_ATTEMPT_EVENT`] under the step's workflow id +
+    /// correlation. Without it the audit stream only carries the step's
+    /// boundaries and an operator cannot tell a provider outage from a
+    /// hang-prone lead model.
+    pub fn with_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.audit = Some(sink);
+        self
+    }
+
+    /// Record one attempt's end in the audit stream. Infallible by design:
+    /// pure observability, so a missing sink or a sink error is dropped rather
+    /// than failing the run it narrates (mirrors the runner's heartbeat).
+    async fn emit_model_attempt(
+        &self,
+        request: &ExecuteRequest,
+        attempt_index: usize,
+        model: &str,
+        outcome: &str,
+        error: Option<&str>,
+        duration: Duration,
+    ) {
+        let Some(sink) = &self.audit else {
+            return;
+        };
+        let mut event = AuditEvent::new(AGENT_MODEL_ATTEMPT_EVENT)
+            .with_workflow(request.workflow.id.clone())
+            .with_payload(json!({
+                "attempt_index": attempt_index,
+                "model": model,
+                "outcome": outcome,
+                "error": error,
+                "duration_ms": duration.as_millis() as u64,
+                "transition": request.transition,
+            }));
+        if let Some(c) = &request.correlation_id {
+            event = event.with_correlation(c.clone());
+        }
+        let _ = sink.record(event).await;
     }
 
     /// ADR-0007 — enable the `untrusted: true` branch: an untrusted agent runs
@@ -249,18 +374,7 @@ impl AgentExecutor {
         // full-length wall and the "budget" would bound nothing.
         wall_cap: Duration,
     ) -> Result<ExecuteResult, ExecutorError> {
-        let max_seconds = cfg
-            .max_seconds
-            .unwrap_or(DEFAULT_MAX_SECONDS)
-            .min(MAX_SECONDS_CEILING)
-            .min(wall_cap.as_secs());
-        // Stall window: never larger than the total budget (a stall bound that
-        // outlived the wall would be dead code — the total timeout would always
-        // fire first).
-        let stall_seconds = cfg
-            .stall_seconds
-            .unwrap_or(DEFAULT_STALL_SECONDS)
-            .min(max_seconds);
+        let (max_seconds, stall_seconds) = effective_attempt_windows(cfg, wall_cap);
         // Tool-setup bound: the step's call-level override or the 60s default,
         // clamped to this attempt's wall.
         let tool_setup_timeout = resolve_tool_setup_timeout(cfg.tool_setup_seconds, max_seconds);
@@ -515,6 +629,20 @@ impl Executor for AgentExecutor {
         );
         let walk_start = tokio::time::Instant::now();
 
+        // (v0.0.28 defect 1) The walk's attempt log — one record per finished
+        // attempt, so an exhausted chain surfaces WHAT WAS TRIED (model,
+        // outcome class, duration, clamped windows), never just the last
+        // attempt's clamped timeout.
+        let mut attempts: Vec<AttemptRecord> = Vec::new();
+        // The step's CONFIGURED windows (pre-clamp) — carried on the terminal
+        // error so an operator can see "configured 600s wall, last attempt
+        // clamped to 74s" at a glance.
+        let configured_wall = cfg
+            .max_seconds
+            .unwrap_or(DEFAULT_MAX_SECONDS)
+            .min(MAX_SECONDS_CEILING);
+        let configured_stall = cfg.stall_seconds.unwrap_or(DEFAULT_STALL_SECONDS);
+
         for (idx, model) in planned.iter().enumerate() {
             // How much wall is left for this attempt? Checked BEFORE the run so
             // a spent budget stops the walk instead of starting an attempt that
@@ -542,13 +670,19 @@ impl Executor for AgentExecutor {
                     format!(
                         "the {}s step budget was spent after {} model attempt(s) \
                          ({}) without a result; stopping the chain-walk rather than \
-                         starting another full-length attempt — this step needs a human",
+                         starting another full-length attempt — this step needs a human. \
+                         Walk: {}",
                         step_budget.as_secs(),
                         idx,
                         planned[..idx].join(" → "),
+                        walk_summary(&attempts),
                     ),
                 ));
             }
+            // The clamped windows THIS attempt runs under — recorded alongside
+            // the outcome so the terminal summary shows configured vs clamped.
+            let (attempt_wall, attempt_stall) = effective_attempt_windows(&cfg, remaining);
+            let attempt_start = tokio::time::Instant::now();
             match self
                 .run_one(
                     model,
@@ -562,6 +696,20 @@ impl Executor for AgentExecutor {
             {
                 Ok(result) => {
                     self.breaker.on_success(model);
+                    let outcome = if result.suspend.is_some() {
+                        "suspended"
+                    } else {
+                        "success"
+                    };
+                    self.emit_model_attempt(
+                        &request,
+                        idx,
+                        model,
+                        outcome,
+                        None,
+                        attempt_start.elapsed(),
+                    )
+                    .await;
                     let mut result = result;
                     for e in escalations.drain(..).rev() {
                         result.evidence.insert(0, e);
@@ -570,6 +718,24 @@ impl Executor for AgentExecutor {
                 }
                 Err(e) => {
                     let class = FailureClass::from_executor_error(&e);
+                    let attempt_duration = attempt_start.elapsed();
+                    self.emit_model_attempt(
+                        &request,
+                        idx,
+                        model,
+                        &format!("{class:?}"),
+                        Some(&e.to_string()),
+                        attempt_duration,
+                    )
+                    .await;
+                    attempts.push(AttemptRecord {
+                        model: model.clone(),
+                        outcome: format!("{class:?}"),
+                        error: e.to_string(),
+                        duration: attempt_duration,
+                        wall_seconds: attempt_wall,
+                        stall_seconds: attempt_stall,
+                    });
                     // Escalatable classes (incl. Timeout / AGENT_NO_RESULT)
                     // are model-health signals — feed the breaker. Content /
                     // author errors are not the model's fault and don't count.
@@ -577,6 +743,36 @@ impl Executor for AgentExecutor {
                         self.breaker.on_failure(model, Instant::now());
                     }
                     let is_last = idx + 1 == planned.len();
+                    // (v0.0.28 defect 1) The chain EXHAUSTED: the last
+                    // candidate of a MULTI-model walk failed with an
+                    // escalatable class and there is no next model. Surface
+                    // the typed AGENT_CHAIN_EXHAUSTED with the full walk
+                    // summary — never the last attempt's error alone, whose
+                    // clamped "timeout after Nms" reads as a single-model
+                    // timeout and hides everything that was tried. A
+                    // SINGLE-model chain keeps the attempt's own error
+                    // (genuine single-attempt semantics — there was no walk
+                    // to summarize); a non-escalatable class still surfaces
+                    // unchanged below (author/content errors are not
+                    // exhaustion).
+                    if class.is_infrastructure() && is_last && idx > 0 {
+                        return Err(permanent(
+                            AgentErrorCode::ChainExhausted,
+                            format!(
+                                "the full model chain was exhausted after {} attempt(s) \
+                                 consuming {}s of the {}s step budget (configured wall \
+                                 {}s, stall {}s) without a result — every candidate \
+                                 failed with an escalatable class; this step needs a \
+                                 human. Walk: {}",
+                                attempts.len(),
+                                walk_start.elapsed().as_secs(),
+                                step_budget.as_secs(),
+                                configured_wall,
+                                configured_stall,
+                                walk_summary(&attempts),
+                            ),
+                        ));
+                    }
                     if class.is_infrastructure() && !is_last {
                         tracing::warn!(
                             failed_model = %model,
@@ -1681,5 +1877,202 @@ mod tests {
             .await
             .expect_err("untrusted without a sandbox must fail fast");
         assert!(format!("{err:?}").contains("UNTRUSTED_UNAVAILABLE"));
+    }
+
+    // ── chain exhaustion (v0.0.28 dogfood defect 1) ──────────────────────
+
+    /// Every model in the chain times out — the whole walk exhausts. Stands in
+    /// for the observed incident: successive attempts consumed the step wall and
+    /// the LAST attempt's clamped `timeout after 74000 ms` surfaced as the
+    /// terminal error for the WHOLE chain, with zero evidence of what was tried.
+    struct AllTimeoutRunner {
+        seen: std::sync::Mutex<Vec<AgentSession>>,
+    }
+    impl AllTimeoutRunner {
+        fn new() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn sessions(&self) -> Vec<AgentSession> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl AgentSessionRunner for AllTimeoutRunner {
+        async fn run(&self, session: AgentSession) -> Result<AgentRunReport, ExecutorError> {
+            self.seen.lock().unwrap().push(session.clone());
+            Ok(AgentRunReport {
+                outcome: AgentRunOutcome::TimedOut,
+                transcript: String::new(),
+                model: session.model.clone(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            })
+        }
+    }
+
+    /// THE DEFECT-1 REGRESSION TEST. When a multi-model chain-walk EXHAUSTS
+    /// (the last candidate fails with an escalatable class), the terminal
+    /// error must be a typed `AGENT_CHAIN_EXHAUSTED` carrying the walk
+    /// summary — every model tried, each attempt's outcome class — NEVER the
+    /// last attempt's clamped `timeout after Nms`, which reads as a
+    /// single-model timeout and hides the whole walk from the operator.
+    #[tokio::test]
+    async fn an_exhausted_multi_model_chain_surfaces_chain_exhausted_with_the_walk_summary() {
+        let runner = Arc::new(AllTimeoutRunner::new());
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(TwoModelResolver));
+        let err = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "do something" }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("an all-timeout chain must fail");
+        let msg = match &err {
+            ExecutorError::Permanent(m) => m.clone(),
+            other => panic!(
+                "chain exhaustion must be the typed Permanent AGENT_CHAIN_EXHAUSTED, \
+                 not the last attempt's error — got {other:?}"
+            ),
+        };
+        assert!(
+            msg.starts_with("AGENT_CHAIN_EXHAUSTED"),
+            "the terminal error must LEAD with the exhaustion class: {msg}"
+        );
+        // The walk summary carries every model attempted…
+        assert!(msg.contains("openrouter:weak"), "walk summary: {msg}");
+        assert!(msg.contains("openrouter:strong"), "walk summary: {msg}");
+        // …and each attempt's outcome class (TimedOut → NetworkTimeout).
+        assert!(
+            msg.contains("NetworkTimeout"),
+            "each attempt's outcome class must be carried: {msg}"
+        );
+        // Both models were actually attempted.
+        assert_eq!(runner.sessions().len(), 2);
+        // It must SURFACE (route to the flow / a human), never re-escalate.
+        let class = FailureClass::from_executor_error(&err);
+        assert_eq!(
+            class,
+            FailureClass::ContentOther,
+            "an exhausted chain must not hand another layer a reason to escalate"
+        );
+    }
+
+    /// Genuine single-attempt semantics are preserved: a ONE-model chain that
+    /// times out keeps `ExecutorError::Timeout` (there was no walk to
+    /// summarize — the clamped timeout IS the honest terminal error).
+    #[tokio::test]
+    async fn a_single_model_chain_timeout_keeps_genuine_timeout_semantics() {
+        let runner = Arc::new(AllTimeoutRunner::new());
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("openrouter:only".into())),
+        );
+        let err = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "do something" }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("timeout");
+        assert!(
+            matches!(err, ExecutorError::Timeout(_)),
+            "a single-attempt timeout must stay a Timeout: {err:?}"
+        );
+        assert_eq!(runner.sessions().len(), 1);
+    }
+
+    /// The budget-exhausted terminal (mid-walk stop) must carry the same
+    /// per-attempt evidence — every model tried with its outcome class — not
+    /// just the bare model list.
+    #[tokio::test(start_paused = true)]
+    async fn a_spent_step_budget_reports_every_attempt_with_its_outcome() {
+        let runner = Arc::new(BudgetBurningRunner::new());
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(ThreeModelResolver));
+        let err = exec
+            .execute(request(
+                json!({
+                    "affinity": "coding",
+                    "goal": "fix the failing test",
+                    "max_seconds": 600,
+                    "step_budget_seconds": 900,
+                }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("budget spent");
+        let msg = match &err {
+            ExecutorError::Permanent(m) => m.clone(),
+            other => panic!("expected Permanent, got {other:?}"),
+        };
+        assert!(msg.starts_with("AGENT_STEP_BUDGET_EXHAUSTED"), "{msg}");
+        assert!(msg.contains("openrouter:reason-1"), "walk evidence: {msg}");
+        assert!(msg.contains("openrouter:reason-2"), "walk evidence: {msg}");
+        // NoResult classifies Capability — the summary names the class.
+        assert!(
+            msg.contains("Capability"),
+            "each attempt's outcome class must be carried: {msg}"
+        );
+    }
+
+    // ── per-attempt audit telemetry (v0.0.28 dogfood defect 2) ───────────
+
+    /// Every model attempt of the chain-walk must land ONE
+    /// `agent.model_attempt` audit event under the step's workflow id +
+    /// correlation, carrying {model, outcome, duration_ms, attempt_index} —
+    /// so an operator can tell a provider outage from a hang-prone lead
+    /// model without reading process logs.
+    #[tokio::test]
+    async fn every_model_attempt_lands_a_typed_audit_event() {
+        let audit = praxec_core::audit::MemoryAuditSink::new();
+        let runner = Arc::new(EscalatingRunner::new());
+        let exec = AgentExecutor::new(runner, Arc::new(TwoModelResolver))
+            .with_audit_sink(Arc::new(audit.clone()));
+        let mut req = request(
+            json!({ "affinity": "coding", "goal": "do something" }),
+            bare_def(),
+        );
+        req.correlation_id = Some("cor_attempt_test".into());
+        exec.execute(req).await.expect("strong model succeeds");
+
+        let attempts: Vec<_> = audit
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.event_type == AGENT_MODEL_ATTEMPT_EVENT)
+            .collect();
+        assert_eq!(
+            attempts.len(),
+            2,
+            "one event per attempt (weak failed, strong succeeded)"
+        );
+
+        // Attempt 0: the weak model's NoResult → Capability.
+        assert_eq!(attempts[0].payload["attempt_index"], json!(0));
+        assert_eq!(attempts[0].payload["model"], json!("openrouter:weak"));
+        assert_eq!(attempts[0].payload["outcome"], json!("Capability"));
+        assert!(
+            attempts[0].payload["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("AGENT_NO_RESULT")),
+            "the failed attempt carries its error: {:#}",
+            attempts[0].payload
+        );
+        assert!(attempts[0].payload["duration_ms"].is_u64());
+        assert_eq!(
+            attempts[0].workflow_id.as_deref(),
+            Some("wf_agent"),
+            "attempt events join the child workflow's id"
+        );
+        assert_eq!(
+            attempts[0].correlation_id, "cor_attempt_test",
+            "attempt events join the step's correlation"
+        );
+
+        // Attempt 1: the strong model succeeded.
+        assert_eq!(attempts[1].payload["attempt_index"], json!(1));
+        assert_eq!(attempts[1].payload["model"], json!("openrouter:strong"));
+        assert_eq!(attempts[1].payload["outcome"], json!("success"));
+        assert_eq!(attempts[1].payload["error"], json!(null));
     }
 }

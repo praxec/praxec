@@ -75,6 +75,18 @@ pub enum AgentErrorCode {
     /// so an operator can tell "one model gave up" from "the whole step ran out
     /// of time churning."
     StepBudgetExhausted,
+    /// (v0.0.28 dogfood) The model chain EXHAUSTED: the LAST candidate failed
+    /// with an escalatable (infrastructure/capability) class and there is no
+    /// next model to walk to. The message carries the full walk summary —
+    /// every model attempted, each attempt's outcome class and duration, and
+    /// the configured vs clamped windows — so the terminal error is never
+    /// just the last attempt's clamped "timeout after Nms" (which reads as a
+    /// single-model timeout and hides the walk). Classifies as `ContentOther`
+    /// (NOT `Capability`): the escalation layer itself ran out of candidates,
+    /// so this must SURFACE to the flow (→ human review), never re-escalate.
+    /// Distinct from `StepBudgetExhausted` (the walk stopped mid-chain on a
+    /// spent wall budget) — here every candidate was actually tried.
+    ChainExhausted,
 }
 
 impl AgentErrorCode {
@@ -101,6 +113,7 @@ impl AgentErrorCode {
             AgentErrorCode::ParkedSessionCorrupt => "AGENT_PARKED_SESSION_CORRUPT",
             AgentErrorCode::ParkStore => "AGENT_PARK_STORE",
             AgentErrorCode::StepBudgetExhausted => "AGENT_STEP_BUDGET_EXHAUSTED",
+            AgentErrorCode::ChainExhausted => "AGENT_CHAIN_EXHAUSTED",
         }
     }
 }
@@ -145,6 +158,14 @@ mod tests {
         assert_eq!(
             AgentErrorCode::StepBudgetExhausted.as_wire_code(),
             "AGENT_STEP_BUDGET_EXHAUSTED"
+        );
+    }
+
+    #[test]
+    fn chain_exhausted_wire_code_is_stable() {
+        assert_eq!(
+            AgentErrorCode::ChainExhausted.as_wire_code(),
+            "AGENT_CHAIN_EXHAUSTED"
         );
     }
 

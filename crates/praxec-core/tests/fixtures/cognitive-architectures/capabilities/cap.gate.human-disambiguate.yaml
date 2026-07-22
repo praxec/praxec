@@ -1,4 +1,11 @@
 # capabilities/cap.gate.human-disambiguate.yaml
+#
+# Carries the E1-E3 elicitation contract: the operator picks by
+# `chosen_id` (a titled single-select over the candidates), and the
+# `pick` output operator re-derives the FULL candidate object into
+# `chosen` — callers' `chosen: object` contract is unchanged.
+# Convention: each candidate element carries `id` (stable handle)
+# and `name` (display title).
 
 workflows:
   cap.gate.human-disambiguate:
@@ -22,14 +29,24 @@ workflows:
           pick:
             target: done
             actor: human
+            presents: ["$.context.candidates"]
+            choices:
+              field: chosen_id
+              from: "$.context.candidates"
+              value: "id"
+              title: "name"
             inputSchema:
               type: object
-              required: [chosen]
+              required: [chosen_id]
               properties:
-                chosen:    { type: object }
+                chosen_id: { type: string }
                 rationale: { type: string, default: "" }
             executor: { kind: human }
             output:
-              chosen:    "$.arguments.chosen"
+              chosen:
+                pick:
+                  from: "$.context.candidates"
+                  by: "id"
+                  eq: "$.arguments.chosen_id"
               rationale: "$.arguments.rationale"
       done: { terminal: true }

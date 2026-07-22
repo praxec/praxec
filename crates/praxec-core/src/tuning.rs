@@ -359,6 +359,45 @@ pub fn reasoning_params(vendor: &str, level: &str) -> Option<serde_json::Value> 
     }
 }
 
+/// Normalize a declared reasoning-effort level the same way [`reasoning_params`]
+/// does, so validation and application can never disagree about what a string
+/// means.
+fn normalize_effort(level: &str) -> String {
+    level.trim().to_lowercase()
+}
+
+/// Every reasoning-effort level this build understands, DERIVED from the
+/// configured `tuning.reasoning` maps rather than hard-coded at any call site —
+/// an operator who adds a level to the maps gets it accepted by the authoring
+/// validator with no Rust change.
+///
+/// The union (not the intersection) of the per-vendor maps is the vocabulary: a
+/// level is a praxec-level abstraction and each vendor map is a *translation*
+/// with a documented fallback, so a level present for one vendor is still a
+/// legitimate thing to declare.
+pub fn known_effort_levels() -> Vec<&'static str> {
+    let r = &tuning().reasoning;
+    let mut set: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    set.extend(r.anthropic_budget_tokens.keys().map(String::as_str));
+    set.extend(r.openai_effort.keys().map(String::as_str));
+    set.extend(r.gemini_level.keys().map(String::as_str));
+    set.into_iter().collect()
+}
+
+/// Whether `level` is a declarable reasoning-effort level.
+///
+/// This exists because the `ReasoningTuning` accessors deliberately FALL BACK to
+/// `medium` for an unknown level: without an up-front check, a typo
+/// (`xhig`) silently becomes a no-op cap and the author never learns. Note
+/// `medium` itself IS accepted — it is a real key of the shipped maps and means
+/// "provider default, do not cap this step", which is a meaningful thing for a
+/// state to declare even though [`reasoning_params`] emits nothing for it.
+/// The empty string is NOT declarable: omit the key instead of writing `""`.
+pub fn is_known_effort(level: &str) -> bool {
+    let level = normalize_effort(level);
+    !level.is_empty() && known_effort_levels().contains(&level.as_str())
+}
+
 /// The output-token multiplier for `level`, from the configured map; an unknown
 /// level falls back to `medium` (rig's default effort), or 4.0 if absent.
 pub fn reasoning_multiplier(level: &str) -> f64 {
@@ -439,6 +478,30 @@ mod tests {
         assert_eq!(r.openai_effort("max"), "xhigh");
         assert_eq!(r.gemini_level("low"), "low");
         assert_eq!(r.gemini_level("mystery"), "high"); // fallback
+    }
+
+    #[test]
+    fn known_effort_levels_are_derived_from_the_configured_maps() {
+        // The legal vocabulary is DERIVED from the tuning maps, never a
+        // hard-coded list in a caller — an operator who adds a level to the
+        // maps gets it accepted at authoring time with no Rust change.
+        let levels = known_effort_levels();
+        for expected in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            assert!(
+                levels.contains(&expected),
+                "`{expected}` is a key of the shipped maps so it must be legal"
+            );
+        }
+        assert!(is_known_effort("xhigh"));
+        // Case/whitespace are normalized exactly as `reasoning_params` does.
+        assert!(is_known_effort("  HIGH "));
+        // A typo must NOT be legal — the accessors silently fall back to
+        // `medium` for an unknown level, so an unvalidated typo becomes a
+        // no-op cap. That silent degrade is what validation exists to stop.
+        assert!(!is_known_effort("xhig"));
+        assert!(!is_known_effort("extra-high"));
+        // Empty is not a *declared* level: omit the key instead.
+        assert!(!is_known_effort(""));
     }
 
     #[test]

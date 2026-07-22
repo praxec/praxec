@@ -4,24 +4,25 @@
 //! `Vec<(label, mutant)>` — one mutant per applicable injection site. The label
 //! is human-readable and uniquely identifies the site (used in reports).
 //!
-//! Fourteen operators are provided:
+//! The operators provided:
 //!
-//! | Operator                  | Kind       | Expected kill? | Detector           |
-//! |---------------------------|------------|----------------|--------------------|
-//! | orphan_state              | Structural | KILLED         | reachability       |
-//! | dangle_target             | Structural | KILLED         | validate           |
-//! | deadend                   | Structural | KILLED         | validate           |
-//! | det_cycle                 | Structural | KILLED         | loop detection     |
-//! | literal_type_break        | Type       | KILLED         | runtime type check |
-//! | drop_output_write         | Contract   | KILLED         | V24 (must-write)   |
-//! | drop_initial_context_seed | Contract   | KILLED         | V24 (must-write)   |
-//! | weaken_output_source      | Contract   | KILLED         | V26 (scalar-null)  |
-//! | retarget_guard_scope      | Scope      | KILLED         | V25 (guard scope)  |
-//! | retarget_output_scope     | Scope      | KILLED         | V27 (write scope)  |
-//! | retarget_use_input_scope  | Scope      | KILLED         | V28 (use-input)    |
-//! | retarget_executor_arg_scope | Scope    | KILLED         | V29 (executor arg) |
-//! | delete_guard              | Semantic   | KILLED         | violating-ctx probe|
-//! | flip_guard_op             | Semantic   | KILLED         | violating-ctx probe|
+//! | Operator                  | Kind        | Expected kill? | Detector           |
+//! |---------------------------|-------------|----------------|--------------------|
+//! | orphan_state              | Structural  | KILLED         | reachability       |
+//! | dangle_target             | Structural  | KILLED         | validate           |
+//! | deadend                   | Structural  | KILLED         | validate           |
+//! | det_cycle                 | Structural  | KILLED         | loop detection     |
+//! | literal_type_break        | Type        | KILLED         | runtime type check |
+//! | drop_output_write         | Contract    | KILLED         | V24 (must-write)   |
+//! | drop_initial_context_seed | Contract    | KILLED         | V24 (must-write)   |
+//! | weaken_output_source      | Contract    | KILLED         | V26 (scalar-null)  |
+//! | retarget_guard_scope      | Scope       | KILLED         | V25 (guard scope)  |
+//! | retarget_output_scope     | Scope       | KILLED         | V27 (write scope)  |
+//! | retarget_use_input_scope  | Scope       | KILLED         | V28 (use-input)    |
+//! | retarget_executor_arg_scope | Scope     | KILLED         | V29 (executor arg) |
+//! | drop_prompt_source        | Elicitation | KILLED         | V33 (prompt source)|
+//! | delete_guard              | Semantic    | KILLED         | violating-ctx probe|
+//! | flip_guard_op             | Semantic    | KILLED         | violating-ctx probe|
 //!
 //! The harness collects per-operator kill rates, which is how the tool's actual
 //! guarantees stay distinguishable from its assumed ones.
@@ -915,6 +916,98 @@ pub fn retarget_guard_scope(config: &Value) -> Vec<(String, Value)> {
     mutants
 }
 
+/// ELICITATION — for each transition-level `actor: human` gate, delete EVERY
+/// statically-guaranteed prompt source at once: the transition's
+/// `prompt`/`goal`/`title`, the enclosing state's `goal`, and the workflow's
+/// `prompt` input declaration (both `inputs:` and `snippet.inputs`).
+///
+/// The operator that proves V33 (`HUMAN_GATE_NO_PROMPT_SOURCE`). A human gate
+/// with no prompt source parks the mission and asks the operator to decide
+/// with zero context — the promptless-gate class that shipped before V33
+/// existed. Deleting every link of the chain in one mutant is deliberate:
+/// V33 is order-insensitive (ANY surviving link satisfies it), so a partial
+/// deletion would test nothing.
+///
+/// Only currently-PROMPTED gates are mutation sites — a gate that already has
+/// no source is the baseline's complaint, not the mutant's, and would be
+/// (correctly) discounted by the baseline diff as a survivor.
+pub fn drop_prompt_source(config: &Value) -> Vec<(String, Value)> {
+    let mut mutants = Vec::new();
+    let Some(wfs) = config.pointer("/workflows").and_then(Value::as_object) else {
+        return mutants;
+    };
+
+    for (wf_id, wf_def) in wfs {
+        let has_prompt_input = wf_def.pointer("/inputs/prompt").is_some()
+            || wf_def.pointer("/snippet/inputs/prompt").is_some();
+        let Some(states) = wf_def.pointer("/states").and_then(Value::as_object) else {
+            continue;
+        };
+        for (state_name, state_def) in states {
+            let state_goal = state_def
+                .get("goal")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            let Some(transitions) = state_def.pointer("/transitions").and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for (t_name, t_def) in transitions {
+                // V33's exact scope: transition-level `actor: human` — the
+                // same predicate `pending_gate` keys on to surface a gate.
+                if t_def.get("actor").and_then(Value::as_str) != Some("human") {
+                    continue;
+                }
+                let transition_key = ["prompt", "goal", "title"].into_iter().any(|k| {
+                    t_def
+                        .get(k)
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty())
+                });
+                if !transition_key && !state_goal && !has_prompt_input {
+                    continue; // already promptless — the baseline owns that complaint
+                }
+
+                let label = format!("drop_prompt_source/{wf_id}/{state_name}/{t_name}");
+                let (wf_id_c, sn_c, tn_c) = (wf_id.clone(), state_name.clone(), t_name.clone());
+                let mutant = mutate(config, |v| {
+                    let Some(wfs_mut) = v.get_mut("workflows").and_then(Value::as_object_mut)
+                    else {
+                        return;
+                    };
+                    // Link 1: the transition's own prompt keys.
+                    if let Some(td) = get_transition_mut(wfs_mut, &wf_id_c, &sn_c, &tn_c) {
+                        for k in ["prompt", "goal", "title"] {
+                            td.remove(k);
+                        }
+                    }
+                    // Link 2: the enclosing state's `goal`.
+                    if let Some(st) = get_state_mut(wfs_mut, &wf_id_c, &sn_c) {
+                        st.remove("goal");
+                    }
+                    // Link 3: the workflow-level `prompt` input declaration
+                    // (whose input→context seeding guarantees `$.context.prompt`).
+                    if let Some(wf) = wfs_mut.get_mut(&wf_id_c).and_then(Value::as_object_mut) {
+                        if let Some(inputs) = wf.get_mut("inputs").and_then(Value::as_object_mut) {
+                            inputs.remove("prompt");
+                        }
+                        if let Some(inputs) = wf
+                            .get_mut("snippet")
+                            .and_then(Value::as_object_mut)
+                            .and_then(|s| s.get_mut("inputs"))
+                            .and_then(Value::as_object_mut)
+                        {
+                            inputs.remove("prompt");
+                        }
+                    }
+                });
+                mutants.push((label, mutant));
+            }
+        }
+    }
+    mutants
+}
+
 /// SEMANTIC — for each guarded transition, remove all its guards.
 ///
 /// Known blind spot: the tool cannot tell whether a guard is intentional without
@@ -1175,6 +1268,7 @@ pub async fn mutation_score(resolved: &Value) -> anyhow::Result<MutationReport> 
         ("retarget_output_scope", retarget_output_scope),
         ("retarget_use_input_scope", retarget_use_input_scope),
         ("retarget_executor_arg_scope", retarget_executor_arg_scope),
+        ("drop_prompt_source", drop_prompt_source),
         ("delete_guard", delete_guard),
         ("flip_guard_op", flip_guard_op),
     ];
@@ -1626,6 +1720,84 @@ mod tests {
                 .iter()
                 .any(|d| d.message().contains("UNRESOLVABLE_EXECUTOR_ARG_SCOPE")),
             "must be killed by V29"
+        );
+    }
+
+    #[test]
+    fn drop_prompt_source_deletes_every_link_and_is_killed_by_v33() {
+        // A human gate with ALL THREE prompt-source links present: transition
+        // `prompt`, state `goal`, and a required string `prompt` input (in
+        // both `inputs:` and `snippet.inputs` spellings).
+        let cfg = json!({ "workflows": { "wf": {
+            "initialState": "gate",
+            "inputs": { "prompt": { "type": "string", "required": true } },
+            "snippet": {
+                "inputs": { "prompt": { "type": "string", "default": "Decide." } },
+                "outputs": {}
+            },
+            "states": {
+                "gate": {
+                    "goal": "Decide whether to ship",
+                    "transitions": { "approve": {
+                        "target": "done", "actor": "human",
+                        "prompt": "Ship it?",
+                        "executor": { "kind": "human" }
+                    }}
+                },
+                "done": { "terminal": true }
+            }
+        }}});
+
+        // GREEN: the unmutated config satisfies V33.
+        assert!(
+            !praxec_core::validate::validate_workflows(&cfg)
+                .iter()
+                .any(|d| d.message().contains("HUMAN_GATE_NO_PROMPT_SOURCE")),
+            "the unmutated fixture must be V33-clean, or the kill proves nothing"
+        );
+
+        let mutants = drop_prompt_source(&cfg);
+        assert_eq!(mutants.len(), 1, "one human gate to strip");
+        let (label, mutant) = &mutants[0];
+        assert_eq!(label, "drop_prompt_source/wf/gate/approve");
+
+        // EVERY link is gone — V33 is order-insensitive, so any survivor
+        // would silently satisfy the rule and the mutant would prove nothing.
+        for gone in [
+            "/workflows/wf/states/gate/transitions/approve/prompt",
+            "/workflows/wf/states/gate/goal",
+            "/workflows/wf/inputs/prompt",
+            "/workflows/wf/snippet/inputs/prompt",
+        ] {
+            assert!(mutant.pointer(gone).is_none(), "{gone} must be deleted");
+        }
+
+        // RED: V33 kills it.
+        assert!(
+            praxec_core::validate::validate_workflows(mutant)
+                .iter()
+                .any(|d| d.message().contains("HUMAN_GATE_NO_PROMPT_SOURCE")),
+            "the mutant must be killed by V33"
+        );
+    }
+
+    #[test]
+    fn drop_prompt_source_skips_an_already_promptless_gate() {
+        // No prompt source anywhere: the baseline already owns the V33 error,
+        // so mutating would only mint guaranteed survivors and dilute the rate.
+        let cfg = json!({ "workflows": { "wf": {
+            "initialState": "gate",
+            "states": {
+                "gate": { "transitions": { "approve": {
+                    "target": "done", "actor": "human",
+                    "executor": { "kind": "human" }
+                }}},
+                "done": { "terminal": true }
+            }
+        }}});
+        assert!(
+            drop_prompt_source(&cfg).is_empty(),
+            "a promptless gate is the baseline's complaint, not a mutation site"
         );
     }
 

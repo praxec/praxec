@@ -8,6 +8,151 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.28] — 2026-07-22 — HITL elicitation context: gates that carry their own decision context
+
+### Added — HITL elicitation context: human gates that carry their own decision context
+
+A human gate used to park a mission with whatever prompt happened to be around and
+hope the operator knew why they were being asked. This branch makes the gate itself
+carry everything the decision needs — the question, the evidence, and the option
+set — and makes the validator prove at **load time** that it always can. The full
+contract, including the migration recipe for pack authors, is in
+[`docs/hitl-elicitation.md`](docs/hitl-elicitation.md).
+
+- **Prompt-source chain (E1).** A parked gate resolves its prompt through a fixed
+  chain: the transition's `prompt`/`goal`/`title` → the instance context's `prompt`
+  string (the caller-seeded convention) → the enclosing state's `goal`, rendered
+  through the same template renderer as state guidance. **V33
+  `HUMAN_GATE_NO_PROMPT_SOURCE`** rejects at load any transition-level
+  `actor: human` gate with no statically-guaranteed link — a transition prompt key,
+  a state `goal`, or a required-or-defaulted string `prompt` input (whose
+  input→context seeding guarantees `$.context.prompt`). The now-unreachable runtime
+  fallback is not deleted but instrumented: a firing on fresh config is reported as
+  a validator↔runtime parity breach.
+- **`presents:` (E2).** A gate transition declares which `$.context.<key>` values
+  the operator sees alongside the question — a projection, not a context dump.
+  Resolution is **all-or-nothing**: a malformed pointer, an unresolvable key, or a
+  projection over the byte budget defect-marks the gate (`PRESENTS_UNRESOLVED`)
+  rather than showing a partial view. **V34 `INVALID_PRESENTS`** rejects at load a
+  malformed declaration, a pointer to a context key nothing in the workflow can
+  have written, or a `presents:` on a non-human transition (a dead declaration).
+- **`choices:` (E3).** A gate transition declares a typed option set drawn from a
+  live context array (`{ field, from, value, title? }`); the elicitation form
+  renders it as a titled single-select enum, and the chosen value is submitted as a
+  plain string argument. **V35 `INVALID_CHOICES`** checks the declaration at load
+  through the same parser the runtime uses, so the validator can never accept a
+  shape the runtime rejects. The **`pick` output-mapping operator** selects the
+  array element the chosen key names, preserving downstream `chosen: object`
+  contracts while the human answers with a string. The **`CHOICE_MISMATCH` submit
+  guard** rejects any submission whose choice is not among the live options — on
+  the push (elicitation resume) and pull (hand-typed) paths alike, through the same
+  parser/resolver pair the gate-time projection uses, so what was offered and what
+  is accepted can never disagree. That guard is also what makes `pick`'s no-match
+  Null unreachable for governed gate submits.
+- **V36 `ELICITATION_INCOMPATIBLE_GATE` (Warning).** The "Accept can never
+  succeed" smell: a human gate whose `inputSchema` requires a non-primitive
+  property no elicitation form can collect — including the partially-doomed shape
+  where `choices:` is declared but the schema *also* requires a non-primitive
+  beyond the choice field. A Warning rather than an Error because pull-only object
+  gates (resolved via CLI/approvals with full JSON arguments) are legitimate.
+- **FormPlan push/skip fence.** Form construction now makes an explicit push/skip
+  decision: a defect-marked gate, or a declared schema whose required fields no
+  elicitation answer could satisfy, is **never pushed** as a form whose Accept is
+  doomed — the mission stays parked with its pull handle and the reason. Presented
+  context renders as labeled blocks under a per-value budget; an over-budget value
+  is truncated with a self-announcing marker naming where the full value lives
+  (`pending_human.presented`), never silently clipped.
+- **First elicitation round-trip test coverage.** The push → answer → governed
+  submit → advance loop is exercised end-to-end in tests rather than assumed.
+- **`drop_prompt_source` mutation operator.** Deletes every prompt-source link of
+  a human gate at once — transition keys, state `goal`, and the `prompt` input
+  declaration — and the harness asserts V33 kills the mutant. V33's guarantee is
+  measured, not assumed.
+
+### Fixed — failure-path hardening from the same dogfood run (#95)
+
+The program that built this release was executed *through* praxec + CPM, and its
+failure telemetry closed three engine defects along the way:
+
+- **`AGENT_CHAIN_EXHAUSTED` terminal classification.** A model chain that
+  exhausts its wall across attempts no longer surfaces as the last attempt's
+  clamped `timeout after Nms` — the typed terminal error leads with the walk
+  summary: every model tried, each attempt's failure class and duration, wall
+  consumed vs budget. Single-model chains keep genuine timeout semantics.
+- **`agent.model_attempt` audit telemetry.** One event per finished model
+  attempt, stamped with the child workflow id + correlation, so a failed run's
+  audit stream shows *which* models were tried and how each ended — provider
+  outage and hang-prone lead are now distinguishable from the operator's seat.
+- **Cancelled children leave their parent recoverable.** `_subworkflow_wait`
+  was only cleared on the success path, so a cancelled child was resurrected on
+  every re-fire and the parent was permanently stuck. The dead wait is now
+  consumed (version-checked, audited) and the next submit spawns a fresh child.
+- **`purpose: ask` channels are not approval gates.** The SPEC §29
+  `enable_human_ask` injected self-loops are exempt from V33 (their prompt is
+  the agent's question, carried by the required AgentAwait marker) and are no
+  longer surfaced as promptless pseudo-approvals in the pending list — both
+  sides of the validator↔runtime parity fence, with fence tests.
+
+## [0.0.27] — 2026-07-20 — dogfood hardening: three load-time poka-yokes
+
+The follow-up release to v0.0.26's browser E2E substrate. Running that substrate
+against real applications surfaced defects in the engine as well as the workflow
+pack; this is the engine half. Every change here moves a failure **earlier** — from
+mid-run to load time, or from one-at-a-time to all-at-once — and none of them
+changes what is legal, so upgrading is behaviour-preserving for a config that was
+already correct.
+
+One correction worth recording, because it was the campaign's own headline finding:
+the multi-model stall was attributed to unplumbed reasoning bounds. That diagnosis
+was **wrong**. Reasoning effort has been plumbed end-to-end and capped at `"low"` by
+default since v0.0.15 (`ReasoningTuning.default_effort`, pinned by a test), so the
+stall has **no confirmed root cause** and should not be considered resolved by this
+release. The per-state knob below is a real ergonomic gap that the campaign exposed —
+it is not the stall fix.
+
+### Added — per-state `reasoning_effort:`
+
+- **Per-state `reasoning_effort:`** completes the per-state trio with `affinity:` and
+  `tools:`. A state that is the hardest reasoning step of a loop (a diagnosis leaf)
+  can now raise its own thinking budget from its capability YAML, without a core
+  change or a gateway-wide default bump. Precedence: **state declaration** >
+  `$.context`/`$.input.effort_override` > the configured `ReasoningTuning
+  .default_effort` (which ships as `"low"`). An absent key is bit-identical to
+  before, so this is purely additive.
+- The effective effort is recorded on the `agent.invoked` audit event, the same
+  parity rule that already applies to the effective `tools:` set — an audit of a
+  raised-effort step can never report the gateway default.
+- **V32 `UNKNOWN_REASONING_EFFORT`** — a load-time poka-yoke. The `ReasoningTuning`
+  accessors deliberately fall back to `medium` for an unrecognized level, so an
+  unvalidated typo (`xhig`) would silently become a no-op cap. The level vocabulary
+  is **derived from the `tuning.reasoning` maps**, never hard-coded in Rust, so an
+  operator who adds a level gets it accepted with no code change. The runtime rejects
+  it too (`AUTO_DRIVE_STATE_REASONING_EFFORT_INVALID`), but V32 moves the failure to
+  `praxec check` — before the human gate and before any lease is taken.
+
+### Fixed — an unresolvable script reference no longer passes `praxec check`
+
+- **`SCRIPT_SUBJECT_UNKNOWN`** — a `kind: script` executor naming a subject that no
+  `scripts:` entry defines is an authoring typo, but `stamp_scripts_library` skipped
+  it silently. `praxec check` reported `validation: ok` and the run failed much later
+  with `SCRIPT_NOT_IN_SNAPSHOT` — an error whose own text blames collection and points
+  straight back at the skip. The gate every workflow pack relies on had a blind spot
+  on exactly the reference it exists to check. Found while dogfooding the browser-E2E
+  QA family: a typo'd script subject validated green, and the only way to prove a new
+  script loaded at all was to corrupt its YAML.
+- Same poka-yoke class as V32 — a reference that resolves to nothing must fail at
+  load, before the human gate and before any lease is taken. All unresolvable
+  references across all workflows are reported in one error (matching the writable-
+  repo-root change below), naming the workflow, the subject, and the declared
+  subjects so the typo is obvious.
+
+### Changed
+
+- Boot now reports **every** unresolvable `writable: true` repo root in one error
+  instead of short-circuiting on the first, so an operator fixes them in a single
+  pass rather than one reboot per broken path. The fail-fast itself is unchanged: a
+  run's root must be real, not a hopeful string.
+
 ## [0.0.26] — 2026-07-20 — browser E2E substrate: collision-free parallel runs across a leased pool
 
 Enables running many browser-automation checks **in parallel across many projects

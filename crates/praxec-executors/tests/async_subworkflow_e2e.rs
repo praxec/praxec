@@ -279,3 +279,142 @@ async fn parent_surfaces_the_childs_human_gate() {
     );
     assert_eq!(ph["resolve"]["requiresHuman"], true);
 }
+
+/// v0.0.28 dogfood defect 3 — a CANCELLED child must resume its parent like a
+/// failed one, and the failure must be RECOVERABLE. Observed live: parent
+/// parked on `_subworkflow_wait`; child cancelled via `{"intent":"cancel"}`;
+/// the parent stayed `waiting` forever (the dead wait marker lingered), and
+/// every re-fire of the spawning transition reused the terminal-cancelled
+/// child and permanently rejected `sub-workflow failed (cancelled)` — the only
+/// recovery was cancelling the whole tree.
+///
+/// The contract: cancel(child) re-drives the parent; the re-driven transition
+/// observes the terminal child and fails LOUDLY (transition.rejected /
+/// EXECUTOR_FAILED) while CONSUMING the dead `_subworkflow_wait` — so the
+/// parent is actionable again and a subsequent submit of the same spawning
+/// transition spawns a FRESH child rather than permanently rejecting.
+#[tokio::test]
+async fn a_cancelled_child_fails_the_parent_loudly_and_leaves_it_refireable() {
+    let (runtime, store, audit) = build_runtime();
+
+    // 1. Start the parent and park it on the child (same as the happy path).
+    let start = runtime
+        .start(StartWorkflow {
+            definition_id: "parent".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .expect("parent start");
+    let parent_id = start["workflow"]["id"].as_str().unwrap().to_string();
+    let suspended = runtime
+        .submit(SubmitTransition {
+            workflow_id: parent_id.clone(),
+            expected_version: 0,
+            transition: "run_child".into(),
+            arguments: json!({}),
+            principal: Principal::anonymous(),
+            summary: None,
+            trace_id: None,
+            run_id: None,
+        })
+        .await
+        .expect("parent submit (parks, not errors)");
+    assert_eq!(suspended["result"]["status"].as_str(), Some("waiting"));
+    let child_id = {
+        let parent_inst = store.load(&parent_id).await.unwrap();
+        parent_inst.context["_subworkflow_wait"]["child_workflow_id"]
+            .as_str()
+            .expect("parent must record the parked child id")
+            .to_string()
+    };
+
+    // 2. Cancel the CHILD. The cancel must re-drive the parent (synchronously,
+    //    inside `cancel`), whose executor observes the terminal-cancelled
+    //    child, fails loudly, and consumes the dead wait.
+    runtime
+        .cancel(&child_id, "operator abort")
+        .await
+        .expect("cancel child");
+
+    let parent_after = store.load(&parent_id).await.unwrap();
+    assert_eq!(
+        parent_after.state, "spawning",
+        "the parent must NOT advance past a cancelled child"
+    );
+    assert!(
+        parent_after.cancelled_at.is_none(),
+        "cancelling the child must never cancel the parent"
+    );
+    assert!(
+        parent_after.context.get("_subworkflow_wait").is_none(),
+        "the dead wait on the terminal-cancelled child must be CONSUMED — a \
+         lingering wait leaves the parent `waiting` forever and every re-fire \
+         reusing the dead child; context: {:#}",
+        parent_after.context
+    );
+
+    // The failure was LOUD: the re-driven transition recorded EXECUTOR_FAILED
+    // carrying the cancelled reason — never a silent re-park.
+    let rejected = audit
+        .snapshot()
+        .into_iter()
+        .find(|e| {
+            e.event_type == "transition.rejected"
+                && e.payload["code"] == json!("EXECUTOR_FAILED")
+                && e.workflow_id.as_deref() == Some(parent_id.as_str())
+        })
+        .expect("the re-driven parent transition must fail LOUDLY (transition.rejected)");
+    assert!(
+        rejected.payload["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("cancelled")),
+        "the loud failure must carry the child's cancelled reason: {:#}",
+        rejected.payload
+    );
+
+    // 3. The parent is re-fireable: a fresh submit of the SAME spawning
+    //    transition must spawn a FRESH child (not permanently reject on the
+    //    cancelled one).
+    let refire = runtime
+        .submit(SubmitTransition {
+            workflow_id: parent_id.clone(),
+            expected_version: parent_after.version,
+            transition: "run_child".into(),
+            arguments: json!({}),
+            principal: Principal::anonymous(),
+            summary: None,
+            trace_id: None,
+            run_id: None,
+        })
+        .await
+        .expect("re-fire of the spawning transition must be accepted");
+    assert_eq!(
+        refire["result"]["status"].as_str(),
+        Some("waiting"),
+        "the re-fire must park on a FRESH child, not reject: {refire:#}"
+    );
+    let fresh_child_id = {
+        let parent_inst = store.load(&parent_id).await.unwrap();
+        parent_inst.context["_subworkflow_wait"]["child_workflow_id"]
+            .as_str()
+            .expect("the re-fired parent must record its fresh child")
+            .to_string()
+    };
+    assert_ne!(
+        fresh_child_id, child_id,
+        "the re-fire must spawn a FRESH child, never reuse the cancelled one"
+    );
+    let started = audit
+        .event_types()
+        .into_iter()
+        .filter(|t| t == "sub_workflow.started")
+        .count();
+    assert_eq!(
+        started, 2,
+        "exactly two spawns: the original child and the post-cancel fresh one"
+    );
+}
