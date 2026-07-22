@@ -482,6 +482,83 @@ impl WorkflowRuntime {
         Ok(resp)
     }
 
+    /// (v0.0.28 dogfood defect 3) — consume a DEAD `_subworkflow_wait` when the
+    /// parked transition's executor FAILED while its recorded child is already
+    /// resolved (cancelled or at a terminal state). The success path clears the
+    /// wait on advance (`clear_subworkflow_wait_on_advance`); without this
+    /// failure-path twin the marker lingers after e.g. a child cancellation, so
+    /// the parent reports `waiting` forever and EVERY re-fire of the spawning
+    /// transition reuses the dead child and permanently rejects — the only
+    /// recovery was cancelling the whole tree. Consuming the wait makes the
+    /// loud failure RECOVERABLE: the parent becomes actionable again and the
+    /// next submit of the same transition spawns a FRESH child.
+    ///
+    /// Conservative by construction: the wait is only consumed when it belongs
+    /// to THIS transition AND its child loads AND that child is genuinely
+    /// resolved. A still-in-process child (the executor failed for some other
+    /// reason, e.g. a store error on `get`) keeps its live wait — clearing it
+    /// would orphan a running child and spawn a duplicate on re-fire.
+    pub(crate) async fn consume_dead_subworkflow_wait(
+        &self,
+        inst: WorkflowInstance,
+        transition: &str,
+    ) -> WorkflowInstance {
+        let Some(wait) = inst.context.get("_subworkflow_wait") else {
+            return inst;
+        };
+        if wait.get("transition").and_then(Value::as_str) != Some(transition) {
+            return inst; // the wait belongs to a different leaf — untouched
+        }
+        let Some(child_id) = wait
+            .get("child_workflow_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return inst;
+        };
+        let Ok(child) = self.store.load(&child_id).await else {
+            return inst; // child unknown → keep the wait (never guess)
+        };
+        let child_cancelled = child.cancelled_at.is_some();
+        if !child_cancelled && !is_terminal(&child.definition, &child.state) {
+            return inst; // child still in process — the wait is live
+        }
+        let mut next = inst.clone();
+        if let Some(obj) = next.context.as_object_mut() {
+            obj.remove("_subworkflow_wait");
+        }
+        next.version = inst.version + 1;
+        match self.store.save_if_version(next, inst.version).await {
+            Ok(saved) => {
+                self.record_or_self_event(
+                    saved
+                        .audit_event("sub_workflow.wait.cleared")
+                        .with_payload(json!({
+                            "transition": transition,
+                            "child_workflow_id": child_id,
+                            "child_cancelled": child_cancelled,
+                        })),
+                )
+                .await;
+                saved
+            }
+            Err(err) => {
+                // A concurrent writer advanced the parent — its snapshot (not
+                // ours) is now the truth. Keep the loaded instance for the
+                // failure response; a later re-drive re-observes and re-clears.
+                tracing::warn!(
+                    target: "praxec_core::runtime",
+                    error = %err,
+                    workflow = %inst.id,
+                    child = %child_id,
+                    "sub_workflow.wait.cleared: persisting the consumed wait failed; \
+                     the dead wait will be re-consumed on the next failed re-drive"
+                );
+                inst
+            }
+        }
+    }
+
     /// P12 R1.4 — durably suspend the transition on a parked agent session
     /// (`await_human`). Mirrors [`Self::suspend_on_subworkflow`] EXACTLY —
     /// the same waiting representation, a different resume signal: writes an
@@ -1384,6 +1461,17 @@ impl WorkflowRuntime {
                     } else {
                         instance.clone()
                     };
+
+                    // (v0.0.28 defect 3) A `kind: workflow` leaf that failed
+                    // while parked on an already-RESOLVED child (cancelled /
+                    // terminal) has consumed its `_subworkflow_wait` — drop it
+                    // so the loud failure below is RECOVERABLE (the parent
+                    // stops reporting `waiting` and a re-fire spawns a fresh
+                    // child instead of permanently rejecting on the dead one).
+                    // No-op for every other executor kind / failure shape.
+                    let effective_instance = self
+                        .consume_dead_subworkflow_wait(effective_instance, &request.transition)
+                        .await;
 
                     self.audit
                         .record(
