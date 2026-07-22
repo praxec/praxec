@@ -1365,9 +1365,17 @@ fn validate_human_gate_elicitation(id: &str, def: &Value, out: &mut Vec<Diagnost
             .is_some_and(|s| !s.trim().is_empty());
         for (t_name, t_def) in transitions {
             let is_human = t_def.get("actor").and_then(Value::as_str) == Some("human");
+            // `purpose: ask` transitions (the SPEC §29 `enable_human_ask`
+            // injected self-loops, or hand-authored ask channels) are EXEMPT
+            // from the gate rules: their prompt is intrinsically dynamic —
+            // the agent's question arrives at fire time via the AgentAwait
+            // marker, whose `prompt` field is a required String. Parity
+            // fence: `hitl.rs::human_transition` skips the same shape, so an
+            // ask channel can never surface as a promptless approval gate.
+            let is_ask = t_def.get("purpose").and_then(Value::as_str) == Some("ask");
             v34_presents(id, state_name, t_name, t_def, is_human, &reachable, out);
             v35_choices(id, state_name, t_name, t_def, is_human, &reachable, out);
-            if !is_human {
+            if !is_human || is_ask {
                 continue;
             }
             v33_prompt_source(
@@ -6116,6 +6124,20 @@ mod tests {
         }
     }
 
+    /// A `purpose: ask` transition (the SPEC §29 `enable_human_ask` injected
+    /// self-loop shape) is exempt: its prompt is the agent's question at fire
+    /// time (AgentAwait marker, required String), never a static declaration.
+    #[test]
+    fn an_ask_purpose_transition_is_exempt_from_v33() {
+        let config = gate_config(
+            json!({ "actor": "human", "purpose": "ask",
+                    "executor": { "kind": "noop" } }),
+            None,
+            json!({}),
+        );
+        assert!(errors_with(&config, "HUMAN_GATE_NO_PROMPT_SOURCE").is_empty());
+    }
+
     /// `presents:` on a non-human transition is a dead declaration — nothing
     /// ever surfaces it — and is rejected rather than silently ignored.
     #[test]
@@ -6565,12 +6587,18 @@ mod tests {
                     continue;
                 };
                 for (state_name, state_def) in states {
+                    // Same shape as the human_transition/V33 fence: a
+                    // `purpose: ask` channel is not an approval gate and
+                    // surfaces no pending gate until an agent actually asks
+                    // (AgentAwait marker carries the prompt then).
                     let has_human_transition = state_def
                         .get("transitions")
                         .and_then(Value::as_object)
                         .is_some_and(|ts| {
-                            ts.values()
-                                .any(|t| t.get("actor").and_then(Value::as_str) == Some("human"))
+                            ts.values().any(|t| {
+                                t.get("actor").and_then(Value::as_str) == Some("human")
+                                    && t.get("purpose").and_then(Value::as_str) != Some("ask")
+                            })
                         });
                     if !has_human_transition {
                         continue;

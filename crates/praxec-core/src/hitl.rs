@@ -391,6 +391,13 @@ fn transition_input_schema(definition: &Value, state: &str, transition: &str) ->
 }
 
 /// The first `actor: human` transition of `state`, as `(name, def)`.
+///
+/// `purpose: ask` transitions are skipped: they are the agent's ask CHANNEL
+/// (SPEC §29 injected self-loops), not approval gates — an ask surfaces via
+/// the `_agent_await` marker (whose `prompt` is a required String) only when
+/// an agent actually asks. Surfacing the bare channel here would mint a
+/// promptless pseudo-approval on every state of an `enable_human_ask`
+/// workflow. Parity fence: V33 exempts the same shape in `validate.rs`.
 fn human_transition<'a>(definition: &'a Value, state: &str) -> Option<(String, &'a Value)> {
     let transitions = definition
         .pointer(&format!(
@@ -400,7 +407,10 @@ fn human_transition<'a>(definition: &'a Value, state: &str) -> Option<(String, &
         .and_then(Value::as_object)?;
     transitions
         .iter()
-        .find(|(_, t)| t.get("actor").and_then(Value::as_str) == Some("human"))
+        .find(|(_, t)| {
+            t.get("actor").and_then(Value::as_str) == Some("human")
+                && t.get("purpose").and_then(Value::as_str) != Some("ask")
+        })
         .map(|(name, def)| (name.clone(), def))
 }
 
@@ -676,5 +686,27 @@ mod tests {
              \"prompt\":\"Approve the plan?\",\"source\":\"human_gate\",\"since\":{since}}}"
         );
         assert_eq!(serde_json::to_string(&g).unwrap(), expected);
+    }
+
+    /// The injected ask CHANNEL must not surface as an approval gate: a state
+    /// whose only human transition is `purpose: ask` has no pending gate, and
+    /// a state with both surfaces the real approval, not the channel.
+    #[test]
+    fn an_ask_purpose_transition_is_not_surfaced_as_a_human_gate() {
+        let ask_only = json!({
+            "states": { "working": { "transitions": {
+                "ask_human": { "target": "working", "actor": "human", "purpose": "ask" }
+            } } }
+        });
+        assert!(pending_gate(&instance("working", ask_only, json!({}))).is_none());
+
+        let both = json!({
+            "states": { "gating": { "transitions": {
+                "ask_human": { "target": "gating", "actor": "human", "purpose": "ask" },
+                "approve": { "target": "done", "actor": "human", "title": "Approve the plan." }
+            } } }
+        });
+        let g = pending_gate(&instance("gating", both, json!({}))).expect("gate");
+        assert_eq!(g.transition, "approve");
     }
 }
