@@ -1001,6 +1001,83 @@ impl WorkflowRuntime {
             ));
         }
 
+        // Choice gate (peer of the actor gate above). A transition that
+        // declares `choices` restricts `arguments[<field>]` to the live
+        // option set resolved from the CURRENT context — through the SAME
+        // `hitl::transition_choices` + `hitl::resolve_choices` pair that
+        // `pending_gate` projects to the human, so what was offered and what
+        // is accepted can never disagree. A malformed declaration or an
+        // unresolvable source rejects EVERY submission (a gate that cannot
+        // present its options must not accept any answer). Runs on push
+        // (elicitation resume) and pull (hand-typed) submits alike, which is
+        // what makes the `pick` output operator's no-match Null unreachable
+        // for governed gate submits. A transition WITHOUT `choices` exits at
+        // the `is_some()` probe untouched.
+        if transition.get("choices").is_some() {
+            let mismatch = match crate::hitl::transition_choices(&transition) {
+                None => Some(
+                    "malformed `choices` declaration — expected \
+                     { field, from, value, title? } strings"
+                        .to_string(),
+                ),
+                Some(decl) => match crate::hitl::resolve_choices(&decl, &instance.context) {
+                    Err(detail) => Some(format!(
+                        "live options for '{}' are unresolvable — {detail}; a gate \
+                         whose declared options cannot be resolved accepts no submission",
+                        decl.field
+                    )),
+                    Ok(options) => {
+                        let in_set = request
+                            .arguments
+                            .get(&decl.field)
+                            .and_then(Value::as_str)
+                            .is_some_and(|got| options.iter().any(|o| o.value == got));
+                        if in_set {
+                            None
+                        } else {
+                            let got = match request.arguments.get(&decl.field) {
+                                None => "<absent>".to_string(),
+                                Some(Value::String(s)) => s.clone(),
+                                Some(other) => other.to_string(),
+                            };
+                            let listing = if options.len() <= 10 {
+                                format!(
+                                    ": [{}]",
+                                    options
+                                        .iter()
+                                        .map(|o| format!("'{}'", o.value))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            } else {
+                                String::new()
+                            };
+                            Some(format!(
+                                "value '{got}' is not among the {} live options \
+                                 for '{}'{listing}",
+                                options.len(),
+                                decl.field
+                            ))
+                        }
+                    }
+                },
+            };
+            if let Some(message) = mismatch {
+                return Ok(DispatchOutcome::terminal(
+                    self.record_rejected(
+                        &definition,
+                        &instance,
+                        "CHOICE_MISMATCH",
+                        message,
+                        &request.transition,
+                        &correlation_id,
+                        &request.principal,
+                    )
+                    .await,
+                ));
+            }
+        }
+
         // P12 R1.4 origin gate (mirrors P16, `docs/await-resume-architecture.md`):
         // when this transition is parked on an `_agent_await` (a `kind: agent`
         // session suspended on `await_human`), re-submitting it is *resolving a
@@ -2747,6 +2824,241 @@ mod tests {
             sched.len().await,
             1,
             "only the healthy _lock_wait record should be re-enqueued"
+        );
+    }
+
+    // ---- g4: submit-time choice guard (CHOICE_MISMATCH) ------------------
+
+    /// A human `pick` gate declaring `choices` over `$.context.candidates`
+    /// (seeded via `initialContext`), paired with the `pick` output mapping
+    /// the HITL contract ships — `context.chosen` = the FULL selected object.
+    /// `from` is parameterized so a test can point it at a defective source.
+    fn choice_gate_config(from: &str) -> serde_json::Value {
+        json!({
+            "version": "1.0.0",
+            "workflows": {
+                "p": {
+                    "version": "1.0.0",
+                    "initialState": "picking",
+                    "initialContext": {
+                        "candidates": [
+                            { "id": "a", "name": "Alpha", "tradeoff": "fast" },
+                            { "id": "b", "name": "Beta", "tradeoff": "thorough" }
+                        ]
+                    },
+                    "states": {
+                        "picking": {
+                            "transitions": {
+                                "pick": {
+                                    "target": "done",
+                                    "actor": "human",
+                                    "choices": {
+                                        "field": "chosen_id",
+                                        "from": from,
+                                        "value": "id",
+                                        "title": "name"
+                                    },
+                                    "inputSchema": {
+                                        "type": "object",
+                                        "required": ["chosen_id"],
+                                        "properties": { "chosen_id": { "type": "string" } }
+                                    },
+                                    "output": { "chosen": { "pick": {
+                                        "from": "$.context.candidates",
+                                        "by": "id",
+                                        "eq": "$.arguments.chosen_id"
+                                    }}}
+                                }
+                            }
+                        },
+                        "done": { "terminal": true }
+                    }
+                }
+            }
+        })
+    }
+
+    fn human_principal() -> Principal {
+        Principal {
+            subject: "matt".into(),
+            roles: vec![Principal::HUMAN_ROLE.into()],
+            permissions: vec![],
+        }
+    }
+
+    fn choice_gate_runtime(
+        cfg: &serde_json::Value,
+    ) -> (
+        WorkflowRuntime,
+        Arc<InMemoryWorkflowStore>,
+        Arc<MemoryAuditSink>,
+    ) {
+        let store = Arc::new(InMemoryWorkflowStore::new());
+        let audit = Arc::new(MemoryAuditSink::new());
+        let runtime = WorkflowRuntime::new(
+            Arc::new(ConfigDefinitionStore::from_config(cfg)),
+            store.clone(),
+            Arc::new(EmptyRegistry),
+            Arc::new(DefaultGuardEvaluator::new()),
+            audit.clone() as Arc<dyn AuditSink>,
+        );
+        (runtime, store, audit)
+    }
+
+    /// Submit `pick` with `arguments.chosen_id = <chosen>` as a HUMAN
+    /// principal (the actor gate passes — anything rejected after it is the
+    /// choice guard's doing).
+    async fn submit_pick(runtime: &WorkflowRuntime, workflow_id: &str, chosen: &str) -> Value {
+        runtime
+            .submit(SubmitTransition {
+                workflow_id: workflow_id.into(),
+                expected_version: 0,
+                transition: "pick".into(),
+                arguments: json!({ "chosen_id": chosen }),
+                principal: human_principal(),
+                summary: None,
+                trace_id: None,
+                run_id: None,
+            })
+            .await
+            .expect("a choice-guard rejection is a typed response, not an Err")
+    }
+
+    /// g4 — a submitted value OUTSIDE the live option set is rejected typed
+    /// (`CHOICE_MISMATCH`), the gate stays intact, and the audit trail
+    /// carries the code + message. With ≤10 options the message lists the
+    /// option values verbatim.
+    #[tokio::test]
+    async fn a_choice_outside_the_candidate_set_is_rejected() {
+        let cfg = choice_gate_config("$.context.candidates");
+        let (runtime, store, audit) = choice_gate_runtime(&cfg);
+        let id = start_id(&runtime, "p").await;
+
+        let rejected = submit_pick(&runtime, &id, "z").await;
+        assert_eq!(
+            rejected["error"]["code"].as_str(),
+            Some("CHOICE_MISMATCH"),
+            "got: {rejected:#}"
+        );
+        let message = rejected["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("value 'z' is not among the 2 live options for 'chosen_id'"),
+            "the rejection must name the value, count, and field, got: {message}"
+        );
+        assert!(
+            message.contains("'a'") && message.contains("'b'"),
+            "with <=10 options the message must list the option values, got: {message}"
+        );
+
+        // The gate is intact: no advance, nothing picked.
+        let reloaded = store.load(&id).await.unwrap();
+        assert_eq!(
+            reloaded.state, "picking",
+            "a rejected choice must not advance"
+        );
+        assert!(
+            reloaded.context.get("chosen").is_none(),
+            "no output mapping may run on a rejected submit: {:#}",
+            reloaded.context
+        );
+
+        // The audit event carries the typed rejection (same record_rejected
+        // shape as ACTOR_MISMATCH).
+        let event = audit
+            .snapshot()
+            .into_iter()
+            .find(|e| e.event_type == "transition.rejected")
+            .expect("a transition.rejected audit event must be recorded");
+        assert_eq!(event.payload["code"].as_str(), Some("CHOICE_MISMATCH"));
+        assert!(
+            event.payload["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("'z'"),
+            "the audit message must carry the offending value: {:#}",
+            event.payload
+        );
+    }
+
+    /// g4 — an in-set value falls through the guard untouched: the transition
+    /// fires, and the paired `pick` output mapping lands the FULL selected
+    /// object (not the bare id) in `context.chosen`.
+    #[tokio::test]
+    async fn a_valid_choice_passes() {
+        let cfg = choice_gate_config("$.context.candidates");
+        let (runtime, store, _) = choice_gate_runtime(&cfg);
+        let id = start_id(&runtime, "p").await;
+
+        let response = submit_pick(&runtime, &id, "b").await;
+        assert_eq!(
+            response["workflow"]["state"].as_str(),
+            Some("done"),
+            "an in-set choice must fire the transition, got: {response:#}"
+        );
+
+        let reloaded = store.load(&id).await.unwrap();
+        assert_eq!(
+            reloaded.context["chosen"],
+            json!({ "id": "b", "name": "Beta", "tradeoff": "thorough" }),
+            "the pick output mapping must land the FULL selected object"
+        );
+    }
+
+    /// g4 behavior fence — a gate WITHOUT `choices` is untouched by the
+    /// guard: the very value the guarded twin rejects sails through, and the
+    /// unguarded `pick` no-match Null branch remains observable (that Null is
+    /// exactly what the guard makes unreachable for governed gate submits).
+    #[tokio::test]
+    async fn a_gate_without_choices_is_untouched_by_the_guard() {
+        let mut cfg = choice_gate_config("$.context.candidates");
+        cfg["workflows"]["p"]["states"]["picking"]["transitions"]["pick"]
+            .as_object_mut()
+            .expect("transition is an object")
+            .remove("choices");
+        let (runtime, store, _) = choice_gate_runtime(&cfg);
+        let id = start_id(&runtime, "p").await;
+
+        let response = submit_pick(&runtime, &id, "z").await;
+        assert_eq!(
+            response["workflow"]["state"].as_str(),
+            Some("done"),
+            "without `choices` no restriction applies, got: {response:#}"
+        );
+        let reloaded = store.load(&id).await.unwrap();
+        assert_eq!(
+            reloaded.context["chosen"],
+            Value::Null,
+            "the unguarded no-match pick resolves Null (pre-existing behavior)"
+        );
+    }
+
+    /// g4 — a DEFECTIVE `choices` source (`from` names a context key that
+    /// does not resolve to an array) rejects EVERY submission, even one whose
+    /// value would have been in-set had the source resolved; the rejection
+    /// names the declared source.
+    #[tokio::test]
+    async fn a_defective_choices_source_rejects_all_submissions() {
+        let cfg = choice_gate_config("$.context.missing");
+        let (runtime, store, _) = choice_gate_runtime(&cfg);
+        let id = start_id(&runtime, "p").await;
+
+        let rejected = submit_pick(&runtime, &id, "a").await;
+        assert_eq!(
+            rejected["error"]["code"].as_str(),
+            Some("CHOICE_MISMATCH"),
+            "got: {rejected:#}"
+        );
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("$.context.missing"),
+            "the rejection must name the declared source, got: {rejected:#}"
+        );
+        let reloaded = store.load(&id).await.unwrap();
+        assert_eq!(
+            reloaded.state, "picking",
+            "a defective gate must not accept any submission"
         );
     }
 }
