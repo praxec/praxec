@@ -6419,61 +6419,33 @@ mod tests {
         );
     }
 
-    /// The three unremediated fixture gates carry exactly the V36 smell; the
-    /// warning must name each precisely (g7 remediates them; this pins the
-    /// target list). `cap.gate.human-signoff` is all-primitive and must NOT
-    /// warn.
+    /// g7 remediated the three formerly-incompatible fixture gates onto the
+    /// declared contract (`chosen_id` string + `choices:` / `approved`
+    /// boolean); every fixture gate cap is now elicitation-compatible —
+    /// V36-silent, none of the new error rules fire, and each validates
+    /// fully clean (so all four sit in the parity-proof corpus).
     #[test]
-    fn v36_warns_on_the_three_unremediated_fixture_gates() {
+    fn v36_is_silent_on_remediated_fixture_gates() {
         let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        for (rel, state, transition) in [
-            (
-                "tests/fixtures/praxec-meta/capabilities/cap.gate.human-pick-shape.yaml",
-                "awaiting_human",
-                "pick",
-            ),
-            (
-                "tests/fixtures/praxec-meta/capabilities/cap.gate.human-approve-plan.yaml",
-                "awaiting_human",
-                "approve",
-            ),
-            (
-                "tests/fixtures/cognitive-architectures/capabilities/cap.gate.human-disambiguate.yaml",
-                "awaiting_human",
-                "pick",
-            ),
+        for rel in [
+            "tests/fixtures/praxec-meta/capabilities/cap.gate.human-pick-shape.yaml",
+            "tests/fixtures/praxec-meta/capabilities/cap.gate.human-approve-plan.yaml",
+            "tests/fixtures/cognitive-architectures/capabilities/cap.gate.human-disambiguate.yaml",
+            "tests/fixtures/cognitive-architectures/capabilities/cap.gate.human-signoff.yaml",
         ] {
             let config = crate::config::load_resolved(manifest.join(rel))
                 .unwrap_or_else(|e| panic!("fixture '{rel}' must load: {e}"));
-            // Regression fence: the NEW error rules must not fire on any of
-            // these unremediated fixtures — V36 is deliberately the only new
-            // diagnostic they earn, and it is a Warning. (approve-plan carries
-            // PRE-existing standalone errors — `$.input.*` scopes, V6 — which
-            // are out of this deliverable's scope and not asserted on.)
-            for code in [
-                "HUMAN_GATE_NO_PROMPT_SOURCE",
-                "INVALID_PRESENTS",
-                "INVALID_CHOICES",
-            ] {
-                assert!(
-                    errors_with(&config, code).is_empty(),
-                    "fixture '{rel}' must not trip {code}: {:?}",
-                    errors_with(&config, code)
-                );
-            }
-            let warns = warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE");
-            assert_eq!(warns.len(), 1, "'{rel}' must warn exactly once: {warns:?}");
+            let errors: Vec<_> = validate_workflows(&config)
+                .into_iter()
+                .filter(Diagnostic::is_error)
+                .collect();
             assert!(
-                warns[0].contains(state) && warns[0].contains(transition),
-                "'{rel}' warning must name state '{state}' + transition '{transition}': {warns:?}"
+                errors.is_empty(),
+                "fixture '{rel}' must validate fully clean: {errors:?}"
             );
+            let warns = warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE");
+            assert!(warns.is_empty(), "'{rel}' must be V36-silent: {warns:?}");
         }
-        // The all-primitive gate fixture is compatible and silent.
-        let config = crate::config::load_resolved(manifest.join(
-            "tests/fixtures/cognitive-architectures/capabilities/cap.gate.human-signoff.yaml",
-        ))
-        .expect("human-signoff fixture must load");
-        assert!(warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE").is_empty());
     }
 
     /// V27 descends into `pick` operands: a typo'd scope in `from`/`eq` would
