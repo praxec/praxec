@@ -94,10 +94,23 @@ pub(crate) fn plan(gate: &PendingHumanGate) -> FormPlan {
 pub(crate) fn message(gate: &PendingHumanGate) -> String {
     let mut out = match &gate.prompt {
         Some(p) => p.clone(),
-        None => format!(
-            "Mission {} is waiting on you to '{}'.",
-            gate.workflow_id, gate.transition
-        ),
+        None => {
+            // V33 statically guarantees every human gate of a validated config
+            // resolves a prompt, so this branch is unreachable except for
+            // pre-V33 persisted instance snapshots. Firing on a fresh config is
+            // a validator↔runtime parity breach (FMECA FM-1) — say so loudly.
+            tracing::error!(
+                workflow_id = %gate.workflow_id,
+                transition = %gate.transition,
+                "gate has no resolvable prompt — V33 should have rejected this \
+                 definition at load (validator-runtime parity breach unless this \
+                 instance predates the V33 upgrade)"
+            );
+            format!(
+                "Mission {} is waiting on you to '{}'.",
+                gate.workflow_id, gate.transition
+            )
+        }
     };
     if let Some(presented) = &gate.presented {
         for (pointer, value) in presented {
