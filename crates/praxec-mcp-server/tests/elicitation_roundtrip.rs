@@ -283,25 +283,29 @@ async fn accept_with_valid_choice_advances_and_maps_the_full_object() {
 
     // The push the server sent carried the rendered decision context (g1→g5):
     // prompt first, presented candidates, and the titled single-select form.
-    let pushed = pushed.lock().expect("pushed lock");
-    assert_eq!(pushed.len(), 1, "exactly one elicitation push");
-    let (message, schema) = &pushed[0];
-    assert!(
-        message.starts_with("Pick a shape for the capability."),
-        "the caller-seeded prompt must lead the message, got: {message}"
-    );
-    assert!(
-        message.contains("— $.context.candidates —") && message.contains("Monolith"),
-        "the presented candidates must be rendered into the message, got: {message}"
-    );
-    assert_eq!(
-        schema["properties"]["chosen_id"]["oneOf"],
-        json!([
-            { "const": "monolith", "title": "Monolith" },
-            { "const": "split", "title": "Split" }
-        ]),
-        "the choice field must be the titled single-select over the live candidates"
-    );
+    // Scoped so the std MutexGuard drops before the awaits below
+    // (clippy::await_holding_lock is deny-level in CI).
+    {
+        let pushed = pushed.lock().expect("pushed lock");
+        assert_eq!(pushed.len(), 1, "exactly one elicitation push");
+        let (message, schema) = &pushed[0];
+        assert!(
+            message.starts_with("Pick a shape for the capability."),
+            "the caller-seeded prompt must lead the message, got: {message}"
+        );
+        assert!(
+            message.contains("— $.context.candidates —") && message.contains("Monolith"),
+            "the presented candidates must be rendered into the message, got: {message}"
+        );
+        assert_eq!(
+            schema["properties"]["chosen_id"]["oneOf"],
+            json!([
+                { "const": "monolith", "title": "Monolith" },
+                { "const": "split", "title": "Split" }
+            ]),
+            "the choice field must be the titled single-select over the live candidates"
+        );
+    }
 
     let _ = client.cancel().await;
     server_task.abort();
