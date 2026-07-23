@@ -982,3 +982,32 @@ repos:
     let msg = format!("{:#}", err);
     assert!(msg.contains("ALL_REPOS_FAILED"), "msg: {msg}");
 }
+
+#[test]
+fn f13_bare_writable_plus_failing_real_repo_still_trips_the_empty_registry_guard() {
+    // Backstop edge: a bare-writable run target does NOT contribute
+    // definitions, so `[bare-writable, failing-real-repo]` has skipped(1) <
+    // declared(2) — the old skipped==declared guard let it through and started
+    // a SILENTLY definition-less gateway. The guard keys off definition-bearing
+    // repos loaded, so zero-loaded + something-skipped must still fail loud.
+    let td = TempDir::new().unwrap();
+    let code = TempDir::new().unwrap(); // manifest-less writable run target
+    let host = format!(
+        r#"
+version: "1.0.0"
+repos:
+  - path: "{code}"
+    definitions: false
+    writable: true
+  - path: "{gone}"
+"#,
+        code = code.path().display(),
+        gone = td.path().join("no-such-worktree").display(),
+    );
+    let path = write_host(&td, &host);
+    let err = praxec_core::config::load_resolved_with_repos_resilient(&path).expect_err(
+        "a bare-writable target cannot stand in for the failed real repo — no definitions loaded",
+    );
+    let msg = format!("{:#}", err);
+    assert!(msg.contains("ALL_REPOS_FAILED"), "msg: {msg}");
+}

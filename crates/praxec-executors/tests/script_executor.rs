@@ -430,6 +430,51 @@ async fn small_arg_passes_verbatim_with_empty_spilled_args() {
     assert!(stdout.contains("spilled=[]"), "stdout: {stdout}");
 }
 
+// ── Finding #15: an arg BELOW the execve limit is never spilled ──────────
+// Regression fence for the spill threshold. An arg in the [100 KB, 128 KiB)
+// window is execve-safe and historically passed verbatim; the threshold sits
+// at the true MAX_ARG_STRLEN so such an arg must still arrive as its literal
+// value with PRAXEC_SPILLED_ARGS=[] — never silently rewritten to
+// `@argfile:...` for a script that doesn't dereference spills.
+
+#[tokio::test]
+async fn arg_just_below_the_execve_limit_passes_verbatim_not_spilled() {
+    // 120 000 bytes: above the OLD 100 000 threshold, below MAX_ARG_STRLEN.
+    let mid = format!("HEAD{}TAIL", "b".repeat(119_992));
+    assert_eq!(mid.len(), 120_000);
+    let mut instance = instance_with_scripts_library(json!({
+        "run.mid.arg": {
+            "verb": "run",
+            "lifecycle": "stable",
+            // Deliberately does NOT dereference @argfile: a verbatim value must
+            // arrive intact for a spill-unaware script.
+            "body": "val=\"$1\"\necho \"spilled=$PRAXEC_SPILLED_ARGS\"\necho \"len=${#val}\"\necho \"head=${val:0:4}\"\necho \"tail=${val: -4}\"\n",
+            "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "source": "config"
+        }
+    }));
+    instance.context = json!({ "mid": mid });
+    let exec = ScriptExecutor::new();
+    let result = exec
+        .execute(req(
+            instance,
+            json!({
+                "kind": "script",
+                "subject": "run.mid.arg",
+                "args": ["$.context.mid"]
+            }),
+            json!({}),
+        ))
+        .await
+        .expect("a sub-limit arg must run");
+    assert_eq!(result.output["success"], true);
+    let stdout = result.output["stdout"].as_str().unwrap();
+    assert!(stdout.contains("len=120000"), "stdout: {stdout}");
+    assert!(stdout.contains("head=HEAD"), "stdout: {stdout}");
+    assert!(stdout.contains("tail=TAIL"), "stdout: {stdout}");
+    assert!(stdout.contains("spilled=[]"), "stdout: {stdout}");
+}
+
 // ── Stdout JSON auto-parsed when valid ────────────────────────────────────
 
 #[tokio::test]

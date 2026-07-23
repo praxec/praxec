@@ -2988,6 +2988,12 @@ fn merge_declared_repos(
 
     let mut repo_aggregate = Value::Object(Map::new());
     let mut repo_provided_ids: HashSet<String> = HashSet::new();
+    // Finding #13 backstop — count repos that actually contributed a
+    // definition registry (bare-writable run targets do NOT: they `continue`
+    // above). The empty-registry guard keys off THIS, not skipped-vs-declared:
+    // a config mixing a bare-writable target with a single failing real repo
+    // has `skipped < declared` yet still loads zero definitions.
+    let mut loaded_definition_repos: usize = 0;
     let mut seen_namespaces: HashMap<String, String> = HashMap::new();
     // SPEC §8.4 — (absolute root, push) of repos opted in as authoring write
     // targets, carried forward to the gateway via the resolved config (see
@@ -3133,20 +3139,26 @@ fn merge_declared_repos(
             &grant_connections,
         )?);
         repo_aggregate = deep_merge(repo_aggregate, repo_value);
+        loaded_definition_repos += 1;
     }
 
-    // Finding #13 backstop — resilience isolates ONE bad entry; it must not
-    // silently degrade to an empty registry. If every declared repo failed,
-    // something is systemically wrong (moved host dir, broken git auth) and
-    // a loud startup failure beats a definition-less gateway.
-    if skipped.len() == declared_count {
+    // Finding #13 backstop — resilience isolates a bad entry; it must not
+    // silently degrade to an empty registry. If NO definition-bearing repo
+    // loaded yet at least one was skipped, something is systemically wrong
+    // (moved host dir, broken git auth) and a loud startup failure beats a
+    // definition-less gateway. Keyed off loaded-count (not skipped==declared)
+    // so a bare-writable target alongside a failing real repo still trips it;
+    // an all-bare-writable config (nothing skipped) is a legitimate
+    // definition-less run and is left alone.
+    if loaded_definition_repos == 0 && !skipped.is_empty() {
         let details: Vec<String> = skipped
             .iter()
             .map(|(entry, err)| format!("- {entry}: {err}"))
             .collect();
         bail!(
-            "ALL_REPOS_FAILED: every declared `repos:` entry ({declared_count}) failed to \
-             load — no repo definitions are available:\n{}",
+            "ALL_REPOS_FAILED: no definition-bearing `repos:` entry loaded (of {declared_count} \
+             declared) — every registry-providing repo was skipped, so no repo definitions are \
+             available:\n{}",
             details.join("\n")
         );
     }

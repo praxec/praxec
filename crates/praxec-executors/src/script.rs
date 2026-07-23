@@ -61,11 +61,15 @@ use tokio::process::Command;
 use uuid::Uuid;
 
 /// Finding #15 — Linux caps a single execve argv string at MAX_ARG_STRLEN
-/// (32 pages = 128 KiB on 4 KiB-page kernels). A rendered arg at or beyond
-/// that limit makes the child unspawnable with E2BIG ("Argument list too
-/// long"). Spill anything over this comfortable margin below the kernel
-/// limit to a temp file and pass `@argfile:<path>` in its place.
-const ARG_SPILL_THRESHOLD_BYTES: usize = 100_000;
+/// (32 pages = 128 KiB on the common 4 KiB-page kernel). A rendered arg AT or
+/// beyond this makes the child unspawnable with E2BIG ("Argument list too
+/// long"). We spill ONLY args that would actually break execve: anything
+/// strictly smaller passes verbatim exactly as it did before finding #15, so
+/// no historically-working arg silently turns into a literal `@argfile:...`
+/// string. Args at/over the limit would have hard-failed E2BIG regardless, so
+/// diverting them to a tempfile (and requiring the receiving script to be
+/// spill-aware via PRAXEC_SPILLED_ARGS) is strictly better than a crash.
+const ARG_SPILL_THRESHOLD_BYTES: usize = 128 * 1024;
 
 /// SPEC §22 + ADR-0006. Confinement is opt-in per script: with no provider and
 /// no profile, scripts run exactly as before. A configured provider confines
@@ -193,7 +197,10 @@ impl Executor for ScriptExecutor {
             .into_iter()
             .enumerate()
             .map(|(i, arg)| {
-                if arg.len() <= ARG_SPILL_THRESHOLD_BYTES {
+                // `<` not `<=`: an arg of exactly MAX_ARG_STRLEN bytes still
+                // overflows once the NUL terminator is counted, so it must
+                // spill too.
+                if arg.len() < ARG_SPILL_THRESHOLD_BYTES {
                     return Ok(arg);
                 }
                 let spill = NamedTempFile::new().map_err(|e| {
