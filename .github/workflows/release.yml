@@ -4,6 +4,12 @@
 # Runs alongside publish.yml (crates.io) — both trigger on v* tags.
 # This workflow produces binaries + checksums; publish.yml handles
 # crate publishing.
+#
+# Also runnable via `workflow_dispatch` with a `tag` input to (re)build
+# and (re)publish the binaries for an EXISTING tag — used when a tag was
+# pushed before this workflow could produce a release, without having to
+# delete/re-create the tag (the `release-tags` ruleset restricts tag
+# creation).
 
 name: Release binaries
 
@@ -11,12 +17,21 @@ on:
     push:
         tags:
             - 'v*'
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: 'Existing tag to build and release (e.g. v0.0.30)'
+                required: true
+                type: string
 
 permissions:
     contents: write
 
 env:
     CARGO_TERM_COLOR: always
+    # The tag we build + release: the dispatch input when run manually,
+    # otherwise the pushed tag's short name (e.g. v0.0.30).
+    RELEASE_TAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.tag) || github.ref_name }}
 
 jobs:
     build:
@@ -32,7 +47,13 @@ jobs:
                       os: ubuntu-latest
                       use_cross: true
                     - target: x86_64-apple-darwin
-                      os: macos-13
+                      # Intel-mac binary is CROSS-COMPILED on an Apple-Silicon
+                      # runner: GitHub's Intel `macos-13` runners are effectively
+                      # unavailable and this leg used to queue forever, silently
+                      # skipping the whole release. macOS cross-compiles arm64 ->
+                      # x86_64 natively (the toolchain step installs the target;
+                      # Apple's SDK is universal), so no emulation is involved.
+                      os: macos-latest
                       use_cross: false
                     - target: aarch64-apple-darwin
                       os: macos-latest
@@ -44,6 +65,10 @@ jobs:
         timeout-minutes: 60
         steps:
             - uses: actions/checkout@v4
+              with:
+                  # Build the tagged commit even under workflow_dispatch (which
+                  # otherwise checks out the dispatched branch).
+                  ref: ${{ env.RELEASE_TAG }}
 
             - name: Install Linux system dependencies
               # libdbus-1-dev is required by libdbus-sys (transitive dep
@@ -78,6 +103,23 @@ jobs:
               if: matrix.use_cross
               run: cross build --release -p praxec --target ${{ matrix.target }}
 
+            - name: Smoke-test the built binary
+              # Run the freshly built binary so a broken artifact fails the leg
+              # BEFORE it ships. Catches the genuinely-new risk here: the Intel
+              # (x86_64) mac binary is cross-compiled on the Apple-Silicon runner
+              # and executes via Rosetta 2 (present on GitHub's macos runners).
+              # Skipped only for the cross-compiled aarch64-linux leg, whose
+              # foreign-arch binary can't exec on the x86_64 build host.
+              if: "!matrix.use_cross"
+              shell: bash
+              run: |
+                  bin="target/${{ matrix.target }}/release/praxec"
+                  [[ "${{ matrix.target }}" == *windows* ]] && bin="${bin}.exe"
+                  echo "smoke: $bin --version"
+                  "$bin" --version
+                  echo "smoke: $bin --help (discard output)"
+                  "$bin" --help >/dev/null
+
             - name: Archive (tar.gz)
               if: "!contains(matrix.target, 'windows')"
               shell: bash
@@ -105,13 +147,19 @@ jobs:
     release:
         name: Create GitHub Release
         needs: build
+        # Run even if a build leg failed/was cancelled: publish whatever
+        # binaries DID build rather than silently skipping the whole release,
+        # then fail LOUD at the end if the matrix was incomplete.
+        if: always()
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
+              with:
+                  ref: ${{ env.RELEASE_TAG }}
 
             - name: Verify tag matches workspace version
               run: |
-                  tag="${GITHUB_REF#refs/tags/v}"
+                  tag="${RELEASE_TAG#v}"
                   ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
                   if [ "$tag" != "$ver" ]; then
                     echo "::error::Tag v$tag does not match workspace version $ver"
@@ -122,21 +170,48 @@ jobs:
               uses: actions/download-artifact@v4
               with:
                   path: artifacts
+              # A totally-failed build produces no artifacts; don't hard-error
+              # here — the collect step below turns "zero assets" into a loud,
+              # explicit failure.
+              continue-on-error: true
 
             - name: Collect release assets
+              id: collect
               run: |
                   mkdir -p release
-                  find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} release/ \;
+                  find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+                      -exec mv {} release/ \; 2>/dev/null || true
+                  count=$(find release -type f | wc -l | tr -d ' ')
+                  echo "count=$count" >> "$GITHUB_OUTPUT"
+                  if [ "$count" -eq 0 ]; then
+                    echo "::error::No build artifacts were produced — every build leg failed; nothing to release."
+                    exit 1
+                  fi
                   cd release
                   sha256sum * > checksums.sha256
+                  echo "Publishing $count platform archive(s):"
                   cat checksums.sha256
 
-            - name: Create release
+            - name: Create or update release
               env:
                   GH_TOKEN: ${{ github.token }}
               run: |
-                  tag="${GITHUB_REF#refs/tags/}"
-                  gh release create "$tag" \
-                    --title "$tag" \
-                    --generate-notes \
-                    release/*
+                  # Idempotent: create the release if it doesn't exist, else
+                  # upload/clobber assets onto the existing one (safe to re-run
+                  # / dispatch against an already-released tag).
+                  if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+                    gh release upload "$RELEASE_TAG" release/* --clobber
+                  else
+                    gh release create "$RELEASE_TAG" \
+                      --title "$RELEASE_TAG" \
+                      --generate-notes \
+                      release/*
+                  fi
+
+            - name: Fail loud if the platform matrix was incomplete
+              # Binaries are already published above; now surface a red run so a
+              # missing platform is never mistaken for a clean release.
+              if: needs.build.result != 'success'
+              run: |
+                  echo "::error::Release '${RELEASE_TAG}' was published but the build matrix did not fully succeed (build result: ${{ needs.build.result }}). One or more platform binaries are missing — investigate before advertising this release."
+                  exit 1
