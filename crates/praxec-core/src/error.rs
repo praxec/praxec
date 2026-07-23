@@ -350,6 +350,23 @@ pub enum ErrorClass {
     Permanent,
 }
 
+/// Finding #13 — TRUE iff an executor failure message carries one of the
+/// wire-stable agent-walk exhaustion codes. `AGENT_CHAIN_EXHAUSTED` means
+/// every model in the fallback chain failed its own full attempt;
+/// `AGENT_STEP_BUDGET_EXHAUSTED` means the shared per-step wall-clock budget
+/// is spent. Both are terminal by construction: a blind re-fire can only burn
+/// the identical walk again, so the runtime durably cancels the instance
+/// instead of leaving a response-transient failure (a zombie mission that
+/// strands parked parents and spins drivers).
+///
+/// `contains` rather than `starts_with` because the chain path wraps the
+/// executor message in the `ExecutorError` Display form
+/// (`"permanent error: AGENT_…"`). The codes are pinned wire-stable by the
+/// agent executor's own tests.
+pub fn is_agent_exhaustion(message: &str) -> bool {
+    message.contains("AGENT_CHAIN_EXHAUSTED") || message.contains("AGENT_STEP_BUDGET_EXHAUSTED")
+}
+
 impl ErrorClass {
     pub fn token(self) -> &'static str {
         match self {
@@ -366,6 +383,28 @@ impl ErrorClass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding #13 — the predicate must match both wire-stable exhaustion
+    /// codes, bare and Display-wrapped, and nothing else.
+    #[test]
+    fn agent_exhaustion_predicate_matches_only_the_exhaustion_codes() {
+        assert!(is_agent_exhaustion(
+            "AGENT_CHAIN_EXHAUSTED: all 3 models failed"
+        ));
+        assert!(is_agent_exhaustion(
+            "AGENT_STEP_BUDGET_EXHAUSTED: 900s spent"
+        ));
+        // Chain path wraps in the ExecutorError Display form.
+        assert!(is_agent_exhaustion(
+            &ExecutorError::Permanent("AGENT_CHAIN_EXHAUSTED: walk".into()).to_string()
+        ));
+        // Ordinary permanent failures stay recoverable.
+        assert!(!is_agent_exhaustion("permanent error: boom"));
+        // Sibling agent codes are escalatable, not terminal.
+        assert!(!is_agent_exhaustion(
+            "AGENT_NO_RESULT: model returned nothing"
+        ));
+    }
 
     /// SPEC §33 FMECA F2 — wire codes are operator-facing and MUST NOT
     /// change across releases. This test fails loudly if anyone edits a
