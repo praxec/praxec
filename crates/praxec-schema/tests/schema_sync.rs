@@ -20,6 +20,9 @@ fn packaged_schemas_match_the_repo_root_sources() {
     ] {
         let ours = fs::read(crate_dir.join("schemas").join(name)).expect(name);
         let theirs = fs::read(root_schemas.join(name)).expect(name);
-        assert_eq!(ours, theirs, "{name} drifted — re-copy it into crates/praxec-schema/schemas/");
+        assert_eq!(
+            ours, theirs,
+            "{name} drifted — re-copy it into crates/praxec-schema/schemas/"
+        );
     }
 }

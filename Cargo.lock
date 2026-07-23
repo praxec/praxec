@@ -4682,7 +4682,7 @@ dependencies = [
 
 [[package]]
 name = "praxec"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4712,7 +4712,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-agents"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4734,7 +4734,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-cockpit"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
@@ -4754,7 +4754,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-cockpit-mcp"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4769,7 +4769,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-core"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4799,7 +4799,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-embeddings"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4814,7 +4814,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-executors"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4838,7 +4838,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-llm-executor"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4857,7 +4857,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-mcp-server"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4878,7 +4878,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-schema"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4893,7 +4893,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-test"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4910,7 +4910,7 @@ dependencies = [
 
 [[package]]
 name = "praxec-tui"
-version = "0.0.28"
+version = "0.0.29"
 dependencies = [
  "aether-agent-cli",
  "aether-agent-core",
