@@ -31,9 +31,9 @@ dependencies = [
 
 [[package]]
 name = "aether-acp-utils"
-version = "0.3.27"
+version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f776f803b46de85d36bd93da5fa9374cf5da1bd50619fa563b055316a916408c"
+checksum = "655c56a11ba6a31a17ec44759aa55b8ababec0cb8c6354fe97df78835df18bc9"
 dependencies = [
  "aether-mcp-utils",
  "aether-utils",
@@ -41,6 +41,7 @@ dependencies = [
  "async-trait",
  "futures",
  "rmcp",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -51,9 +52,9 @@ dependencies = [
 
 [[package]]
 name = "aether-agent-cli"
-version = "0.7.20"
+version = "0.7.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bf00321c34c723e8f6c9b0c6966a417893d0805445e9ae4bdca9beab7645f29"
+checksum = "32994fb80cfce9c10bb698add8acc6f5295d70d8e8c82d7d351bf004111d8e40"
 dependencies = [
  "aether-acp-utils",
  "aether-agent-core",
@@ -63,7 +64,9 @@ dependencies = [
  "aether-mcp-servers",
  "aether-mcp-utils",
  "aether-project",
+ "aether-telemetry",
  "aether-tui",
+ "aether-utils",
  "aether-wisp",
  "agent-client-protocol",
  "async-trait",
@@ -89,9 +92,9 @@ dependencies = [
 
 [[package]]
 name = "aether-agent-core"
-version = "0.6.18"
+version = "0.6.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f22f1fe3e1d8fc12bfe4b0a23814e3b6ee0c8c7674465340cfbb8142b6691d6"
+checksum = "44a79f10e1fd2bce724b3ba1a0e5e614537d44c05d4fd746eba5cc307d0a579b"
 dependencies = [
  "aether-acp-utils",
  "aether-auth",
@@ -120,9 +123,9 @@ dependencies = [
 
 [[package]]
 name = "aether-auth"
-version = "0.1.6"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bb37ad2c10e2174ff9497eb777489b46bf81a8cf85e8ae1059640fd51dc15fe"
+checksum = "c749111f1a7ad6c8484601a77b9982e31fe62a56a480023addfbd6e97595ef53"
 dependencies = [
  "age",
  "apple-native-keyring-store",
@@ -145,9 +148,9 @@ dependencies = [
 
 [[package]]
 name = "aether-llm"
-version = "0.7.16"
+version = "0.7.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d0b8c07ff0b98fb1b7a0536f6cd897fd9419f3407f721242c23a60142fbff96"
+checksum = "922d116569064643e10a6dc7633d3d25938b30801d707785c58e916cc58f79f3"
 dependencies = [
  "aether-auth",
  "aether-llm-codegen",
@@ -179,10 +182,11 @@ dependencies = [
 
 [[package]]
 name = "aether-llm-codegen"
-version = "0.2.12"
+version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e09a4ea394d7ee5dae6221949cb03fb1be61522e91e887925cbd2bb1c7c23cc1"
+checksum = "637281a45571a8aeb2d71187887dd2c47e11d2e2ee92e0d552bf2ec07681d836"
 dependencies = [
+ "aether-utils",
  "prettyplease",
  "proc-macro2",
  "quote",
@@ -194,9 +198,9 @@ dependencies = [
 
 [[package]]
 name = "aether-lspd"
-version = "0.1.20"
+version = "0.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "935c530a98155c15e2646f71a8a6b4a84f6a6905a43e3fbefbbe03a850359488"
+checksum = "7cb594c185985402054c126d4fe59e6e95587a0faa1059e3ed5ff9f320cd842d"
 dependencies = [
  "clap",
  "futures",
@@ -218,9 +222,9 @@ dependencies = [
 
 [[package]]
 name = "aether-mcp-servers"
-version = "0.4.23"
+version = "0.4.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97d83e389a4da151f60542a1971a13dbede7f8f7462ab1abec1910ec7abd1111"
+checksum = "ede856bf4a7b3746fed7971a5693a09963d05392f493b3ef58c66c2df0f3a263"
 dependencies = [
  "aether-agent-core",
  "aether-auth",
@@ -256,9 +260,9 @@ dependencies = [
 
 [[package]]
 name = "aether-mcp-utils"
-version = "0.5.21"
+version = "0.5.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "343f62df02d7fa3b7191546a5819a637bfba1d8ed8392e69109d8d144b075ebf"
+checksum = "893bcf1a190112a63d948f15752dc125851e20cd489e4336572c51066bd339da"
 dependencies = [
  "aether-auth",
  "aether-llm",
@@ -277,9 +281,9 @@ dependencies = [
 
 [[package]]
 name = "aether-project"
-version = "0.5.18"
+version = "0.5.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da51ba81d35dac5190c27976fd841342ffe9cde4edc2a70f05b5a78d543f74d7"
+checksum = "deefbf42b8c67c230da7934b701809a86f263aca084c8834e0a7cc4844fa6745"
 dependencies = [
  "aether-agent-core",
  "aether-llm",
@@ -296,10 +300,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "aether-tui"
-version = "0.2.15"
+name = "aether-telemetry"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aa965cceabcd113078ab161d9830d6fd46350e5d060cfe9443c9f5bb7d8270c"
+checksum = "0257f18c7373f4671e3b87b83837f1488725feece5ec120b073cde100513d2e6"
+dependencies = [
+ "aether-agent-core",
+ "aether-llm",
+ "aether-utils",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
+ "reqwest 0.13.4",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "aether-tui"
+version = "0.2.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44fb7f76f2741a3f80f99de0a56ad19e3a36ddea413f1e2379319baa2f8f15b9"
 dependencies = [
  "crossterm 0.29.0",
  "futures",
@@ -318,9 +343,9 @@ dependencies = [
 
 [[package]]
 name = "aether-utils"
-version = "0.2.8"
+version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17d0ed0b3595eb6ecae37802399f4e7a755bacd2c70425c09d5e3f0bc529af73"
+checksum = "13deb453be02cebe1b5a9c5ecea30f9edf34d997a45363d0860de90bdc9a69e5"
 dependencies = [
  "futures",
  "regex",
@@ -335,9 +360,9 @@ dependencies = [
 
 [[package]]
 name = "aether-wisp"
-version = "0.4.27"
+version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21f7f4624f8cd2f991a55d05c0d1ca1441d57a8b4823ab14e98124c55cda7946"
+checksum = "6008b19cbebddb43eb4f8f9434adfcbe97bb86beb98e0640cf4bbfd3a4d4849f"
 dependencies = [
  "aether-acp-utils",
  "aether-tui",
@@ -4293,6 +4318,83 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "opentelemetry"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "opentelemetry-http"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http 1.4.2",
+ "opentelemetry",
+ "reqwest 0.13.4",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
+dependencies = [
+ "http 1.4.2",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "reqwest 0.13.4",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+]
+
+[[package]]
+name = "opentelemetry-semantic-conventions"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c913ac17a6c451661ee255f4625d143e51647ae78ebd969b75e41c4442f4fe47"
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.32.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry",
+ "percent-encoding",
+ "portable-atomic",
+ "rand 0.9.4",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4547,6 +4649,12 @@ dependencies = [
  "opaque-debug",
  "universal-hash",
 ]
+
+[[package]]
+name = "portable-atomic"
+version = "1.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d20d5497ef88037a52ff98267d066e7f11fcc5e99bbfbd58a42336193aacec3"
 
 [[package]]
 name = "potential_utf"
@@ -4912,6 +5020,29 @@ dependencies = [
  "tokio",
  "tracing",
  "windows",
+]
+
+[[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -5410,7 +5541,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d1f571c72940a19d9532fe52dbea8bc9912bf1d766c2970bb824056b86f3f59"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
  "chrono",
  "futures",
  "http 1.4.2",
