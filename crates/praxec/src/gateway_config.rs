@@ -544,7 +544,14 @@ pub(crate) fn load_config(path: &PathBuf) -> anyhow::Result<Value> {
     // `executor: { capability: ... }` references into the inline shapes the
     // runtime expects. Soft diagnostics are discarded here; `check` uses the
     // diagnostics-returning variant.
-    praxec_core::config::load_resolved_with_repos(path)
+    //
+    // Finding #13 — this is the serve/runtime load path, so it uses the
+    // RESILIENT loader: a `repos:` entry that fails to load (e.g. a pruned
+    // worktree with no praxec.repo.yaml) is skipped with a logged warning
+    // instead of poisoning every session's config load. `praxec check` keeps
+    // the strict all-or-nothing loader so authors still see the dead entry
+    // as a hard error.
+    praxec_core::config::load_resolved_with_repos_resilient(path)
         .map(|(config, _diagnostics)| config)
         .with_context(|| format!("loading config {}", path.display()))
 }

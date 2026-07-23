@@ -759,6 +759,14 @@ impl WorkflowRuntime {
                 if let Some(e) = &effort {
                     agent_config["reasoning_effort"] = json!(e);
                 }
+                // (finding #12) The configured allowance must bound the WHOLE
+                // chain-walk, not just each attempt: without this the executor
+                // falls back to its own 900s walk default and cuts a step whose
+                // `auto_drive_max_seconds` is larger. Omitted when the operator
+                // didn't set the knob, so the executor default still governs.
+                if let Some(budget) = self.auto_drive_step_budget_seconds {
+                    agent_config["step_budget_seconds"] = json!(budget);
+                }
                 // Repo write-exclusion gate on the AUTO-DRIVE path.
                 //
                 // Read `owned_files` from the DECLARED executor (`def`), not the
@@ -810,6 +818,11 @@ impl WorkflowRuntime {
                 // the config, so absent-key runs stay byte-identical.
                 if let Some(e) = &effort {
                     invoked_payload["reasoning_effort"] = json!(e);
+                }
+                // Same parity rule: record the step budget the walk actually
+                // ran under when the operator configured one (finding #12).
+                if let Some(budget) = self.auto_drive_step_budget_seconds {
+                    invoked_payload["step_budget_seconds"] = json!(budget);
                 }
                 self.record_or_self_event(
                     instance
