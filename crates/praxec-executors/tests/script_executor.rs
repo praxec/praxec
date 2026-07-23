@@ -356,6 +356,80 @@ async fn praxec_env_vars_exposed_to_script_body() {
     assert!(stdout.contains(&format!("hash={hash}")), "stdout: {stdout}");
 }
 
+// ── Finding #15: oversized args spill to temp files ──────────────────────
+// Linux caps a single argv string at MAX_ARG_STRLEN (~128 KiB); any rendered
+// arg beyond it makes the child unspawnable ("Argument list too long", E2BIG).
+// `concat` fan-in routinely binds ~400 KB strings as script args, so the
+// executor must spill oversized rendered args to a temp file and pass
+// `@argfile:<path>` in argv, with PRAXEC_SPILLED_ARGS naming the spilled
+// indices so scripts can distinguish a spill from a literal deterministically.
+
+#[tokio::test]
+async fn oversized_arg_spills_to_tempfile_and_script_reads_full_value() {
+    let big = format!("HEAD{}TAIL", "a".repeat(199_992));
+    assert_eq!(big.len(), 200_000);
+    let mut instance = instance_with_scripts_library(json!({
+        "run.big.arg": {
+            "verb": "run",
+            "lifecycle": "stable",
+            "body": "val=\"$1\"\ncase \"$val\" in\n  @argfile:*) val=\"$(cat \"${val#@argfile:}\")\" ;;\nesac\necho \"spilled=$PRAXEC_SPILLED_ARGS\"\necho \"len=${#val}\"\necho \"head=${val:0:4}\"\necho \"tail=${val: -4}\"\n",
+            "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "source": "config"
+        }
+    }));
+    instance.context = json!({ "big": big });
+    let exec = ScriptExecutor::new();
+    let result = exec
+        .execute(req(
+            instance,
+            json!({
+                "kind": "script",
+                "subject": "run.big.arg",
+                "args": ["$.context.big"]
+            }),
+            json!({}),
+        ))
+        .await
+        .expect("oversized arg must not make the child unspawnable");
+    assert_eq!(result.output["success"], true);
+    let stdout = result.output["stdout"].as_str().unwrap();
+    assert!(stdout.contains("len=200000"), "stdout: {stdout}");
+    assert!(stdout.contains("head=HEAD"), "stdout: {stdout}");
+    assert!(stdout.contains("tail=TAIL"), "stdout: {stdout}");
+    assert!(stdout.contains("spilled=[0]"), "stdout: {stdout}");
+}
+
+// ── Finding #15: small args are NOT spilled; PRAXEC_SPILLED_ARGS is [] ───
+
+#[tokio::test]
+async fn small_arg_passes_verbatim_with_empty_spilled_args() {
+    let instance = instance_with_scripts_library(json!({
+        "run.small.arg": {
+            "verb": "run",
+            "lifecycle": "stable",
+            "body": "echo \"got=$1 spilled=$PRAXEC_SPILLED_ARGS\"",
+            "hash": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "source": "config"
+        }
+    }));
+    let exec = ScriptExecutor::new();
+    let result = exec
+        .execute(req(
+            instance,
+            json!({
+                "kind": "script",
+                "subject": "run.small.arg",
+                "args": ["plain-value"]
+            }),
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    let stdout = result.output["stdout"].as_str().unwrap();
+    assert!(stdout.contains("got=plain-value"), "stdout: {stdout}");
+    assert!(stdout.contains("spilled=[]"), "stdout: {stdout}");
+}
+
 // ── Stdout JSON auto-parsed when valid ────────────────────────────────────
 
 #[tokio::test]

@@ -30,6 +30,19 @@
 //! workflow's transition record carries the script's `subject` + `hash`
 //! via the executor output JSON, so a future replay can pull the same
 //! script body out of cold storage by hash.
+//!
+//! ## Oversized args (finding #15)
+//!
+//! Linux caps a single execve argv string at MAX_ARG_STRLEN (~128 KiB), so
+//! a rendered arg beyond that makes the child unspawnable ("Argument list
+//! too long"). `concat` fan-in routinely produces such args. Any rendered
+//! arg over [`ARG_SPILL_THRESHOLD_BYTES`] is therefore spilled to a temp
+//! file (same lifecycle as the body temp file: deleted when execution
+//! returns) and its argv slot is replaced with `@argfile:<path>`. The
+//! child additionally receives `PRAXEC_SPILLED_ARGS`, a JSON array of the
+//! 0-based indices of spilled args (`[]` when none), so a script can
+//! distinguish a spill from a literal `@argfile:...` string
+//! deterministically.
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -46,6 +59,13 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::process::Command;
 use uuid::Uuid;
+
+/// Finding #15 — Linux caps a single execve argv string at MAX_ARG_STRLEN
+/// (32 pages = 128 KiB on 4 KiB-page kernels). A rendered arg at or beyond
+/// that limit makes the child unspawnable with E2BIG ("Argument list too
+/// long"). Spill anything over this comfortable margin below the kernel
+/// limit to a temp file and pass `@argfile:<path>` in its place.
+const ARG_SPILL_THRESHOLD_BYTES: usize = 100_000;
 
 /// SPEC §22 + ADR-0006. Confinement is opt-in per script: with no provider and
 /// no profile, scripts run exactly as before. A configured provider confines
@@ -161,6 +181,39 @@ impl Executor for ScriptExecutor {
             .map(|a| crate::arg_render::render_arg(a, &request))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Finding #15 — spill oversized rendered args to temp files so the
+        // child stays spawnable under MAX_ARG_STRLEN. Spill files share the
+        // body temp file's lifecycle: the `TempPath` guards live until this
+        // function returns, then delete the files. Spilled slots become
+        // `@argfile:<path>`; `spilled_indices` feeds PRAXEC_SPILLED_ARGS so
+        // scripts can tell a spill from a literal `@argfile:...` string.
+        let mut spill_paths: Vec<tempfile::TempPath> = Vec::new();
+        let mut spilled_indices: Vec<usize> = Vec::new();
+        let rendered_args: Vec<String> = rendered_args
+            .into_iter()
+            .enumerate()
+            .map(|(i, arg)| {
+                if arg.len() <= ARG_SPILL_THRESHOLD_BYTES {
+                    return Ok(arg);
+                }
+                let spill = NamedTempFile::new().map_err(|e| {
+                    ExecutorError::Connection(format!(
+                        "failed to create temp file for oversized arg {i}: {e}"
+                    ))
+                })?;
+                std::fs::write(spill.path(), &arg).map_err(|e| {
+                    ExecutorError::Connection(format!(
+                        "failed to write oversized arg {i} to temp file: {e}"
+                    ))
+                })?;
+                let path = spill.into_temp_path();
+                let argv_value = format!("@argfile:{}", path.to_string_lossy());
+                spill_paths.push(path);
+                spilled_indices.push(i);
+                Ok(argv_value)
+            })
+            .collect::<Result<Vec<_>, ExecutorError>>()?;
+
         // Honor shebang if body starts with `#!`. Otherwise default to bash.
         // Compute (program, argv) + env + workdir as VALUES so the same intent
         // feeds either the direct (unconfined) path or the sandbox provider.
@@ -205,6 +258,12 @@ impl Executor for ScriptExecutor {
         }
         env.push(("PRAXEC_SCRIPT_SUBJECT".to_string(), subject.to_string()));
         env.push(("PRAXEC_SCRIPT_HASH".to_string(), hash.clone()));
+        // Finding #15 — always set (as `[]` when nothing spilled) so scripts
+        // can detect spills deterministically.
+        env.push((
+            "PRAXEC_SPILLED_ARGS".to_string(),
+            json!(spilled_indices).to_string(),
+        ));
 
         // ADR-0006 — per-script confinement decision. Default is unconfined
         // (existing scripts unchanged); a declared profile routes through the
@@ -220,9 +279,12 @@ impl Executor for ScriptExecutor {
                 let spec = SandboxSpec {
                     workspace: workdir.as_ref().map(PathBuf::from),
                     command,
-                    // The script body lives in a temp file the fresh sandbox
-                    // tmpfs would otherwise hide — bind it in read-only.
-                    ro_binds: vec![temp_path.to_path_buf()],
+                    // The script body (and any spilled-arg files) live in
+                    // temp files the fresh sandbox tmpfs would otherwise
+                    // hide — bind them in read-only.
+                    ro_binds: std::iter::once(temp_path.to_path_buf())
+                        .chain(spill_paths.iter().map(|p| p.to_path_buf()))
+                        .collect(),
                     env: env.clone(),
                     egress: p.egress.clone(),
                     env_allowlist: p.env_allowlist.clone(),
