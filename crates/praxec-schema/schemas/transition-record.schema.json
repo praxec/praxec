@@ -1,0 +1,47 @@
+{
+  "$id": "https://praxec.dev/schemas/transition-record.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TransitionRecord",
+  "description": "One immutable record per applied workflow transition, emitted as a workflow.transition audit event.",
+  "type": "object",
+  "required": ["workflowId", "definitionId", "definitionVersion", "seq", "timestamp", "fromState", "toState", "transition", "actor"],
+  "additionalProperties": false,
+  "properties": {
+    "workflowId": { "type": "string" },
+    "definitionId": { "type": "string" },
+    "definitionVersion": { "type": "string" },
+    "seq": { "type": "integer", "minimum": 1, "description": "Equals the resulting WorkflowInstance.version." },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "fromState": { "type": "string" },
+    "toState": { "type": "string" },
+    "transition": { "type": "string" },
+    "actor": { "type": "string", "enum": ["agent", "deterministic", "human", "system"] },
+    "principal": { "type": ["string", "null"], "description": "Who submitted; null for deterministic/system actors." },
+    "guards": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "required": ["kind", "result"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string" },
+          "result": { "type": "boolean" }
+        }
+      }
+    },
+    "arguments": { "type": "object", "default": {} },
+    "blackboardDelta": { "type": "object", "default": {} },
+    "executor": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string" },
+        "ok": { "type": "boolean" },
+        "durationMs": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "childWorkflowId": { "type": ["string", "null"], "default": null },
+    "correlationId": { "type": ["string", "null"], "default": null }
+  }
+}

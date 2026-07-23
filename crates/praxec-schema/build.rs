@@ -4,11 +4,11 @@ use anyhow::Context;
 
 fn main() -> anyhow::Result<()> {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-    let schemas_dir = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.join("schemas"))
-        .context("locating schemas directory")?;
+    // The crate ships its own schema copies (schemas/ inside the crate) so the
+    // cargo-package verification sandbox builds without the workspace around it.
+    // tests/schema_sync.rs pins the copies byte-identical to the repo-root
+    // authored sources.
+    let schemas_dir = manifest_dir.join("schemas");
 
     let inputs = [
         "gateway-config.schema.json",
