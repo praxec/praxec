@@ -1568,6 +1568,29 @@ impl WorkflowRuntime {
                                 })),
                         )
                         .await?;
+                    // Finding #13 — an agent-walk exhaustion
+                    // (`AGENT_CHAIN_EXHAUSTED` / `AGENT_STEP_BUDGET_EXHAUSTED`)
+                    // is terminal by construction: every model / the whole
+                    // step budget is spent, so a blind re-fire can only burn
+                    // the identical walk again. Durably cancel (idempotent;
+                    // guards further submits with WORKFLOW_CANCELLED; wakes any
+                    // suspended parent — the same machinery the livelock
+                    // quarantine uses) instead of leaving a response-transient
+                    // failure that re-derives `running` on the next query — a
+                    // zombie that strands parked parents and spins drivers.
+                    if crate::error::is_agent_exhaustion(&err.to_string()) {
+                        if let Err(cancel_err) =
+                            self.cancel(&effective_instance.id, &err.to_string()).await
+                        {
+                            tracing::error!(
+                                target: "praxec_core::runtime",
+                                error = %cancel_err,
+                                workflow = %effective_instance.id,
+                                "agent-walk exhaustion could not durably cancel the \
+                                 instance; it may remain re-fireable (finding #13)"
+                            );
+                        }
+                    }
                     return Ok(DispatchOutcome::terminal(
                         self.failed_response(
                             &definition,
@@ -1865,17 +1888,37 @@ impl WorkflowRuntime {
                 if !partial.steps.is_empty() {
                     response["chain"] = serde_json::to_value(&partial.steps)?;
                 }
-                // Include the failed deterministic transition in links for recovery
-                push_failed_chain_recovery_link(
-                    &mut response,
-                    &definition,
-                    &partial.instance,
-                    &failed_transition,
-                );
-                // selection_error has no single failed transition — surface the
-                // state's legal transitions so the caller can recover (no dead-end).
-                if failed_transition.is_empty() {
-                    push_state_recovery_links(&mut response, &definition, &partial.instance);
+                // Finding #13 — a chain that failed on an agent-walk exhaustion
+                // is terminal by construction (every model / the whole step
+                // budget is spent). A recovery link would only re-burn the dead
+                // walk, and the response-transient failure would re-derive
+                // `running`/`waiting` on the next query — a zombie that strands
+                // parked parents and spins drivers. Durably cancel instead
+                // (idempotent; wakes any suspended parent) and omit the recovery
+                // link. Every other chain failure keeps its recoverable links.
+                if crate::error::is_agent_exhaustion(&error) {
+                    if let Err(cancel_err) = self.cancel(&partial.instance.id, &error).await {
+                        tracing::error!(
+                            target: "praxec_core::runtime",
+                            error = %cancel_err,
+                            workflow = %partial.instance.id,
+                            "chain exhaustion could not durably cancel the instance; \
+                             it may remain re-fireable (finding #13)"
+                        );
+                    }
+                } else {
+                    // Include the failed deterministic transition in links for recovery
+                    push_failed_chain_recovery_link(
+                        &mut response,
+                        &definition,
+                        &partial.instance,
+                        &failed_transition,
+                    );
+                    // selection_error has no single failed transition — surface the
+                    // state's legal transitions so the caller can recover (no dead-end).
+                    if failed_transition.is_empty() {
+                        push_state_recovery_links(&mut response, &definition, &partial.instance);
+                    }
                 }
                 // SPEC §33 D3 — a failed deterministic chain leaves the
                 // workflow in a broken state; do not chain further LLM

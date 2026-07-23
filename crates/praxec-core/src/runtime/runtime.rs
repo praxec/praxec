@@ -195,6 +195,15 @@ pub struct WorkflowRuntime {
     /// Wall-clock bound (seconds) for an auto-driven agent step — fail-fast so a
     /// non-converging agent surfaces in minutes, not the 600s executor default.
     pub(crate) auto_drive_max_seconds: u64,
+    /// (finding #12) The operator's CONFIGURED `auto_drive_max_seconds`, kept
+    /// separately so the synthesized step can carry it as `step_budget_seconds`
+    /// (the executor's whole chain-walk budget). Without it the executor fell
+    /// back to its own 900s walk default and cut a step whose configured
+    /// allowance was larger (observed live: `AGENT_STEP_BUDGET_EXHAUSTED` at
+    /// exactly 900s under a 1800s allowance). `None` when the operator didn't
+    /// set the knob — the executor default then governs, preserving
+    /// multi-attempt escalation under the 180s-per-attempt default wall.
+    pub(crate) auto_drive_step_budget_seconds: Option<u64>,
     /// The repo roots a run may operate on, from the config's `writable: true`
     /// repos (`/praxec/_writableRepos`). A top-level `start` resolves the run's
     /// mandatory [`crate::run_env::RepoRoot`] from this set (see
@@ -245,6 +254,7 @@ impl WorkflowRuntime {
             auto_drive_affinity: "reasoning".to_string(),
             auto_drive_tools: Vec::new(),
             auto_drive_max_seconds: 180,
+            auto_drive_step_budget_seconds: None,
             writable_repo_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             exclusive_pools: Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
         }
@@ -566,7 +576,11 @@ impl WorkflowRuntime {
     /// (1b) Enable auto-driving of skill-surfacing `actor: agent` states via the
     /// `kind: agent` executor, using `affinity` for the model binding,
     /// `tools` (MCP connection names) for the agent's tool access, and a
-    /// `max_seconds` fail-fast bound (0 keeps the default 180s).
+    /// `max_seconds` fail-fast bound (0 keeps the default 180s). A non-zero
+    /// `max_seconds` also becomes the synthesized step's `step_budget_seconds`,
+    /// so the configured allowance bounds the executor's WHOLE chain-walk —
+    /// not just each attempt — instead of the executor's own 900s default
+    /// cutting the step short (finding #12).
     pub fn with_auto_drive_agents(
         mut self,
         enabled: bool,
@@ -582,6 +596,7 @@ impl WorkflowRuntime {
         self.auto_drive_tools = tools;
         if max_seconds > 0 {
             self.auto_drive_max_seconds = max_seconds;
+            self.auto_drive_step_budget_seconds = Some(max_seconds);
         }
         self
     }
@@ -1086,6 +1101,42 @@ impl WorkflowRuntime {
 
         let instance = self.store.create(instance).await?;
 
+        // Finding #18 — persist the parent↔child binding at SPAWN time, the
+        // moment the child row exists in the store. Historically the
+        // `_subworkflow_wait` record was written ONLY by the clean-suspend
+        // path (`suspend_on_subworkflow`); when this child's start/auto-drive
+        // errored, the parent's submit was rejected wholesale, no record was
+        // persisted — and the child row (which DOES survive, created above)
+        // became unreachable: every parent re-submit spawned a brand-new
+        // child, so an externally-rescued child could never be harvested.
+        // Writing the record here, through the store directly, uses the same
+        // channel that makes the child row itself survive the rejected
+        // submit. Best-effort: a failed write degrades to the old behavior
+        // (the clean-suspend path still hard-commits the record), so warn
+        // loudly rather than fail the child's start.
+        if let Some(link) = instance.parent.clone() {
+            if !link.transition.is_empty() {
+                if let Err(e) = self
+                    .record_subworkflow_spawn_binding(
+                        &link.workflow_id,
+                        &link.transition,
+                        &instance.id,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "praxec_core::runtime",
+                        parent = %link.workflow_id,
+                        child = %instance.id,
+                        error = %e,
+                        "sub_workflow.spawn.binding: failed to persist the parent's \
+                         _subworkflow_wait record at spawn; if this child's start \
+                         errors, the parent will not be able to reuse it"
+                    );
+                }
+            }
+        }
+
         // T25 — spawn the timeout watchdog as soon as the instance
         // exists in the store. Definitions without `timeoutMs` (the
         // common case) skip this; the lazy check still covers any
@@ -1229,17 +1280,34 @@ impl WorkflowRuntime {
                 if !partial.evidence.is_empty() {
                     response["evidence"] = serde_json::to_value(&partial.evidence)?;
                 }
-                // Include the failed deterministic transition in links for recovery
-                push_failed_chain_recovery_link(
-                    &mut response,
-                    &definition,
-                    &partial.instance,
-                    &failed_transition,
-                );
-                // selection_error has no single failed transition — surface the
-                // state's legal transitions so the caller can recover (no dead-end).
-                if failed_transition.is_empty() {
-                    push_state_recovery_links(&mut response, &definition, &partial.instance);
+                // Finding #13 — a start-chain that failed on an agent-walk
+                // exhaustion is terminal by construction. Durably cancel
+                // (idempotent; wakes any suspended parent) and omit the recovery
+                // link so the spent walk cannot be re-fired; every other chain
+                // failure keeps its recoverable links. See the submit-path arm.
+                if crate::error::is_agent_exhaustion(&error) {
+                    if let Err(cancel_err) = self.cancel(&partial.instance.id, &error).await {
+                        tracing::error!(
+                            target: "praxec_core::runtime",
+                            error = %cancel_err,
+                            workflow = %partial.instance.id,
+                            "start-chain exhaustion could not durably cancel the \
+                             instance; it may remain re-fireable (finding #13)"
+                        );
+                    }
+                } else {
+                    // Include the failed deterministic transition in links for recovery
+                    push_failed_chain_recovery_link(
+                        &mut response,
+                        &definition,
+                        &partial.instance,
+                        &failed_transition,
+                    );
+                    // selection_error has no single failed transition — surface the
+                    // state's legal transitions so the caller can recover (no dead-end).
+                    if failed_transition.is_empty() {
+                        push_state_recovery_links(&mut response, &definition, &partial.instance);
+                    }
                 }
                 Ok(response)
             }
@@ -1330,6 +1398,48 @@ impl WorkflowRuntime {
                 Ok(response)
             }
         }
+    }
+
+    /// Finding #18 — durably record `_subworkflow_wait` on the PARENT the
+    /// moment a spawned child's row is persisted. Written straight through
+    /// the store — NOT through the parent's in-flight dispatch — so the
+    /// record survives even when that dispatch is later rejected wholesale
+    /// (the executor error path saves nothing; this write has already
+    /// committed independently, exactly like the child row itself).
+    ///
+    /// The save deliberately does NOT bump the parent's version: the parent
+    /// is mid-dispatch at its loaded version, and every later commit in that
+    /// dispatch (clean suspend, advance, chain step) CAS-checks against the
+    /// stored version via `save_if_version`. A same-version save keeps those
+    /// commits valid. They also rebuild `next` from their in-memory snapshot
+    /// (which predates this write), so:
+    /// - a clean suspend re-writes the identical record with the usual
+    ///   version bump (`suspend_on_subworkflow` — unchanged contract);
+    /// - a successful harvest saves a context WITHOUT the record, clearing
+    ///   it on advance exactly as before (`clear_subworkflow_wait_on_advance`
+    ///   plus the snapshot rebuild both drop it).
+    async fn record_subworkflow_spawn_binding(
+        &self,
+        parent_workflow_id: &str,
+        transition: &str,
+        child_workflow_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut parent = self.store.load(parent_workflow_id).await?;
+        let wait = json!({
+            "child_workflow_id": child_workflow_id,
+            "transition": transition,
+        });
+        match parent.context.as_object_mut() {
+            Some(obj) => {
+                obj.insert("_subworkflow_wait".to_string(), wait);
+            }
+            None => {
+                parent.context = json!({ "_subworkflow_wait": wait });
+            }
+        }
+        let expected = parent.version;
+        self.store.save_if_version(parent, expected).await?;
+        Ok(())
     }
 
     pub async fn get(&self, request: GetWorkflow) -> anyhow::Result<Value> {

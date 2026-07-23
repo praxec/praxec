@@ -882,3 +882,132 @@ overrides:
     assert!(msg.contains("STALE_OVERRIDE"), "msg: {msg}");
     assert!(msg.contains("swe/cap.does-not-exist"), "msg: {msg}");
 }
+
+// ---------- finding #13 — per-repo load isolation (resilient mode) ----------
+
+#[test]
+fn f13_one_bad_repo_entry_does_not_poison_the_resilient_load() {
+    // Live defect: a `repos:` entry pointing at a directory with no
+    // praxec.repo.yaml (e.g. a pruned git worktree) hard-failed the ENTIRE
+    // config load — every session lost ALL definitions. The serve/runtime
+    // path must instead skip the bad entry with a warning diagnostic and
+    // load every other repo normally.
+    let td = TempDir::new().unwrap();
+    let host = format!(
+        r#"
+version: "1.0.0"
+repos:
+  - path: "{swe}"
+  - path: "{gone}"
+"#,
+        swe = fixtures_root().join("swe-core").display(),
+        gone = td.path().join("no-such-worktree").display(),
+    );
+    let path = write_host(&td, &host);
+
+    // (a) the load SUCCEEDS despite the dead entry.
+    let (config, diagnostics) = praxec_core::config::load_resolved_with_repos_resilient(&path)
+        .expect("one bad repos entry must not poison the whole load");
+
+    // (b) the valid repo's definitions are present.
+    let workflows = config
+        .pointer("/workflows")
+        .and_then(Value::as_object)
+        .expect("workflows present");
+    assert!(
+        workflows.contains_key("swe/cap.plan.vet"),
+        "valid repo should still load; got {:?}",
+        workflows.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        workflows.contains_key("swe/flow.add-feature"),
+        "valid repo's flow should still load"
+    );
+
+    // (c) the bad entry surfaces as a warning diagnostic naming the entry
+    // and the underlying error.
+    let skip = diagnostics
+        .iter()
+        .find(|d| d.code == "REPO_LOAD_SKIPPED")
+        .expect("skipped repo must surface a REPO_LOAD_SKIPPED diagnostic");
+    assert_eq!(
+        skip.severity,
+        praxec_core::config::DiagnosticSeverity::Warn,
+        "skip is a warning, not an error: {skip:?}"
+    );
+    assert!(
+        skip.message.contains("no-such-worktree"),
+        "diagnostic should name the dead entry: {}",
+        skip.message
+    );
+}
+
+#[test]
+fn f13_strict_load_still_fails_on_a_bad_repo_entry() {
+    // `praxec check` keeps the all-or-nothing contract: the default
+    // (strict) loader must still reject a config with a dead entry loudly.
+    let td = TempDir::new().unwrap();
+    let host = format!(
+        r#"
+version: "1.0.0"
+repos:
+  - path: "{swe}"
+  - path: "{gone}"
+"#,
+        swe = fixtures_root().join("swe-core").display(),
+        gone = td.path().join("no-such-worktree").display(),
+    );
+    let path = write_host(&td, &host);
+    let err = load_resolved_with_repos(&path).expect_err("strict load must still fail");
+    let msg = format!("{:#}", err);
+    assert!(msg.contains("no-such-worktree"), "msg: {msg}");
+}
+
+#[test]
+fn f13_all_repos_failing_is_still_an_error_even_in_resilient_mode() {
+    let td = TempDir::new().unwrap();
+    let host = format!(
+        r#"
+version: "1.0.0"
+repos:
+  - path: "{gone_a}"
+  - path: "{gone_b}"
+"#,
+        gone_a = td.path().join("gone-a").display(),
+        gone_b = td.path().join("gone-b").display(),
+    );
+    let path = write_host(&td, &host);
+    let err = praxec_core::config::load_resolved_with_repos_resilient(&path)
+        .expect_err("every repo failing means no definitions — that stays an error");
+    let msg = format!("{:#}", err);
+    assert!(msg.contains("ALL_REPOS_FAILED"), "msg: {msg}");
+}
+
+#[test]
+fn f13_bare_writable_plus_failing_real_repo_still_trips_the_empty_registry_guard() {
+    // Backstop edge: a bare-writable run target does NOT contribute
+    // definitions, so `[bare-writable, failing-real-repo]` has skipped(1) <
+    // declared(2) — the old skipped==declared guard let it through and started
+    // a SILENTLY definition-less gateway. The guard keys off definition-bearing
+    // repos loaded, so zero-loaded + something-skipped must still fail loud.
+    let td = TempDir::new().unwrap();
+    let code = TempDir::new().unwrap(); // manifest-less writable run target
+    let host = format!(
+        r#"
+version: "1.0.0"
+repos:
+  - path: "{code}"
+    definitions: false
+    writable: true
+  - path: "{gone}"
+"#,
+        code = code.path().display(),
+        gone = td.path().join("no-such-worktree").display(),
+    );
+    let path = write_host(&td, &host);
+    let err = praxec_core::config::load_resolved_with_repos_resilient(&path).expect_err(
+        "a bare-writable target cannot stand in for the failed real repo — no definitions loaded",
+    );
+    let msg = format!("{:#}", err);
+    assert!(msg.contains("ALL_REPOS_FAILED"), "msg: {msg}");
+}
