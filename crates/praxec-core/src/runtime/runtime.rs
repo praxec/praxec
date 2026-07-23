@@ -1101,6 +1101,42 @@ impl WorkflowRuntime {
 
         let instance = self.store.create(instance).await?;
 
+        // Finding #18 — persist the parent↔child binding at SPAWN time, the
+        // moment the child row exists in the store. Historically the
+        // `_subworkflow_wait` record was written ONLY by the clean-suspend
+        // path (`suspend_on_subworkflow`); when this child's start/auto-drive
+        // errored, the parent's submit was rejected wholesale, no record was
+        // persisted — and the child row (which DOES survive, created above)
+        // became unreachable: every parent re-submit spawned a brand-new
+        // child, so an externally-rescued child could never be harvested.
+        // Writing the record here, through the store directly, uses the same
+        // channel that makes the child row itself survive the rejected
+        // submit. Best-effort: a failed write degrades to the old behavior
+        // (the clean-suspend path still hard-commits the record), so warn
+        // loudly rather than fail the child's start.
+        if let Some(link) = instance.parent.clone() {
+            if !link.transition.is_empty() {
+                if let Err(e) = self
+                    .record_subworkflow_spawn_binding(
+                        &link.workflow_id,
+                        &link.transition,
+                        &instance.id,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "praxec_core::runtime",
+                        parent = %link.workflow_id,
+                        child = %instance.id,
+                        error = %e,
+                        "sub_workflow.spawn.binding: failed to persist the parent's \
+                         _subworkflow_wait record at spawn; if this child's start \
+                         errors, the parent will not be able to reuse it"
+                    );
+                }
+            }
+        }
+
         // T25 — spawn the timeout watchdog as soon as the instance
         // exists in the store. Definitions without `timeoutMs` (the
         // common case) skip this; the lazy check still covers any
@@ -1362,6 +1398,48 @@ impl WorkflowRuntime {
                 Ok(response)
             }
         }
+    }
+
+    /// Finding #18 — durably record `_subworkflow_wait` on the PARENT the
+    /// moment a spawned child's row is persisted. Written straight through
+    /// the store — NOT through the parent's in-flight dispatch — so the
+    /// record survives even when that dispatch is later rejected wholesale
+    /// (the executor error path saves nothing; this write has already
+    /// committed independently, exactly like the child row itself).
+    ///
+    /// The save deliberately does NOT bump the parent's version: the parent
+    /// is mid-dispatch at its loaded version, and every later commit in that
+    /// dispatch (clean suspend, advance, chain step) CAS-checks against the
+    /// stored version via `save_if_version`. A same-version save keeps those
+    /// commits valid. They also rebuild `next` from their in-memory snapshot
+    /// (which predates this write), so:
+    /// - a clean suspend re-writes the identical record with the usual
+    ///   version bump (`suspend_on_subworkflow` — unchanged contract);
+    /// - a successful harvest saves a context WITHOUT the record, clearing
+    ///   it on advance exactly as before (`clear_subworkflow_wait_on_advance`
+    ///   plus the snapshot rebuild both drop it).
+    async fn record_subworkflow_spawn_binding(
+        &self,
+        parent_workflow_id: &str,
+        transition: &str,
+        child_workflow_id: &str,
+    ) -> anyhow::Result<()> {
+        let mut parent = self.store.load(parent_workflow_id).await?;
+        let wait = json!({
+            "child_workflow_id": child_workflow_id,
+            "transition": transition,
+        });
+        match parent.context.as_object_mut() {
+            Some(obj) => {
+                obj.insert("_subworkflow_wait".to_string(), wait);
+            }
+            None => {
+                parent.context = json!({ "_subworkflow_wait": wait });
+            }
+        }
+        let expected = parent.version;
+        self.store.save_if_version(parent, expected).await?;
+        Ok(())
     }
 
     pub async fn get(&self, request: GetWorkflow) -> anyhow::Result<Value> {
