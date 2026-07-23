@@ -8,6 +8,27 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.30] — 2026-07-23 — Agent-walk exhaustion terminalizes the mission (finding #13)
+
+### Fixed
+
+- **A permanent agent-walk exhaustion durably cancels the instance instead of
+  leaving a zombie (finding #13).** When every model in an agent's fallback
+  chain failed (`AGENT_CHAIN_EXHAUSTED`) or the shared per-step wall-clock
+  budget was spent (`AGENT_STEP_BUDGET_EXHAUSTED`), the failure was
+  *response-transient*: nothing was persisted, so the next `get`/`query`
+  re-derived the mission as `running`/`waiting` with the same spent transition
+  still legal. A parent parked on such a child stranded forever, and a driver
+  polling or re-firing the mission burned the identical dead walk again — the
+  observed symptom was a CLI that hung after a permanent chain failure. All
+  three failure arms (start-chain, submit-chain, direct-submit) now recognize
+  the two wire-stable exhaustion codes and **cancel the instance durably**
+  (idempotent; further submits return `WORKFLOW_CANCELLED`; any suspended parent
+  is woken to fail-propagate — reusing the machinery the livelock quarantine
+  already relies on), and omit the now-misleading recovery link. Every other
+  permanent failure keeps its pre-existing recoverable behavior — the fix is
+  scoped precisely to exhaustion by a shared `is_agent_exhaustion` predicate.
+
 ## [0.0.29] — 2026-07-23 — Close the ledger: snippet inputs, async-park push, packageable schema
 
 Closes the two open dogfood findings from the v0.0.28 program and squares away

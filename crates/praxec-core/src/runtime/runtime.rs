@@ -1229,17 +1229,34 @@ impl WorkflowRuntime {
                 if !partial.evidence.is_empty() {
                     response["evidence"] = serde_json::to_value(&partial.evidence)?;
                 }
-                // Include the failed deterministic transition in links for recovery
-                push_failed_chain_recovery_link(
-                    &mut response,
-                    &definition,
-                    &partial.instance,
-                    &failed_transition,
-                );
-                // selection_error has no single failed transition — surface the
-                // state's legal transitions so the caller can recover (no dead-end).
-                if failed_transition.is_empty() {
-                    push_state_recovery_links(&mut response, &definition, &partial.instance);
+                // Finding #13 — a start-chain that failed on an agent-walk
+                // exhaustion is terminal by construction. Durably cancel
+                // (idempotent; wakes any suspended parent) and omit the recovery
+                // link so the spent walk cannot be re-fired; every other chain
+                // failure keeps its recoverable links. See the submit-path arm.
+                if crate::error::is_agent_exhaustion(&error) {
+                    if let Err(cancel_err) = self.cancel(&partial.instance.id, &error).await {
+                        tracing::error!(
+                            target: "praxec_core::runtime",
+                            error = %cancel_err,
+                            workflow = %partial.instance.id,
+                            "start-chain exhaustion could not durably cancel the \
+                             instance; it may remain re-fireable (finding #13)"
+                        );
+                    }
+                } else {
+                    // Include the failed deterministic transition in links for recovery
+                    push_failed_chain_recovery_link(
+                        &mut response,
+                        &definition,
+                        &partial.instance,
+                        &failed_transition,
+                    );
+                    // selection_error has no single failed transition — surface the
+                    // state's legal transitions so the caller can recover (no dead-end).
+                    if failed_transition.is_empty() {
+                        push_state_recovery_links(&mut response, &definition, &partial.instance);
+                    }
                 }
                 Ok(response)
             }
