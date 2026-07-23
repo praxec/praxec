@@ -2910,14 +2910,53 @@ pub fn load_resolved_with_diagnostics(
 pub fn load_resolved_with_repos(
     path: impl AsRef<Path>,
 ) -> anyhow::Result<(Value, Vec<Diagnostic>)> {
+    load_resolved_with_repos_mode(path, RepoLoadMode::Strict)
+}
+
+/// Finding #13 — like [`load_resolved_with_repos`], but a `repos:` entry that
+/// fails to load (missing dir, missing/invalid manifest, definition parse
+/// error inside that repo) is SKIPPED with a `REPO_LOAD_SKIPPED` warning
+/// diagnostic instead of failing the whole load. All other repos load
+/// normally. Only when EVERY declared repo fails does the load still error
+/// (`ALL_REPOS_FAILED`) — an empty registry is a worse outcome than a loud
+/// startup failure.
+///
+/// This is the serve/runtime entrypoint. `praxec check` keeps calling the
+/// strict [`load_resolved_with_repos`] so authors still see a dead entry as
+/// a hard failure.
+pub fn load_resolved_with_repos_resilient(
+    path: impl AsRef<Path>,
+) -> anyhow::Result<(Value, Vec<Diagnostic>)> {
+    load_resolved_with_repos_mode(path, RepoLoadMode::Resilient)
+}
+
+/// How `repos:` entry load failures are treated. See
+/// [`load_resolved_with_repos_resilient`] (finding #13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoLoadMode {
+    /// Any repo entry failing to load fails the whole config load
+    /// (`praxec check` and other authoring surfaces).
+    Strict,
+    /// A failing repo entry is skipped with a warning diagnostic; the rest
+    /// of the config loads (serve/runtime surfaces).
+    Resilient,
+}
+
+fn load_resolved_with_repos_mode(
+    path: impl AsRef<Path>,
+    mode: RepoLoadMode,
+) -> anyhow::Result<(Value, Vec<Diagnostic>)> {
     let path = path.as_ref();
     let host = load_yaml(path)?;
     let parent_dir = path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    let merged = merge_declared_repos(host, &parent_dir)?;
-    resolve_with_diagnostics(merged)
+    let mut repo_diagnostics: Vec<Diagnostic> = Vec::new();
+    let merged = merge_declared_repos(host, &parent_dir, mode, &mut repo_diagnostics)?;
+    let (resolved, diagnostics) = resolve_with_diagnostics(merged)?;
+    repo_diagnostics.extend(diagnostics);
+    Ok((resolved, repo_diagnostics))
 }
 
 /// Extract `repos:` + `overrides:` from `host`, load each repo, validate
@@ -2925,7 +2964,12 @@ pub fn load_resolved_with_repos(
 /// declared overrides win), and return the cleaned value (with `repos:`
 /// and `overrides:` stripped). Hosts without a `repos:` block round-trip
 /// through unchanged.
-fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Value> {
+fn merge_declared_repos(
+    mut host: Value,
+    host_dir: &Path,
+    mode: RepoLoadMode,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> anyhow::Result<Value> {
     let (repos, overrides) = take_repos_and_overrides(&mut host)?;
     if repos.is_empty() {
         // No repos declared — strip an empty `overrides:` (it's meaningless
@@ -2935,6 +2979,12 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
         stamp_ungranted_connections(&mut host, staged_ungranted);
         return Ok(host);
     }
+
+    let declared_count = repos.len();
+    // Finding #13 — entries skipped in resilient mode: (entry description,
+    // rendered error). Used for the ALL_REPOS_FAILED backstop and the
+    // stale-override downgrade below.
+    let mut skipped: Vec<(String, String)> = Vec::new();
 
     let mut repo_aggregate = Value::Object(Map::new());
     let mut repo_provided_ids: HashSet<String> = HashSet::new();
@@ -2960,40 +3010,95 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
         grant_connections,
     } in repos
     {
-        // Resolve to a local path: a local dir relative to the host config (same
-        // base-dir convention as `include:`), or a remote repo imported (cloned/
-        // updated) into a cache under `<host>/.praxec/repos/<slug>`. The import
-        // shells out to git, inheriting the operator's git auth.
-        let repo_path = match source {
-            RepoSource::Local(p) => {
-                if p.is_absolute() {
-                    p
-                } else {
-                    host_dir.join(p)
-                }
-            }
-            RepoSource::Remote { uri, gitref } => {
-                let dest = host_dir
-                    .join(".praxec")
-                    .join("repos")
-                    .join(crate::repo_git::cache_dir_name(&uri));
-                crate::repo_git::clone_or_update(&uri, &gitref, &dest)
-                    .with_context(|| format!("importing repo {uri}"))?
-            }
+        // How the operator wrote the entry — used to name it in skip
+        // warnings (finding #13).
+        let entry_desc = match &source {
+            RepoSource::Local(p) => p.display().to_string(),
+            RepoSource::Remote { uri, .. } => uri.clone(),
         };
-        // FB-2 — a bare writable run target (`definitions: false`) ships no
-        // `praxec.repo.yaml`: skip manifest + layout loading entirely (0
-        // definitions, no namespace, no connections to gate) but STILL register
-        // its canonical path as a writable repo_root so a run can be scoped to
-        // it. The path is validated (canonical + existing dir) downstream by
-        // `RepoRoot::new` when the gateway builds `_writableRepos`.
-        if !definitions {
-            // `parse_repo_entry` already guaranteed `writable` here.
+        // Resolve to a local path and load: a local dir relative to the host
+        // config (same base-dir convention as `include:`), or a remote repo
+        // imported (cloned/updated) into a cache under
+        // `<host>/.praxec/repos/<slug>`. The import shells out to git,
+        // inheriting the operator's git auth. The whole per-repo pipeline is
+        // fallible as one unit so resilient mode can skip a bad entry
+        // without losing the others (finding #13). The inner `Option` is the
+        // FB-2 bare-writable case: `definitions: false` ships no
+        // `praxec.repo.yaml`, so there is no manifest/registry to load.
+        type LoadedRepo = (PathBuf, Option<(crate::repo::RepoManifest, Value)>);
+        let loaded: anyhow::Result<LoadedRepo> = (|| {
+            let repo_path = match source {
+                RepoSource::Local(p) => {
+                    if p.is_absolute() {
+                        p
+                    } else {
+                        host_dir.join(p)
+                    }
+                }
+                RepoSource::Remote { uri, gitref } => {
+                    let dest = host_dir
+                        .join(".praxec")
+                        .join("repos")
+                        .join(crate::repo_git::cache_dir_name(&uri));
+                    crate::repo_git::clone_or_update(&uri, &gitref, &dest)
+                        .with_context(|| format!("importing repo {uri}"))?
+                }
+            };
+            // FB-2 — a bare writable run target (`definitions: false`) ships no
+            // `praxec.repo.yaml`: skip manifest + layout loading entirely (0
+            // definitions, no namespace, no connections to gate) but STILL
+            // register its canonical path as a writable repo_root so a run can
+            // be scoped to it. The path is validated (canonical + existing dir)
+            // downstream by `RepoRoot::new` when the gateway builds
+            // `_writableRepos`.
+            if !definitions {
+                return Ok((repo_path, None));
+            }
+            let (manifest, repo_value) = crate::repo::load_repo(&repo_path)
+                .with_context(|| format!("loading repo at {}", repo_path.display()))?;
+            Ok((repo_path, Some((manifest, repo_value))))
+        })();
+        let (repo_path, manifest_and_registry) = match loaded {
+            Ok(v) => v,
+            Err(err) => match mode {
+                // Strict (check/authoring): keep the historical
+                // all-or-nothing contract — a dead entry fails the load.
+                RepoLoadMode::Strict => return Err(err),
+                // Resilient (serve/runtime): one stale entry must not
+                // poison every session using this gateway config. Skip it,
+                // warn loudly, keep loading the rest (finding #13).
+                RepoLoadMode::Resilient => {
+                    let rendered = format!("{err:#}");
+                    tracing::warn!(
+                        entry = %entry_desc,
+                        error = %rendered,
+                        "REPO_LOAD_SKIPPED: `repos:` entry failed to load and was skipped; \
+                         its definitions are unavailable this run (finding #13)"
+                    );
+                    diagnostics.push(Diagnostic {
+                        severity: DiagnosticSeverity::Warn,
+                        code: "REPO_LOAD_SKIPPED".into(),
+                        message: format!(
+                            "repos entry '{entry_desc}' failed to load and was skipped: {rendered}"
+                        ),
+                        location: None,
+                        suggestion: Some(
+                            "fix or remove the dead `repos:` entry; `praxec check` reports it \
+                             as a hard error"
+                                .into(),
+                        ),
+                    });
+                    skipped.push((entry_desc, rendered));
+                    continue;
+                }
+            },
+        };
+        let Some((manifest, mut repo_value)) = manifest_and_registry else {
+            // FB-2 bare writable run target: `parse_repo_entry` already
+            // guaranteed `writable` here.
             writable_repo_roots.push((repo_path.display().to_string(), push));
             continue;
-        }
-        let (manifest, mut repo_value) = crate::repo::load_repo(&repo_path)
-            .with_context(|| format!("loading repo at {}", repo_path.display()))?;
+        };
         if writable {
             writable_repo_roots.push((repo_path.display().to_string(), push));
         }
@@ -3030,6 +3135,22 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
         repo_aggregate = deep_merge(repo_aggregate, repo_value);
     }
 
+    // Finding #13 backstop — resilience isolates ONE bad entry; it must not
+    // silently degrade to an empty registry. If every declared repo failed,
+    // something is systemically wrong (moved host dir, broken git auth) and
+    // a loud startup failure beats a definition-less gateway.
+    if skipped.len() == declared_count {
+        let details: Vec<String> = skipped
+            .iter()
+            .map(|(entry, err)| format!("- {entry}: {err}"))
+            .collect();
+        bail!(
+            "ALL_REPOS_FAILED: every declared `repos:` entry ({declared_count}) failed to \
+             load — no repo definitions are available:\n{}",
+            details.join("\n")
+        );
+    }
+
     // V23 — any host-defined id that collides with a repo-provided id MUST
     // appear in the explicit `overrides:` block. This closes the supply-chain
     // backdoor: an operator cannot silently shadow a vendored definition.
@@ -3050,6 +3171,23 @@ fn merge_declared_repos(mut host: Value, host_dir: &Path) -> anyhow::Result<Valu
     // misled into thinking they're shadowing something they aren't.
     for id in &overrides {
         if !repo_provided_ids.contains(id) {
+            // Finding #13 — when a repo was skipped in resilient mode, the
+            // "missing" id may simply live in the skipped repo. Downgrade to
+            // a warning so a dead entry can't re-poison the load through its
+            // own overrides.
+            if mode == RepoLoadMode::Resilient && !skipped.is_empty() {
+                diagnostics.push(Diagnostic {
+                    severity: DiagnosticSeverity::Warn,
+                    code: "STALE_OVERRIDE".into(),
+                    message: format!(
+                        "`overrides:` lists '{id}', but no loaded repo provides that id \
+                         (a `repos:` entry was skipped this run, which may explain it)."
+                    ),
+                    location: None,
+                    suggestion: None,
+                });
+                continue;
+            }
             bail!(
                 "STALE_OVERRIDE: `overrides:` lists '{id}', but no declared repo provides \
                  that id. Remove it or correct the namespace prefix (SPEC §9.4)."
