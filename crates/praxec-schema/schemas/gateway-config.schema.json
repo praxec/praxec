@@ -1,0 +1,1592 @@
+{
+  "$id": "https://praxec.dev/schemas/gateway-config.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewayConfig",
+  "type": "object",
+  "required": [
+    "version"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "include": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "Sibling YAML files to merge in before resolving. Maps merge (later wins on key collisions), arrays concatenate."
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/capabilityDefinition"
+      },
+      "default": {},
+      "description": "Named, reusable capabilities. Referenced from `proxy.expose[].capability` and from workflow transition `executor: { capability: name }`."
+    },
+    "connections": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/connection"
+      },
+      "default": {}
+    },
+    "stagedConnections": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/connection"
+      },
+      "default": {},
+      "description": "SPEC §9.5 — operator-staged, not-yet-granted connections (written by `px connections add`). Same entry shape as `connections:`, but a staged connection is INERT: it is never in the live `/connections` registry until its name is listed in the top-level `grant_connections:`. Ungranted staged entries are diverted to `/praxec/_ungrantedConnections` at load, so a spawn attempt fails typed with the grant remedy — treated identically to a pack-declared, ungranted connection."
+    },
+    "grant_connections": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "SPEC §9.5 — the names of `stagedConnections:` entries the operator has GRANTED (via `px connections grant <name>`). On load, each granted staged body is promoted into the live `/connections` registry. Granting a name with no staged entry fails at load (STALE_CONNECTION_GRANT). This is the host-level analog of a `repos:` entry's `grant_connections:`."
+    },
+    "proxy": {
+      "$ref": "#/$defs/proxyConfig"
+    },
+    "workflows": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/workflowDefinition"
+      },
+      "default": {}
+    },
+    "audit": {
+      "$ref": "#/$defs/auditConfig"
+    },
+    "discovery": {
+      "$ref": "#/$defs/discoveryConfig"
+    },
+    "store": {
+      "$ref": "#/$defs/storeConfig"
+    },
+    "lexicon": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/lexiconEntry"
+      },
+      "default": {},
+      "description": "Curated ubiquitous-language vocabulary (SPEC \u00a730). Each key is the canonical term; each value carries a one-sentence `definition_short`, an optional multi-paragraph `definition_long`, optional surface-form `aliases`, an optional DDD `bounded_context`, optional `refs` to related terms, and a `governance` marker (default `human-only`). At config load the full block is snapshot-stamped onto every workflow definition (`_lexiconLibrary`). Same-bounded-context alias collisions fail at load."
+    },
+    "embeddings": {
+      "$ref": "#/$defs/embeddingsConfig"
+    },
+    "schemas": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {},
+      "description": "Spec A.1 §4.2 — SchemaBound inner-schema registry. Each key is a (repo-namespaced) name; each value is a JSON Schema that a `finding.fix` SchemaBound `value` is validated against (the one v1 extension point). Every statically-referenced `schema_ref` must resolve at config load (closed-world, V24); every entry must compile. Stamped onto each workflow snapshot as `_schemasRegistry` for the runtime blackboard-write seam."
+    },
+    "skills": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/skillFragment"
+      },
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9-]*$"
+      },
+      "default": {},
+      "description": "Guidance fragment library. Each entry is keyed by its `subject` (the gateway.describe lookup handle) and carries a space-free `verb` + a static markdown `body`. Subjects and verbs are constrained at config load to lowercase kebab \u2014 malformed descriptors are unrepresentable (SPEC \u00a75.4)."
+    },
+    "scripts": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/scriptFragment"
+      },
+      "default": {},
+      "description": "Curated script library (SPEC \u00a722). Peer to `skills`: where skills tell an LLM what to think, scripts tell a workflow what to do deterministically. Each entry has a `verb` from the closed ScriptVerb set (build/test/deploy/format/lint/install/verify/run), a `lifecycle`, and either an inline `body` OR an external `uri` + required `hash`. Invoked via the `script` executor kind."
+    },
+    "repos": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "A declared repo. Exactly one of `path` (local dir) or `uri` (remote git import) is required.",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Directory containing a `praxec.repo.yaml` manifest (unless `definitions: false`). Accepts absolute, relative (resolved against the host config's directory), or `~/`-prefixed paths."
+          },
+          "uri": {
+            "type": "string",
+            "description": "SPEC §9 — a remote git repo to import (clone/update) into a local cache instead of a local `path`. Exactly one of `path` / `uri` per entry."
+          },
+          "ref": {
+            "type": "string",
+            "description": "Git ref (branch/tag/sha) to pin a `uri` import to. Default `main`."
+          },
+          "writable": {
+            "type": "boolean",
+            "default": false,
+            "description": "SPEC §8.4 — opt this repo in as an authoring write target and a run `repo_root`. Its canonical path is stamped into `/praxec/_writableRepos`."
+          },
+          "push": {
+            "type": "boolean",
+            "default": false,
+            "description": "SPEC §9 — `git push` authored commits after each register. Requires `writable: true`."
+          },
+          "definitions": {
+            "type": "boolean",
+            "default": true,
+            "description": "FB-2 — whether this entry is a definition repo (ships a `praxec.repo.yaml` manifest + layout to load). Default true. `definitions: false` is a bare writable run target: its manifest/layout are NOT loaded (0 definitions) but its canonical `path` is still registered as a writable `repo_root`. A `definitions: false` entry MUST set `writable: true`."
+          },
+          "priority": {
+            "type": "integer",
+            "default": 0,
+            "description": "Spec A §5 — repo priority for `hop_slot:` cap-resolution tie-breaking. Highest wins; an equal-priority tie is a hard load error (HOP_SLOT_AMBIGUOUS)."
+          },
+          "grant_connections": {
+            "type": "array",
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "description": "SPEC §9.5 — operator grant for this repo's declared connections. A pack may DECLARE `connections:`, but a declared connection only goes live when its name (bare pack-local, or fully-qualified `<namespace>/<name>`) is listed here. Ungranted declarations are diverted to `/praxec/_ungrantedConnections` and are never spawnable. Granting a connection the repo does not declare fails at load (STALE_CONNECTION_GRANT)."
+          }
+        }
+      },
+      "description": "Declared resource repos (SPEC \u00a79). Each repo is loaded via its `praxec.repo.yaml` manifest; every loaded definitionId is namespace-prefixed `<namespace>/<id>` before being merged into the gateway registry. Two repos sharing a namespace fail at load (V20)."
+    },
+    "overrides": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "description": "Fully-qualified definitionIds (`<namespace>/<id>`) that the host config explicitly shadows after a repo has provided them (SPEC \u00a79.4). Anonymous shadowing \u2014 defining `<namespace>/<id>` locally without listing it here \u2014 fails at load (V23). Listing an id that no repo provides is also an error (stale override)."
+    }
+  },
+  "$defs": {
+    "connection": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/mcpConnection"
+        },
+        {
+          "$ref": "#/$defs/cliConnection"
+        },
+        {
+          "$ref": "#/$defs/restConnection"
+        }
+      ]
+    },
+    "mcpConnection": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "mcp"
+        },
+        "command": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "url": {
+          "type": "string"
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "idleTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Per-connection inactivity (no-activity) ceiling in ms for each tool call. Inbound MCP bytes reset the window, so a slow-but-alive call survives while a silent one is cut off. Defaults to 30000."
+        },
+        "startupTimeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "FB-7 — inactivity ceiling in ms for the connect/`initialize` phase specifically. Lets a server that indexes a large repo on cold start (e.g. structureos) get a wider establishment budget without loosening the per-call `idleTimeoutMs`. Defaults to `idleTimeoutMs` (which defaults to 30000)."
+        },
+        "exclusive": {
+          "type": "boolean",
+          "default": false,
+          "description": "The connection backs a resource with GLOBAL MUTABLE STATE (a browser whose selected-page pointer is per-server-process; a serial port; a shared test DB). Concurrent unleased access silently cross-contaminates. When true, any state reaching this connection MUST declare the lease in `owned_files` (validator rule V31 / UNLEASED_BROWSER_ACCESS). Declared on the RESOURCE, not in a separate operator list, so the constraint cannot drift from the thing it governs. No browser knowledge in core: the engine enforces 'exclusive resources must be leased'; config declares which resources are exclusive."
+        }
+      }
+    },
+    "cliConnection": {
+      "type": "object",
+      "required": [
+        "kind",
+        "command"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "cli"
+        },
+        "command": {
+          "type": "string"
+        },
+        "workingDirectory": {
+          "type": "string"
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      }
+    },
+    "restConnection": {
+      "type": "object",
+      "required": [
+        "kind",
+        "baseUrl"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "rest"
+        },
+        "baseUrl": {
+          "type": "string"
+        },
+        "headers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        }
+      }
+    },
+    "proxyConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expose": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/proxyExposure"
+          },
+          "default": []
+        },
+        "import": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/proxyImport"
+          },
+          "default": []
+        }
+      }
+    },
+    "proxyImport": {
+      "type": "object",
+      "required": [
+        "connection"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "connection": {
+          "type": "string"
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "include": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      }
+    },
+    "capabilityDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A reusable capability. Either declares an executor inline or wraps another named capability adding guards / reliability / metadata.",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "examples": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "inputSchema": {
+          "$ref": "#/$defs/jsonSchema"
+        },
+        "wraps": {
+          "type": "string",
+          "description": "Name of a capability to wrap. The wrapper's guards and reliability stack on top of the wrapped capability's; the executor is inherited."
+        },
+        "executor": {
+          "$ref": "#/$defs/executor"
+        },
+        "guards": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/guard"
+          },
+          "default": []
+        },
+        "reliability": {
+          "$ref": "#/$defs/reliabilityPolicy"
+        }
+      }
+    },
+    "proxyExposure": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/proxyExposureInline"
+        },
+        {
+          "$ref": "#/$defs/proxyExposureRef"
+        }
+      ]
+    },
+    "proxyExposureRef": {
+      "type": "object",
+      "required": [
+        "capability"
+      ],
+      "additionalProperties": false,
+      "description": "Expose a named capability. Optional `as:` aliases the proxy name; guards/reliability stack on top of the capability's.",
+      "properties": {
+        "capability": {
+          "type": "string"
+        },
+        "as": {
+          "type": "string",
+          "pattern": "^[a-zA-Z][a-zA-Z0-9_.-]*$"
+        },
+        "description": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Search synonyms for discovery. A capability named release.promote with aliases: [deploy, ship] will be found by those terms."
+        },
+        "guards": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/guard"
+          },
+          "default": []
+        },
+        "reliability": {
+          "$ref": "#/$defs/reliabilityPolicy"
+        }
+      }
+    },
+    "proxyExposureInline": {
+      "type": "object",
+      "required": [
+        "name",
+        "executor"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-zA-Z][a-zA-Z0-9_.-]*$"
+        },
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Search synonyms for discovery."
+        },
+        "examples": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "inputSchema": {
+          "$ref": "#/$defs/jsonSchema"
+        },
+        "guards": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/guard"
+          },
+          "default": []
+        },
+        "executor": {
+          "$ref": "#/$defs/executor"
+        },
+        "reliability": {
+          "$ref": "#/$defs/reliabilityPolicy"
+        }
+      }
+    },
+    "skillFragment": {
+      "type": "object",
+      "required": [
+        "verb",
+        "body"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "verb": {
+          "type": "string",
+          "enum": [
+            "triage",
+            "diagnose",
+            "plan",
+            "implement",
+            "review",
+            "refactor",
+            "explain",
+            "compose",
+            "research",
+            "summarize"
+          ],
+          "description": "Cognitive verb \u2014 closed enum per SPEC \u00a75.4.1. Surfaced alongside the subject so the model reads the ref as `\"{verb} {subject}\"`. Adding a verb is a spec amendment (SPEC \u00a723.7)."
+        },
+        "body": {
+          "type": "string",
+          "description": "Static markdown body. Referenced fragments are never templated (SPEC \u00a75.3) \u2014 they cache once for the workflow's life."
+        }
+      }
+    },
+    "skillRefs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]*$"
+      },
+      "default": [],
+      "description": "References to entries in the top-level `skills:` library. Surfaced in the response's `guidance.refs` whenever this scope is active."
+    },
+    "scriptFragment": {
+      "type": "object",
+      "required": [
+        "verb",
+        "lifecycle"
+      ],
+      "additionalProperties": false,
+      "description": "SPEC \u00a722 \u2014 a curated script. Either inline `body` OR external `uri`+`hash` (XOR enforced at config load).",
+      "properties": {
+        "verb": {
+          "type": "string",
+          "enum": [
+            "build",
+            "test",
+            "deploy",
+            "format",
+            "lint",
+            "install",
+            "verify",
+            "run",
+            "inspect",
+            "search",
+            "fetch",
+            "audit"
+          ],
+          "description": "Action verb \u2014 what category of operation this script performs. Closed enum per SPEC \u00a722.3."
+        },
+        "lifecycle": {
+          "type": "string",
+          "enum": [
+            "experimental",
+            "stable",
+            "deprecated"
+          ],
+          "description": "Maturity marker. Mirrors skill lifecycle semantics."
+        },
+        "source": {
+          "type": "string",
+          "description": "Provenance. Examples: `cognitive-architectures@v0.1.0`, `<repo>/scripts/local`."
+        },
+        "body": {
+          "type": "string",
+          "description": "Inline script body (literal text). Mutually exclusive with `uri`. Hash is computed at load time; if `hash` is also provided, mismatch is SCRIPT_HASH_MISMATCH."
+        },
+        "uri": {
+          "type": "string",
+          "description": "External script body location. v1 supports `file://` only (resolved relative to the config file). `hash` is required when `uri` is set."
+        },
+        "hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "description": "Content-identity hash: `sha256:` + 64 lowercase hex chars. Required when `uri` is set; optional when `body` is inline (computed otherwise)."
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "body"
+          ],
+          "not": {
+            "required": [
+              "uri"
+            ]
+          }
+        },
+        {
+          "required": [
+            "uri",
+            "hash"
+          ],
+          "not": {
+            "required": [
+              "body"
+            ]
+          }
+        }
+      ]
+    },
+    "workflowDefinition": {
+      "type": "object",
+      "required": [
+        "initialState",
+        "states"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "type": "string",
+          "description": "Definition version discriminator; an ISO 'as-of' date is the recommended convention."
+        },
+        "description": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Search synonyms for discovery."
+        },
+        "examples": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "snippet": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "inputs",
+            "outputs"
+          ],
+          "properties": {
+            "inputs": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object"
+              }
+            },
+            "outputs": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object"
+              }
+            }
+          },
+          "description": "SPEC \u00a75.1 \u2014 typed I/O contract for a capability workflow. `inputs` and `outputs` are objects keyed by name with JSON-schema-fragment values. Required on `cap.*` workflows (V3); forbidden on orchestrators (V8, PR3)."
+        },
+        "verb": {
+          "type": "string",
+          "description": "SPEC \u00a74 \u2014 capability verb from the 24-token CapVerb cloud (PR3 will enforce the closed enum). Required on `cap.*` workflows for verb-shape checks; absent on orchestrators."
+        },
+        "inputs": {
+          "type": "object",
+          "description": "SPEC \u00a77 \u2014 orchestrator entry signature, used to seed the slot table for cross-workflow type checks. Distinct from a capability's `snippet.inputs`."
+        },
+        "lifecycle": {
+          "type": "string",
+          "default": "experimental",
+          "description": "SPEC \u00a76.2 \u2014 workflow lifecycle. Capabilities default to `experimental`; declaring `stable` is what makes `expects_contract_hash` mandatory on callers (V16, PR3)."
+        },
+        "stack": {
+          "description": "Spec A \u00a75.1 \u2014 the resolution descriptor this workflow's `hop_slot:` transitions resolve against. Either a plain string (language-only, e.g. `rust`) or an object `{ language, frameworks, primary_framework, project }`. At config load each `hop_slot: <slot>` walks the specificity chain most-specific-first \u2014 `cap.<slot>.<project>` \u2192 `cap.<slot>.<primary_framework>` \u2192 `cap.<slot>.<language>` \u2192 `cap.<slot>.generic` \u2014 first match wins. `frameworks:` is accepted (additive-knowledge composition, Spec A \u00a75.2) but only `primary_framework` participates in override-resolution. Absent \u2192 `generic`.",
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "language": {
+                  "type": "string",
+                  "description": "The language link (the least-specific non-generic level)."
+                },
+                "frameworks": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "default": [],
+                  "description": "The set of frameworks in play. Additive-knowledge composition (detect rulesets, lenses) is a later concern; these do NOT drive override-resolution."
+                },
+                "primary_framework": {
+                  "type": "string",
+                  "description": "The one framework that governs the override slots (scaffold template, verify/lint command). Layers above `language` in resolution."
+                },
+                "project": {
+                  "type": "string",
+                  "description": "The project name \u2014 the most-specific resolution level, above `primary_framework`."
+                }
+              }
+            }
+          ]
+        },
+        "initialState": {
+          "type": "string"
+        },
+        "initialContext": {
+          "type": "object",
+          "description": "Seed values written into instance.context at start. Lets you declare counters / flags without an onEnter that re-fires on self-loops.",
+          "default": {}
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Lazy workflow-level timeout. If the next `submit` or `get` occurs more than this many milliseconds after the workflow started, the instance auto-transitions to `onTimeout.target` (or `failed` if no onTimeout block is declared)."
+        },
+        "maxChainDepth": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 50,
+          "description": "Maximum number of deterministic transitions the runtime will chain automatically before halting. Prevents infinite loops in misconfigured workflows."
+        },
+        "onTimeout": {
+          "$ref": "#/$defs/onTimeout"
+        },
+        "linkFilter": {
+          "type": "string",
+          "enum": [
+            "all",
+            "byGuards"
+          ],
+          "default": "all",
+          "description": "How transition links are filtered for this workflow's responses. `byGuards` runs each transition's guards silently against the current state and only returns links for those that would pass. `all` returns every legal-by-state transition."
+        },
+        "inputSchema": {
+          "$ref": "#/$defs/jsonSchema"
+        },
+        "blackboard": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "type": "object"
+            }
+          ],
+          "default": [],
+          "description": "Declared context slots \u2014 either a list of slot names, or a map of slot name to a JSON-schema fragment. Optional; absent means no declared slots."
+        },
+        "skills": {
+          "$ref": "#/$defs/skillRefs"
+        },
+        "_skillsLibrary": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": [
+              "verb",
+              "body"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "verb": {
+                "type": "string"
+              },
+              "body": {
+                "type": "string"
+              }
+            }
+          },
+          "description": "Runtime-stamped \u2014 do NOT author. Resolve writes this as a `{ subject: { verb, body } }` slice of the top-level `skills:` map, scoped to the subjects this workflow references. SPEC \u00a78.2: the snapshot carries resolved fragment bodies so an in-flight instance never depends on the live config \u2014 editing the top-level `skills:` block cannot mutate what running instances see."
+        },
+        "states": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/state"
+          }
+        }
+      }
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "goal": {
+          "type": "string",
+          "description": "What the LLM should aim to accomplish in this phase. Returned in the workflow response as guidance."
+        },
+        "guidance": {
+          "type": "string",
+          "description": "Behavioral instructions for the LLM in this phase. Returned in the workflow response as guidance."
+        },
+        "delegate": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Delegate this state to a sub-agent (a worker). Pass-through field \u2014 surfaced verbatim at the top level of every workflow response. The value names which model the worker runs on: an affinity-tier model reference (e.g. coding-frontier, resolved via models.yaml) or a named binding. The gateway itself never reads or validates it; a consuming agentic runtime spawns the sub-agent."
+        },
+        "terminal": {
+          "type": "boolean",
+          "default": false
+        },
+        "onEnter": {
+          "$ref": "#/$defs/action"
+        },
+        "skills": {
+          "$ref": "#/$defs/skillRefs"
+        },
+        "linkFilter": {
+          "type": "string",
+          "enum": [
+            "all",
+            "byGuards"
+          ],
+          "description": "Per-state override of the workflow's linkFilter. `byGuards` runs each transition's guards silently against the current state and only returns links for those that would pass."
+        },
+        "transitions": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/transition"
+          },
+          "default": {}
+        }
+      }
+    },
+    "transition": {
+      "type": "object",
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "actor": {
+          "type": "string",
+          "enum": [
+            "agent",
+            "human",
+            "system",
+            "deterministic"
+          ],
+          "default": "agent"
+        },
+        "inputSchema": {
+          "$ref": "#/$defs/jsonSchema"
+        },
+        "hop_slot": {
+          "type": "string",
+          "enum": [
+            "verify",
+            "detect",
+            "scaffold",
+            "implement",
+            "lint_format"
+          ],
+          "description": "Specialization-slot marker (Spec A §3). At config load the engine injects this slot's canonical `In` contract as the transition `inputSchema` and its `Out` contract as the `$.context.<name>` typed blackboard slot, both by `$ref` into the shipped HOP vocabulary (praxec://hop). The concrete `cap.<name>.<stack>` resolution is layered separately."
+        },
+        "guards": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/guard"
+          },
+          "default": []
+        },
+        "executor": {
+          "$ref": "#/$defs/executor"
+        },
+        "output": {
+          "$ref": "#/$defs/outputMapping"
+        },
+        "evidence": {
+          "$ref": "#/$defs/evidenceRequirement"
+        },
+        "reliability": {
+          "$ref": "#/$defs/reliabilityPolicy"
+        },
+        "skills": {
+          "$ref": "#/$defs/skillRefs"
+        },
+        "prefill": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Argument values to pre-resolve into each link for this transition. Reduces what an LLM caller has to generate to only the genuinely-unknown fields. Each value uses the same expression syntax as output mappings: a path string ($.context.x, $.workflow.input.x), an operator object ({ set: ... }, { add: [...] }), or a literal."
+        },
+        "branches": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/transitionBranch"
+          },
+          "default": [],
+          "description": "Auto-branch the destination state based on the executor's result. Evaluated after the executor succeeds and after `output` mappings have been applied. First branch whose `when` guard passes wins; if none match, falls back to the transition's `target`."
+        }
+      }
+    },
+    "transitionBranch": {
+      "type": "object",
+      "required": [
+        "when",
+        "target"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "when": {
+          "$ref": "#/$defs/guard"
+        },
+        "target": {
+          "type": "string"
+        }
+      }
+    },
+    "action": {
+      "type": "object",
+      "required": [
+        "executor"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "executor": {
+          "$ref": "#/$defs/executor"
+        },
+        "output": {
+          "$ref": "#/$defs/outputMapping"
+        },
+        "reliability": {
+          "$ref": "#/$defs/reliabilityPolicy"
+        }
+      }
+    },
+    "onTimeout": {
+      "type": "object",
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "target": {
+          "type": "string"
+        },
+        "executor": {
+          "$ref": "#/$defs/executor"
+        },
+        "output": {
+          "$ref": "#/$defs/outputMapping"
+        }
+      }
+    },
+    "executor": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Either inline (`kind: ...`) or a capability reference (`capability: <name>`). The latter resolves at config-load time to the named capability's executor and merges the capability's guards/reliability into the calling context.",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "examples": [
+            "mcp",
+            "cli",
+            "rest",
+            "human",
+            "workflow",
+            "noop",
+            "script",
+            "parallel",
+            "pipeline",
+            "llm",
+            "agent",
+            "registry",
+            "dry_run",
+            "structural_analysis",
+            "ingest",
+            "diff",
+            "path_grounding",
+            "inventory",
+            "tool_source"
+          ]
+        },
+        "connection": {
+          "type": "string"
+        },
+        "capability": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string",
+          "description": "Script subject (SPEC \u00a722) when `kind: script`. Names a curated entry in the top-level `scripts:` block; the runtime materializes the body from the workflow's pinned snapshot at execute time."
+        },
+        "idempotencyKey": {
+          "oneOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "description": "If `true`, an idempotency key is auto-derived from workflowId + transition + correlationId \u2014 same key across retries and fallback candidates so downstream dedup works. If a string, it's used as a literal template; supported tokens: {workflowId}, {transition}, {correlationId}."
+        },
+        "branches": {
+          "description": "SPEC \u00a724 (kind: parallel only) \u2014 fan-out branches. Either a literal array of executor configs OR a `{for_each: <path>, do: <executor>}` template for dynamic per-element fan-out. Each literal branch / each `do:` template is itself a valid `executor` config (recursive).",
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/executor"
+              }
+            },
+            {
+              "$ref": "#/$defs/parallelForEach"
+            }
+          ]
+        },
+        "join": {
+          "description": "SPEC \u00a724.2 (kind: parallel only) \u2014 join condition. `all` (default), `any`, `{at_least: K}` (K positive), `{percent: P}` (P in 0..=100), or `{expression: \"<expr>\"}` evaluated post-completion against the aggregated {branches, summary, ok_count, failed_count, cancelled_count, n} value.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "all",
+                "any"
+              ]
+            },
+            {
+              "$ref": "#/$defs/parallelAtLeast"
+            },
+            {
+              "$ref": "#/$defs/parallelPercent"
+            },
+            {
+              "$ref": "#/$defs/parallelExpression"
+            }
+          ]
+        },
+        "max_concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "SPEC \u00a724 (kind: parallel only) \u2014 semaphore cap on simultaneous in-flight branches. REQUIRED when `branches.len() >= 10` (DOS poka-yoke); optional below that."
+        },
+        "on_branch_failure": {
+          "type": "string",
+          "enum": [
+            "bail",
+            "continue"
+          ],
+          "default": "bail",
+          "description": "SPEC \u00a724.2 (kind: parallel only) \u2014 `bail` (default) cancels in-flight siblings on first failure; `continue` drains all branches and computes verdict per join condition."
+        },
+        "total_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "SPEC \u00a724.2 (kind: parallel only) \u2014 wall-clock cap on the whole fan-out. On expiry, in-flight branches are cancelled and the executor returns Timeout."
+        },
+        "max_recursion_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3,
+          "description": "SPEC \u00a724.8 (kind: parallel only) \u2014 cap on nested parallel-of-parallels depth. Default 3 (catches authoring bugs); override for deliberately deep nesting."
+        },
+        "use": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "SPEC \u00a76.1 (kind: workflow only) \u2014 typed use-binding for capability invocations. `inputs` resolves to the capability's `snippet.inputs` schema; `outputs` projects declared capability outputs back to host context slots. Required when targeting a `cap.*` definitionId (V12).",
+          "properties": {
+            "inputs": {
+              "type": "object"
+            },
+            "outputs": {
+              "type": "object",
+              "description": "Map of host JSON path (`$.context.<slot>`) to capability output name. Only the listed outputs propagate; capability-internal slots stay scoped to the child blackboard.",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "expects_contract_hash": {
+          "type": "string",
+          "description": "SPEC \u00a76.2 (kind: workflow only) \u2014 optional pin on the target capability's `snippet`-derived contract hash. Mismatch is V15 (PR3). Required when targeting a `stable`-lifecycle capability (V16, PR3)."
+        },
+        "_snippetOutputs": {
+          "type": "object",
+          "description": "Runtime-stamped \u2014 do NOT author. Resolve embeds the target capability's `snippet.outputs` schema here so the runtime executor can validate without a DefinitionStore lookup."
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "required": [
+            "capability"
+          ]
+        }
+      ]
+    },
+    "parallelForEach": {
+      "type": "object",
+      "required": [
+        "for_each",
+        "do"
+      ],
+      "additionalProperties": false,
+      "description": "SPEC \u00a724.2 \u2014 dynamic `branches` form. `for_each` is a path expression resolving to a JSON array against the workflow's `$.context`, `$.workflow.input`, or `$.arguments`. `do` is an executor template; `$.branch.value` and `$.branch.index` are substituted per element. Optional `where:` filter drops elements before fan-out.",
+      "properties": {
+        "for_each": {
+          "type": "string",
+          "description": "Path expression \u2014 `$.context.queries`, `$.workflow.input.aspects`, etc. \u2014 that resolves to a JSON array."
+        },
+        "do": {
+          "$ref": "#/$defs/executor",
+          "description": "Per-branch executor template. `$.branch.value` and `$.branch.index` are substituted per array element."
+        },
+        "where": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Pre-fan-out predicate. Each element of `for_each` is evaluated with `$.value` and `$.index` as the operand surface (same binary-comparison syntax as `expr` guards / `join.expression`). Falsy elements are dropped BEFORE branches spawn. `$.branch.index` inside `do:` templates still substitutes the ORIGINAL source-array index for matched elements."
+        }
+      }
+    },
+    "parallelAtLeast": {
+      "type": "object",
+      "required": [
+        "at_least"
+      ],
+      "additionalProperties": false,
+      "description": "SPEC \u00a724.2 \u2014 quorum join condition. Executor succeeds iff at least `at_least` branches succeed.",
+      "properties": {
+        "at_least": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Minimum number of branches that must succeed for the parallel executor to return Ok."
+        }
+      }
+    },
+    "slotConstraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "SPEC \u00a728 \u2014 declarative slot constraints evaluated at write time. JSON Schema primitives (regex, min/max, length, enum) belong in the slot's `type:` field; \u00a728 covers only what JSON Schema cannot express. Multiple constraint kinds on one slot compose conjunctively.",
+      "properties": {
+        "path_allowlist": {
+          "type": "object",
+          "required": [
+            "allow"
+          ],
+          "additionalProperties": false,
+          "description": "Slot value is an array of strings; every element must match an `allow:` glob and no `deny:` glob.",
+          "properties": {
+            "allow": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Gitignore-syntax glob patterns. At least one required \u2014 empty allowlist is misconfiguration."
+            },
+            "deny": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Optional. Applied within `allow:` \u2014 any element matching a deny glob fails even if it also matches an allow glob."
+            }
+          }
+        },
+        "subset_of": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Dynamic reference path (e.g. `$.context.declared_features`) resolving to an array. The constrained slot's elements must all appear in that referenced array. Unresolvable reference is fail-fast (not silent-pass)."
+        }
+      }
+    },
+    "parallelPercent": {
+      "type": "object",
+      "required": [
+        "percent"
+      ],
+      "additionalProperties": false,
+      "description": "SPEC \u00a724.2 \u2014 percentage-quorum join condition. Threshold computed as ceil(percent * n / 100); vacuous fan-out (n=0) succeeds.",
+      "properties": {
+        "percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Minimum percent of branches that must succeed (0..=100). Threshold uses ceiling division to avoid silent rounding."
+        }
+      }
+    },
+    "parallelExpression": {
+      "type": "object",
+      "required": [
+        "expression"
+      ],
+      "additionalProperties": false,
+      "description": "SPEC \u00a724.2 \u2014 operator-supplied expression evaluated post-completion against `{branches, ok_count, failed_count, cancelled_count, n}`. Same binary-comparison surface as `expr` guards. NO early exit \u2014 expression cannot observe a still-running branch (structural answer to SPEC \u00a724.8 amendment concern).",
+      "properties": {
+        "expression": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Either a bare path (`$.ok_count`) checked for truthiness, or a binary expression (`$.ok_count >= 3`, `$.branches[0].output.passed == true`). Operators: literals (string/number/bool/null) and `$.<path>` references."
+        }
+      }
+    },
+    "parallelExecutor": {
+      "type": "object",
+      "required": [
+        "kind",
+        "branches"
+      ],
+      "additionalProperties": true,
+      "description": "SPEC \u00a724 \u2014 the `parallel` executor (canonical shape). The `executor` $def above accepts these fields too (with additionalProperties: true); this $def documents them for tools that introspect the schema (IDE autocomplete, YAML LSPs).",
+      "properties": {
+        "kind": {
+          "const": "parallel"
+        },
+        "branches": {
+          "oneOf": [
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/executor"
+              }
+            },
+            {
+              "$ref": "#/$defs/parallelForEach"
+            }
+          ]
+        },
+        "join": {
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": [
+                "all",
+                "any"
+              ]
+            },
+            {
+              "$ref": "#/$defs/parallelAtLeast"
+            },
+            {
+              "$ref": "#/$defs/parallelPercent"
+            },
+            {
+              "$ref": "#/$defs/parallelExpression"
+            }
+          ],
+          "default": "all"
+        },
+        "max_concurrency": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "on_branch_failure": {
+          "type": "string",
+          "enum": [
+            "bail",
+            "continue"
+          ],
+          "default": "bail"
+        },
+        "total_timeout_ms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_recursion_depth": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 3
+        }
+      }
+    },
+    "guard": {
+      "type": "object",
+      "required": [
+        "kind"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "examples": [
+            "permission",
+            "role",
+            "expr",
+            "evidence"
+          ]
+        }
+      }
+    },
+    "outputMapping": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "evidenceRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requires": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      }
+    },
+    "reliabilityPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeoutMs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "retry": {
+          "$ref": "#/$defs/retryPolicy"
+        },
+        "fallback": {
+          "$ref": "#/$defs/fallbackPolicy"
+        }
+      }
+    },
+    "retryPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        },
+        "backoff": {
+          "type": "string",
+          "enum": [
+            "none",
+            "fixed",
+            "exponential"
+          ],
+          "default": "none"
+        },
+        "initialDelayMs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "maxDelayMs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "retryOn": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "timeout",
+              "transient_error",
+              "rate_limited",
+              "connection_error"
+            ]
+          },
+          "default": [
+            "timeout",
+            "transient_error",
+            "rate_limited"
+          ]
+        }
+      }
+    },
+    "fallbackPolicy": {
+      "type": "object",
+      "required": [
+        "executors"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "first_success"
+          ],
+          "default": "first_success"
+        },
+        "executors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/executor"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "discoveryConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "index": {
+          "type": "string",
+          "enum": [
+            "memory"
+          ],
+          "default": "memory"
+        },
+        "registry": {
+          "type": "string",
+          "description": "Path to a `praxec.packs/v3` (or v2) registry document — the pack/tool catalog (`packs.yaml`, ADR-0013 + design-0.0.17 §D4b). When set, the gateway loads it at startup and on every config reload: its tool descriptors join the discovery index (searchable via `praxec.query {kind: \"tool\"}`) and its crossmatrix feeds the selector's topology term. Absent: no tool catalog, no topology term. A configured registry that fails to load is a fail-fast boot error (and rejects a reload), never a silent registry-less start."
+        },
+        "include": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "proxy",
+              "workflows",
+              "connections"
+            ]
+          },
+          "default": [
+            "proxy",
+            "workflows"
+          ]
+        }
+      }
+    },
+    "auditConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sink": {
+          "type": "string",
+          "enum": [
+            "stderr",
+            "memory",
+            "file",
+            "none"
+          ],
+          "default": "stderr"
+        },
+        "path": {
+          "type": "string",
+          "description": "Directory into which rotated log files are written (used when sink=file). Each rotation period creates files named {stamp}-audit.log and {stamp}-transitions.log."
+        },
+        "rotation": {
+          "type": "string",
+          "enum": [
+            "daily",
+            "hourly",
+            "weekly"
+          ],
+          "default": "daily",
+          "description": "How often to rotate log files. daily \u2192 YYYY-MM-DD stamp; hourly \u2192 YYYY-MM-DD-HH stamp; weekly \u2192 YYYY-Www stamp."
+        }
+      }
+    },
+    "storeConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "memory",
+            "file",
+            "sqlite"
+          ],
+          "default": "memory"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    "jsonSchema": {
+      "type": "object"
+    },
+    "embeddingsConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional Tier 3 semantic embedding backend (SPEC \u00a730.10.10). Defaults to `backend: none` \u2014 Tier 3 is disabled and the system operates on Tiers 1/2/4 only. When a backend is configured, embeddings are computed at lexicon write time and stored on entries; at SUBJECT_NEEDS_DEFINITION time, the unknown subject is embedded and compared against stored vectors (cosine \u2265 0.85 threshold).",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": [
+            "none",
+            "ollama",
+            "openai_compatible"
+          ],
+          "default": "none",
+          "description": "Embedding backend to use. `none` (default) disables Tier 3. `ollama` \u2014 POST `{model, prompt}` to `url`, parse `embedding` field. `openai_compatible` \u2014 POST `{model, input}` to `url`, parse `data[0].embedding`."
+        },
+        "url": {
+          "type": "string",
+          "description": "Required when `backend != none`. The HTTP endpoint to POST embedding requests to. Example: `http://localhost:11434/api/embeddings` for Ollama."
+        },
+        "model": {
+          "type": "string",
+          "description": "Required when `backend != none`. The model name sent in the request body. Example: `nomic-embed-text` for Ollama, `text-embedding-ada-002` for OpenAI."
+        },
+        "dimensions": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Expected dimensionality of the embedding vector. Informational \u2014 used by `HttpEmbedder::dimensions()`; does not affect runtime behaviour."
+        },
+        "api_key_env": {
+          "type": "string",
+          "description": "Optional. Environment variable name whose value is sent as `Authorization: Bearer <value>`. Required for OpenAI and other key-gated backends."
+        }
+      }
+    },
+    "lexiconEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "definition_short"
+      ],
+      "properties": {
+        "definition_short": {
+          "type": "string",
+          "description": "Required. One-sentence summary of the term. The canonical human- and agent-readable label used in search and discovery. (SPEC \u00a730.10.1)"
+        },
+        "definition_long": {
+          "type": "string",
+          "description": "Optional. Multi-paragraph elaboration \u2014 examples, nuance, historical context. Not required for the index to function. (SPEC \u00a730.10.1)"
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional. Recognized surface-form variants of the canonical term (e.g. plural, hyphenated, abbreviated forms). Aliases are indexed alongside the canonical term in the combined-form index. Within a bounded_context, no alias may collide with another entry's term or alias. (SPEC \u00a730.10.1)"
+        },
+        "bounded_context": {
+          "type": "string",
+          "description": "DDD bounded context this term belongs to. Cross-context overlap is allowed; within a single context, all terms and aliases must be unique."
+        },
+        "refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Term names of related entries. Used for navigation and discoverability."
+        },
+        "governance": {
+          "type": "string",
+          "enum": [
+            "human-only",
+            "agent-may-propose"
+          ],
+          "default": "human-only",
+          "description": "Controls who may write (define) this term. `human-only` (default) \u2014 agents are rejected. `agent-may-propose` \u2014 agents may propose; a human transition commits. (SPEC \u00a730.6)"
+        }
+      }
+    }
+  }
+}

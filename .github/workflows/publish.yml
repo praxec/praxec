@@ -21,13 +21,38 @@ on:
     push:
         tags:
             - 'v*'
+    pull_request:
 
 env:
     CARGO_TERM_COLOR: always
 
 jobs:
+    # PR gate: prove `praxec-schema` still packages standalone (the
+    # cargo-package verification sandbox builds the crate without the
+    # workspace around it) so schema packaging can never rot invisibly
+    # between releases.
+    package-dry-run:
+        name: cargo package -p praxec-schema (PR dry-run)
+        if: github.event_name == 'pull_request'
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Cache cargo registry + build
+              uses: Swatinem/rust-cache@v2
+
+            - name: cargo package dry-run
+              run: cargo package -p praxec-schema
+
     publish:
         name: cargo publish (tag-triggered)
+        # The `if` keeps this job strictly tag-triggered now that the
+        # workflow also fires on pull_request for the dry-run gate above.
+        if: github.event_name == 'push'
         runs-on: ubuntu-latest
         timeout-minutes: 45
         steps:

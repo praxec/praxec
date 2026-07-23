@@ -179,6 +179,10 @@ impl SubAgentSpawner for AetherSubAgentSpawner {
             // Sub-agents authenticate via provider keys, not OAuth — use an
             // empty in-memory store (aether 0.7.20 added this required field).
             oauth_credential_store: std::sync::Arc::new(FakeOAuthCredentialStore::new()),
+            // aether 0.7.27 additions: both opt-in features praxec does not
+            // route yet — explicitly disabled, not silently defaulted.
+            telemetry: None,
+            trace_context: None,
         };
 
         let total_timeout = Duration::from_secs(self.config.max_sub_agent_seconds);

@@ -8,6 +8,42 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.29] — 2026-07-23 — Close the ledger: snippet inputs, async-park push, packageable schema
+
+Closes the two open dogfood findings from the v0.0.28 program and squares away
+release plumbing.
+
+### Fixed
+
+- **Snippet inputs join the synthesized inputSchema (finding #10).** A capability
+  built from a snippet whose `inputs:` declared defaults used to lose those
+  declarations — `synthesize_input_schema` only read the top-level `inputs:`
+  block, so snippet-declared defaults silently vanished from the contract. The
+  synthesized schema now unions both homes (top-level wins on a shared key), and
+  new **V37 `INPUT_DECLARATION_CONFLICT`** rejects at load a key declared in both
+  places with *conflicting* definitions rather than letting one silently shadow
+  the other.
+- **Elicitation push reaches async-parked ancestor gates (finding #11).** When a
+  child workflow's completion parked a *parent* mission on a human gate, the MCP
+  call that drove the completion returned without pushing the parent's
+  elicitation — the operator only saw the gate on the next unrelated call. The
+  completing call now walks the ancestor chain (visited-set + depth cap, with
+  `elicitation.ancestor_walk.cycle`/`.capped` audit events) and pushes any
+  newly-parked gate exactly once per gate version.
+
+### Changed
+
+- **`praxec-schema` packages standalone.** The crate now carries its own
+  in-crate `schemas/` copies (build.rs reads `CARGO_MANIFEST_DIR`, a byte-identity
+  test fences them against the canonical top-level copies), so `cargo package`
+  succeeds from a clean checkout. A `package-dry-run` CI job proves it on every
+  PR. Publishing to crates.io remains a **manual, deliberate step** — no
+  auto-publish on tag.
+- **aether-agent-cli catch-up to 0.7.27.** The TUI sub-agent `RunConfig` gains
+  the new `telemetry`/`trace_context` fields (explicitly disabled), so a bare
+  `cargo install --path crates/praxec` no longer needs `--locked` to build.
+  `aether-llm` stays within its `~0.7.x` review fence (resolves 0.7.22).
+
 ## [0.0.28] — 2026-07-22 — HITL elicitation context: gates that carry their own decision context
 
 ### Added — HITL elicitation context: human gates that carry their own decision context

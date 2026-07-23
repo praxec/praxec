@@ -730,23 +730,41 @@ fn validate_slot_key_ownership(config: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// SPEC: compile a workflow's `inputs:` block into a synthesized `/inputSchema`
+/// SPEC: compile a workflow's input declarations into a synthesized `/inputSchema`
 /// so the start-time default + validate path (runtime_schema::apply_schema_defaults
-/// and validate_schema, runtime.rs:502-503) applies. Each `inputs.<name>` becomes
+/// and validate_schema, runtime.rs:502-503) applies. The source map is the UNION
+/// of the two declaration homes — top-level `inputs:` and `snippet.inputs` (the
+/// V4/V30 caller-contract home) — with top-level winning on identical keys.
+/// Conflict DETECTION is deliberately NOT done here (the loader stays
+/// infallible); V37 in validate.rs rejects materially different dual-home
+/// declarations at check time. Each union entry becomes
 /// `inputSchema.properties.<name>` (carrying its `type`/`default`/etc.), and a
 /// per-input `required: true` lifts to the top-level JSON-Schema `required: []`.
-/// No-op when the workflow already declares an explicit `inputSchema`, or has no
-/// `inputs:` block.
+/// No-op when the workflow already declares an explicit `inputSchema`, or
+/// declares neither home's inputs block.
 fn synthesize_input_schema(def: &mut Map<String, Value>) {
     if def.contains_key("inputSchema") {
         return;
     }
-    let Some(inputs) = def.get("inputs").and_then(Value::as_object) else {
+    let top_level = def.get("inputs").and_then(Value::as_object);
+    let snippet = def
+        .get("snippet")
+        .and_then(|s| s.get("inputs"))
+        .and_then(Value::as_object);
+    if top_level.is_none() && snippet.is_none() {
         return;
-    };
+    }
+    // Union: start from top-level `inputs:`; fold in `snippet.inputs` entries
+    // only where the key is absent — top-level wins on identical keys.
+    let mut inputs = top_level.cloned().unwrap_or_default();
+    if let Some(snippet_inputs) = snippet {
+        for (name, spec) in snippet_inputs {
+            inputs.entry(name.clone()).or_insert_with(|| spec.clone());
+        }
+    }
     let mut properties = Map::new();
     let mut required: Vec<Value> = Vec::new();
-    for (name, spec) in inputs {
+    for (name, spec) in &inputs {
         let mut prop = spec.as_object().cloned().unwrap_or_default();
         // `required: true` is a per-input convenience; lift it to the schema-level
         // `required` array and drop it from the property (it's not a valid
@@ -3918,4 +3936,47 @@ fn rewrite_executors_in_value(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── inputs: / snippet.inputs → inputSchema synthesis ─────────────────────
+    // (The load-path integration tests live in tests/config_validation.rs;
+    // these unit tests exercise `synthesize_input_schema` directly because the
+    // snippet-home union is the fn's own contract — finding #10.)
+
+    #[test]
+    fn snippet_inputs_feed_the_synthesized_input_schema() {
+        let mut def = serde_json::from_value::<Map<String, Value>>(json!({
+            "snippet": { "inputs": {
+                "prompt": { "type": "string", "default": "Pick one" },
+                "candidates": { "type": "array", "required": true }
+            } },
+            "states": {}
+        }))
+        .unwrap();
+        synthesize_input_schema(&mut def);
+        let schema = def.get("inputSchema").expect("synthesized");
+        assert_eq!(
+            schema.pointer("/properties/prompt/default"),
+            Some(&json!("Pick one")),
+            "a snippet-only default must reach the schema the runtime seeds from"
+        );
+        assert_eq!(schema.pointer("/required/0"), Some(&json!("candidates")));
+    }
+
+    #[test]
+    fn identical_dual_home_declarations_are_fine() {
+        // The YAML-anchor pattern (same declaration in both homes) must keep working.
+        let mut def = serde_json::from_value::<Map<String, Value>>(json!({
+            "inputs":  { "plan": { "type": "object", "required": true } },
+            "snippet": { "inputs": { "plan": { "type": "object", "required": true } } },
+            "states": {}
+        }))
+        .unwrap();
+        synthesize_input_schema(&mut def);
+        assert!(def.get("inputSchema").is_some());
+    }
 }
