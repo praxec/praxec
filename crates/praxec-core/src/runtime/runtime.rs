@@ -195,6 +195,15 @@ pub struct WorkflowRuntime {
     /// Wall-clock bound (seconds) for an auto-driven agent step — fail-fast so a
     /// non-converging agent surfaces in minutes, not the 600s executor default.
     pub(crate) auto_drive_max_seconds: u64,
+    /// (finding #12) The operator's CONFIGURED `auto_drive_max_seconds`, kept
+    /// separately so the synthesized step can carry it as `step_budget_seconds`
+    /// (the executor's whole chain-walk budget). Without it the executor fell
+    /// back to its own 900s walk default and cut a step whose configured
+    /// allowance was larger (observed live: `AGENT_STEP_BUDGET_EXHAUSTED` at
+    /// exactly 900s under a 1800s allowance). `None` when the operator didn't
+    /// set the knob — the executor default then governs, preserving
+    /// multi-attempt escalation under the 180s-per-attempt default wall.
+    pub(crate) auto_drive_step_budget_seconds: Option<u64>,
     /// The repo roots a run may operate on, from the config's `writable: true`
     /// repos (`/praxec/_writableRepos`). A top-level `start` resolves the run's
     /// mandatory [`crate::run_env::RepoRoot`] from this set (see
@@ -245,6 +254,7 @@ impl WorkflowRuntime {
             auto_drive_affinity: "reasoning".to_string(),
             auto_drive_tools: Vec::new(),
             auto_drive_max_seconds: 180,
+            auto_drive_step_budget_seconds: None,
             writable_repo_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             exclusive_pools: Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
         }
@@ -566,7 +576,11 @@ impl WorkflowRuntime {
     /// (1b) Enable auto-driving of skill-surfacing `actor: agent` states via the
     /// `kind: agent` executor, using `affinity` for the model binding,
     /// `tools` (MCP connection names) for the agent's tool access, and a
-    /// `max_seconds` fail-fast bound (0 keeps the default 180s).
+    /// `max_seconds` fail-fast bound (0 keeps the default 180s). A non-zero
+    /// `max_seconds` also becomes the synthesized step's `step_budget_seconds`,
+    /// so the configured allowance bounds the executor's WHOLE chain-walk —
+    /// not just each attempt — instead of the executor's own 900s default
+    /// cutting the step short (finding #12).
     pub fn with_auto_drive_agents(
         mut self,
         enabled: bool,
@@ -582,6 +596,7 @@ impl WorkflowRuntime {
         self.auto_drive_tools = tools;
         if max_seconds > 0 {
             self.auto_drive_max_seconds = max_seconds;
+            self.auto_drive_step_budget_seconds = Some(max_seconds);
         }
         self
     }

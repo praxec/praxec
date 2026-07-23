@@ -887,3 +887,80 @@ async fn agent_completed_cost_is_null_for_uncatalogued_model() {
     assert_eq!(completed.payload["cost_usd"], serde_json::Value::Null);
     assert_eq!(completed.payload["completion_tokens"], 5);
 }
+
+/// (finding #12) A configured `auto_drive_max_seconds` must bound the WHOLE
+/// synthesized step, not just each attempt's wall: the composed `kind: agent`
+/// config carries it as `step_budget_seconds` too. Without it the executor
+/// falls back to its own `DEFAULT_STEP_BUDGET_SECONDS` (900s) chain-walk
+/// budget and cuts a step whose configured allowance is larger — observed live
+/// as `AGENT_STEP_BUDGET_EXHAUSTED` at exactly 900s under a 1800s allowance.
+#[tokio::test]
+async fn auto_drive_max_seconds_flows_to_the_step_budget() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({})));
+    let (runtime, _audit) = build_runtime_with_executor(
+        linear_chain_stops_at_agent(),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec![], 1800);
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+
+    let config = exec
+        .config_for_kind("agent")
+        .expect("the agent executor was invoked");
+    assert_eq!(config["max_seconds"], json!(1800));
+    assert_eq!(
+        config["step_budget_seconds"],
+        json!(1800),
+        "the operator's wall allowance must bound the whole chain-walk, \
+         not leave the executor's 900s default to cut the step short"
+    );
+}
+
+/// The regression fence for the default path: when the operator does NOT
+/// configure `auto_drive_max_seconds` (gateway passes 0), the composed config
+/// omits `step_budget_seconds` entirely so the executor's own default (900s)
+/// still governs the walk — preserving multi-attempt escalation within the
+/// default 180s-per-attempt wall, bit-identical to before.
+#[tokio::test]
+async fn auto_drive_step_budget_is_omitted_when_unconfigured() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({})));
+    let (runtime, _audit) = build_runtime_with_executor(
+        linear_chain_stops_at_agent(),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec![], 0);
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+
+    let config = exec
+        .config_for_kind("agent")
+        .expect("the agent executor was invoked");
+    assert_eq!(
+        config["max_seconds"],
+        json!(180),
+        "0 keeps the 180s fail-fast default"
+    );
+    assert!(
+        config.get("step_budget_seconds").is_none(),
+        "an unconfigured allowance must leave the executor's own walk default in charge"
+    );
+}
