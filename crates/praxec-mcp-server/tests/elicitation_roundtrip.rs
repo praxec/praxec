@@ -16,7 +16,7 @@
 //! thing asserted about the push itself is what the SERVER sent (message +
 //! form schema), which is engine output.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use praxec_core::WorkflowRuntime;
 use praxec_core::audit::{AuditSink, MemoryAuditSink};
@@ -42,6 +42,34 @@ struct NoopRegistry;
 impl ExecutorRegistry for NoopRegistry {
     fn get(&self, _kind: &str) -> Option<Arc<dyn praxec_core::Executor>> {
         None
+    }
+}
+
+/// Registry for the parent/child scenario: serves ONLY `kind: workflow` (the
+/// real [`WorkflowExecutor`], late-installed to break the registry↔runtime
+/// construction cycle — same pattern as praxec-executors' own tests).
+struct SubflowRegistry {
+    workflow: OnceLock<Arc<praxec_executors::workflow::WorkflowExecutor>>,
+}
+impl SubflowRegistry {
+    fn new() -> Self {
+        Self {
+            workflow: OnceLock::new(),
+        }
+    }
+    fn install(&self, e: Arc<praxec_executors::workflow::WorkflowExecutor>) {
+        self.workflow.set(e).map_err(|_| ()).expect("install once");
+    }
+}
+impl ExecutorRegistry for SubflowRegistry {
+    fn get(&self, kind: &str) -> Option<Arc<dyn praxec_core::Executor>> {
+        match kind {
+            "workflow" => self
+                .workflow
+                .get()
+                .map(|w| w.clone() as Arc<dyn praxec_core::Executor>),
+            _ => None,
+        }
     }
 }
 
@@ -120,6 +148,115 @@ fn server_with_store() -> (PraxecServer, Arc<InMemoryWorkflowStore>) {
         audit as Arc<dyn AuditSink>,
     )
     .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
+    (PraxecServer::new(runtime), store)
+}
+
+/// Finding #11 — parent/child split of the same E1–E3 gate. The parent's
+/// deterministic `spawn` transition runs a `kind: workflow` child whose
+/// `use.outputs` maps `candidates` up (the `flow.author-capability`
+/// `composing`-state shape); the parent then advances into `gating`, the
+/// SAME full-contract human gate as [`gate_config`]. The child is a bare
+/// agent-driven cap: `ready → submit → done`, its `submit` landing the
+/// candidates in its terminal context for the projection.
+///
+/// Resolved through `praxec_core::config::resolve` because the `use:` block
+/// is a config-resolve-time expansion (synthesized transition `output:` +
+/// embedded `_snippetOutputs`) — a raw definition map would silently skip
+/// the output projection.
+fn parent_child_config() -> Value {
+    praxec_core::config::resolve(json!({
+        "version": "1.0.0",
+        "workflows": {
+            "parent_flow": {
+                "version": "1.0.0",
+                "initialState": "spawning",
+                "states": {
+                    "spawning": {
+                        "transitions": {
+                            "spawn": {
+                                "target": "gating",
+                                "actor": "deterministic",
+                                "executor": {
+                                    "kind": "workflow",
+                                    "definitionId": "child_cap",
+                                    "use": {
+                                        "outputs": { "$.context.candidates": "candidates" }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    "gating": {
+                        "transitions": {
+                            "pick": {
+                                "target": "done",
+                                "actor": "human",
+                                "presents": ["$.context.candidates"],
+                                "choices": {
+                                    "field": "chosen_id",
+                                    "from": "$.context.candidates",
+                                    "value": "id",
+                                    "title": "name"
+                                },
+                                "inputSchema": {
+                                    "type": "object",
+                                    "required": ["chosen_id"],
+                                    "properties": {
+                                        "chosen_id": { "type": "string" },
+                                        "rationale": { "type": "string" }
+                                    }
+                                },
+                                "output": { "chosen": { "pick": {
+                                    "from": "$.context.candidates",
+                                    "by": "id",
+                                    "eq": "$.arguments.chosen_id"
+                                }}}
+                            }
+                        }
+                    },
+                    "done": { "terminal": true }
+                }
+            },
+            "child_cap": {
+                "version": "1.0.0",
+                "initialState": "ready",
+                "states": {
+                    "ready": {
+                        "transitions": {
+                            "submit": {
+                                "target": "done",
+                                "actor": "agent",
+                                "output": { "candidates": "$.arguments.candidates" }
+                            }
+                        }
+                    },
+                    "done": { "terminal": true }
+                }
+            }
+        }
+    }))
+    .expect("parent/child config resolves")
+}
+
+/// A real `PraxecServer` over the parent/child config with the REAL
+/// `WorkflowExecutor` wired for `kind: workflow`, plus the shared store
+/// handle the scenario reads engine side-effects from.
+fn server_with_parent_child() -> (PraxecServer, Arc<InMemoryWorkflowStore>) {
+    let store = Arc::new(InMemoryWorkflowStore::new());
+    let audit: Arc<dyn AuditSink> = Arc::new(MemoryAuditSink::new());
+    let registry = Arc::new(SubflowRegistry::new());
+    let runtime = WorkflowRuntime::new(
+        Arc::new(ConfigDefinitionStore::from_config(&parent_child_config())),
+        store.clone(),
+        registry.clone() as Arc<dyn ExecutorRegistry>,
+        Arc::new(DefaultGuardEvaluator::new()),
+        audit.clone(),
+    )
+    .with_writable_repo_roots(vec![praxec_core::RepoRoot::for_test()]);
+    registry.install(Arc::new(praxec_executors::workflow::WorkflowExecutor::new(
+        runtime.clone(),
+        audit,
+    )));
     (PraxecServer::new(runtime), store)
 }
 
@@ -430,6 +567,136 @@ async fn an_out_of_set_choice_is_rejected_and_the_mission_stays_parked() {
         instance.context.get("chosen").is_none(),
         "no output mapping may run on a rejected submit: {:#}",
         instance.context
+    );
+
+    let _ = client.cancel().await;
+    server_task.abort();
+}
+
+/// (e) Finding #11 — a child's completing submit re-drives the parent
+/// asynchronously; the parent's gate parks with no command RESPONSE carrying
+/// `pending_human`, so the capability-negotiated push never fired until an
+/// operator re-poked. The fix: the SAME completing call scans the ancestor
+/// chain and pushes the parked gate, push-once per `(workflow_id,
+/// expected_version)`.
+#[tokio::test]
+async fn an_async_parked_parent_gate_is_pushed_in_the_completing_call() {
+    // parent: spawning -> (kind: workflow child) -> gating(actor human, full E1-E3 contract)
+    // child:  ready -> submit(agent) -> done
+    // Drive: start parent (parks waiting on child) -> praxec.command submit on the CHILD.
+    let (server, store) = server_with_parent_child();
+    let pushed = Arc::new(Mutex::new(Vec::new()));
+    let handler = ScriptedClient {
+        action: ElicitationAction::Accept,
+        content: Some(json!({ "chosen_id": "split", "rationale": "seams first" })),
+        pushed: pushed.clone(),
+    };
+    let (client, server_task) = connect(server, handler).await;
+
+    // Start the parent: its deterministic chain spawns the child and durably
+    // parks on it (`_subworkflow_wait`). No human gate exists yet — no push.
+    let start = call(
+        client.peer(),
+        "praxec.command",
+        json!({
+            "definitionId": "parent_flow",
+            "input": { "prompt": "Pick a shape for the capability." }
+        }),
+    )
+    .await;
+    let parent_id = start["workflow"]["id"]
+        .as_str()
+        .expect("parent workflow.id")
+        .to_string();
+    let parent = store.load(&parent_id).await.expect("parent persisted");
+    assert_eq!(
+        parent.state, "spawning",
+        "the parent must park waiting on the child, got: {start}"
+    );
+    let child_id = parent
+        .context
+        .pointer("/_subworkflow_wait/child_workflow_id")
+        .and_then(Value::as_str)
+        .expect("recorded child workflow id")
+        .to_string();
+    let child = store.load(&child_id).await.expect("child persisted");
+    assert_eq!(
+        pushed.lock().expect("pushed lock").len(),
+        0,
+        "no gate exists before the child completes — nothing to push"
+    );
+
+    // The completing call: submit on the CHILD. The child response itself
+    // carries no pending_human; the parent's gate parks in the async
+    // re-drive. THE SAME command call must still deliver exactly one
+    // elicitation push for the parent's gate, and the scripted Accept must
+    // resume the parent through the governed submit.
+    let candidates = json!([
+        { "id": "monolith", "name": "Monolith", "tradeoffs": "simple but coupled" },
+        { "id": "split", "name": "Split", "tradeoffs": "clean seams, more files" }
+    ]);
+    let resp = call(
+        client.peer(),
+        "praxec.command",
+        json!({
+            "workflowId": child_id,
+            "expectedVersion": child.version,
+            "transition": "submit",
+            "arguments": { "candidates": candidates }
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        pushed.lock().expect("pushed lock").len(),
+        1,
+        "the completing call must deliver exactly one push for the parent's \
+         async-parked gate, got response: {resp}"
+    );
+
+    // Engine side-effects (store reads), never the mock's echo: the parent
+    // advanced past the gate and the g3 pick output landed the FULL object.
+    let parent = store.load(&parent_id).await.expect("parent persisted");
+    assert_eq!(
+        parent.state, "done",
+        "the pushed-and-accepted ancestor gate must advance the parent"
+    );
+    assert_eq!(
+        parent.context["chosen"],
+        json!({ "id": "split", "name": "Split", "tradeoffs": "clean seams, more files" }),
+        "the resume submit must run the governed pick output on the parent"
+    );
+
+    // Same-call-resume contract: the completing call's answer is the RESUMED
+    // parent's response, not the child's terminal echo.
+    assert_eq!(
+        resp["workflow"]["id"].as_str(),
+        Some(parent_id.as_str()),
+        "the resumed parent's response must replace the child's, got: {resp}"
+    );
+
+    // Then: a SECOND no-op command (rejected transition — the child is
+    // terminal and its version moved on) must NOT re-push the same
+    // (workflow_id, expected_version) — pushes.len() stays 1.
+    let second = call(
+        client.peer(),
+        "praxec.command",
+        json!({
+            "workflowId": child_id,
+            "expectedVersion": child.version,
+            "transition": "submit",
+            "arguments": {}
+        }),
+    )
+    .await;
+    assert!(
+        second.get("error").is_some(),
+        "the stale re-submit must be rejected typed, got: {second}"
+    );
+    assert_eq!(
+        pushed.lock().expect("pushed lock").len(),
+        1,
+        "a later command must not re-push an already-pushed gate version"
     );
 
     let _ = client.cancel().await;
