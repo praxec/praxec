@@ -8,7 +8,13 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
-## [0.0.30] — 2026-07-23 — Agent-walk exhaustion terminalizes the mission (finding #13)
+## [0.0.30] — 2026-07-23 — Agent-walk exhaustion terminalizes the mission; four kernel potholes
+
+> Note on finding numbers: the agent-walk item below is the release-ledger's
+> finding #13. The four kernel-pothole items are from the separate
+> `flow.ux.optimize` dogfooding ledger (`DISCOVERABILITY-DOGFOODING-FINDING.md`),
+> whose #12/#13/#15/#18 are unrelated to the release-ledger numbering — that
+> ledger's "#13" is the config-load isolation fix, not the agent-walk fix.
 
 ### Fixed
 
@@ -28,6 +34,42 @@ covered by a stability commitment.
   already relies on), and omit the now-misleading recovery link. Every other
   permanent failure keeps its pre-existing recoverable behavior — the fix is
   scoped precisely to exhaustion by a shared `is_agent_exhaustion` predicate.
+
+- **Auto-drive honors `auto_drive_max_seconds` as the per-step budget
+  (dogfooding finding #12).** Auto-drive used a hardcoded 900 s step budget, so
+  `auto_drive_max_seconds` bounded only the whole run, never a single step — a
+  long agent step silently blew past operator intent. The configured limit now
+  threads into a per-step `auto_drive_step_budget_seconds` on the runtime (and
+  the `agent.invoked` audit payload), so a single step is genuinely bounded.
+
+- **One bad `repos:` entry no longer poisons the whole gateway config load
+  (dogfooding finding #13).** A single unreadable/missing repo entry failed the
+  entire config load, taking every healthy repo down with it. The serve/runtime
+  path now loads resiliently — a bad entry is skipped with a `REPO_LOAD_SKIPPED`
+  warning — while `praxec check` stays strict (all-or-nothing). The empty-registry
+  backstop keys off whether any definition-bearing repo actually loaded (not a
+  skipped-vs-declared count), so `ALL_REPOS_FAILED` still fires loudly even when a
+  bare-writable run target sits alongside a single failing real repo — no silently
+  definition-less gateway.
+
+- **Oversized rendered script args spill to a tempfile instead of failing
+  `execve` with E2BIG (dogfooding finding #15).** A rendered arg at or beyond the
+  Linux `MAX_ARG_STRLEN` (~128 KiB) made the child unspawnable, so any workflow
+  passing a large blackboard string (e.g. a `concat` fan-in) to a script died.
+  Args at/over the limit now spill to a tempfile — the argv slot becomes
+  `@argfile:<path>` and `PRAXEC_SPILLED_ARGS` always carries the JSON array of
+  spilled indices (`[]` when none) so scripts can dereference deterministically.
+  The threshold sits at the true limit, so every arg that historically fit still
+  passes verbatim — no silent rewrite of a sub-limit value.
+
+- **An errored child dispatch no longer leaves the parent unable to harvest a
+  sub-workflow (dogfooding finding #18).** The `_subworkflow_wait` binding was
+  written only on the clean-suspend path, so if the child's first dispatch
+  errored the parent recorded no binding and could never harvest the child even
+  after it was rescued (a live wedge that needed manual DB surgery). The binding
+  is now also persisted at spawn time — straight through the store, no parent
+  version bump — so it survives a rejected submit; clean-suspend, harvest, and
+  the reuse-by-transition-name contract are unchanged.
 
 ## [0.0.29] — 2026-07-23 — Close the ledger: snippet inputs, async-park push, packageable schema
 
