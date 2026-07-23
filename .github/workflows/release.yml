@@ -103,6 +103,23 @@ jobs:
               if: matrix.use_cross
               run: cross build --release -p praxec --target ${{ matrix.target }}
 
+            - name: Smoke-test the built binary
+              # Run the freshly built binary so a broken artifact fails the leg
+              # BEFORE it ships. Catches the genuinely-new risk here: the Intel
+              # (x86_64) mac binary is cross-compiled on the Apple-Silicon runner
+              # and executes via Rosetta 2 (present on GitHub's macos runners).
+              # Skipped only for the cross-compiled aarch64-linux leg, whose
+              # foreign-arch binary can't exec on the x86_64 build host.
+              if: "!matrix.use_cross"
+              shell: bash
+              run: |
+                  bin="target/${{ matrix.target }}/release/praxec"
+                  [[ "${{ matrix.target }}" == *windows* ]] && bin="${bin}.exe"
+                  echo "smoke: $bin --version"
+                  "$bin" --version
+                  echo "smoke: $bin --help (discard output)"
+                  "$bin" --help >/dev/null
+
             - name: Archive (tar.gz)
               if: "!contains(matrix.target, 'windows')"
               shell: bash
