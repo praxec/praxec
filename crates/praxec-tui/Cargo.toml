@@ -13,7 +13,7 @@ autobins = false
 # don't duplicate it.
 praxec-agents = { workspace = true }
 # Aether agent framework — full feature set
-aether_cli = { version = "0.7", package = "aether-agent-cli" }
+aether_cli = { version = "0.7.27", package = "aether-agent-cli" }
 aether_auth = { version = "0.1", package = "aether-auth" }
 wisp = { version = "0.4", package = "aether-wisp" }
 tui = { version = "0.2", package = "aether-tui", features = ["syntax"] }

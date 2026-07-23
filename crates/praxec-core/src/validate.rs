@@ -603,6 +603,9 @@ fn validate_one_workflow(
     // declarations must be well-formed and resolvable; V36 warns on a gate
     // whose required schema can never be satisfied by a push-elicitation form.
     validate_human_gate_elicitation(id, def, out);
+    // Finding #10, V37 — a key declared in BOTH `inputs:` and `snippet.inputs`
+    // with materially different schemas is a drift trap; reject at load.
+    v37_input_declaration_conflict(id, def, out);
 
     let Some(initial_state) = def.get("initialState").and_then(Value::as_str) else {
         out.push(Diagnostic::Error(format!(
@@ -1388,6 +1391,35 @@ fn validate_human_gate_elicitation(id: &str, def: &Value, out: &mut Vec<Diagnost
                 out,
             );
             v36_elicitation_compatibility(id, state_name, t_name, t_def, out);
+        }
+    }
+}
+
+/// V37 — dual-home input-declaration conflict (finding #10). A workflow may
+/// declare an input in top-level `inputs:` (the synthesis home) and/or in
+/// `snippet.inputs` (the V4/V30 caller-contract home). `config.rs::
+/// synthesize_input_schema` unions the two homes with top-level winning on
+/// identical keys, so a SILENT conflict would ship the top-level schema while
+/// the caller contract (V30) reads snippet — the two governed surfaces would
+/// drift apart without a trace. V37 makes the drift loud: any key present in
+/// both homes must carry `Value`-identical declarations (the YAML-anchor
+/// duplication pattern), or one home must be dropped.
+fn v37_input_declaration_conflict(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
+    let Some(top_level) = def.get("inputs").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(snippet_inputs) = def.pointer("/snippet/inputs").and_then(Value::as_object) else {
+        return;
+    };
+    for (key, top_decl) in top_level {
+        if let Some(snippet_decl) = snippet_inputs.get(key) {
+            if top_decl != snippet_decl {
+                out.push(Diagnostic::Error(format!(
+                    "INPUT_DECLARATION_CONFLICT: workflow '{id}' input '{key}' is declared \
+                     differently in `inputs:` and `snippet.inputs` — one declaration must be \
+                     the source of truth; make them identical or keep only one (V37)"
+                )));
+            }
         }
     }
 }
@@ -6468,6 +6500,32 @@ mod tests {
             let warns = warnings_with(&config, "ELICITATION_INCOMPATIBLE_GATE");
             assert!(warns.is_empty(), "'{rel}' must be V36-silent: {warns:?}");
         }
+    }
+
+    // --- V37 — dual-home input-declaration conflict (finding #10) ------------
+
+    #[test]
+    fn conflicting_dual_home_input_declarations_are_rejected() {
+        // Same key, MATERIALLY different schema in the two homes → drift trap.
+        let config = json!({ "version": "1.0.0", "workflows": { "cap.x": {
+            "inputs":  { "plan": { "type": "object" } },
+            "snippet": { "verb": "plan", "inputs": { "plan": { "type": "string" } } },
+            "states": { "done": { "terminal": true } }
+        } } });
+        let errs = errors_with(&config, "INPUT_DECLARATION_CONFLICT");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("'plan'"), "{errs:?}");
+        assert!(errs[0].contains("(V37)"), "{errs:?}");
+    }
+
+    #[test]
+    fn identical_dual_home_declarations_pass_v37() {
+        let config = json!({ "version": "1.0.0", "workflows": { "cap.x": {
+            "inputs":  { "plan": { "type": "object", "required": true } },
+            "snippet": { "verb": "plan", "inputs": { "plan": { "type": "object", "required": true } } },
+            "states": { "done": { "terminal": true } }
+        } } });
+        assert!(errors_with(&config, "INPUT_DECLARATION_CONFLICT").is_empty());
     }
 
     /// V27 descends into `pick` operands: a typo'd scope in `from`/`eq` would

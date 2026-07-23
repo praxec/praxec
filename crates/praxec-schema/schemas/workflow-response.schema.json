@@ -1,0 +1,212 @@
+{
+  "$id": "https://praxec.dev/schemas/workflow-response.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkflowResponse",
+  "type": "object",
+  "required": ["workflow", "result", "links"],
+  "additionalProperties": false,
+  "properties": {
+    "workflow": { "$ref": "#/$defs/workflowSnapshot" },
+    "result": { "$ref": "#/$defs/result" },
+    "context": { "type": "object" },
+    "summary": {
+      "type": "string",
+      "description": "The optional model-authored summary stored at `context.summary` (SPEC §6.3). Surfaced here so a cold-resuming LLM sees the last narrative without digging through context."
+    },
+    "links": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/link" }
+    },
+    "evidence": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/evidence" },
+      "default": []
+    },
+    "error": { "$ref": "#/$defs/error" },
+    "pending_human": { "$ref": "#/$defs/pendingHuman" },
+    "chain": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/chainStep" },
+      "default": [],
+      "description": "When deterministic chaining occurred, records each intermediate state the workflow traversed automatically."
+    },
+    "delegate": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Pass-through agent-config name (SPEC §21). When present, a consuming agentic runtime spawns an isolated sub-agent session with this name to drive the current state. The gateway itself never reads or branches on this field — it surfaces whatever was declared on the active state's `delegate` key."
+    },
+    "guidance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "goal": { "type": "string" },
+        "instructions": { "type": "string" },
+        "refs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["verb", "subject"],
+            "additionalProperties": false,
+            "properties": {
+              "verb": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+              "subject": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" }
+            }
+          },
+          "default": [],
+          "description": "Referenced-tier guidance — a menu of `{verb, subject}` tokens the model can fetch via gateway.describe (SPEC §5.4-§5.5)."
+        }
+      },
+      "description": "Phase-level guidance for the LLM: what to aim for and how to behave in the current workflow state."
+    },
+    "outcomes": {
+      "type": "array",
+      "default": [],
+      "description": "ADR-0008 — the mission's outcomes (its measurable definition of done), evaluated live against the current context.",
+      "items": {
+        "type": "object",
+        "required": ["id", "statement", "met"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "statement": { "type": "string" },
+          "met": { "type": "boolean" }
+        }
+      }
+    },
+    "orchestrator": {
+      "type": "string",
+      "minLength": 1,
+      "description": "ADR-0009 — the actor (agent/model binding) that drives the mission toward its outcomes. Present only when the workflow declares one."
+    }
+  },
+  "$defs": {
+    "workflowSnapshot": {
+      "type": "object",
+      "required": ["id", "definitionId", "state", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "definitionId": { "type": "string" },
+        "definitionVersion": { "type": "string" },
+        "state": { "type": "string" },
+        "version": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "result": {
+      "type": "object",
+      "required": ["status"],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "description": "ADR-0008 — the mission's resolution status.",
+          "enum": ["running", "waiting", "succeeded", "failed"]
+        },
+        "reason": {
+          "type": "string",
+          "description": "ADR-0008 — present when status is `failed`: why it failed.",
+          "enum": ["cancelled", "timed_out", "guard_unmet", "error"]
+        }
+      }
+    },
+    "link": {
+      "type": "object",
+      "required": ["rel", "method", "args"],
+      "additionalProperties": false,
+      "properties": {
+        "rel": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": ["string", "null"] },
+        "method": {
+          "type": "string",
+          "const": "praxec.command"
+        },
+        "actor": {
+          "type": "string",
+          "enum": ["agent", "human", "system", "deterministic"]
+        },
+        "args": {
+          "type": "object",
+          "required": ["workflowId", "expectedVersion", "transition"],
+          "additionalProperties": false,
+          "properties": {
+            "workflowId": { "type": "string" },
+            "expectedVersion": { "type": "integer", "minimum": 0 },
+            "transition": { "type": "string" }
+          }
+        },
+        "inputSchema": { "type": "object" },
+        "guidance": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "refs": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["verb", "subject"],
+                "additionalProperties": false,
+                "properties": {
+                  "verb": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+                  "subject": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" }
+                }
+              }
+            }
+          },
+          "description": "Link-scoped guidance — references that surface only when this transition is offered (SPEC §5.5 transition-scope skills)."
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["kind", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "type": "string" },
+        "id": { "type": "string" },
+        "uri": { "type": "string" },
+        "summary": { "type": "string" }
+      }
+    },
+    "pendingHuman": {
+      "type": "object",
+      "description": "The typed human gate this mission (or its sub-workflow) is parked on, with a ready-to-fire `resolve` handle. Surfaced so an MCP-driving agent escalates to the operator instead of treating `waiting` as a soft stall.",
+      "additionalProperties": true,
+      "properties": {
+        "workflow_id": { "type": "string" },
+        "definition_id": { "type": "string" },
+        "state": { "type": "string" },
+        "expected_version": { "type": "integer" },
+        "transition": { "type": "string" },
+        "prompt": { "type": "string" },
+        "input_schema": { "type": "object" },
+        "source": { "type": "string", "enum": ["human_gate", "agent_await"] },
+        "since": { "type": "string" },
+        "onChildWorkflow": { "type": "boolean" },
+        "note": { "type": "string" },
+        "resolve": { "type": "object" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "attemptedTransition": { "type": "string" }
+      }
+    },
+    "chainStep": {
+      "type": "object",
+      "required": ["fromState", "transition", "toState", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "fromState": { "type": "string" },
+        "transition": { "type": "string" },
+        "toState": { "type": "string" },
+        "version": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

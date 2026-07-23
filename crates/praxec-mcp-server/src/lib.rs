@@ -186,6 +186,15 @@ pub struct PraxecServer {
     /// full surface. A slot (not a plain field) so a hot reload can flip it:
     /// clean reload clears it, dirty reload sets it (Fork C).
     pub(crate) repair_gate: RepairGateSlot,
+    /// Finding #11 — push-once dedup for ancestor-chain gate pushes, keyed by
+    /// `(workflow_id, expected_version)`. Session-scoped: shared (`Arc`) across
+    /// the clones rmcp makes of this server within one serve session, reset by
+    /// construction on the next session. A key is inserted BEFORE the peer is
+    /// awaited, so even a client-side elicitation error never earns the same
+    /// gate version a second push. The DIRECT-response push path deliberately
+    /// does not consult this set — a gate on the response itself is the
+    /// canonical same-call contract, not a re-poke.
+    pushed_gates: Arc<std::sync::Mutex<std::collections::HashSet<(String, u64)>>>,
 }
 
 /// #14 — the shared, hot-swappable repair-gate slot. Cloned into the serve
@@ -222,6 +231,23 @@ impl RepairGate {
 /// (agent-controlled).
 pub const PRINCIPAL_META_KEY: &str = "io.praxec/principal";
 
+/// Finding #11 — depth cap on the ancestor-chain gate walk. Parent links are
+/// written by the sub-workflow spawn path, whose own recursion guard caps
+/// nesting at 10, so a chain deeper than 8 ancestors above a completing leaf
+/// signals store corruption rather than legitimate structure. The visited-set
+/// in [`PraxecServer::ancestor_pending_gates`] is the cycle half of the same
+/// FMECA-mandated fence.
+const ANCESTOR_WALK_MAX_DEPTH: usize = 8;
+
+/// Capability negotiation (MCP 2025-11-25 / SEP-1319): whether this client
+/// declared the top-level `elicitation` capability. Everyone else keeps the
+/// pull handle (`praxec.query { approvals: true }`).
+fn client_supports_elicitation(peer: &Peer<RoleServer>) -> bool {
+    peer.peer_info()
+        .map(|info| info.capabilities.elicitation.is_some())
+        .unwrap_or(false)
+}
+
 impl PraxecServer {
     /// Build a server with a default empty in-memory discovery index. The
     /// gateway.* tools still work but return no items.
@@ -248,6 +274,7 @@ impl PraxecServer {
             reload_hook: None,
             staleness_hook: None,
             repair_gate: Arc::new(std::sync::RwLock::new(None)),
+            pushed_gates: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -358,20 +385,43 @@ impl PraxecServer {
         // Capability negotiation (MCP 2025-11-25 / SEP-1319): push only to a
         // client that declared the top-level `elicitation` capability. Everyone
         // else keeps the pull handle.
-        let supports = peer
-            .peer_info()
-            .map(|info| info.capabilities.elicitation.is_some())
-            .unwrap_or(false);
-        if !supports {
+        if !client_supports_elicitation(peer) {
             return Ok(result);
         }
-        let gate: praxec_core::hitl::PendingHumanGate = match serde_json::from_value(pending) {
+        match self.push_gate(peer, principal, pending).await? {
+            // Accept-resume ran: its response supersedes the parked one.
+            Some(resumed) => Ok(resumed),
+            // No resume (malformed gate, doomed form, push failure, decline /
+            // cancel): hand back the original result so the `pending_human`
+            // block and its `resolve` handle survive for the pull fallback.
+            None => Ok(result),
+        }
+    }
+
+    /// The shared push+resume core both gate sources go through — the gate on
+    /// the command RESPONSE ([`Self::drive_human_elicitation`]) and a gate
+    /// found on an ANCESTOR of the completing workflow
+    /// ([`Self::drive_ancestor_elicitation`], finding #11).
+    ///
+    /// `Ok(Some(v))` — the human ACCEPTED and the fully-governed resume submit
+    /// ran; `v` is that submit's response (which may itself be a typed
+    /// rejection, e.g. `CHOICE_MISMATCH`) and supersedes the caller's result.
+    /// `Ok(None)` — no resume happened: malformed gate, doomed/defect-marked
+    /// form, `elicitation/create` failure, or the human declined/cancelled.
+    /// The caller keeps its original result in every `None` case.
+    async fn push_gate(
+        &self,
+        peer: &Peer<RoleServer>,
+        principal: &Principal,
+        gate_value: Value,
+    ) -> Result<Option<Value>, McpError> {
+        let gate: praxec_core::hitl::PendingHumanGate = match serde_json::from_value(gate_value) {
             Ok(gate) => gate,
             // A malformed gate is not worth failing the whole call over — the
             // caller still has the raw `pending_human` block to act on.
             Err(e) => {
                 tracing::warn!(error = %e, "pending_human did not deserialize; skipping elicitation push");
-                return Ok(result);
+                return Ok(None);
             }
         };
 
@@ -399,7 +449,7 @@ impl PraxecServer {
                 } else {
                     tracing::warn!(reason = %reason, "elicitation push skipped; returning parked result");
                 }
-                return Ok(result);
+                return Ok(None);
             }
         };
         let params = CreateElicitationRequestParams::FormElicitationParams {
@@ -411,7 +461,7 @@ impl PraxecServer {
             Ok(elicited) => elicited,
             Err(e) => {
                 tracing::warn!(error = %e, "elicitation/create failed; returning parked result");
-                return Ok(result);
+                return Ok(None);
             }
         };
 
@@ -425,10 +475,170 @@ impl PraxecServer {
                 let submit = build_gate_submit(&gate, content);
                 self.dispatch_call_with_principal(submit, human_principal(principal))
                     .await
+                    .map(Some)
             }
             // Declined / cancelled: leave the mission parked, hand back the
             // original result so the operator can still resolve out-of-band.
-            ElicitationAction::Decline | ElicitationAction::Cancel => Ok(result),
+            ElicitationAction::Decline | ElicitationAction::Cancel => Ok(None),
+        }
+    }
+
+    /// Finding #11 — elicitation push for ASYNC-PARKED ancestor gates. A
+    /// child's completing submit re-drives its parent asynchronously; the
+    /// parent's human gate then parks with no command RESPONSE carrying
+    /// `pending_human`, so the capability-negotiated push never fired until an
+    /// operator re-poked. This scan runs in the same `call_tool` post-dispatch
+    /// block, ONLY when the command's response carries no gate of its own (a
+    /// direct-response `pending_human` keeps precedence), and pushes each
+    /// not-yet-pushed ancestor gate through the same [`Self::push_gate`] core.
+    /// On a successful accept-resume the RESUMED mission's response replaces
+    /// the original (mirroring the same-call-resume contract).
+    async fn drive_ancestor_elicitation(
+        &self,
+        peer: &Peer<RoleServer>,
+        principal: &Principal,
+        result: Value,
+    ) -> Result<Value, McpError> {
+        if result.get("pending_human").is_some() {
+            // The direct-response gate already went through
+            // `drive_human_elicitation`; it keeps precedence.
+            return Ok(result);
+        }
+        // Non-workflow command shapes (define / reload / structured errors
+        // without a workflow) have no ancestry to scan.
+        let Some(workflow_id) = result
+            .pointer("/workflow/id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return Ok(result);
+        };
+        if !client_supports_elicitation(peer) {
+            return Ok(result);
+        }
+        for gate_value in self.ancestor_pending_gates(&workflow_id).await {
+            let key = (
+                gate_value
+                    .get("workflow_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                gate_value
+                    .get("expected_version")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+            );
+            {
+                // Push-once per gate version: insert BEFORE awaiting the peer,
+                // so even a client error never earns the same gate a re-push.
+                // Scoped so the std MutexGuard drops before the await below.
+                let mut pushed = self
+                    .pushed_gates
+                    .lock()
+                    .expect("LOCK_POISONED: pushed_gates");
+                if !pushed.insert(key) {
+                    continue;
+                }
+            }
+            if let Some(resumed) = self.push_gate(peer, principal, gate_value).await? {
+                return Ok(resumed);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Finding #11 — every pending human gate on the ANCESTOR chain of
+    /// `workflow_id`, oldest link first, each serialized like the
+    /// `runtime_response` attachment (`serde_json::to_value` over
+    /// [`praxec_core::hitl::pending_gate`]'s typed gate).
+    ///
+    /// The walk follows `instance.parent` links via the runtime's store and is
+    /// double-fenced (FMECA-mandated prevention, mirroring the sub-workflow
+    /// spawn depth guard): a visited-set catches a corrupt CYCLIC parent
+    /// chain, and [`ANCESTOR_WALK_MAX_DEPTH`] caps a runaway-deep one. Either
+    /// trip logs a `tracing::warn` AND records an audit event
+    /// (`elicitation.ancestor_walk.cycle` / `.capped`) so the corruption is
+    /// operator-visible instead of silently truncating the scan.
+    async fn ancestor_pending_gates(&self, workflow_id: &str) -> Vec<Value> {
+        let mut gates = Vec::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        visited.insert(workflow_id.to_string());
+        let Ok(mut current) = self.runtime.load_instance(workflow_id).await else {
+            // No instance, no ancestry (e.g. the store lost the id between
+            // dispatch and this scan) — nothing to push.
+            return gates;
+        };
+        for _ in 0..ANCESTOR_WALK_MAX_DEPTH {
+            let Some(link) = current.parent.clone() else {
+                return gates;
+            };
+            if !visited.insert(link.workflow_id.clone()) {
+                tracing::warn!(
+                    workflow_id = %workflow_id,
+                    repeated = %link.workflow_id,
+                    "elicitation.ancestor_walk.cycle: parent chain revisits an \
+                     instance — corrupt parent links; stopping the gate scan"
+                );
+                self.record_ancestor_walk_defect(
+                    "elicitation.ancestor_walk.cycle",
+                    workflow_id,
+                    json!({ "repeated_workflow_id": link.workflow_id }),
+                )
+                .await;
+                return gates;
+            }
+            let Ok(parent) = self.runtime.load_instance(&link.workflow_id).await else {
+                tracing::warn!(
+                    workflow_id = %workflow_id,
+                    parent = %link.workflow_id,
+                    "ancestor gate scan: parent instance not loadable; stopping"
+                );
+                return gates;
+            };
+            if let Some(gate) = praxec_core::hitl::pending_gate(&parent) {
+                if let Ok(v) = serde_json::to_value(&gate) {
+                    gates.push(v);
+                }
+            }
+            current = parent;
+        }
+        if current.parent.is_some() {
+            tracing::warn!(
+                workflow_id = %workflow_id,
+                max_depth = ANCESTOR_WALK_MAX_DEPTH,
+                "elicitation.ancestor_walk.capped: parent chain deeper than the \
+                 walk cap; gates above the cap are not scanned"
+            );
+            self.record_ancestor_walk_defect(
+                "elicitation.ancestor_walk.capped",
+                workflow_id,
+                json!({ "max_depth": ANCESTOR_WALK_MAX_DEPTH }),
+            )
+            .await;
+        }
+        gates
+    }
+
+    /// Audit-visible half of the ancestor-walk fences: a tripped fence is a
+    /// store-corruption signal an operator must be able to find after the
+    /// fact, not just a log line that scrolled away.
+    async fn record_ancestor_walk_defect(
+        &self,
+        event_type: &str,
+        workflow_id: &str,
+        payload: Value,
+    ) {
+        if let Err(e) = self
+            .runtime
+            .audit()
+            .record(
+                AuditEvent::new(event_type)
+                    .with_workflow(workflow_id)
+                    .with_payload(payload),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, event = %event_type, "ancestor-walk audit write failed");
         }
     }
 
@@ -1105,8 +1315,14 @@ impl ServerHandler for PraxecServer {
         // elicitation, turn the gate into an `elicitation/create` round-trip and
         // resume in-band on accept. A non-capable client is untouched (it keeps
         // the `pending_human` block + its `resolve` handle — the pull fallback).
+        // When the response carries NO gate of its own, the ancestor-chain scan
+        // (finding #11) covers the async-parked case: a completing child whose
+        // parent re-drove into a human gate that no response ever surfaced.
         let result = if is_command {
-            self.drive_human_elicitation(&context.peer, &principal, result)
+            let result = self
+                .drive_human_elicitation(&context.peer, &principal, result)
+                .await?;
+            self.drive_ancestor_elicitation(&context.peer, &principal, result)
                 .await?
         } else {
             result
