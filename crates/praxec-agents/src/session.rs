@@ -234,7 +234,18 @@ pub mod testing {
             Self::with_outcome(AgentRunOutcome::Completed(result))
         }
         pub fn no_result() -> Self {
-            Self::with_outcome(AgentRunOutcome::NoResult)
+            // Empty transcript = genuinely produced nothing → AGENT_NO_RESULT.
+            // (A run that produced output but never finalized is NOT_CONVERGING;
+            // see `not_converging()`.)
+            Self::with_outcome_transcript(AgentRunOutcome::NoResult, String::new())
+        }
+        /// (WS3) Ran and produced output but never emitted a conforming
+        /// `final_answer` → AGENT_NOT_CONVERGING, distinct from `no_result`.
+        pub fn not_converging() -> Self {
+            Self::with_outcome_transcript(
+                AgentRunOutcome::NoResult,
+                "{\"kind\":\"text\",\"message\":\"worked but never finalized\"}".into(),
+            )
         }
         pub fn timed_out() -> Self {
             Self::with_outcome(AgentRunOutcome::TimedOut)
@@ -246,10 +257,16 @@ pub mod testing {
             }))
         }
         fn with_outcome(outcome: AgentRunOutcome) -> Self {
+            Self::with_outcome_transcript(
+                outcome,
+                "{\"kind\":\"text\",\"message\":\"mock\"}".into(),
+            )
+        }
+        fn with_outcome_transcript(outcome: AgentRunOutcome, transcript: String) -> Self {
             Self {
                 report: AgentRunReport {
                     outcome,
-                    transcript: "{\"kind\":\"text\",\"message\":\"mock\"}".into(),
+                    transcript,
                     model: "mock:model".into(),
                     prompt_tokens: 0,
                     completion_tokens: 0,

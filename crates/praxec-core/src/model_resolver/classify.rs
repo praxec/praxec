@@ -114,8 +114,13 @@ impl FailureClass {
     pub fn from_executor_error(err: &ExecutorError) -> Self {
         match err {
             ExecutorError::Permanent(msg)
-                if msg.starts_with("AGENT_NO_RESULT") || msg.starts_with("AGENT_RESULT_FAILED") =>
+                if msg.starts_with("AGENT_NO_RESULT")
+                    || msg.starts_with("AGENT_RESULT_FAILED")
+                    || msg.starts_with("AGENT_NOT_CONVERGING") =>
             {
+                // NOT_CONVERGING (did work, never finalized) escalates like
+                // NoResult — a stronger model may finalize. The distinct wire
+                // code is for honest observability, not a behavior change.
                 FailureClass::Capability
             }
             // A spent time budget is a distinct outcome from a dead-air stall
@@ -304,6 +309,26 @@ mod tests {
         // remaining step budget) — behavior is preserved, only the label honest.
         assert!(budget_class.is_infrastructure());
         assert!(stall_class.is_infrastructure());
+    }
+
+    /// WS3: NOT_CONVERGING (did work, never finalized) escalates like NoResult
+    /// (Capability), so the walk behavior is unchanged — the distinct code is
+    /// purely for honest observability.
+    #[test]
+    fn not_converging_escalates_like_no_result() {
+        let nc = ExecutorError::Permanent(
+            "AGENT_NOT_CONVERGING: agent produced output but never finalized".into(),
+        );
+        let nr = ExecutorError::Permanent("AGENT_NO_RESULT: nothing produced".into());
+        assert_eq!(
+            FailureClass::from_executor_error(&nc),
+            FailureClass::Capability
+        );
+        assert_eq!(
+            FailureClass::from_executor_error(&nr),
+            FailureClass::Capability
+        );
+        assert!(FailureClass::from_executor_error(&nc).is_infrastructure());
     }
 
     /// RateLimited maps to RateLimit429 (infrastructure).

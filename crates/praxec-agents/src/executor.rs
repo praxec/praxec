@@ -506,10 +506,31 @@ impl AgentExecutor {
                     partial_tail(&report.transcript)
                 ),
             )),
-            AgentRunOutcome::NoResult => Err(permanent(
-                AgentErrorCode::NoResult,
-                "agent run ended without a conforming `final_answer` call",
-            )),
+            // WS3: split the "ended without a conforming final_answer" outcome.
+            // A run that produced output (streamed text / tool calls) but never
+            // finalized is NOT_CONVERGING (did work, didn't converge) — honestly
+            // distinct from a genuinely empty NoResult, and carries the partial
+            // work rather than discarding it. Both classify as Capability
+            // (escalate to a stronger model), so the walk is unchanged.
+            AgentRunOutcome::NoResult => {
+                if report.transcript.trim().is_empty() {
+                    Err(permanent(
+                        AgentErrorCode::NoResult,
+                        "agent run ended without producing any output or a conforming \
+                         `final_answer` call",
+                    ))
+                } else {
+                    Err(permanent(
+                        AgentErrorCode::NotConverging,
+                        format!(
+                            "agent produced output across its turns but never converged on a \
+                             conforming `final_answer` — a not-converging run, not a dead one. \
+                             Partial work: {}",
+                            partial_tail(&report.transcript)
+                        ),
+                    ))
+                }
+            }
             // P12 R1.4 — the agent parked on a human gate. FIRST-CLASS
             // control flow, not a failure: the conversation is already
             // durably persisted under `correlation_id`, and the runtime maps
@@ -1091,6 +1112,31 @@ mod tests {
             .await
             .expect_err("no final_answer → error");
         assert!(format!("{err:?}").contains("AGENT_NO_RESULT"));
+    }
+
+    #[tokio::test]
+    async fn produced_output_but_no_final_answer_is_not_converging_with_partial_work() {
+        // WS3: a run that emitted output but never finalized is NOT_CONVERGING
+        // (honestly distinct from a genuinely-empty NoResult) and carries the
+        // partial work rather than discarding it.
+        let exec = exec_with(MockSessionRunner::not_converging());
+        let err = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "g" }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("no final_answer → error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("AGENT_NOT_CONVERGING"), "got {msg}");
+        assert!(
+            msg.contains("Partial work"),
+            "partial work must be surfaced, not discarded: {msg}"
+        );
+        assert!(
+            !msg.contains("AGENT_NO_RESULT"),
+            "a run that did work must not be mislabeled NoResult: {msg}"
+        );
     }
 
     #[tokio::test]
