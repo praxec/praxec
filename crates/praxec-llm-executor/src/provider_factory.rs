@@ -12,12 +12,15 @@
 //! the right typed client (the cockpit pattern). The factory maps rig's stream to
 //! the executor's provider-agnostic [`StreamEvent`]s **lazily** — each event is
 //! forwarded as it arrives (via an `async_stream` generator), not pre-collected.
-//! Laziness is load-bearing: the agent runner's per-event stall watchdog can only
-//! bound inter-event silence if the underlying model wait actually happens while
-//! the consumer polls `.next()`. An earlier version drained the whole turn into a
-//! `Vec` before returning, which moved every token (and any first-token hang) to
-//! *before* the watchdog saw the stream — so a hung reasoning call sat at 0 CPU
-//! until the whole-session wall, and the advertised stall timeout never fired.
+//! Laziness is load-bearing: the underlying model wait must happen while the
+//! consumer polls `.next()`, so that (a) the runner's per-event `agent.heartbeat`
+//! pulses during a slow reasoning call instead of showing dead air, and (b) a
+//! genuinely dead socket surfaces as a mid-stream transport `Err` (the client's
+//! `read_timeout`, see [`configured_http_client`]) the runner can retry, rather
+//! than blocking a whole-turn drain before anyone sees the stream. An earlier
+//! version drained the whole turn into a `Vec` before returning, which moved
+//! every token (and any first-token hang) to *before* the consumer polled — so a
+//! hung call sat at 0 CPU with no pulse until the whole-session wall.
 //! The trailing token-usage aggregate + `Done` are emitted after the stream ends.
 
 use async_trait::async_trait;

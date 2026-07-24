@@ -8,6 +8,31 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.31] — Unreleased
+
+### Changed
+
+- **Streaming liveness moved to the transport layer; the token dead-air watchdog
+  is retired (WS5).** The agent runner previously killed a turn whose stream
+  produced no *token* for `stall_seconds` (120 s). That watchdog was blind to
+  SSE keep-alive comments (OpenRouter emits `: OPENROUTER PROCESSING` while a
+  model reasons), so a model that was merely thinking looked identical to a hung
+  one — the root of the "reasoning models stall" reports. Liveness is now the
+  provider client's job, using rig's own facilities rather than a hand-rolled
+  timer: each rig client is built with a configured `reqwest` transport
+  (`read_timeout` 60 s, `tcp_keepalive` 30 s, `connect_timeout` 20 s) injected
+  via `ClientBuilder::http_client`. A genuinely dead socket surfaces as a
+  mid-stream transport error while keep-alive bytes keep a reasoning connection
+  alive. That transport error is now raised as a **retriable `Connection`
+  error** (previously it was folded into the transcript and silently yielded a
+  hollow `NoResult` that killed the whole model chain): the runner re-issues the
+  same turn on a fresh connection up to `MAX_RETRY_ATTEMPTS` (2), so an
+  intermittent provider blip becomes a bounded retry instead of a dead step, and
+  only a *persistent* failure escalates to the next model in the chain. Stream
+  ESTABLISHMENT is still bounded by `stall_timeout`; the whole-step budget
+  (`max_seconds`) remains the outer wall on a stream that stays alive but never
+  terminates. Upgrades `rig-core` 0.38 → 0.40.
+
 ## [0.0.30] — 2026-07-23 — Agent-walk exhaustion terminalizes the mission; four kernel potholes
 
 > Note on finding numbers: the agent-walk item below is the release-ledger's
