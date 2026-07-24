@@ -443,15 +443,43 @@ fn init_tracing(log_format: &str) {
 /// interactive/dev use is unaffected — only a deliberate `serve` with
 /// non-durable storage is stopped.
 fn guard_durable_serve(config: &Value) -> anyhow::Result<()> {
-    let env_opt_in = std::env::var("PRAXEC_ALLOW_EPHEMERAL")
-        .map(|v| !matches!(v.as_str(), "" | "0" | "false"))
-        .unwrap_or(false);
+    // Env-aware (honors the PRAXEC_ALLOW_EPHEMERAL escape hatch), exactly as
+    // `doctor` does — the two share `durability_problems` so a serve-refusal
+    // and a clean doctor/health report can never disagree.
+    let problems = durability_problems(config, true);
+    if !problems.is_empty() {
+        anyhow::bail!(
+            "refusing to serve with ephemeral / non-durable storage:\n  - {}\n\n\
+             Configure durable storage for production, or set \
+             `gateway.allow_ephemeral: true` (or env PRAXEC_ALLOW_EPHEMERAL=1) to \
+             override for dev/testing.",
+            problems.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// The durability problems that would make a long-running `serve` refuse to
+/// start (empty = servable). Single source of truth shared by `serve`
+/// (fail-fast), `doctor` (health), and `check` (static validation) so those
+/// three surfaces can never disagree about whether a config is servable — the
+/// exact "check says ok but serve refuses" gap this closes.
+///
+/// `consider_env_optin`: honor the runtime `PRAXEC_ALLOW_EPHEMERAL` escape
+/// hatch. `serve`/`doctor` pass `true` (they run in the same environment a
+/// serve would, so they match serve precisely); static `check` passes `false`
+/// — it validates the config file itself, independent of any one shell's env.
+fn durability_problems(config: &Value, consider_env_optin: bool) -> Vec<String> {
+    let env_opt_in = consider_env_optin
+        && std::env::var("PRAXEC_ALLOW_EPHEMERAL")
+            .map(|v| !matches!(v.as_str(), "" | "0" | "false"))
+            .unwrap_or(false);
     let config_opt_in = config
         .pointer("/gateway/allow_ephemeral")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if env_opt_in || config_opt_in {
-        return Ok(());
+        return Vec::new();
     }
 
     // Absent store/audit config defaults to memory/stderr respectively — both
@@ -506,16 +534,7 @@ fn guard_durable_serve(config: &Value) -> anyhow::Result<()> {
         }
     }
 
-    if !problems.is_empty() {
-        anyhow::bail!(
-            "refusing to serve with ephemeral / non-durable storage:\n  - {}\n\n\
-             Configure durable storage for production, or set \
-             `gateway.allow_ephemeral: true` (or env PRAXEC_ALLOW_EPHEMERAL=1) to \
-             override for dev/testing.",
-            problems.join("\n  - ")
-        );
-    }
-    Ok(())
+    problems
 }
 
 /// ADR-0009 — drive a workflow instance to its outcomes headlessly. Builds the
@@ -2244,10 +2263,34 @@ fn doctor(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let report = crate::preflight::preflight(&config);
     print!("{}", crate::preflight::format_report(&report));
+
+    // Durability parity with `serve`: report the SAME env-aware condition serve
+    // fails fast on, so `doctor` (the health command) can never greenlight a
+    // config that `serve` would refuse to start on.
+    let durability = durability_problems(&config, true);
+    if durability.is_empty() {
+        println!("durable storage: ok");
+    } else {
+        println!("durable storage: DEGRADED — `serve` will refuse to start:");
+        for p in &durability {
+            println!("  - {p}");
+        }
+        println!(
+            "  fix: configure durable storage (store.kind: sqlite + audit.sink: file), \
+             or set gateway.allow_ephemeral: true (env PRAXEC_ALLOW_EPHEMERAL=1) for dev/testing."
+        );
+    }
+
     if !report.ok {
         anyhow::bail!(
             "doctor: required provider credential(s) missing — a drive against this \
              config would fail at the first model call"
+        );
+    }
+    if !durability.is_empty() {
+        anyhow::bail!(
+            "doctor: this config would start a DEGRADED gateway — durable storage is not \
+             configured and ephemeral operation is not permitted (see `durable storage` above)"
         );
     }
     Ok(())
@@ -2339,8 +2382,16 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
     // CMP-002 — the same suite `serve` enforces at startup (validate_workflows
     // + executor-kind doctor + feature-gated cost / kind:llm config doctors).
     let diagnostics = collect_diagnostics_with(&config, extra_diagnostics);
+    // Durability parity with `serve` — static / config-only: `check` validates
+    // the file itself, so it does NOT consult the runtime PRAXEC_ALLOW_EPHEMERAL
+    // env hatch (`doctor` does). A WARNING, not an error: the config may
+    // legitimately be served with the env opt-in set elsewhere. This surfaces
+    // the "serve will refuse this" condition that `check` used to hide behind
+    // `validation: ok`.
+    let durability = durability_problems(&config, false);
     let errors = diagnostics.iter().filter(|d| d.is_error()).count();
-    let warnings = diagnostics.iter().filter(|d| !d.is_error()).count();
+    let warnings =
+        diagnostics.iter().filter(|d| !d.is_error()).count() + usize::from(!durability.is_empty());
     let soft_warnings = soft_diagnostics.len();
 
     if !diagnostics.is_empty() {
@@ -2348,6 +2399,20 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
         for d in &diagnostics {
             println!("  {d}");
         }
+    }
+    // Durability warning — the config-level condition `serve` fails fast on.
+    if !durability.is_empty() {
+        println!();
+        println!(
+            "  warn[EPHEMERAL_STORAGE]: `serve` will refuse to start this config (it starts DEGRADED):"
+        );
+        for p in &durability {
+            println!("    - {p}");
+        }
+        println!(
+            "    set gateway.allow_ephemeral: true (or env PRAXEC_ALLOW_EPHEMERAL=1) to serve \
+             ephemerally for dev/testing, or configure durable storage."
+        );
     }
     // SPEC §5.4.2 / audit-resolution C.2 — print soft diagnostics under
     // their own banner so operators see them even when the rest of
@@ -2369,7 +2434,7 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
             println!("  warn[{}]{loc}: {}{suggestion}", d.code, d.message);
         }
     }
-    if !diagnostics.is_empty() || !soft_diagnostics.is_empty() {
+    if !diagnostics.is_empty() || !soft_diagnostics.is_empty() || !durability.is_empty() {
         println!();
         println!(
             "validation: {} error(s), {} warning(s), {} soft warning(s)",
@@ -3705,9 +3770,9 @@ mod tests {
     use super::{
         GatewayOverlays, ack_guards_used, aggregate_calls, build_audit_sink, build_evidence_store,
         build_hot_components, build_runtime_for_orchestrate, build_workflow_store,
-        drive_outcome_to_result, guard_durable_serve, headless_policy_from, is_ephemeral_path,
-        maybe_enable_authoring, maybe_enable_sandbox, reload_gated, require_file_sink_for_follow,
-        resolve_embedder, tail_dir_once,
+        drive_outcome_to_result, durability_problems, guard_durable_serve, headless_policy_from,
+        is_ephemeral_path, maybe_enable_authoring, maybe_enable_sandbox, reload_gated,
+        require_file_sink_for_follow, resolve_embedder, tail_dir_once,
     };
     use praxec_agents::orchestrator::DriveOutcome;
     use praxec_agents::orchestrator::HeadlessPolicy;
@@ -4655,6 +4720,63 @@ mod tests {
             err.contains("sqlite"),
             "must point at the durable backend: {err}"
         );
+    }
+
+    #[test]
+    fn durability_problems_config_only_flags_default_ephemeral() {
+        // The static `check` surface (consider_env_optin=false): an empty config
+        // defaults to memory store + stderr audit — both flagged, env-independent.
+        let p = durability_problems(&json!({}), false);
+        assert!(
+            p.iter().any(|s| s.contains("store.kind")),
+            "must flag the memory store: {p:?}"
+        );
+        assert!(
+            p.iter().any(|s| s.contains("audit.sink")),
+            "must flag the stderr audit: {p:?}"
+        );
+    }
+
+    #[test]
+    fn durability_problems_config_optin_clears_both_modes() {
+        // gateway.allow_ephemeral is a config-level opt-in, so it clears the
+        // problems whether or not the env hatch is consulted.
+        let cfg = json!({ "gateway": { "allow_ephemeral": true } });
+        assert!(durability_problems(&cfg, false).is_empty(), "static mode");
+        assert!(durability_problems(&cfg, true).is_empty(), "env-aware mode");
+    }
+
+    #[test]
+    fn durability_problems_clear_on_durable_config() {
+        let cfg = json!({
+            "store": { "kind": "sqlite", "path": "/var/lib/praxec/x.db" },
+            "audit": { "sink": "file", "path": "/var/lib/praxec/audit" }
+        });
+        assert!(durability_problems(&cfg, false).is_empty());
+        assert!(durability_problems(&cfg, true).is_empty());
+    }
+
+    #[test]
+    fn serve_guard_and_durability_problems_never_disagree() {
+        // The whole point of the shared function: `serve`'s refusal and the
+        // assessment `doctor`/`check` read can't diverge. (Env-robust: if
+        // PRAXEC_ALLOW_EPHEMERAL is set in this env, BOTH sides clear together.)
+        for cfg in [
+            json!({}),
+            json!({ "store": { "kind": "file", "path": "/tmp/s" } }),
+            json!({ "gateway": { "allow_ephemeral": true } }),
+            json!({
+                "store": { "kind": "sqlite", "path": "/var/lib/praxec/x.db" },
+                "audit": { "sink": "file", "path": "/var/lib/praxec/a" }
+            }),
+        ] {
+            let refused = guard_durable_serve(&cfg).is_err();
+            let has_problems = !durability_problems(&cfg, true).is_empty();
+            assert_eq!(
+                refused, has_problems,
+                "serve refusal must match durability_problems for {cfg}"
+            );
+        }
     }
 
     #[test]

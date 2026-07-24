@@ -72,6 +72,12 @@ binary (`cargo install praxec-tui`); you don't need it to run the gateway.
 ```bash
 cat > hello.yaml <<'EOF'
 version: "1.0.0"
+gateway:
+  # Dev/testing: run with in-memory state + stderr audit. praxec refuses
+  # to start with ephemeral storage unless you opt in here. For production,
+  # drop this and set store.kind: sqlite + audit.sink: file for durable,
+  # queryable governance state.
+  allow_ephemeral: true
 proxy:
   expose:
     - name: hello.echo
