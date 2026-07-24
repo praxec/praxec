@@ -40,12 +40,24 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - target: x86_64-unknown-linux-gnu
-                      os: ubuntu-latest
-                      use_cross: false
-                    - target: aarch64-unknown-linux-gnu
+                    # Linux ships STATIC musl binaries: a gnu build on
+                    # `ubuntu-latest` (glibc 2.39) refuses to run on older distros
+                    # (Ubuntu 22.04, Debian 12, RHEL 9, ...). musl links libc
+                    # statically, so the binary runs anywhere — including Alpine —
+                    # with no glibc floor. The `praxec` gateway has no C/dbus deps
+                    # (libdbus-sys only reaches the `px` TUI, not this binary), so
+                    # the musl build is clean; both legs go through `cross`, whose
+                    # images carry the musl C toolchain.
+                    - target: x86_64-unknown-linux-musl
                       os: ubuntu-latest
                       use_cross: true
+                      # x86_64 static binary runs on the x86_64 host → smoke-test it.
+                      smoke: true
+                    - target: aarch64-unknown-linux-musl
+                      os: ubuntu-latest
+                      use_cross: true
+                      # foreign arch — can't exec on the x86_64 build host.
+                      smoke: false
                     - target: x86_64-apple-darwin
                       # Intel-mac binary is CROSS-COMPILED on an Apple-Silicon
                       # runner: GitHub's Intel `macos-13` runners are effectively
@@ -55,12 +67,16 @@ jobs:
                       # Apple's SDK is universal), so no emulation is involved.
                       os: macos-latest
                       use_cross: false
+                      # runs on the arm64 runner via Rosetta 2.
+                      smoke: true
                     - target: aarch64-apple-darwin
                       os: macos-latest
                       use_cross: false
+                      smoke: true
                     - target: x86_64-pc-windows-msvc
                       os: windows-latest
                       use_cross: false
+                      smoke: true
         runs-on: ${{ matrix.os }}
         timeout-minutes: 60
         steps:
@@ -70,16 +86,9 @@ jobs:
                   # otherwise checks out the dispatched branch).
                   ref: ${{ env.RELEASE_TAG }}
 
-            - name: Install Linux system dependencies
-              # libdbus-1-dev is required by libdbus-sys (transitive dep
-              # via aether-auth's OS keyring abstraction on Linux). Only
-              # needed for native Linux builds; cross uses its own
-              # container; macOS / Windows don't pull libdbus-sys.
-              if: matrix.os == 'ubuntu-latest' && !matrix.use_cross
-              run: |
-                  sudo apt-get update
-                  sudo apt-get install -y libdbus-1-dev pkg-config
-
+            # No host system-deps step: the `praxec` gateway binary has no C /
+            # dbus dependency (libdbus-sys only reaches the `px` TUI), and both
+            # Linux legs build inside `cross`'s musl container anyway.
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@stable
               with:
@@ -105,12 +114,11 @@ jobs:
 
             - name: Smoke-test the built binary
               # Run the freshly built binary so a broken artifact fails the leg
-              # BEFORE it ships. Catches the genuinely-new risk here: the Intel
-              # (x86_64) mac binary is cross-compiled on the Apple-Silicon runner
-              # and executes via Rosetta 2 (present on GitHub's macos runners).
-              # Skipped only for the cross-compiled aarch64-linux leg, whose
-              # foreign-arch binary can't exec on the x86_64 build host.
-              if: "!matrix.use_cross"
+              # BEFORE it ships. Runs on every leg whose binary can execute on its
+              # build host (`matrix.smoke`): native x86_64-musl, both macOS
+              # (Intel via Rosetta 2), and Windows. Skipped only for the
+              # foreign-arch aarch64-linux leg, which can't exec on the x86_64 host.
+              if: matrix.smoke
               shell: bash
               run: |
                   bin="target/${{ matrix.target }}/release/praxec"
