@@ -186,8 +186,13 @@ effort-bounding fix is **untested**. Hence B.
 
 ### B — Controlled live experiment
 
-- **Harness:** each model through the *real* agent loop on ~5 representative
-  auto-drive tasks (a real pack `cap.*` step, deterministic inputs), N=3.
+- **Harness:** each model through the *real* agent loop on
+  **`meta/cap.review.adversarial`** (`actor: agent`, `skills:
+  [review.code.adversarial]`, no tool connections, structured verdict output) —
+  reasoning-heavy, tool-light, self-contained, and exactly the "does a reasoning
+  model earn the lead" discriminator. Fixed deterministic input (a small code
+  diff to review), N=3. Add a coding cap (`meta/cap.*`) as a second round only if
+  round one is ambiguous.
 - **Models:** `glm-5.2`, `deepseek-r1-0528`, `qwen3-235b-thinking`, `minimax-m3`
   (reasoning) + `deepseek-v4-pro` (non-reasoning control).
 - **Conditions:** `reasoning_effort ∈ {low, high}` × `budget ∈ {600s, 1800s}`.
@@ -217,15 +222,20 @@ few dollars (all commodity); capped and reported.
    reasoning/default lead slot; wire `setup.sh`.
 5. **WS3-full** — unify the timers (can trail into a later release if needed).
 
-## Open decisions (need sign-off before code)
+## Decisions (settled 2026-07-24 review)
 
-1. **WS2 threshold basis:** `output_usd_per_million` (recommended) vs blended.
-2. **WS4 task:** a real pack `cap.*` step vs a synthetic fixed task.
-3. **WS1 ¹/²:** the reasoning-lead and review-lead calls (¹ resolved by WS4).
-4. **Live-config revert:** is the 07-20 QA campaign done? If yes, restore the
-   live `~/.config/praxec/models.yaml` `reasoning`/`review` chains to
-   commodity-lead as part of WS1. If not, leave the live config untouched and
-   ship only the shipped default + guard.
+1. **WS2 threshold basis:** `output_usd_per_million ≥ CAP`. **SETTLED** — output
+   price (output dominates realized cost).
+2. **WS4 task:** **SETTLED** — `meta/cap.review.adversarial` (see WS4 harness).
+3. **WS1 ¹/²:** ¹ deferred to WS4 (no standalone decision); ² **SETTLED** — review
+   leads `glm-5.2` commodity (matches the operator's own live config).
+4. **Live-config revert:** **RESOLVED — no action.** The live
+   `~/.config/praxec/models.yaml` was already restored to commodity-lead
+   (verified 2026-07-24: `doctor` resolves `affinity 'reasoning' →
+   openrouter:z-ai/glm-5.2`). `reasoning`/`coding`/`prose`/`review` all resolve
+   commodity via `overrides:`; the only frontier reference is the explicitly-named
+   `coding-frontier` tier (opt-in by name, not a default). The QA campaign was
+   last active 07-23 (winding down); nothing to revert.
 
 ## Acceptance
 
