@@ -87,6 +87,16 @@ pub enum AgentErrorCode {
     /// Distinct from `StepBudgetExhausted` (the walk stopped mid-chain on a
     /// spent wall budget) — here every candidate was actually tried.
     ChainExhausted,
+    /// (WS3) A single agent attempt spent its whole wall-clock time budget
+    /// (`max_seconds`) without finalizing. A SPEND/TIME CEILING, NOT a dead-air
+    /// stall: the model may have been actively streaming when the budget hit
+    /// (the exact case that mislabeled a streaming reasoning model a "stall").
+    /// Classifies as `FailureClass::BudgetExceeded` — escalatable (a faster
+    /// model may finish within the remaining step budget), so the walk is
+    /// unchanged; only the label is honest. Distinct from the drain-turn
+    /// dead-air `Timeout` (→ NetworkTimeout) and from `StepBudgetExhausted`
+    /// (the WHOLE walk's budget, not one attempt's).
+    BudgetExceeded,
 }
 
 impl AgentErrorCode {
@@ -113,6 +123,7 @@ impl AgentErrorCode {
             AgentErrorCode::ParkedSessionCorrupt => "AGENT_PARKED_SESSION_CORRUPT",
             AgentErrorCode::ParkStore => "AGENT_PARK_STORE",
             AgentErrorCode::StepBudgetExhausted => "AGENT_STEP_BUDGET_EXHAUSTED",
+            AgentErrorCode::BudgetExceeded => "AGENT_BUDGET_EXCEEDED",
             AgentErrorCode::ChainExhausted => "AGENT_CHAIN_EXHAUSTED",
         }
     }
@@ -166,6 +177,17 @@ mod tests {
         assert_eq!(
             AgentErrorCode::ChainExhausted.as_wire_code(),
             "AGENT_CHAIN_EXHAUSTED"
+        );
+    }
+
+    #[test]
+    fn budget_exceeded_wire_code_is_stable() {
+        // WS3: the spend/time-ceiling outcome, distinct from AGENT_NO_RESULT and
+        // from the drain-turn dead-air timeout. classify.rs maps this prefix to
+        // FailureClass::BudgetExceeded.
+        assert_eq!(
+            AgentErrorCode::BudgetExceeded.as_wire_code(),
+            "AGENT_BUDGET_EXCEEDED"
         );
     }
 

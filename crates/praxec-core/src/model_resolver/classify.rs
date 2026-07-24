@@ -39,6 +39,13 @@ pub enum FailureClass {
     /// MODEL'S CAPABILITY GAP, which the resolver routes around by
     /// escalating to a stronger model in the chain.
     Capability,
+    /// The attempt spent its whole wall-clock time budget without finalizing —
+    /// a SPEND/TIME CEILING, distinct from a dead-air stall (`NetworkTimeout`,
+    /// the model went silent). The model may have been actively streaming when
+    /// the budget hit; this must not be mislabeled a stall. Escalatable (a
+    /// faster model may finish within the remaining step budget), so it walks
+    /// like `NetworkTimeout` but is reported honestly as a budget outcome.
+    BudgetExceeded,
 }
 
 impl FailureClass {
@@ -55,6 +62,7 @@ impl FailureClass {
                 | FailureClass::NotFound404
                 | FailureClass::NetworkTimeout
                 | FailureClass::Capability
+                | FailureClass::BudgetExceeded
         )
     }
 
@@ -109,6 +117,12 @@ impl FailureClass {
                 if msg.starts_with("AGENT_NO_RESULT") || msg.starts_with("AGENT_RESULT_FAILED") =>
             {
                 FailureClass::Capability
+            }
+            // A spent time budget is a distinct outcome from a dead-air stall
+            // (`Timeout` → NetworkTimeout below): the model may have been
+            // streaming. Escalatable, but never mislabeled a stall.
+            ExecutorError::Permanent(msg) if msg.starts_with("AGENT_BUDGET_EXCEEDED") => {
+                FailureClass::BudgetExceeded
             }
             ExecutorError::Llm(LlmErrorCode::NoToolCall, _) => FailureClass::Capability,
             ExecutorError::LlmWithUpdates {
@@ -264,6 +278,32 @@ mod tests {
             FailureClass::from_executor_error(&err),
             FailureClass::NetworkTimeout
         );
+    }
+
+    /// WS3: a spent time budget is BudgetExceeded, NOT a stall — and it is
+    /// DISTINCT from the dead-air stall (`Timeout` → NetworkTimeout). This is the
+    /// exact conflation that mislabeled a streaming-but-budget-cut model a
+    /// "stall" and got it demoted.
+    #[test]
+    fn budget_exceeded_is_distinct_from_dead_air_stall_but_still_escalatable() {
+        let budget = ExecutorError::Permanent(
+            "AGENT_BUDGET_EXCEEDED: agent used its full 600s time budget".into(),
+        );
+        let stall = ExecutorError::Timeout(120_000);
+
+        let budget_class = FailureClass::from_executor_error(&budget);
+        let stall_class = FailureClass::from_executor_error(&stall);
+
+        assert_eq!(budget_class, FailureClass::BudgetExceeded);
+        assert_eq!(stall_class, FailureClass::NetworkTimeout);
+        assert_ne!(
+            budget_class, stall_class,
+            "a budget-cut must be distinguishable from a dead-air stall"
+        );
+        // Both still walk to the next model (a faster model may finish in the
+        // remaining step budget) — behavior is preserved, only the label honest.
+        assert!(budget_class.is_infrastructure());
+        assert!(stall_class.is_infrastructure());
     }
 
     /// RateLimited maps to RateLimit429 (infrastructure).

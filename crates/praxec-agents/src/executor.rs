@@ -162,6 +162,26 @@ fn walk_summary(attempts: &[AttemptRecord]) -> String {
         .join("; ")
 }
 
+/// A short, self-announcing tail of an agent transcript, for surfacing PARTIAL
+/// work on a budget outcome so the flow sees what WAS produced rather than a
+/// hollow error. The full transcript is always retained in the God-view audit
+/// record; this is the inline breadcrumb. Char-boundary safe.
+fn partial_tail(transcript: &str) -> String {
+    const MAX: usize = 600;
+    let t = transcript.trim();
+    if t.is_empty() {
+        return "(no output produced)".to_string();
+    }
+    if t.len() <= MAX {
+        return t.to_string();
+    }
+    let cut = t.len() - MAX;
+    let start = (cut..t.len())
+        .find(|&i| t.is_char_boundary(i))
+        .unwrap_or(t.len());
+    format!("…{}", &t[start..])
+}
+
 /// The durable `_agent_await` wait marker, read off the workflow context when
 /// it belongs to the transition being dispatched (transition-identity guarded,
 /// mirroring the runtime's `agent_await_for`). `Some(_)` means this dispatch
@@ -471,12 +491,21 @@ impl AgentExecutor {
         }];
 
         match report.outcome {
-            // `ExecutorError::Timeout` carries milliseconds (its Display appends
-            // " ms"); `max_seconds` is seconds, so convert or a 600s wall prints
-            // as "600 ms".
-            AgentRunOutcome::TimedOut => {
-                Err(ExecutorError::Timeout(max_seconds.saturating_mul(1000)))
-            }
+            // WS3: the whole-run wall (`max_seconds`) elapsing is a BUDGET
+            // outcome, not a dead-air stall — the model may have been actively
+            // streaming when the ceiling hit. Surface it honestly
+            // (AGENT_BUDGET_EXCEEDED → FailureClass::BudgetExceeded, still
+            // escalatable so the walk is unchanged) and carry the partial work
+            // rather than discarding it into a bare timeout that reads as a stall.
+            AgentRunOutcome::TimedOut => Err(permanent(
+                AgentErrorCode::BudgetExceeded,
+                format!(
+                    "agent spent its full {max_seconds}s time budget without finalizing — a \
+                     spend/time ceiling, NOT a dead-air stall (the model may have been \
+                     streaming). Partial work: {}",
+                    partial_tail(&report.transcript)
+                ),
+            )),
             AgentRunOutcome::NoResult => Err(permanent(
                 AgentErrorCode::NoResult,
                 "agent run ended without a conforming `final_answer` call",
@@ -1099,7 +1128,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_maps_to_executor_timeout() {
+    async fn timeout_maps_to_budget_exceeded() {
+        // WS3: a spent time budget surfaces AGENT_BUDGET_EXCEEDED (a spend/time
+        // ceiling), NOT a dead-air ExecutorError::Timeout — the model may have
+        // been actively streaming when the wall hit.
         let exec = exec_with(MockSessionRunner::timed_out());
         let err = exec
             .execute(request(
@@ -1108,7 +1140,10 @@ mod tests {
             ))
             .await
             .expect_err("timeout");
-        assert!(matches!(err, ExecutorError::Timeout(_)), "got {err:?}");
+        assert!(
+            format!("{err:?}").contains("AGENT_BUDGET_EXCEEDED"),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -1769,7 +1804,10 @@ mod tests {
                 .execute(req())
                 .await
                 .expect_err("weak always times out");
-            assert!(matches!(err, ExecutorError::Timeout(_)), "got {err:?}");
+            assert!(
+                format!("{err:?}").contains("AGENT_BUDGET_EXCEEDED"),
+                "got {err:?}"
+            );
         }
 
         assert_eq!(
@@ -1943,9 +1981,11 @@ mod tests {
         // The walk summary carries every model attempted…
         assert!(msg.contains("openrouter:weak"), "walk summary: {msg}");
         assert!(msg.contains("openrouter:strong"), "walk summary: {msg}");
-        // …and each attempt's outcome class (TimedOut → NetworkTimeout).
+        // …and each attempt's outcome class (WS3: TimedOut → BudgetExceeded — a
+        // spent time budget, honestly distinct from a dead-air NetworkTimeout
+        // stall).
         assert!(
-            msg.contains("NetworkTimeout"),
+            msg.contains("BudgetExceeded"),
             "each attempt's outcome class must be carried: {msg}"
         );
         // Both models were actually attempted.
@@ -1959,11 +1999,12 @@ mod tests {
         );
     }
 
-    /// Genuine single-attempt semantics are preserved: a ONE-model chain that
-    /// times out keeps `ExecutorError::Timeout` (there was no walk to
-    /// summarize — the clamped timeout IS the honest terminal error).
+    /// WS3: a ONE-model chain that spends its whole time budget surfaces the
+    /// honest AGENT_BUDGET_EXCEEDED (a spend/time ceiling) — still distinct from
+    /// a dead-air stall, even in the single-attempt case where there is no walk
+    /// to summarize.
     #[tokio::test]
-    async fn a_single_model_chain_timeout_keeps_genuine_timeout_semantics() {
+    async fn a_single_model_chain_timeout_surfaces_budget_exceeded() {
         let runner = Arc::new(AllTimeoutRunner::new());
         let exec = AgentExecutor::new(
             runner.clone(),
@@ -1977,8 +2018,8 @@ mod tests {
             .await
             .expect_err("timeout");
         assert!(
-            matches!(err, ExecutorError::Timeout(_)),
-            "a single-attempt timeout must stay a Timeout: {err:?}"
+            format!("{err:?}").contains("AGENT_BUDGET_EXCEEDED"),
+            "a single-attempt budget-cut must surface as BudgetExceeded, not a stall: {err:?}"
         );
         assert_eq!(runner.sessions().len(), 1);
     }
