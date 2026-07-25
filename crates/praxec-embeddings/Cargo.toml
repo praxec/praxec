@@ -24,7 +24,7 @@ dirs = "5"
 # The embedding engine. rig treats embeddings as first-class (EmbeddingModel +
 # vector stores), independent of the chat SDK (aether-llm). Renamed to `rig`
 # (the crate's lib is `rig_core`) so imports follow the ecosystem convention.
-rig = { package = "rig-core", version = "0.38" }
+rig = { package = "rig-core", version = "0.40" }
 
 [dev-dependencies]
 tokio = { workspace = true }
