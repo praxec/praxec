@@ -211,7 +211,10 @@ pub fn preflight_with(config: &Value, has_env: impl Fn(&str) -> bool) -> Preflig
     let credentials = check_credentials_with(&referenced_providers(config), has_env);
     let tools = provision::detect(&provision_config_from(config));
     let auto_drive_model = check_auto_drive_model(config);
-    let reasoning = check_reasoning_config(config);
+    let mut reasoning = check_reasoning_config(config);
+    // WS1‑B G3 — per-phase (`states.reasoning_effort`) coverage, appended to the
+    // same advisory findings.
+    reasoning.extend(check_state_reasoning_config(config));
     // Reasoning findings are advisory (warn/info) — the catalog is data and a
     // mis-mapped effort degrades quality, it doesn't fail the run — so they do
     // NOT gate `ok`.
@@ -487,6 +490,91 @@ pub fn check_reasoning_config_with(config: &Value, level: &str) -> Vec<Reasoning
                     scope,
                     message,
                 });
+            }
+        }
+    }
+    out
+}
+
+/// WS1‑B G3 — validate each workflow state's `reasoning_effort` against the
+/// models its affinity resolves to. `check_reasoning_config` covers the
+/// `models.yaml` bindings (binding ?? global); this covers the PER-PHASE
+/// override a capability state declares (`states.<state>.reasoning_effort`,
+/// applied by the auto-drive composer).
+///
+/// A state's effort reaches a model only when that model has no paired effort of
+/// its own (a binding's `effort` wins — already covered above), so a pool member
+/// WITH its own effort is skipped here. The static affinity is
+/// `states.<state>.affinity ?? gateway auto_drive_affinity`; context/input
+/// `affinity_override`s are runtime-only and out of static scope. Advisory
+/// (`STATE_REASONING_EFFORT_UNSUPPORTED`, warn) — the runtime chain-walk
+/// fail-fast is the backstop.
+pub fn check_state_reasoning_config(config: &Value) -> Vec<ReasoningDiagnostic> {
+    use crate::affinity_resolver::{AgentsYamlAffinityResolver, resolve_affinity_to_chain};
+
+    let mut out = Vec::new();
+    let Some(path) = config
+        .pointer("/gateway/models_yaml")
+        .and_then(Value::as_str)
+    else {
+        return out;
+    };
+    let Ok(resolver) = AgentsYamlAffinityResolver::from_path(std::path::Path::new(path)) else {
+        return out;
+    };
+    let global_affinity = config
+        .pointer("/praxec/agents/auto_drive_affinity")
+        .and_then(Value::as_str)
+        .unwrap_or("reasoning");
+    let Some(workflows) = config.pointer("/workflows").and_then(Value::as_object) else {
+        return out;
+    };
+
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (wf_id, def) in workflows {
+        let Some(states) = def.pointer("/states").and_then(Value::as_object) else {
+            continue;
+        };
+        for (state_name, state) in states {
+            let Some(effort) = state.get("reasoning_effort").and_then(Value::as_str) else {
+                continue;
+            };
+            let effort = effort.trim();
+            // `medium`/empty send no reasoning param — nothing to validate.
+            if effort.is_empty() || effort.eq_ignore_ascii_case("medium") {
+                continue;
+            }
+            let affinity = state
+                .get("affinity")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(global_affinity);
+            for (model, binding_effort) in resolve_affinity_to_chain(resolver.resolver(), affinity)
+            {
+                // A model that pairs its OWN effort overrides the state effort —
+                // its pairing is validated by `check_reasoning_config`, so it is
+                // out of scope here.
+                if binding_effort.is_some() {
+                    continue;
+                }
+                if !praxec_core::model_catalog::effort_supported(&model, effort) {
+                    let scope = format!("{wf_id}/{state_name}");
+                    if seen.insert(format!("{scope}|{model}")) {
+                        out.push(ReasoningDiagnostic {
+                            code: "STATE_REASONING_EFFORT_UNSUPPORTED",
+                            severity: ReasoningSeverity::Warn,
+                            model: model.clone(),
+                            scope: scope.clone(),
+                            message: format!(
+                                "state `{state_name}` declares reasoning_effort `{effort}`, but \
+                                 model `{model}` (reached via affinity `{affinity}`) does not \
+                                 advertise it — the run will fail fast here. Pair that model with \
+                                 a supported effort in models.yaml, or change the state's effort."
+                            ),
+                        });
+                    }
+                }
             }
         }
     }
@@ -870,6 +958,70 @@ mod tests {
             diags.iter().any(|d| d.code == "REASONING_LEVEL_UNSUPPORTED"
                 && d.model == "openrouter:qwen/qwen3-coder"),
             "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn g3_flags_a_state_effort_the_affinity_pool_cannot_do() {
+        // affinity `coding` → qwen (max `medium`); a state asks for `high`.
+        let path = write_models(
+            "g3bad",
+            concat!(
+                "version: 1\n",
+                "default:\n",
+                "  - provider: { name: openrouter }\n",
+                "    model: z-ai/glm-5.2\n",
+                "activity:\n",
+                "  coding:\n",
+                "    - provider: { name: openrouter }\n",
+                "      model: qwen/qwen3-coder\n",
+            ),
+        );
+        let cfg = json!({
+            "gateway": { "models_yaml": path.to_str().unwrap() },
+            "workflows": { "wf": { "states": {
+                "hard": { "affinity": "coding", "reasoning_effort": "high" }
+            } } }
+        });
+        let diags = check_state_reasoning_config(&cfg);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == "STATE_REASONING_EFFORT_UNSUPPORTED"
+                    && d.model == "openrouter:qwen/qwen3-coder"
+                    && d.scope == "wf/hard"),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn g3_is_silent_when_the_state_effort_is_supported() {
+        // affinity `coding` → glm-5.2 (advertises `high`) → no finding.
+        let path = write_models(
+            "g3ok",
+            concat!(
+                "version: 1\n",
+                "default:\n",
+                "  - provider: { name: openrouter }\n",
+                "    model: z-ai/glm-5.2\n",
+                "activity:\n",
+                "  coding:\n",
+                "    - provider: { name: openrouter }\n",
+                "      model: z-ai/glm-5.2\n",
+            ),
+        );
+        let cfg = json!({
+            "gateway": { "models_yaml": path.to_str().unwrap() },
+            "workflows": { "wf": { "states": {
+                "hard": { "affinity": "coding", "reasoning_effort": "high" }
+            } } }
+        });
+        let diags = check_state_reasoning_config(&cfg);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            diags.is_empty(),
+            "a supported state effort must be silent, got {diags:?}"
         );
     }
 

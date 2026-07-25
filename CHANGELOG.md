@@ -28,7 +28,10 @@ covered by a stability commitment.
   (`binding.effort ?? global`) against the model, via the single shared
   `effort_supported` predicate the runtime fail-fast also uses (so preflight and
   runtime never disagree). A typo'd `effort:` is rejected at parse
-  (`INVALID_EFFORT`).
+  (`INVALID_EFFORT`). The validator also checks each workflow state's
+  per-phase `reasoning_effort` against the models its affinity resolves to
+  (`STATE_REASONING_EFFORT_UNSUPPORTED`, G3) — skipping pool members that pair
+  their own effort (which wins).
 
 - **`doctor`/`check` now validate reasoning-effort configuration (WS1‑A).** A new
   preflight check walks every model binding in `gateway.models_yaml` (`default` +
