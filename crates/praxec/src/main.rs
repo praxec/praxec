@@ -92,8 +92,10 @@ mod agent {
         async fn resolve_chain(
             &self,
             binding: &praxec_agents::config::ModelBinding,
-        ) -> Result<Vec<String>, praxec_core::error::ExecutorError> {
+        ) -> Result<Vec<praxec_agents::session::ResolvedHop>, praxec_core::error::ExecutorError>
+        {
             use praxec_agents::config::ModelBinding;
+            use praxec_agents::session::ResolvedHop;
             let name = match binding {
                 ModelBinding::Affinity(d) => d.to_string(),
                 ModelBinding::Activity(s) => s.clone(),
@@ -107,7 +109,10 @@ mod agent {
                      resolved against models.yaml"
                 )))
             } else {
-                Ok(chain)
+                Ok(chain
+                    .into_iter()
+                    .map(|(model, effort)| ResolvedHop { model, effort })
+                    .collect())
             }
         }
     }

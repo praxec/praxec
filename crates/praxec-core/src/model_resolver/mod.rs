@@ -101,6 +101,7 @@ pub fn validate_models_config_envelope(path: &std::path::Path) -> serde_json::Va
                 ModelConfigError::MissingProviderModel => "MISSING_PROVIDER_MODEL",
                 ModelConfigError::UnknownOverrideKey(_) => "UNKNOWN_OVERRIDE_KEY",
                 ModelConfigError::UnknownFeatureKey { .. } => "UNKNOWN_FEATURE_KEY",
+                ModelConfigError::InvalidEffort { .. } => "INVALID_EFFORT",
                 ModelConfigError::ProviderEndpointRequired => "PROVIDER_ENDPOINT_REQUIRED",
                 ModelConfigError::VersionMismatch { .. } => "VERSION_MISMATCH",
                 ModelConfigError::YamlSyntax(_) => "YAML_SYNTAX",

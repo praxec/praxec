@@ -12,6 +12,24 @@ covered by a stability commitment.
 
 ### Added
 
+- **Per-model reasoning effort in `models.yaml`, threaded end-to-end, fail-fast
+  (WS1‑B).** A binding may now declare `effort: <low|medium|high|…>` — the
+  reasoning level PAIRED with that specific model. Reasoning levels are not
+  portable across models (a level one advertises another may not, and "high"
+  means different things to different models), so effort lives with the model and
+  each chain hop resolves its effort INDEPENDENTLY — never carried from a sibling
+  model. Per hop the applied effort is `binding.effort ?? state.reasoning_effort
+  ?? global default`, and if the resolved model does not advertise that level the
+  run **fails fast** (`REASONING_EFFORT_UNSUPPORTED`, permanent — it stops the
+  chain-walk rather than silently downgrading or escalating; a config error is
+  not a transient). The resolver now returns per-hop `ResolvedHop { model, effort
+  }` instead of bare model strings. The reasoning-config validator (WS1‑A) gains
+  per-binding coverage: it validates each binding's effective effort
+  (`binding.effort ?? global`) against the model, via the single shared
+  `effort_supported` predicate the runtime fail-fast also uses (so preflight and
+  runtime never disagree). A typo'd `effort:` is rejected at parse
+  (`INVALID_EFFORT`).
+
 - **`doctor`/`check` now validate reasoning-effort configuration (WS1‑A).** A new
   preflight check walks every model binding in `gateway.models_yaml` (`default` +
   `activity` + `overrides`) and, for the effort it will actually run at (today

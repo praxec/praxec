@@ -453,6 +453,15 @@ pub struct Binding {
     pub provider: Provider,
     pub model: String,
     pub features: ProviderFeatures,
+    /// WS1-B — the reasoning effort PAIRED with this specific model (uniform
+    /// `low|medium|high|…`, mapped per-vendor by `tuning::reasoning_params`).
+    /// Effort is non-portable across models (a level one advertises another may
+    /// not), so it lives with the model, not smeared across a chain. `None` =
+    /// this model contributes no reasoning param of its own (the caller's
+    /// phase/global effort applies, re-validated for this model). Validated at
+    /// parse to a known effort; validated against the model's `reasoning_levels`
+    /// at preflight (the validator) and fail-fast at runtime.
+    pub effort: Option<String>,
 }
 
 /// On-disk shape (before features are typed per-provider).
@@ -463,6 +472,8 @@ struct RawBinding {
     model: String,
     #[serde(default)]
     features: Option<serde_yaml::Value>,
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 impl RawBinding {
@@ -509,10 +520,24 @@ impl RawBinding {
             }
             (_, None) => ProviderFeatures::None,
         };
+        // WS1-B: the paired effort must be a KNOWN effort token at parse (a
+        // typo like `deap` fails loud with the file, not silently at dispatch).
+        // Its support by THIS model's `reasoning_levels` is a separate check
+        // (preflight validator + runtime fail-fast) — the catalog isn't in
+        // scope here.
+        if let Some(e) = &self.effort {
+            if !crate::tuning::is_known_effort(e) {
+                return Err(ModelConfigError::InvalidEffort {
+                    effort: e.clone(),
+                    model: self.model.clone(),
+                });
+            }
+        }
         Ok(Binding {
             provider: self.provider,
             model: self.model,
             features,
+            effort: self.effort,
         })
     }
 }
@@ -687,6 +712,13 @@ pub enum ModelConfigError {
     #[error("models.yaml `default:` is present but empty — at least one binding is required")]
     EmptyDefault,
 
+    #[error(
+        "binding for model `{model}` declares `effort: {effort}` which is not a known reasoning \
+         effort (one of {:?})",
+        crate::tuning::known_effort_levels()
+    )]
+    InvalidEffort { effort: String, model: String },
+
     #[error("binding is missing `provider` and/or `model`")]
     MissingProviderModel,
 
@@ -847,6 +879,27 @@ mod pool_serde_tests {
     }
 
     #[test]
+    fn a_binding_with_an_unknown_effort_is_rejected_at_parse() {
+        // WS1-B poka-yoke: a typo'd effort fails loud WITH the file, never
+        // silently at dispatch.
+        let yaml = "version: 1\ndefault:\n  - provider: { name: openrouter }\n    \
+                    model: z-ai/glm-5.2\n    effort: deap\n";
+        let err = ModelsFile::from_yaml(yaml).unwrap_err();
+        assert!(
+            matches!(err, ModelConfigError::InvalidEffort { .. }),
+            "a typo'd effort must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_binding_with_a_known_effort_parses_and_carries_it() {
+        let yaml = "version: 1\ndefault:\n  - provider: { name: openrouter }\n    \
+                    model: z-ai/glm-5.2\n    effort: high\n";
+        let file = ModelsFile::from_yaml(yaml).expect("a known effort parses");
+        assert_eq!(file.default[0].effort.as_deref(), Some("high"));
+    }
+
+    #[test]
     fn mapping_with_empty_members_and_no_strategy() {
         let pool = raw_pool_from_yaml("members: []\n").unwrap();
         assert_eq!(pool.members.len(), 0);
@@ -895,6 +948,7 @@ mod pool_serde_tests {
                 provider: Provider::Known(ProviderId::Openai),
                 model: "gpt-4o".to_string(),
                 features: None,
+                effort: None,
             }],
             strategy: Strategy::Distribute,
         };
