@@ -95,14 +95,20 @@ overrides:
 "#;
     let r = AgentsYamlAffinityResolver::from_yaml_str(CHAIN_FIXTURE).expect("fixture parses");
     let chain = resolve_affinity_to_chain(r.resolver(), "coding");
+    let models: Vec<&str> = chain.iter().map(|(m, _)| m.as_str()).collect();
     assert_eq!(
-        chain,
+        models,
         vec![
             "anthropic:claude-haiku-3-5",
             "anthropic:claude-sonnet-4-6",
             "anthropic:claude-opus-4-8",
         ],
         "chain must contain all 3 bindings in order"
+    );
+    // No `effort:` in the fixture → every hop's paired effort is None (WS1-B).
+    assert!(
+        chain.iter().all(|(_, e)| e.is_none()),
+        "unpaired bindings carry no effort"
     );
 }
 

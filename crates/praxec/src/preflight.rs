@@ -368,12 +368,11 @@ pub fn check_reasoning_config_with(config: &Value, level: &str) -> Vec<Reasoning
     use praxec_core::model_resolver::config::Binding;
 
     let mut out = Vec::new();
-    let level = level.trim();
-    // `medium`/empty deliberately send NO reasoning param (provider default —
-    // see `reasoning_params`), so there is nothing to validate.
-    if level.is_empty() || level.eq_ignore_ascii_case("medium") {
-        return out;
-    }
+    // The GLOBAL default effort — the fallback for a binding that declares no
+    // effort of its own. WS1-B: a binding's own `effort` (the model-paired
+    // level) wins over this, so we do NOT early-return when the global is
+    // `medium`/empty — a paired binding still needs validating.
+    let global_level = level.trim();
     let Some(path) = config
         .pointer("/gateway/models_yaml")
         .and_then(Value::as_str)
@@ -404,6 +403,22 @@ pub fn check_reasoning_config_with(config: &Value, level: &str) -> Vec<Reasoning
     let mut seen: std::collections::BTreeSet<(&'static str, String)> =
         std::collections::BTreeSet::new();
     for (scope, b) in scoped {
+        // WS1-B — the effort THIS binding will actually run at: its own paired
+        // `effort` (the model-specific level) wins over the global default. This
+        // is resolved per-binding and validated per-binding, exactly matching
+        // the runtime's per-hop resolution.
+        let level: &str = b
+            .effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(global_level);
+        // `medium`/empty sends NO reasoning param (provider default) — nothing
+        // to validate for this binding.
+        if level.is_empty() || level.eq_ignore_ascii_case("medium") {
+            continue;
+        }
+
         // Vendor slug is derived EXACTLY as the runtime does — the runtime
         // `provider:model` string uses `Provider::display_name`, which is the
         // token `reasoning_for` later splits on. (FMECA FM-1: a validator that
@@ -807,6 +822,55 @@ mod tests {
             })
             .count();
         assert_eq!(n, 1, "must dedup per (code, model), got {diags:?}");
+    }
+
+    #[test]
+    fn reasoning_validator_honors_a_binding_paired_effort_over_the_global() {
+        // Global is `low` (which deepseek-v4-pro can't do), but the binding
+        // PAIRS deepseek with `high` (which it can) → no finding. The pair wins
+        // over the global — this is the WS1-B fix for the live config bug.
+        let path = write_models(
+            "paired-ok",
+            concat!(
+                "version: 1\n",
+                "default:\n",
+                "  - provider: { name: openrouter }\n",
+                "    model: deepseek/deepseek-v4-pro\n",
+                "    effort: high\n",
+            ),
+        );
+        let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
+        let diags = check_reasoning_config_with(&cfg, "low");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            diags.is_empty(),
+            "a valid paired effort must override the global and be silent, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn reasoning_validator_flags_an_invalid_binding_paired_effort() {
+        // Binding pairs qwen (max `medium`) with `high` → LEVEL_UNSUPPORTED even
+        // though the global (`medium`) alone would have been silent. Proves the
+        // paired effort is validated per-binding.
+        let path = write_models(
+            "paired-bad",
+            concat!(
+                "version: 1\n",
+                "default:\n",
+                "  - provider: { name: openrouter }\n",
+                "    model: qwen/qwen3-coder\n",
+                "    effort: high\n",
+            ),
+        );
+        let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
+        let diags = check_reasoning_config_with(&cfg, "medium");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            diags.iter().any(|d| d.code == "REASONING_LEVEL_UNSUPPORTED"
+                && d.model == "openrouter:qwen/qwen3-coder"),
+            "{diags:?}"
+        );
     }
 
     #[test]

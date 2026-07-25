@@ -223,6 +223,8 @@ pub trait AgentRegistry: Send + Sync {
             provider,
             model: agent.model.clone(),
             features: agent.features.clone(),
+            // Legacy CLI agent path has no per-model reasoning effort.
+            effort: None,
         };
         Ok(ResolvedBindingList {
             label: agent.label.clone(),

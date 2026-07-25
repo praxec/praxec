@@ -261,6 +261,7 @@ mod tests {
             provider: p,
             model: model.into(),
             features: ProviderFeatures::None,
+            effort: None,
         }
     }
 

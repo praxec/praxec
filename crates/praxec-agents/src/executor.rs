@@ -392,6 +392,11 @@ impl AgentExecutor {
         // attempt's wall so the sum across the whole walk can never exceed the
         // budget — without it, each escalation would silently start a fresh
         // full-length wall and the "budget" would bound nothing.
+        //
+        // (WS1-B) The per-hop reasoning effort rides on `cfg.reasoning_effort` —
+        // the caller passes a per-attempt `cfg` whose `reasoning_effort` is the
+        // model's paired effort (already fail-fast-validated) — so this fn keeps
+        // its signature and the session build below is unchanged.
         wall_cap: Duration,
     ) -> Result<ExecuteResult, ExecutorError> {
         let (max_seconds, stall_seconds) = effective_attempt_windows(cfg, wall_cap);
@@ -435,6 +440,9 @@ impl AgentExecutor {
             system_prompt: system_prompt.clone(),
             user_prompt: user_prompt.to_string(),
             tools,
+            // WS1-B — `cfg.reasoning_effort` is the per-attempt effort the
+            // caller resolved for THIS hop (model-paired ?? phase); the global
+            // default is applied downstream by `reasoning_for` when it's None.
             reasoning_effort: cfg.reasoning_effort.clone(),
             timeout: Duration::from_secs(max_seconds),
             stall_timeout: Duration::from_secs(stall_seconds),
@@ -656,15 +664,24 @@ impl Executor for AgentExecutor {
         // User prompt = the templated goal, rendered against the blackboard.
         let user_prompt = render_template(&cfg.goal, &request.workflow);
 
-        // Resolve the full ordered model chain (cheapest-effective first).
+        // Resolve the full ordered model chain (cheapest-effective first). Each
+        // hop carries its model-paired reasoning effort (WS1-B).
         let chain = self.resolver.resolve_chain(&cfg.model_binding()).await?;
+        // Re-associate each model with its paired effort so it survives the
+        // breaker's reorder below (which works on bare model strings). Effort is
+        // per-model, so keying by model is exact.
+        let effort_by_model: std::collections::HashMap<String, Option<String>> = chain
+            .iter()
+            .map(|h| (h.model.clone(), h.effort.clone()))
+            .collect();
+        let chain_models: Vec<String> = chain.iter().map(|h| h.model.clone()).collect();
 
         // P12 — consult the per-model breaker: skip models whose breaker is
         // open (they failed ≥ threshold times recently), keeping chain order.
         // The walk starts below a known-bad primary instead of re-probing it
         // every call. If EVERYTHING is open, `plan` degrades to the
         // least-recently-failed model — never an empty walk.
-        let planned = self.breaker.plan(&chain, Instant::now());
+        let planned = self.breaker.plan(&chain_models, Instant::now());
 
         let mut escalations: Vec<Evidence> = Vec::new();
 
@@ -729,14 +746,62 @@ impl Executor for AgentExecutor {
                     ),
                 ));
             }
+            // WS1-B — the reasoning effort APPLIED to this model, resolved
+            // INDEPENDENTLY for this hop (never carried from a sibling model —
+            // levels aren't portable across models): the model's own paired
+            // effort wins, else the phase (`cfg`) effort, else the global
+            // default. Then FAIL-FAST if the model can't do it — a level a model
+            // doesn't advertise is a config error, not a transient, so it STOPS
+            // the walk (does not silently downgrade, does not escalate). The
+            // preflight validator catches this statically; this is the runtime
+            // backstop.
+            let hop_effort = effort_by_model.get(model).cloned().flatten();
+            let applied_effort = hop_effort
+                .clone()
+                .or_else(|| cfg.reasoning_effort.clone())
+                .or_else(|| {
+                    let d = praxec_core::tuning::tuning()
+                        .reasoning
+                        .default_effort
+                        .trim()
+                        .to_string();
+                    (!d.is_empty()).then_some(d)
+                });
+            if let Some(level) = &applied_effort {
+                if !praxec_core::model_catalog::effort_supported(model, level) {
+                    return Err(permanent(
+                        AgentErrorCode::InvalidModelBinding,
+                        format!(
+                            "REASONING_EFFORT_UNSUPPORTED: model `{model}` is asked for reasoning \
+                             effort `{level}` which it does not advertise. Pair this model with a \
+                             supported effort in models.yaml (`effort:` on the binding), or change \
+                             the phase/global effort — a reasoning level is not portable across \
+                             models, so praxec fails fast rather than silently downgrading."
+                        ),
+                    ));
+                }
+            }
+            // The per-attempt config carries THIS hop's effort: the model's
+            // paired effort wins over the phase effort. `reasoning_for` applies
+            // the global default downstream when both are absent. Threading it
+            // via `cfg` (rather than a new `run_one` arg) keeps that signature
+            // small.
+            let attempt_cfg = match &hop_effort {
+                Some(_) => AgentExecutorConfig {
+                    reasoning_effort: hop_effort.clone(),
+                    ..cfg.clone()
+                },
+                None => cfg.clone(),
+            };
+
             // The clamped windows THIS attempt runs under — recorded alongside
             // the outcome so the terminal summary shows configured vs clamped.
-            let (attempt_wall, attempt_stall) = effective_attempt_windows(&cfg, remaining);
+            let (attempt_wall, attempt_stall) = effective_attempt_windows(&attempt_cfg, remaining);
             let attempt_start = tokio::time::Instant::now();
             match self
                 .run_one(
                     model,
-                    &cfg,
+                    &attempt_cfg,
                     &request,
                     &system_prompt,
                     &user_prompt,
@@ -1069,6 +1134,52 @@ mod tests {
         );
     }
 
+    /// WS1-B — a hop whose PAIRED effort the model can't do must fail fast
+    /// (permanent `REASONING_EFFORT_UNSUPPORTED`) BEFORE the model runs — a
+    /// config error is not a transient, so it neither escalates nor silently
+    /// downgrades.
+    #[tokio::test]
+    async fn a_hop_effort_the_model_cannot_do_fails_fast_without_running_it() {
+        struct EffortMismatchResolver;
+        #[async_trait::async_trait]
+        impl AgentModelResolver for EffortMismatchResolver {
+            async fn resolve(&self, _b: &ModelBinding) -> Result<String, ExecutorError> {
+                Ok("openrouter:qwen/qwen3-coder".into())
+            }
+            async fn resolve_chain(
+                &self,
+                _b: &ModelBinding,
+            ) -> Result<Vec<crate::session::ResolvedHop>, ExecutorError> {
+                // qwen3-coder advertises [none,low,medium]; pair it with `high`.
+                Ok(vec![crate::session::ResolvedHop {
+                    model: "openrouter:qwen/qwen3-coder".into(),
+                    effort: Some("high".into()),
+                }])
+            }
+        }
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(EffortMismatchResolver));
+        let err = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "go" }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("an unsupported paired effort must fail");
+        assert!(
+            format!("{err:?}").contains("REASONING_EFFORT_UNSUPPORTED"),
+            "expected a fail-fast effort error, got {err:?}"
+        );
+        assert!(
+            runner.sessions().is_empty(),
+            "the model must NOT be run when its paired effort is unsupported"
+        );
+    }
+
     #[tokio::test]
     async fn skills_become_the_system_prompt() {
         let runner = Arc::new(MockSessionRunner::completed(AgentResult {
@@ -1266,11 +1377,14 @@ mod tests {
         async fn resolve_chain(
             &self,
             _binding: &ModelBinding,
-        ) -> Result<Vec<String>, ExecutorError> {
-            Ok(vec![
-                "openrouter:weak".to_string(),
-                "openrouter:strong".to_string(),
-            ])
+        ) -> Result<Vec<crate::session::ResolvedHop>, ExecutorError> {
+            Ok(["openrouter:weak", "openrouter:strong"]
+                .into_iter()
+                .map(|m| crate::session::ResolvedHop {
+                    model: m.to_string(),
+                    effort: None,
+                })
+                .collect())
         }
     }
 
@@ -1332,12 +1446,18 @@ mod tests {
         async fn resolve_chain(
             &self,
             _binding: &ModelBinding,
-        ) -> Result<Vec<String>, ExecutorError> {
-            Ok(vec![
-                "openrouter:reason-1".to_string(),
-                "openrouter:reason-2".to_string(),
-                "openrouter:reason-3".to_string(),
-            ])
+        ) -> Result<Vec<crate::session::ResolvedHop>, ExecutorError> {
+            Ok([
+                "openrouter:reason-1",
+                "openrouter:reason-2",
+                "openrouter:reason-3",
+            ]
+            .into_iter()
+            .map(|m| crate::session::ResolvedHop {
+                model: m.to_string(),
+                effort: None,
+            })
+            .collect())
         }
     }
 
