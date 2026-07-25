@@ -10,6 +10,24 @@ covered by a stability commitment.
 
 ## [0.0.31] — Unreleased
 
+### Added
+
+- **`doctor`/`check` now validate reasoning-effort configuration (WS1‑A).** A new
+  preflight check walks every model binding in `gateway.models_yaml` (`default` +
+  `activity` + `overrides`) and, for the effort it will actually run at (today
+  the global `tuning.default_effort`), verifies the reasoning param will form and
+  be honored. It closes a silent gap: the auto-drive path mapped effort to a
+  vendor param with no check that (a) the vendor is one praxec maps a param for —
+  only anthropic/openai/openrouter/gemini are, so Fireworks / the
+  OpenAI-compatible fleet / custom endpoints silently drop the effort
+  (`REASONING_VENDOR_UNMAPPED`) — or (b) the model's catalog `reasoning_levels`
+  advertises the requested level (`REASONING_LEVEL_UNSUPPORTED`, e.g. asking a
+  `[none, high]` model for `low`). Also flags a reasoning param sent to a
+  non-reasoning model (`REASONING_ON_NONREASONING_MODEL`) and a model absent from
+  the catalog (`REASONING_MODEL_UNKNOWN`). All findings are advisory (warn/info)
+  and never fail preflight. Findings de-duplicate per `(code, model)`. (Per-step
+  overrides and per-activity effort are a follow-up, WS1‑B.)
+
 ### Changed
 
 - **Streaming liveness moved to the transport layer; the token dead-air watchdog
