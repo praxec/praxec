@@ -48,6 +48,15 @@ pub struct RepoManifest {
     /// name matching the field name.
     #[serde(default)]
     pub layout: RepoLayout,
+    /// WS-B B4 — repo-relative directories the engine `create_dir_all`s when
+    /// this repo's writable root resolves at boot/reload (extends the
+    /// `RunEnv::artifacts_dir` engine-created-dir precedent). ONLY directories
+    /// are ever created — never files (a missing credential file must stay a
+    /// fail-fast; the engine cannot mint credentials). Each entry MUST be
+    /// repo-relative: an absolute path or a `..` traversal is a hard error
+    /// (see [`create_scaffold_dirs`]). Default empty (no scaffolding).
+    #[serde(default)]
+    pub scaffold: Vec<String>,
 }
 
 /// Layout of resource directories within a repo. All fields are optional;
@@ -144,6 +153,79 @@ pub fn read_manifest_name(worktree_root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(&manifest_path).ok()?;
     let parsed: NameOnly = serde_yaml::from_str(&text).ok()?;
     Some(parsed.name)
+}
+
+/// WS-B B4 — cheaply read the `scaffold:` list of a `praxec.repo.yaml` at
+/// `root`, WITHOUT the full [`load_manifest`] parse — the identity-first
+/// `worktrees_of:` path (see [`read_manifest_name`]) has only the resolved
+/// worktree root in hand, not a loaded manifest, so it reads the stub with a
+/// minimal projection here.
+///
+/// Returns an EMPTY list — never an error — when the stub is absent, unreadable,
+/// or declares no `scaffold:` (best-effort, the same tolerance as
+/// [`read_manifest_name`]: a worktree lacking/ malforming its stub is simply not
+/// scaffolded, and `check`/`load_repo` surface a malformed stub loudly where the
+/// repo is actually consumed). Not `deny_unknown_fields` — this reads solely the
+/// `scaffold` field and ignores the rest.
+pub fn read_manifest_scaffold(root: &Path) -> Vec<String> {
+    #[derive(Deserialize)]
+    struct ScaffoldOnly {
+        #[serde(default)]
+        scaffold: Vec<String>,
+    }
+    let manifest_path = root.join("praxec.repo.yaml");
+    let Ok(text) = std::fs::read_to_string(&manifest_path) else {
+        return Vec::new();
+    };
+    serde_yaml::from_str::<ScaffoldOnly>(&text)
+        .map(|s| s.scaffold)
+        .unwrap_or_default()
+}
+
+/// WS-B B4 — idempotently `create_dir_all` each repo-relative directory in
+/// `scaffold` under `root` (extends the `RunEnv::artifacts_dir` precedent where
+/// the engine pre-creates a dir a tool will only write into). Called wherever a
+/// repo's writable root is finalized at boot/reload.
+///
+/// POKA-YOKE — only DIRECTORIES are ever created; FILES are never touched (a
+/// missing `storage-state.json` must stay a fail-fast — the engine cannot mint
+/// credentials). A scaffold entry that would escape the repo root is a HARD
+/// error, never silently clamped:
+/// - an ABSOLUTE path (it would write outside the repo);
+/// - a `..` traversal (it would climb out of the repo).
+///
+/// An empty list is a silent no-op (nothing declared). Each created dir is
+/// logged at debug.
+pub fn create_scaffold_dirs(root: &Path, scaffold: &[String]) -> anyhow::Result<()> {
+    for entry in scaffold {
+        let rel = Path::new(entry);
+        if rel.is_absolute() {
+            bail!(
+                "INVALID_SCAFFOLD_DIR: scaffold entry `{entry}` for repo at {} is an ABSOLUTE \
+                 path; scaffold directories MUST be repo-relative so they stay within the repo.",
+                root.display()
+            );
+        }
+        if rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            bail!(
+                "INVALID_SCAFFOLD_DIR: scaffold entry `{entry}` for repo at {} escapes the repo \
+                 root via `..`; scaffold directories MUST stay within the repo.",
+                root.display()
+            );
+        }
+        let target = root.join(rel);
+        tracing::debug!(
+            repo_root = %root.display(),
+            dir = %entry,
+            "scaffold: create_dir_all"
+        );
+        std::fs::create_dir_all(&target)
+            .with_context(|| format!("creating scaffold directory {}", target.display()))?;
+    }
+    Ok(())
 }
 
 /// Top-level config blocks whose entries are subject to namespace prefixing
@@ -963,6 +1045,93 @@ workflows:
             .and_then(Value::as_str)
             .unwrap();
         assert_eq!(step1, "other/cap.y", "qualified ref untouched");
+    }
+
+    #[test]
+    fn manifest_parses_scaffold_list_and_defaults_empty() {
+        // Declared scaffold parses; absent scaffold defaults to empty (the field
+        // is additive, so a v1 stub with no `scaffold:` still loads).
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: qa\nnamespace: qa\nversion: 0.1.0\nscaffold:\n  - .praxec/qa-auth\n  - .praxec/qa-artifacts\n",
+        );
+        let m = load_manifest(td.path()).expect("scaffold stub loads");
+        assert_eq!(m.scaffold, vec![".praxec/qa-auth", ".praxec/qa-artifacts"]);
+
+        let td2 = TempDir::new().unwrap();
+        write_manifest(td2.path(), &minimal_manifest("swe"));
+        let m2 = load_manifest(td2.path()).unwrap();
+        assert!(m2.scaffold.is_empty(), "absent scaffold defaults empty");
+    }
+
+    #[test]
+    fn read_manifest_scaffold_reads_stub_without_full_load() {
+        // The worktrees_of path reads only `scaffold:` from the stub.
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: qa\nnamespace: qa\nversion: 0.1.0\nscaffold: [.praxec/qa-auth]\n",
+        );
+        assert_eq!(read_manifest_scaffold(td.path()), vec![".praxec/qa-auth"]);
+        // Absent stub → empty (best-effort, never errors).
+        let empty = TempDir::new().unwrap();
+        assert!(read_manifest_scaffold(empty.path()).is_empty());
+    }
+
+    #[test]
+    fn create_scaffold_dirs_creates_declared_directories_idempotently() {
+        let td = TempDir::new().unwrap();
+        let scaffold = vec![
+            ".praxec/qa-auth".to_string(),
+            ".praxec/qa-artifacts".to_string(),
+        ];
+        create_scaffold_dirs(td.path(), &scaffold).expect("dirs created");
+        assert!(td.path().join(".praxec/qa-auth").is_dir());
+        assert!(td.path().join(".praxec/qa-artifacts").is_dir());
+        // Idempotent — a second call over the same list is a no-op success.
+        create_scaffold_dirs(td.path(), &scaffold).expect("idempotent");
+        assert!(td.path().join(".praxec/qa-auth").is_dir());
+    }
+
+    #[test]
+    fn create_scaffold_dirs_never_creates_files() {
+        // A missing FILE (e.g. storage-state.json) must stay missing — the engine
+        // only ever creates directories, never mints credential files.
+        let td = TempDir::new().unwrap();
+        create_scaffold_dirs(td.path(), &[".praxec/qa-auth".to_string()]).unwrap();
+        let file = td.path().join(".praxec/qa-auth/storage-state.json");
+        assert!(!file.exists(), "scaffold must not create a file");
+        // What WAS created is a directory, not a file.
+        assert!(td.path().join(".praxec/qa-auth").is_dir());
+    }
+
+    #[test]
+    fn create_scaffold_dirs_rejects_parent_traversal_and_absolute_paths() {
+        let td = TempDir::new().unwrap();
+        let esc = create_scaffold_dirs(td.path(), &["../evil".to_string()])
+            .expect_err("`..` traversal must be rejected");
+        let msg = format!("{esc:#}");
+        assert!(msg.contains("INVALID_SCAFFOLD_DIR"), "msg: {msg}");
+        assert!(msg.contains("escapes"), "names the escape: {msg}");
+        assert!(
+            !td.path().parent().unwrap().join("evil").exists(),
+            "nothing created outside the repo"
+        );
+
+        let abs = create_scaffold_dirs(td.path(), &["/abs/evil".to_string()])
+            .expect_err("absolute path must be rejected");
+        let msg = format!("{abs:#}");
+        assert!(msg.contains("INVALID_SCAFFOLD_DIR"), "msg: {msg}");
+        assert!(msg.contains("ABSOLUTE"), "names it absolute: {msg}");
+    }
+
+    #[test]
+    fn create_scaffold_dirs_empty_list_is_a_noop() {
+        let td = TempDir::new().unwrap();
+        create_scaffold_dirs(td.path(), &[]).expect("empty scaffold is a no-op");
+        // No `.praxec` dir sprang into being from an empty list.
+        assert!(!td.path().join(".praxec").exists());
     }
 
     #[test]

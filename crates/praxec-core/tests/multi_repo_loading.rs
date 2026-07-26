@@ -467,6 +467,130 @@ fn definitions_false_mixes_with_a_real_definition_repo() {
     );
 }
 
+// ---------- WS-B B2 — connection path-token interpolation ----------
+
+#[test]
+fn connection_repo_root_token_resolves_to_the_declared_writable_root() {
+    // A bare writable target named `qa`, plus a connection whose arg pins a path
+    // via `${repo:qa.root}/…`. After load the arg must carry the repo's current
+    // root — no dead absolute pin.
+    let td = TempDir::new().unwrap();
+    let code = TempDir::new().unwrap(); // the writable run target (no manifest)
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{code}\"\n    name: qa\n    definitions: false\n    writable: true\n\
+         connections:\n  browser:\n    kind: mcp\n    command: playwright-mcp\n    args: [\"--out\", \"${{repo:qa.root}}/.praxec/qa-artifacts\"]\n",
+        code = code.path().display(),
+    );
+    let path = write_host(&td, &host);
+    let (config, _diags) = load_resolved_with_repos(&path).expect("token config loads");
+    let arg = config
+        .pointer("/connections/browser/args/1")
+        .and_then(Value::as_str)
+        .expect("interpolated arg present");
+    assert_eq!(
+        arg,
+        format!("{}/.praxec/qa-artifacts", code.path().display()),
+        "the repo-root token resolved to the declared writable root"
+    );
+}
+
+#[test]
+fn connection_state_dir_token_resolves_under_the_operator_state_dir() {
+    // `${praxec.state_dir}` resolves env-derived — the durable home for auth
+    // material (credential state must outlive a prunable worktree).
+    let td = TempDir::new().unwrap();
+    let host =
+        "version: \"1.0.0\"\nconnections:\n  browser:\n    kind: mcp\n    command: playwright-mcp\n    env:\n      STORAGE: \"${praxec.state_dir}/qa-auth/storage-state.json\"\n";
+    let path = write_host(&td, host);
+    let (config, _diags) = load_resolved_with_repos(&path).expect("state_dir token loads");
+    let v = config
+        .pointer("/connections/browser/env/STORAGE")
+        .and_then(Value::as_str)
+        .expect("interpolated env present");
+    // Ends with the literal suffix and sits under a `…/praxec/` state dir (either
+    // $XDG_STATE_HOME/praxec or $HOME/.local/state/praxec, per the environment).
+    assert!(
+        v.ends_with("/praxec/qa-auth/storage-state.json"),
+        "state_dir token resolved: {v}"
+    );
+    assert!(!v.contains("${"), "no token left unresolved: {v}");
+}
+
+#[test]
+fn connection_unknown_repo_token_fails_config_load() {
+    // A `${repo:<unknown>.root}` token is a hard config error — in the strict
+    // (check) loader — naming the token, the unknown repo, and declared names.
+    let td = TempDir::new().unwrap();
+    let code = TempDir::new().unwrap();
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{code}\"\n    name: qa\n    definitions: false\n    writable: true\n\
+         connections:\n  browser:\n    kind: mcp\n    command: playwright-mcp\n    args: [\"${{repo:nope.root}}/x\"]\n",
+        code = code.path().display(),
+    );
+    let path = write_host(&td, &host);
+    let err = load_resolved_with_repos(&path).expect_err("unknown repo token must fail load");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("UNKNOWN_REPO_TOKEN"), "msg: {msg}");
+    assert!(msg.contains("nope"), "names the unknown repo: {msg}");
+    assert!(msg.contains("qa"), "lists the declared name: {msg}");
+}
+
+// ---------- WS-B B4 — stub `scaffold:` directory auto-create ----------
+
+#[test]
+fn scaffold_dirs_are_created_when_a_writable_repo_root_resolves() {
+    // A writable definition repo whose stub declares `scaffold:` — the engine
+    // create_dir_all's each dir at load. FILES are never created.
+    let td = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    std::fs::write(
+        repo.path().join("praxec.repo.yaml"),
+        "schema: praxec.repo/v1\nname: qa\nnamespace: qa\nversion: 0.1.0\nscaffold:\n  - .praxec/qa-auth\n  - .praxec/qa-artifacts\n",
+    )
+    .unwrap();
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n    writable: true\n",
+        repo.path().display(),
+    );
+    let path = write_host(&td, &host);
+    load_resolved_with_repos(&path).expect("scaffold repo loads");
+    assert!(
+        repo.path().join(".praxec/qa-auth").is_dir(),
+        "scaffold dir must be created at load"
+    );
+    assert!(repo.path().join(".praxec/qa-artifacts").is_dir());
+    // No credential file was minted — only the directory exists.
+    assert!(
+        !repo.path().join(".praxec/qa-auth/storage-state.json").exists(),
+        "scaffold must never create a file"
+    );
+}
+
+#[test]
+fn scaffold_dir_escaping_the_repo_root_fails_config_load() {
+    let td = TempDir::new().unwrap();
+    let repo = TempDir::new().unwrap();
+    std::fs::write(
+        repo.path().join("praxec.repo.yaml"),
+        "schema: praxec.repo/v1\nname: qa\nnamespace: qa\nversion: 0.1.0\nscaffold: [\"../escape\"]\n",
+    )
+    .unwrap();
+    let host = format!(
+        "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n    writable: true\n",
+        repo.path().display(),
+    );
+    let path = write_host(&td, &host);
+    let err = load_resolved_with_repos(&path).expect_err("escaping scaffold must fail load");
+    assert!(
+        format!("{err:#}").contains("INVALID_SCAFFOLD_DIR"),
+        "msg: {err:#}"
+    );
+    assert!(
+        !repo.path().parent().unwrap().join("escape").exists(),
+        "nothing created outside the repo"
+    );
+}
+
 // ---------- SPEC §9 — remote repo import (clone + layer) ----------
 
 /// Build a local git "origin" repo with a manifest (namespace `imported`) and
