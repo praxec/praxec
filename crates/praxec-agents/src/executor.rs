@@ -746,6 +746,30 @@ impl Executor for AgentExecutor {
                     ),
                 ));
             }
+            // WS2 — cost gate. Before running this model, refuse a FRONTIER
+            // (over-cap $/M) model unless a human allowlisted it. Auto-drive can
+            // never unilaterally spend on a premium model — a config error, not a
+            // transient, so it STOPS the walk (does not escalate). The preflight
+            // `FRONTIER_LEAD` warning surfaces it statically; this is the runtime
+            // enforcement. Only active when the composer injected a cap.
+            if let Some(cap) = cfg.frontier_cap_usd_per_m {
+                if praxec_core::model_catalog::is_frontier(model, cap)
+                    && !cfg.approve_frontier.iter().any(|m| m == model)
+                {
+                    let usd =
+                        praxec_core::model_catalog::output_usd_per_million(model).unwrap_or(0.0);
+                    return Err(permanent(
+                        AgentErrorCode::InvalidModelBinding,
+                        format!(
+                            "FRONTIER_NOT_APPROVED: model `{model}` costs ${usd:.2}/M output \
+                             (≥ ${cap:.2} cap) and is not in gateway.cost.approve_frontier. \
+                             Auto-drive will not spend on a premium model without a human's \
+                             approval — add it to the allowlist to permit it, or bind a commodity \
+                             model."
+                        ),
+                    ));
+                }
+            }
             // WS1-B — the reasoning effort APPLIED to this model, resolved
             // INDEPENDENTLY for this hop (never carried from a sibling model —
             // levels aren't portable across models): the model's own paired
@@ -1177,6 +1201,93 @@ mod tests {
         assert!(
             runner.sessions().is_empty(),
             "the model must NOT be run when its paired effort is unsupported"
+        );
+    }
+
+    /// WS2 — the cost gate must refuse an over-cap frontier model that no human
+    /// allowlisted, BEFORE running it (a config error, not a transient → stops
+    /// the walk).
+    #[tokio::test]
+    async fn the_cost_gate_refuses_an_unapproved_frontier_model_without_running_it() {
+        struct FrontierResolver;
+        #[async_trait::async_trait]
+        impl AgentModelResolver for FrontierResolver {
+            async fn resolve(&self, _b: &ModelBinding) -> Result<String, ExecutorError> {
+                Ok("anthropic:claude-opus-4-8".into())
+            }
+            async fn resolve_chain(
+                &self,
+                _b: &ModelBinding,
+            ) -> Result<Vec<crate::session::ResolvedHop>, ExecutorError> {
+                // claude-opus-4-8 is $25/M output — over the $5 cap.
+                Ok(vec![crate::session::ResolvedHop {
+                    model: "anthropic:claude-opus-4-8".into(),
+                    effort: None,
+                }])
+            }
+        }
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(FrontierResolver));
+        let err = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "go", "frontier_cap_usd_per_m": 5.0 }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("an unapproved frontier model must be refused");
+        assert!(
+            format!("{err:?}").contains("FRONTIER_NOT_APPROVED"),
+            "expected a cost-gate refusal, got {err:?}"
+        );
+        assert!(
+            runner.sessions().is_empty(),
+            "the frontier model must NOT be run when it is not approved"
+        );
+    }
+
+    /// WS2 — an allowlisted frontier model is permitted (a human opted it in).
+    #[tokio::test]
+    async fn the_cost_gate_permits_an_allowlisted_frontier_model() {
+        struct FrontierResolver;
+        #[async_trait::async_trait]
+        impl AgentModelResolver for FrontierResolver {
+            async fn resolve(&self, _b: &ModelBinding) -> Result<String, ExecutorError> {
+                Ok("anthropic:claude-opus-4-8".into())
+            }
+            async fn resolve_chain(
+                &self,
+                _b: &ModelBinding,
+            ) -> Result<Vec<crate::session::ResolvedHop>, ExecutorError> {
+                Ok(vec![crate::session::ResolvedHop {
+                    model: "anthropic:claude-opus-4-8".into(),
+                    effort: None,
+                }])
+            }
+        }
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(FrontierResolver));
+        exec.execute(request(
+            json!({
+                "affinity": "coding", "goal": "go",
+                "frontier_cap_usd_per_m": 5.0,
+                "approve_frontier": ["anthropic:claude-opus-4-8"]
+            }),
+            bare_def(),
+        ))
+        .await
+        .expect("an allowlisted frontier model must run");
+        assert_eq!(
+            runner.sessions().len(),
+            1,
+            "the allowlisted frontier model runs exactly once"
         );
     }
 

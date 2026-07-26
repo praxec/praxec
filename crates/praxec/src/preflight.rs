@@ -62,6 +62,10 @@ pub struct PreflightReport {
     /// at, whether the reasoning param forms + is supported (see
     /// [`check_reasoning_config`]). All advisory — never flips `ok`.
     pub reasoning: Vec<ReasoningDiagnostic>,
+    /// WS2 cost-gate findings: frontier (over-cap) bindings and whether they are
+    /// allowlisted (see [`check_frontier_cost_config`]). Advisory — never flips
+    /// `ok` (the runtime gate is the enforcement point).
+    pub cost: Vec<ReasoningDiagnostic>,
     pub ok: bool,
 }
 
@@ -215,6 +219,7 @@ pub fn preflight_with(config: &Value, has_env: impl Fn(&str) -> bool) -> Preflig
     // WS1‑B G3 — per-phase (`states.reasoning_effort`) coverage, appended to the
     // same advisory findings.
     reasoning.extend(check_state_reasoning_config(config));
+    let cost = check_frontier_cost_config(config);
     // Reasoning findings are advisory (warn/info) — the catalog is data and a
     // mis-mapped effort degrades quality, it doesn't fail the run — so they do
     // NOT gate `ok`.
@@ -228,6 +233,7 @@ pub fn preflight_with(config: &Value, has_env: impl Fn(&str) -> bool) -> Preflig
         keys_file: praxec_core::provider_keys::resolve_path().ok(),
         auto_drive_model,
         reasoning,
+        cost,
         ok,
     }
 }
@@ -581,6 +587,89 @@ pub fn check_state_reasoning_config(config: &Value) -> Vec<ReasoningDiagnostic> 
     out
 }
 
+/// WS2 — the $/M cost gate at preflight. A model is FRONTIER when its catalog
+/// output $/M is at/over `gateway.cost.frontier_cap_usd_per_m` (default
+/// [`DEFAULT_FRONTIER_CAP_USD_PER_M`], $5/M). Each frontier binding NOT in the
+/// `gateway.cost.approve_frontier` allowlist is a `FRONTIER_LEAD` warning — the
+/// config would let auto-drive spend on a premium model no human approved (the
+/// $120-burn class). A frontier binding that IS allowlisted is an info (a human
+/// deliberately opted that specific model in). Uses the shared
+/// [`praxec_core::model_catalog::is_frontier`] predicate the runtime gate also
+/// uses, so preflight and runtime never disagree.
+pub fn check_frontier_cost_config(config: &Value) -> Vec<ReasoningDiagnostic> {
+    use praxec_core::model_catalog::{
+        DEFAULT_FRONTIER_CAP_USD_PER_M, is_frontier, output_usd_per_million,
+    };
+
+    let mut out = Vec::new();
+    let Some(path) = config
+        .pointer("/gateway/models_yaml")
+        .and_then(Value::as_str)
+    else {
+        return out;
+    };
+    let Ok(file) = ModelsFile::from_path(std::path::Path::new(path)) else {
+        return out;
+    };
+    let cap = config
+        .pointer("/gateway/cost/frontier_cap_usd_per_m")
+        .and_then(Value::as_f64)
+        .unwrap_or(DEFAULT_FRONTIER_CAP_USD_PER_M);
+    let approved: std::collections::BTreeSet<String> = config
+        .pointer("/gateway/cost/approve_frontier")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let all = file
+        .default
+        .iter()
+        .chain(file.overrides.values().flatten())
+        .chain(file.activity.values().flatten());
+    for b in all {
+        let model_string = format!("{}:{}", b.provider.display_name(), b.model);
+        if !is_frontier(&model_string, cap) {
+            continue;
+        }
+        if !seen.insert(model_string.clone()) {
+            continue;
+        }
+        let usd = output_usd_per_million(&model_string).unwrap_or(0.0);
+        if approved.contains(&model_string) {
+            out.push(ReasoningDiagnostic {
+                code: "FRONTIER_APPROVED",
+                severity: ReasoningSeverity::Info,
+                model: model_string.clone(),
+                scope: "cost".to_string(),
+                message: format!(
+                    "frontier model (${usd:.2}/M output ≥ ${cap:.2} cap) — allowlisted in \
+                     gateway.cost.approve_frontier, so the runtime gate permits it."
+                ),
+            });
+        } else {
+            out.push(ReasoningDiagnostic {
+                code: "FRONTIER_LEAD",
+                severity: ReasoningSeverity::Warn,
+                model: model_string.clone(),
+                scope: "cost".to_string(),
+                message: format!(
+                    "frontier model (${usd:.2}/M output ≥ ${cap:.2} cap) is bound but NOT in \
+                     gateway.cost.approve_frontier — auto-drive would fail fast rather than spend \
+                     on it. Add it to the allowlist to approve (a human decision), or bind a \
+                     commodity model."
+                ),
+            });
+        }
+    }
+    out
+}
+
 /// Human-readable report for `praxec doctor`.
 pub fn format_report(report: &PreflightReport) -> String {
     let mut out = String::new();
@@ -647,6 +736,19 @@ pub fn format_report(report: &PreflightReport) -> String {
     if !report.reasoning.is_empty() {
         out.push_str("reasoning config (effort each binding will actually run at — advisory):\n");
         for d in &report.reasoning {
+            let tag = match d.severity {
+                ReasoningSeverity::Warn => "warn",
+                ReasoningSeverity::Info => "info",
+            };
+            out.push_str(&format!(
+                "  {tag}  {}  {} — {}\n",
+                d.code, d.model, d.message
+            ));
+        }
+    }
+    if !report.cost.is_empty() {
+        out.push_str("cost gate (frontier models — $/M output cap, advisory):\n");
+        for d in &report.cost {
             let tag = match d.severity {
                 ReasoningSeverity::Warn => "warn",
                 ReasoningSeverity::Info => "info",
@@ -1022,6 +1124,79 @@ mod tests {
         assert!(
             diags.is_empty(),
             "a supported state effort must be silent, got {diags:?}"
+        );
+    }
+
+    #[test]
+    fn frontier_lead_warns_for_an_unapproved_over_cap_model() {
+        // claude-opus-4-8 is $25/M output — over the $5 cap, not allowlisted.
+        let path = write_models(
+            "frontier",
+            concat!(
+                "version: 1\n",
+                "default:\n",
+                "  - provider: { name: anthropic }\n",
+                "    model: claude-opus-4-8\n",
+            ),
+        );
+        let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
+        let diags = check_frontier_cost_config(&cfg);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            diags.iter().any(|d| d.code == "FRONTIER_LEAD"
+                && d.model == "anthropic:claude-opus-4-8"
+                && d.severity == ReasoningSeverity::Warn),
+            "{diags:?}"
+        );
+    }
+
+    #[test]
+    fn frontier_approved_is_an_info_not_a_warning_when_allowlisted() {
+        let path = write_models(
+            "frontok",
+            concat!(
+                "version: 1\n",
+                "default:\n",
+                "  - provider: { name: anthropic }\n",
+                "    model: claude-opus-4-8\n",
+            ),
+        );
+        let cfg = json!({
+            "gateway": {
+                "models_yaml": path.to_str().unwrap(),
+                "cost": { "approve_frontier": ["anthropic:claude-opus-4-8"] }
+            }
+        });
+        let diags = check_frontier_cost_config(&cfg);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            diags.iter().any(|d| d.code == "FRONTIER_APPROVED"),
+            "{diags:?}"
+        );
+        assert!(
+            !diags.iter().any(|d| d.code == "FRONTIER_LEAD"),
+            "an allowlisted model must not also warn: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn a_commodity_model_trips_no_cost_finding() {
+        // glm-5.2 is $3/M — under the $5 cap.
+        let path = write_models(
+            "commodity",
+            concat!(
+                "version: 1\n",
+                "default:\n",
+                "  - provider: { name: openrouter }\n",
+                "    model: z-ai/glm-5.2\n",
+            ),
+        );
+        let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
+        let diags = check_frontier_cost_config(&cfg);
+        std::fs::remove_file(&path).ok();
+        assert!(
+            diags.is_empty(),
+            "a commodity model must be silent, got {diags:?}"
         );
     }
 

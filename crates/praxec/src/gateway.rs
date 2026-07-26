@@ -821,6 +821,28 @@ async fn build_runtime_for_orchestrate(
             .pointer("/praxec/agents/auto_drive_max_seconds")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+    )
+    // WS2 — arm the frontier cost gate. Default-ON at the $5/M cap even without a
+    // `gateway.cost` block, so a fresh config can never auto-drive a premium
+    // model no human approved (commodity + mock models are all under the cap, so
+    // this is inert for them). Raise the cap or allowlist a model to permit it.
+    .with_cost_gate(
+        Some(
+            config
+                .pointer("/gateway/cost/frontier_cap_usd_per_m")
+                .and_then(Value::as_f64)
+                .unwrap_or(praxec_core::model_catalog::DEFAULT_FRONTIER_CAP_USD_PER_M),
+        ),
+        config
+            .pointer("/gateway/cost/approve_frontier")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     );
     // C1 — late-bind the runtime into the `kind: workflow` executor.
     workflow_handle.set_runtime(runtime.clone());
@@ -986,6 +1008,27 @@ async fn build_oneshot_server(
             .pointer("/praxec/agents/auto_drive_max_seconds")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+    )
+    // WS2 — arm the frontier cost gate on the CLI/`command` runtime too (this is
+    // the second of two near-identical build sites; the live dogfood caught that
+    // only the serve site had it). Default-ON at $5/M; see the other site.
+    .with_cost_gate(
+        Some(
+            config
+                .pointer("/gateway/cost/frontier_cap_usd_per_m")
+                .and_then(Value::as_f64)
+                .unwrap_or(praxec_core::model_catalog::DEFAULT_FRONTIER_CAP_USD_PER_M),
+        ),
+        config
+            .pointer("/gateway/cost/approve_frontier")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     );
     // C1 — late-bind the runtime into the `kind: workflow` executor now that the
     // runtime (built around the registry) exists. Without this, every

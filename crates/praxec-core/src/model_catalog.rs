@@ -125,6 +125,31 @@ pub fn effort_supported(model: &str, level: &str) -> bool {
     }
 }
 
+/// WS2 — the output $/M for `model` from the active catalog, or `None` if the
+/// model isn't catalogued. Accepts the runnable `"vendor:model-id"` form or a
+/// bare `model-id` (a leading `vendor:` is stripped, as in [`effort_supported`]).
+pub fn output_usd_per_million(model: &str) -> Option<f64> {
+    let bare = model.split_once(':').map(|(_, m)| m).unwrap_or(model);
+    model_catalog()
+        .models
+        .iter()
+        .find(|m| m.model == bare)
+        .map(|m| m.output_usd_per_million)
+}
+
+/// WS2 — is `model` a FRONTIER (over-cap) model? True iff its catalog output
+/// $/M is `>= cap`. THE single predicate shared by the preflight `FRONTIER_LEAD`
+/// warning and the runtime cost gate, so they can never disagree. A model absent
+/// from the catalog has no known price → **not** frontier (never block on
+/// missing cost data — the validator surfaces the gap as an info instead).
+pub fn is_frontier(model: &str, cap_usd_per_million: f64) -> bool {
+    output_usd_per_million(model).is_some_and(|c| c >= cap_usd_per_million)
+}
+
+/// The default frontier cost cap ($/M output) — the `$5/M` line from the v0.0.31
+/// design. Data-driven + overridable via `gateway.cost.frontier_cap_usd_per_m`.
+pub const DEFAULT_FRONTIER_CAP_USD_PER_M: f64 = 5.0;
+
 /// Compute the realized USD cost for a model run given prompt + completion
 /// token counts, pricing it off the **active model catalog** (the same data the
 /// suggestor ranks over — no dependency on the llm-executor's cost crate).
