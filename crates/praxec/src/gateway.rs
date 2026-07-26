@@ -88,9 +88,10 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             model,
             max_steps,
             policy,
+            repo_root,
         } => {
             orchestrate(
-                config, workflow, definition, input, model, max_steps, policy, overlays,
+                config, workflow, definition, input, model, max_steps, policy, repo_root, overlays,
             )
             .await
         }
@@ -550,6 +551,7 @@ async fn orchestrate(
     model: String,
     max_steps: usize,
     policy: String,
+    repo_root: Option<String>,
     overlays: GatewayOverlays,
 ) -> anyhow::Result<()> {
     use praxec_agents::orchestrator::{
@@ -577,9 +579,10 @@ async fn orchestrate(
             let input_value: Value = serde_json::from_str(&input)
                 .map_err(|e| anyhow::anyhow!("--input is not valid JSON: {e}"))?;
             // v0.0.21 — resolve the run's mandatory repo_root from the declared
-            // writable repos (single one auto-selects; a multi-repo CLI selector
-            // is a follow-on).
-            let repo_root = runtime.resolve_run_repo_root(None)?;
+            // writable repos (single one auto-selects). v0.0.32 — an explicit
+            // `--repo-root` selector picks one when several are declared (a
+            // declared root, a subpath/worktree under one, or a declared name).
+            let repo_root = runtime.resolve_run_repo_root(repo_root.as_deref())?;
             let resp = runtime
                 .start(StartWorkflow {
                     definition_id: def.clone(),
