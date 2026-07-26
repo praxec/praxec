@@ -59,6 +59,20 @@ impl ExecutorRegistry for AlwaysNoopRegistry {
     }
 }
 
+/// A few pattern walks below map fields that only a *real* specialized executor
+/// (`parallel`/`cli`) produces. praxec-core has no real `ExecutorRegistry` —
+/// only `AlwaysNoopRegistry` — so those maps resolve to `null` and the
+/// typed-slot guard (correctly) rejects the write. They carry `#[ignore]` so
+/// normal runs skip them, but the nightly's `cargo test -- --include-ignored`
+/// would otherwise force-run and fail them (17 spurious "nightly-failure"
+/// issues). This default-off gate makes them skip loudly under
+/// `--include-ignored` too, while leaving a door to walk them if a real
+/// registry is ever wired into this crate. Their real coverage lives in the
+/// dedicated executor/guard tests cited on each.
+fn walk_with_registry() -> bool {
+    std::env::var("PRAXEC_WALK_WITH_REGISTRY").is_ok()
+}
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 fn examples_dir() -> PathBuf {
@@ -395,6 +409,13 @@ async fn circuit_breaker_pattern_walks() {
             does not dispatch to ParallelExecutor — typed-slot writes fail. Real parallel walking is \
             covered by crates/praxec-executors/tests/parallel_executor.rs (29 tests)."]
 async fn parallel_all_pattern_walks() {
+    if !walk_with_registry() {
+        eprintln!(
+            "SKIP parallel_all_pattern_walks: needs a real ParallelExecutor registry; \
+             covered by crates/praxec-executors/tests/parallel_executor.rs"
+        );
+        return;
+    }
     let resolved = load_example("pattern-parallel/gateway.yaml");
     let runtime = build_runtime(&resolved);
     let (final_state, steps, _terminal) = walk_workflow(&runtime, "parallel_all", 10).await;
@@ -409,6 +430,13 @@ async fn parallel_all_pattern_walks() {
             root cause as parallel_all_pattern_walks — AlwaysNoopRegistry can't simulate. Real \
             dynamic-fanout walking is covered by crates/praxec-executors/tests/parallel_executor.rs."]
 async fn dynamic_fanout_pattern_walks() {
+    if !walk_with_registry() {
+        eprintln!(
+            "SKIP dynamic_fanout_pattern_walks: needs a real ParallelExecutor registry; \
+             covered by crates/praxec-executors/tests/parallel_executor.rs"
+        );
+        return;
+    }
     let resolved = load_example("pattern-dynamic-fanout/gateway.yaml");
     let runtime = build_runtime(&resolved);
     let (final_state, steps, _terminal) = walk_workflow(&runtime, "dynamic_fanout", 10).await;
@@ -474,6 +502,13 @@ async fn scripts_pattern_walks() {
             string under the noop registry — typed-slot writes fail. The evidence-accumulation \
             mechanics are covered by crates/praxec-core/tests/evidence_guard.rs."]
 async fn evidence_quorum_pattern_walks() {
+    if !walk_with_registry() {
+        eprintln!(
+            "SKIP evidence_quorum_pattern_walks: template resolves to an array only under a real \
+             registry; covered by crates/praxec-core/tests/evidence_guard.rs"
+        );
+        return;
+    }
     let resolved = load_example("pattern-evidence-quorum/gateway.yaml");
     let runtime = build_runtime(&resolved);
     let (final_state, _steps, _terminal) = walk_workflow(&runtime, "evidence_quorum", 10).await;
@@ -485,6 +520,13 @@ async fn evidence_quorum_pattern_walks() {
             doesn't produce. Reliability/retry mechanics are covered by \
             crates/praxec-core/tests/reliability.rs and dedicated executor tests."]
 async fn recovery_pattern_walks() {
+    if !walk_with_registry() {
+        eprintln!(
+            "SKIP recovery_pattern_walks: maps an executor-specific field the noop registry can't \
+             produce; covered by crates/praxec-core/tests/reliability.rs"
+        );
+        return;
+    }
     let resolved = load_example("pattern-recovery/gateway.yaml");
     let runtime = build_runtime(&resolved);
     let (final_state, _steps, _terminal) = walk_workflow(&runtime, "recovery_demo", 20).await;
