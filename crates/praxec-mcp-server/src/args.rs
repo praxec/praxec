@@ -290,6 +290,14 @@ pub struct CommandArgs {
     /// as a uniqueness assertion per §32 (collisions return
     /// `RUN_ID_ALREADY_RUNNING`).
     pub run_id: Option<String>,
+    /// v0.0.21 — on `start`, selects which declared writable repo becomes this
+    /// run's mandatory `repo_root` when more than one is configured. Accepts a
+    /// declared writable root, a worktree/subpath under one, or (v0.0.32) a
+    /// declared repo `name:`. Without it a multi-writable config yields
+    /// `REPO_ROOT_AMBIGUOUS` — the two-tool `command` surface previously dropped
+    /// this field entirely, so it could never select. Ignored for
+    /// submit/define/cancel/reload.
+    pub repo_root: Option<String>,
     /// SPEC §30.10.7C — dispatch intent for out-of-band resolution commands.
     /// Present → `cancel_pending_subject` → drop a PENDING_DEFINITION
     /// placeholder without creating or modifying a lexicon entry.

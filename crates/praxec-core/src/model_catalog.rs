@@ -51,6 +51,20 @@ pub struct ModelEntry {
     pub scores: AffinityScores,
 }
 
+/// The canonical model-identity normalization: the bare `model-id`, stripping
+/// any leading `vendor:`/`provider:` prefix. Model ids use `/` (not `:`), so the
+/// first `:` is the vendor/provider separator — everything after it is the id.
+///
+/// THE single normalization shared across the spine so two strings that name the
+/// same underlying model compare equal regardless of prefix source: the catalog
+/// writes `"{vendor}:{model}"` while `models.yaml` chains write
+/// `"{provider.display_name()}:{model}"`. The de-escalation flywheel's keying and
+/// its fair-trial catalog dedup both compare on this, so a `vendor:model` and a
+/// `provider:model` for the same model never double-count or double-propose.
+pub fn bare_model_id(model: &str) -> &str {
+    model.split_once(':').map(|(_, m)| m).unwrap_or(model)
+}
+
 impl ModelEntry {
     /// The runnable `provider:model-id` string (what the provider factory parses).
     pub fn model_string(&self) -> String {
@@ -106,7 +120,7 @@ pub fn effort_supported(model: &str, level: &str) -> bool {
     if level.is_empty() || level.eq_ignore_ascii_case("medium") {
         return true;
     }
-    let bare = model.split_once(':').map(|(_, m)| m).unwrap_or(model);
+    let bare = bare_model_id(model);
     match model_catalog().models.iter().find(|m| m.model == bare) {
         None => true,
         Some(m) => {
@@ -129,7 +143,7 @@ pub fn effort_supported(model: &str, level: &str) -> bool {
 /// model isn't catalogued. Accepts the runnable `"vendor:model-id"` form or a
 /// bare `model-id` (a leading `vendor:` is stripped, as in [`effort_supported`]).
 pub fn output_usd_per_million(model: &str) -> Option<f64> {
-    let bare = model.split_once(':').map(|(_, m)| m).unwrap_or(model);
+    let bare = bare_model_id(model);
     model_catalog()
         .models
         .iter()

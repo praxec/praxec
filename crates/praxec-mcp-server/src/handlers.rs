@@ -1256,6 +1256,10 @@ impl PraxecServer {
                     "input":        parsed.input,
                     "traceId":      parsed.trace_id,
                     "runId":        parsed.run_id,
+                    // v0.0.32 — carry the writable-repo selector through so a
+                    // multi-writable config is selectable via the command
+                    // surface (previously dropped → always REPO_ROOT_AMBIGUOUS).
+                    "repoRoot":     parsed.repo_root,
                 });
                 self.handle_start(start_args, principal).await
             }

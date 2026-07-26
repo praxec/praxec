@@ -88,9 +88,10 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             model,
             max_steps,
             policy,
+            repo_root,
         } => {
             orchestrate(
-                config, workflow, definition, input, model, max_steps, policy, overlays,
+                config, workflow, definition, input, model, max_steps, policy, repo_root, overlays,
             )
             .await
         }
@@ -550,6 +551,7 @@ async fn orchestrate(
     model: String,
     max_steps: usize,
     policy: String,
+    repo_root: Option<String>,
     overlays: GatewayOverlays,
 ) -> anyhow::Result<()> {
     use praxec_agents::orchestrator::{
@@ -577,9 +579,10 @@ async fn orchestrate(
             let input_value: Value = serde_json::from_str(&input)
                 .map_err(|e| anyhow::anyhow!("--input is not valid JSON: {e}"))?;
             // v0.0.21 — resolve the run's mandatory repo_root from the declared
-            // writable repos (single one auto-selects; a multi-repo CLI selector
-            // is a follow-on).
-            let repo_root = runtime.resolve_run_repo_root(None)?;
+            // writable repos (single one auto-selects). v0.0.32 — an explicit
+            // `--repo-root` selector picks one when several are declared (a
+            // declared root, a subpath/worktree under one, or a declared name).
+            let repo_root = runtime.resolve_run_repo_root(repo_root.as_deref())?;
             let resp = runtime
                 .start(StartWorkflow {
                     definition_id: def.clone(),
@@ -784,7 +787,7 @@ async fn build_runtime_for_orchestrate(
         audit.clone(),
     )
     .with_evidence(evidence)
-    .with_writable_repo_roots(writable_repo_roots_from_config(config)?)
+    .with_writable_repos(writable_repo_roots_from_config(config)?)
     .with_repo_locks(repo_locks)
     .with_exclusive_pools(exclusive_pools_from_config(config))
     .with_lock_scheduler(lock_scheduler)
@@ -971,7 +974,7 @@ async fn build_oneshot_server(
         audit.clone(),
     )
     .with_evidence(evidence)
-    .with_writable_repo_roots(writable_repo_roots_from_config(config)?)
+    .with_writable_repos(writable_repo_roots_from_config(config)?)
     .with_repo_locks(repo_locks)
     .with_exclusive_pools(exclusive_pools_from_config(config))
     .with_lock_scheduler(lock_scheduler)
@@ -1590,8 +1593,8 @@ async fn reload_gated(
     // (`RepoRoot::new`: path missing) drops the reload to REPAIR-ONLY exactly like a
     // contract-dirty edit — never a half-swap. Applied to the live runtime only on
     // full build success (in the Ok arm below), atomic with the other swaps.
-    let new_writable_roots = match writable_repo_roots_from_config(&new_config) {
-        Ok(roots) => roots,
+    let new_writable = match writable_repo_roots_from_config(&new_config) {
+        Ok(set) => set,
         Err(e) => {
             let msg = format!("WRITABLE_REPO_INVALID: {e}");
             tracing::error!(error = %e, "reload writable-repo set is invalid — dropping to repair-only; previous set kept live");
@@ -1640,8 +1643,11 @@ async fn reload_gated(
             swappable_registry.swap(new_registry);
             // FB-1 — swap the writable repo set into the live runtime, atomic with
             // the definitions/executors above. Now `reload: true` rewires run
-            // repo_root resolution without a restart.
-            runtime.set_writable_repo_roots(new_writable_roots);
+            // repo_root resolution without a restart. WS-B B3 — the name→root
+            // index re-derives here too (discovery reran via config resolution),
+            // so an identity selector tracks the current worktree after reload.
+            runtime.set_writable_repo_roots(new_writable.roots);
+            runtime.set_writable_repo_names(new_writable.by_name);
             // Re-derive exclusive-resource pools from the new connections, atomic
             // with the swaps above, so a reload can add/resize a browser pool
             // without a restart.
@@ -1787,6 +1793,32 @@ async fn build_hot_components(
     Ok((definitions, executors, discovery, registry, workflow_handle))
 }
 
+/// v0.0.21 + WS-B B3 — the run-ambient repo set derived from
+/// `/praxec/_writableRepos`: the ordered writable roots AND a name→root index
+/// (from each entry's optional `name`) for the identity-first
+/// `resolve_run_repo_root` selector. Set as a pair into the runtime so they
+/// re-derive together on reload.
+#[derive(Debug)]
+struct WritableRepoSet {
+    roots: Vec<RepoRoot>,
+    by_name: std::collections::BTreeMap<String, RepoRoot>,
+}
+
+/// Gateway-side convenience: wire a whole [`WritableRepoSet`] (ordered roots +
+/// name→root index) into the runtime builder in one call. Kept here (not in
+/// praxec-core) so core's `with_writable_repo_roots(Vec<RepoRoot>)` signature —
+/// which the entire test suite calls — is untouched.
+trait WithWritableRepos {
+    fn with_writable_repos(self, set: WritableRepoSet) -> Self;
+}
+
+impl WithWritableRepos for WorkflowRuntime {
+    fn with_writable_repos(self, set: WritableRepoSet) -> Self {
+        self.with_writable_repo_roots(set.roots)
+            .with_writable_repo_names(set.by_name)
+    }
+}
+
 /// v0.0.21 — the run-ambient repo-root set: the config's `writable: true` repos
 /// (`/praxec/_writableRepos`), each validated as a canonical absolute existing
 /// directory via [`RepoRoot::new`]. A top-level `start` resolves the run's
@@ -1794,8 +1826,16 @@ async fn build_hot_components(
 /// a boot error — a run's root must be real, not a hopeful string. An empty set
 /// (no writable repo declared) is allowed at boot but makes every `start` fail
 /// fast (the mandatory-repo precondition).
-fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<Vec<RepoRoot>> {
+///
+/// WS-B B3 — an entry that carries a `name` is ALSO indexed by that durable
+/// identity. Note a `worktrees_of:` entry that resolved to NO live worktree
+/// stamps NO `_writableRepos` entry at all (config-load), so it never reaches
+/// here — that is precisely why a pruned/switched worktree no longer hard-fails
+/// boot: there is no dead path for `RepoRoot::new` to reject.
+fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<WritableRepoSet> {
     let mut out = Vec::new();
+    let mut by_name: std::collections::BTreeMap<String, RepoRoot> =
+        std::collections::BTreeMap::new();
     // Accumulate EVERY invalid root before failing. Short-circuiting on the
     // first one costs the operator a reboot per broken path to discover the
     // next; the fail-fast is the same, the diagnostic is one pass.
@@ -1807,7 +1847,14 @@ fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<Vec<RepoRoo
         for e in arr {
             if let Some(root) = e.pointer("/root").and_then(Value::as_str) {
                 match RepoRoot::new(root) {
-                    Ok(rr) => out.push(rr),
+                    Ok(rr) => {
+                        // WS-B B3 — index by durable identity when present, so the
+                        // name selector resolves to this (current) root.
+                        if let Some(name) = e.pointer("/name").and_then(Value::as_str) {
+                            by_name.insert(name.to_string(), rr.clone());
+                        }
+                        out.push(rr);
+                    }
                     Err(err) => {
                         invalid.push(format!("`{root}` is invalid: {err}"));
                     }
@@ -1823,7 +1870,10 @@ fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<Vec<RepoRoo
             invalid.join("; ")
         ));
     }
-    Ok(out)
+    Ok(WritableRepoSet {
+        roots: out,
+        by_name,
+    })
 }
 
 /// Derive the exclusive-resource pools from `connections:` — every `kind: mcp`
@@ -3333,7 +3383,14 @@ fn load_current_chains(
     use praxec_core::model_resolver::config::{Binding, ModelsFile};
     let mf = ModelsFile::from_path(std::path::Path::new(models_yaml))
         .map_err(|e| anyhow::anyhow!("loading models.yaml {models_yaml}: {e}"))?;
-    let model_string = |b: &Binding| format!("{}:{}", b.provider.display_name(), b.model);
+    // (#12) Each chain rung is a `model@effort` identity: fold the binding's
+    // WS1-B `.effort` in so the base-lookup and candidate filter in `propose`
+    // compare against the exactly-keyed `(affinity, model, effort)` evidence
+    // bucket — the SAME model at two efforts is two rungs.
+    let model_string = |b: &Binding| {
+        let model = format!("{}:{}", b.provider.display_name(), b.model);
+        praxec_core::deescalation::chain_identity(&model, b.effort.as_deref())
+    };
     let mut chains = std::collections::BTreeMap::new();
     for aff in affinities {
         // overrides are Pool<Binding>, default is Vec<Binding>; unify to a slice.
@@ -3395,8 +3452,20 @@ async fn cost_propose_cmd(
         stats.iter().map(|s| s.affinity.clone()).collect();
     let chains = load_current_chains(models_yaml, &affinities)?;
 
-    let params = DeescalationParams::from_tuning();
-    let proposals = propose(&stats, &chains, &params);
+    // (#13) Thread the active model catalog + the configured frontier cost cap
+    // into `propose` so it can surface fair-trial candidates. The cap defaults to
+    // the catalog's shipped line and is overridden by
+    // `gateway.cost.frontier_cap_usd_per_m` — the SAME knob the runtime cost gate
+    // reads, so a trial never nominates a model the runtime would refuse.
+    let mut params = DeescalationParams::from_tuning();
+    if let Some(cap) = config
+        .pointer("/gateway/cost/frontier_cap_usd_per_m")
+        .and_then(Value::as_f64)
+    {
+        params.frontier_cap_usd_per_m = cap;
+    }
+    let catalog = praxec_core::model_catalog::model_catalog().models;
+    let proposals = propose(&stats, &chains, &params, &catalog);
 
     // Pair each proposal with the concrete chain edit it implies.
     let edits: Vec<(&praxec_core::deescalation::Proposal, Vec<String>)> = proposals
@@ -3461,6 +3530,7 @@ fn print_proposals_human(
         let tag = match p.direction {
             Direction::Lower => "LOWER",
             Direction::Raise => "RAISE",
+            Direction::Trial => "TRIAL",
         };
         println!(
             "\n  [{tag}] {}: {} → {}",
@@ -4359,8 +4429,8 @@ mod tests {
         let config = json!({
             "praxec": { "_writableRepos": [{ "root": dir.path().display().to_string() }] }
         });
-        let roots = super::writable_repo_roots_from_config(&config).expect("all roots resolve");
-        assert_eq!(roots.len(), 1);
+        let set = super::writable_repo_roots_from_config(&config).expect("all roots resolve");
+        assert_eq!(set.roots.len(), 1);
     }
 
     /// #9 — `sync` reads the config's `repos:`, skips non-git local paths and

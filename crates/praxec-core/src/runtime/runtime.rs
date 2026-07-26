@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::bail;
 use chrono::Utc;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use serde::Serialize;
@@ -95,6 +96,17 @@ pub enum ChainOutcome {
     /// backstop, not an executor error, and the caller QUARANTINES the run
     /// (cancels it) so it cannot re-drive and burn the model indefinitely.
     Quarantined {
+        partial: ChainResult,
+        reason: String,
+    },
+    /// Chain stopped because the controlling MCP client ABORTED the in-flight
+    /// call (its rmcp `CancellationToken` fired on cancel/disconnect). Distinct
+    /// from `Quarantined`: a transport abort is NOT a decision to abandon the
+    /// run, so the caller does NOT durably cancel the mission — the run is left
+    /// resumable at its per-hop-committed position. The whole point is to STOP
+    /// the burn between hops the instant the client goes away; the response is
+    /// built for completeness even though the aborting client won't read it.
+    Aborted {
         partial: ChainResult,
         reason: String,
     },
@@ -224,6 +236,16 @@ pub struct WorkflowRuntime {
     /// wrappers' `RwLock<Arc<…>>` idiom. Reads (per run `start`) take a read
     /// lock; a reload takes a write lock via [`set_writable_repo_roots`].
     pub(crate) writable_repo_roots: Arc<std::sync::RwLock<Vec<crate::run_env::RepoRoot>>>,
+    /// WS-B B3 — parallel name→root index over the SAME writable repos, keyed by
+    /// each repo's durable identity (`name:` in config, carried in
+    /// `_writableRepos`). A `resolve_run_repo_root(Some(name))` selector resolves
+    /// here FIRST — an identity resolves to whatever worktree currently backs it,
+    /// so a run selector survives worktree churn even though the underlying path
+    /// changed. Empty when no writable repo declared a `name`. Hot-swappable and
+    /// re-derived on reload alongside `writable_repo_roots` (they are set as a
+    /// pair from the same resolved config).
+    pub(crate) writable_repo_names:
+        Arc<std::sync::RwLock<std::collections::BTreeMap<String, crate::run_env::RepoRoot>>>,
     /// Exclusive-resource pools: `pool name -> member lock-keys`, derived from
     /// the config's `connections:` (each `exclusive: true` mcp connection tagged
     /// with a `pool:`). A flow declaring `exclusive_pools: [browser]` leases ONE
@@ -235,6 +257,21 @@ pub struct WorkflowRuntime {
     /// core: the engine leases exclusive resources; config says which exist.
     pub(crate) exclusive_pools:
         Arc<std::sync::RwLock<std::collections::BTreeMap<String, Vec<std::path::PathBuf>>>>,
+    /// #70 — the in-flight MCP call's abort signal. The serve layer captures the
+    /// rmcp `RequestContext.ct` per `call_tool` (see
+    /// `PraxecServer::set_cancel_token`) and stashes it here; the
+    /// deterministic-chain drive reads it via [`Self::cancel_token`] and checks
+    /// it at the top of every hop, so a cancelled/disconnected client stops the
+    /// token burn between hops instead of running the drive to completion.
+    ///
+    /// A shared slot (not a per-`start`/`submit` argument) for the same reason
+    /// [`crate::runtime::WorkflowRuntime`]'s peer bridge is: the token lives on
+    /// the per-connection request context, not on the request payload, and
+    /// threading it through every `start`/`submit` call site (300+, none using
+    /// `Default`) would be pure mechanical churn. `None` for every non-serve
+    /// caller (CLI, tests) → the loop check is a no-op and behavior is
+    /// bit-identical.
+    pub(crate) cancel_slot: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 impl WorkflowRuntime {
@@ -265,8 +302,33 @@ impl WorkflowRuntime {
             frontier_cap_usd_per_m: None,
             approve_frontier: Vec::new(),
             writable_repo_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
+            writable_repo_names: Arc::new(
+                std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            ),
             exclusive_pools: Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
+            cancel_slot: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// #70 — stash the in-flight MCP call's abort token (rmcp
+    /// `RequestContext.ct`). Takes `&self` so the long-lived shared runtime and
+    /// every handle cloned from it observe the set (the slot is a shared
+    /// `Arc<Mutex>`). Called by the serve layer on each `call_tool`, right where
+    /// it captures the progress peer. Non-serve callers never set it, so
+    /// [`Self::cancel_token`] stays `None` and the drive's cancellation check is
+    /// inert.
+    pub fn set_cancel_token(&self, token: CancellationToken) {
+        *self.cancel_slot.lock().expect("LOCK_POISONED: cancel_slot") = Some(token);
+    }
+
+    /// The in-flight call's abort token, if the serve layer stashed one. Cheap
+    /// `CancellationToken` clone (an `Arc` internally); the drive reads it once
+    /// per drive and polls `is_cancelled()` at each hop top.
+    pub(crate) fn cancel_token(&self) -> Option<CancellationToken> {
+        self.cancel_slot
+            .lock()
+            .expect("LOCK_POISONED: cancel_slot")
+            .clone()
     }
 
     /// Wire the config-derived exclusive-resource pools (pool name → member
@@ -493,6 +555,33 @@ impl WorkflowRuntime {
             .expect("LOCK_POISONED: writable_repo_roots") = roots;
     }
 
+    /// WS-B B3 — wire the config-declared name→root index (from the `name` field
+    /// of `/praxec/_writableRepos`) that the `resolve_run_repo_root` name selector
+    /// resolves against. A companion to [`Self::with_writable_repo_roots`] — kept
+    /// separate so the many `with_writable_repo_roots(vec![RepoRoot::for_test()])`
+    /// callers need no change (the index defaults empty).
+    pub fn with_writable_repo_names(
+        mut self,
+        names: std::collections::BTreeMap<String, crate::run_env::RepoRoot>,
+    ) -> Self {
+        self.writable_repo_names = Arc::new(std::sync::RwLock::new(names));
+        self
+    }
+
+    /// WS-B B3 — hot-swap the name→root index from a re-derived config, the
+    /// companion to [`Self::set_writable_repo_roots`]. `reload_gated` calls both
+    /// (atomic with the other reload swaps) so identity resolution re-derives on
+    /// reload. Takes `&self`: the shared runtime and every cloned handle see it.
+    pub fn set_writable_repo_names(
+        &self,
+        names: std::collections::BTreeMap<String, crate::run_env::RepoRoot>,
+    ) {
+        *self
+            .writable_repo_names
+            .write()
+            .expect("LOCK_POISONED: writable_repo_names") = names;
+    }
+
     /// The canonical paths of the currently-live writable repos — for the reload
     /// response so the operator sees what actually got wired, not a bare "reloaded".
     pub fn writable_repo_roots_snapshot(&self) -> Vec<String> {
@@ -512,8 +601,11 @@ impl WorkflowRuntime {
     /// - N declared → require `selector` to name one of them (or a subpath),
     ///   else fail listing the choices.
     ///
-    /// The selector resolves against the declared roots by canonical path:
-    /// either the exact canonical path of a declared root, OR (FB-3) a
+    /// The selector resolves in priority order: first as a declared repo NAME
+    /// (WS-B B3 — identity-first; the name→root index resolves to the repo's
+    /// current discovered root, surviving worktree churn), then against the
+    /// declared roots by canonical path: either the exact canonical path of a
+    /// declared root, OR (FB-3) a
     /// **worktree / subpath UNDER** a declared root — so an operator can scope a
     /// run to a git worktree or subdirectory of an already-declared repo without
     /// pre-declaring every such path. Still bounded by the allowlist: a selector
@@ -538,6 +630,19 @@ impl WorkflowRuntime {
         }
         match selector {
             Some(sel) => {
+                // WS-B B3 — a declared repo NAME resolves FIRST, ahead of any path
+                // interpretation: an identity resolves to whatever worktree
+                // currently backs it, so a run selector survives worktree churn.
+                // No filesystem touch — the index already holds a validated root.
+                {
+                    let names = self
+                        .writable_repo_names
+                        .read()
+                        .expect("LOCK_POISONED: writable_repo_names");
+                    if let Some(r) = names.get(sel) {
+                        return Ok(r.clone());
+                    }
+                }
                 // Fast path: an exact match against a declared canonical root —
                 // no filesystem touch.
                 if let Some(r) = roots.iter().find(|r| r.as_str() == sel) {
@@ -1416,6 +1521,35 @@ impl WorkflowRuntime {
                 }
                 Ok(response)
             }
+            ChainOutcome::Aborted { partial, reason } => {
+                // #70 — the client aborted the in-flight `start` call. Stop the
+                // burn WITHOUT durably cancelling: a transport abort is not a
+                // decision to abandon the mission, so the per-hop-committed
+                // instance is left at its current (non-terminal) position and a
+                // later poll/re-drive resumes it. The response is built for
+                // completeness though the aborting client will not read it; the
+                // `aborted` marker records why the drive stopped short.
+                let mut response = self
+                    .response(
+                        &definition,
+                        &partial.instance,
+                        StatusHint::Started,
+                        None,
+                        &request.principal,
+                    )
+                    .await;
+                response["aborted"] = json!({
+                    "code": "CLIENT_ABORTED",
+                    "message": reason,
+                });
+                if !partial.steps.is_empty() {
+                    response["chain"] = serde_json::to_value(&partial.steps)?;
+                }
+                if !partial.evidence.is_empty() {
+                    response["evidence"] = serde_json::to_value(&partial.evidence)?;
+                }
+                Ok(response)
+            }
         }
     }
 
@@ -2149,5 +2283,40 @@ mod writable_repo_tests {
             handle.resolve_run_repo_root(None).is_ok(),
             "a runtime clone must see the swap"
         );
+    }
+
+    /// WS-B B3 — a `name:` selector resolves to the repo's discovered root via
+    /// the name index, taking PRIORITY over path interpretation.
+    #[test]
+    fn name_selector_resolves_via_the_name_index() {
+        let td = tempfile::TempDir::new().unwrap();
+        let root = RepoRoot::new(td.path()).unwrap();
+        let mut names = std::collections::BTreeMap::new();
+        names.insert("autopilot-qa-target".to_string(), root.clone());
+        let rt = runtime_with_roots(vec![root.clone()]).with_writable_repo_names(names);
+        // A bare identity — NOT a filesystem path — resolves to the current root.
+        let got = rt
+            .resolve_run_repo_root(Some("autopilot-qa-target"))
+            .expect("a declared name resolves to its discovered root");
+        assert_eq!(got, root);
+    }
+
+    /// WS-B B3 — the name index wins even when a same-named path interpretation
+    /// would otherwise apply: name lookup is checked first and returns before any
+    /// canonicalization is attempted (a bare name is not a valid path anyway, but
+    /// the priority is the contract).
+    #[test]
+    fn name_selector_takes_priority_over_path_interpretation() {
+        let td = tempfile::TempDir::new().unwrap();
+        let declared = RepoRoot::new(td.path()).unwrap();
+        // The identity points at a DIFFERENT valid directory than the declared
+        // root — proving the name index (not the path allowlist) resolved it.
+        let other = tempfile::TempDir::new().unwrap();
+        let other_root = RepoRoot::new(other.path()).unwrap();
+        let mut names = std::collections::BTreeMap::new();
+        names.insert("qa".to_string(), other_root.clone());
+        let rt = runtime_with_roots(vec![declared]).with_writable_repo_names(names);
+        let got = rt.resolve_run_repo_root(Some("qa")).unwrap();
+        assert_eq!(got, other_root, "the name index must resolve, not the path");
     }
 }

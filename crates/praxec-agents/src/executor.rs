@@ -486,6 +486,11 @@ impl AgentExecutor {
                 report.prompt_tokens,
                 report.completion_tokens,
             ),
+            // The applied reasoning effort is resolved per-hop in the chain-walk,
+            // not here (this maps a runner report). The walk stamps it onto the
+            // returned telemetry on the success branch, where the hop's
+            // `applied_effort` is in scope.
+            effort: None,
         });
 
         // The full transcript is always preserved for the async "God-view".
@@ -850,6 +855,15 @@ impl Executor for AgentExecutor {
                     )
                     .await;
                     let mut result = result;
+                    // WS1-B (#12) — stamp THIS hop's applied reasoning effort onto
+                    // the telemetry, PAIRED with the model that actually ran. On an
+                    // escalated hop the walked `model` differs from the composer's
+                    // intent, and effort is non-portable across models, so the
+                    // de-escalation flywheel must key off the effort the winning
+                    // model actually ran under — recorded here, on `agent.completed`.
+                    if let Some(t) = result.telemetry.as_mut() {
+                        t.effort = applied_effort.clone();
+                    }
                     for e in escalations.drain(..).rev() {
                         result.evidence.insert(0, e);
                     }

@@ -8,6 +8,95 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.32] — 2026-07-26 — worktree-proof dogfood substrate + adaptive flywheel
+
+A stabilization + capability release that makes *developing praxec through praxec*
+reliable — a trustworthy CI gate, worktree-churn-proof repo resolution, right-repo
+writes, heartbeating drives — and then extends the governed model-selection flywheel
+to be effort-aware and to fair-trial new models. Developed as two logical phases
+(substrate, then flywheel dogfooded on the locally-built substrate) and shipped as
+one version.
+
+### Added
+
+- **Identity-first, worktree-churn-proof writable repos.** A repo may now be
+  declared by durable identity + a discovery rule instead of a literal path:
+  ```yaml
+  repos:
+    - name: my-target
+      worktrees_of: /stable/anchor
+      writable: true
+  ```
+  At config-load and reload, discovery runs `git worktree list --porcelain` on the
+  anchor and matches each worktree's `praxec.repo.yaml` `name:` against the declared
+  name. Zero matches is a **legal boot state** (`REPO_IDENTITY_UNRESOLVED` diagnostic,
+  no root stamped — a pruned worktree simply drops out instead of hard-failing boot,
+  the headline win); exactly one match becomes a writable root keyed by name; two or
+  more is `REPO_IDENTITY_AMBIGUOUS` (hard error under `check`, skipped-with-warning at
+  serve — **never** auto-picked, since a wrong-repo write is corruption). A run
+  selector (`repoRoot` / `--repo-root`) now resolves a declared repo **name** first
+  (identity survives churn), then the existing exact-root / subpath-under-a-root
+  logic. `path:`/`uri:` entries are unchanged (a dead `path:` still fails loud).
+
+- **`repoRoot` selector on the two-tool `command` surface + `orchestrate` CLI.**
+  `praxec.command` starts could not select among multiple writable repos — the
+  reshape dropped the field, so a multi-writable config was always
+  `REPO_ROOT_AMBIGUOUS`. `command` now carries `repoRoot`, and the `orchestrate` CLI
+  gains `--repo-root`.
+
+- **Connection-arg path interpolation (`${repo:<name>.root}`, `${praxec.state_dir}`).**
+  MCP `connections:` args/env may now reference a named repo's current root or a
+  durable, worktree-independent operator-state dir, resolved at config-resolve time —
+  so a `--storage-state` path (auth credential material) no longer has to be a
+  brittle absolute pin that dies with a worktree. An unknown `${repo:…}` name is a
+  hard config error. Stub `praxec.repo.yaml` files may declare a `scaffold:` list of
+  repo-relative directories the engine creates idempotently when the root resolves
+  (directories only — credential files never auto-create; a missing one stays a
+  fail-fast).
+
+- **Effort-aware de-escalation flywheel.** `praxec cost propose` now keys evidence on
+  `(affinity, model, effort)` — the executor emits the ACTUAL applied per-hop
+  reasoning effort into `agent.completed`, so the flywheel distinguishes e.g.
+  `qwen3-coder@medium` from `@high` instead of lumping them.
+
+- **Fair-trial exploration in the flywheel.** `propose` now also surfaces an untried,
+  catalog-fit, under-cost-cap model (with less than the minimum evidence) for an
+  affinity as a governed recommendation — so a shifting model ecosystem's new
+  entrants actually get sampled, instead of the loop being pure exploit.
+
+### Fixed
+
+- **Client-abort is observed inside the multi-slice drive, with a between-hop
+  heartbeat (#70).** The auto-drive chain walker kept running after the MCP client
+  aborted, and emitted no pulse between agent turns. It now captures the rmcp
+  cancellation token (previously dropped) and, at each hop, stops on cancel with a
+  new typed `ChainOutcome::Aborted` (stops the token burn WITHOUT durably cancelling —
+  the run is left resumable) and emits a `chain.heartbeat` audit event that rides the
+  existing peer bridge to the client, filling the dead-air gaps.
+
+- **Snippet-input default now wins over an injected `null` (#71).** An optional
+  snippet input mapped to a scope path that resolves to `null` (the caller omitted
+  it) no longer defeats the schema `default` — `apply_schema_defaults` treats a
+  present-`null` as absent when a default is declared, so a later `use.inputs`
+  map-path read no longer fails as a spurious unresolved-arg permanent error.
+
+- **Build-loop writes to the deliverable's repo (#69, pack).** `cap.implement.build-loop`
+  is spawned with a `repoRoot` override so a child build-loop re-roots to the
+  deliverable's repo instead of inheriting the parent run's root (wrong-repo
+  corruption in a multi-repo program). Pack change; the engine already bounded the
+  per-spawn override.
+
+### Changed
+
+- **The nightly live-integration suite is green.** The nightly's blanket
+  `cargo test -- --include-ignored` was force-running four pattern-example walks that
+  can never pass in `praxec-core` (it has only a noop executor registry, so
+  specialized-executor outputs resolve to `null` and the typed-slot guard correctly
+  rejects them) — a false failure that auto-filed 17 tracking issues. Those four are
+  now gated behind a default-off `PRAXEC_WALK_WITH_REGISTRY` flag so
+  `--include-ignored` skips them loudly; their real coverage already lives in the
+  dedicated executor/guard tests, so nothing is lost.
+
 ## [0.0.31] — 2026-07-26 — model cost & control: commodity-first, adaptive per-model selection
 
 ### Added
