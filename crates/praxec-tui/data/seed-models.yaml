@@ -1,0 +1,53 @@
+version: 1
+# Commodity-first, specialist-per-activity seed (educated guesses from the model
+# catalog's scores). Each lead is the catalog's top scorer for that dimension,
+# paired with the effort it can actually do (WS1-B). Every lead is < $5/M output,
+# so the WS2 cost gate is inert for them; frontier is opt-in via the *-frontier
+# overrides + gateway.cost.approve_frontier. These are PRIORS — the de-escalation
+# flywheel tunes them from real acceptance evidence, so a shifting model
+# ecosystem is absorbed by (a) updating this catalog-seeded file and (b) the loop
+# correcting it against reality.
+
+# General chain (auto_drive default): cheapest capable reasoner first.
+default:
+  - { provider: { name: openrouter }, model: deepseek/deepseek-v4-pro, effort: high }
+  - { provider: { name: openrouter }, model: z-ai/glm-5.2, effort: high }
+  - { provider: { name: openrouter }, model: moonshotai/kimi-k2.6, effort: high }
+
+activity:
+  # Coding — qwen3-coder tops coding (64) and is fastest; it maxes at medium
+  # reasoning, which coding doesn't need. Cheap reasoners back it up.
+  coding:
+    - { provider: { name: openrouter }, model: qwen/qwen3-coder, effort: medium }
+    - { provider: { name: openrouter }, model: deepseek/deepseek-v4-pro, effort: high }
+    - { provider: { name: openrouter }, model: z-ai/glm-5.2, effort: high }
+  # Review — glm-5.2 @ high won the WS4 adversarial-review trial (2.0 vs deepseek
+  # 1.0), so review leads with the empirical winner; cheap reasoners back it up.
+  review:
+    - { provider: { name: openrouter }, model: z-ai/glm-5.2, effort: high }
+    - { provider: { name: openrouter }, model: deepseek/deepseek-v4-pro, effort: high }
+    - { provider: { name: openrouter }, model: moonshotai/kimi-k2.6, effort: high }
+  # Agentic / tool-loop — kimi-k2.6 tops agentic (58).
+  agentic:
+    - { provider: { name: openrouter }, model: moonshotai/kimi-k2.6, effort: high }
+    - { provider: { name: openrouter }, model: z-ai/glm-5.2, effort: high }
+    - { provider: { name: openrouter }, model: deepseek/deepseek-v4-pro, effort: high }
+  # Prose / narrative — glm-5.2 tops prose (52); low effort (prose isn't reasoning).
+  prose:
+    - { provider: { name: openrouter }, model: z-ai/glm-5.2, effort: low }
+    - { provider: { name: openrouter }, model: deepseek/deepseek-v4-pro, effort: high }
+
+overrides:
+  # Reasoning affinity — deepseek-v4-pro is the cheapest capable reasoner
+  # (catalog reasoning 56 @ $0.87/M); let the flywheel raise to glm if it fails.
+  reasoning:
+    - { provider: { name: openrouter }, model: deepseek/deepseek-v4-pro, effort: high }
+    - { provider: { name: openrouter }, model: z-ai/glm-5.2, effort: high }
+    - { provider: { name: openrouter }, model: moonshotai/kimi-k2.6, effort: high }
+  # Frontier escalation tiers — OPT-IN. These over-$5/M models fail fast
+  # (FRONTIER_NOT_APPROVED) unless added to gateway.cost.approve_frontier, so a
+  # human must deliberately approve frontier spend. Frontier lives at the tail.
+  coding-frontier:
+    - { provider: { name: openrouter }, model: anthropic/claude-sonnet-4-6 }
+  reasoning-frontier:
+    - { provider: { name: openrouter }, model: anthropic/claude-opus-4-8 }

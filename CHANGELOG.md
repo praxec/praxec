@@ -8,9 +8,21 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
-## [0.0.31] — Unreleased
+## [0.0.31] — 2026-07-26 — model cost & control: commodity-first, adaptive per-model selection
 
 ### Added
+
+- **Commodity-first, specialist-per-activity starter `models.yaml` + `px init-models`.**
+  A shipped seed (`px init-models [--out .praxec/models.yaml] [--force]`) that
+  binds each activity to the model catalog's top scorer for that dimension, at
+  the effort it can actually do (WS1‑B): coding→qwen3‑coder, agentic→kimi‑k2.6,
+  reasoning→deepseek‑v4‑pro@high, review/prose→glm‑5.2, with frontier opt-in via
+  the `*-frontier` overrides + `gateway.cost.approve_frontier`. Every lead is
+  under the $5/M cap, so the WS2 gate is inert for them. These are educated-guess
+  PRIORS from the catalog (a data file — updating it re-seeds the guesses); the
+  governed de-escalation flywheel (`praxec cost propose`) then tunes them from
+  real acceptance evidence, so a shifting model ecosystem is absorbed
+  continuously rather than by a one-time benchmark.
 
 - **Frontier-model cost gate — `$5/M` data-driven, human-approved (WS2).** A model
   is *frontier* when its catalog output $/M is at/over `gateway.cost.frontier_cap_usd_per_m`

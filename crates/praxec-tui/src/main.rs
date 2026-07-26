@@ -172,6 +172,12 @@ enum Command {
                       once + commit the file."
     )]
     MigrateAgentsFromCli(MigrateAgentsArgs),
+    /// Write the commodity-first, specialist-per-activity starter `models.yaml`
+    /// (coding→qwen, agentic→kimi, reasoning→deepseek, review/prose→glm, each at
+    /// its paired effort; frontier opt-in). These are educated-guess PRIORS the
+    /// de-escalation flywheel then tunes from real acceptance evidence.
+    #[command(next_help_heading = "Configure the harness")]
+    InitModels(InitModelsArgs),
     /// Write provider API keys to ~/.config/praxec/providers.env
     /// (override via $PRAXEC_PROVIDER_KEYS_FILE). Loaded into env at
     /// px startup; existing env vars take precedence.
@@ -232,6 +238,19 @@ pub struct MigrateAgentsArgs {
     /// Useful for diffing / piping through other tools before commit.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct InitModelsArgs {
+    /// Output path. Default writes to `.praxec/models.yaml`.
+    #[arg(long, default_value = ".praxec/models.yaml")]
+    pub out: PathBuf,
+    /// Print the seed YAML to stdout instead of writing to disk.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Overwrite an existing file (a `.bak` copy is written first).
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -369,6 +388,7 @@ fn command_needs_keyring(cmd: &Option<Command>) -> bool {
         | Some(Command::Mcp(_))
         | Some(Command::ValidateAgentsConfig(_))
         | Some(Command::MigrateAgentsFromCli(_))
+        | Some(Command::InitModels(_))
         | Some(Command::SetProviderKeys(_))
         | Some(Command::Lexicon(_))
         | Some(Command::Completions(_))
@@ -401,6 +421,7 @@ async fn main() -> Result<ExitCode> {
         }
         Some(Command::ValidateAgentsConfig(args)) => Ok(run_validate_agents_config(&args.path)),
         Some(Command::MigrateAgentsFromCli(args)) => run_migrate_agents_from_cli(args),
+        Some(Command::InitModels(args)) => run_init_models(args),
         Some(Command::SetProviderKeys(args)) => provider_keys::run(args),
         Some(Command::Lexicon(cmd)) => lexicon_mod::run(cmd),
         Some(Command::Completions(args)) => Ok(run_completions(args)),
@@ -425,6 +446,44 @@ fn run_migrate_agents_from_cli(args: MigrateAgentsArgs) -> Result<ExitCode> {
     praxec_tui::migrate::write_atomic(&yaml, &args.out)
         .map_err(|e| anyhow::anyhow!("write {} failed: {e}", args.out.display()))?;
     println!("wrote {} ({} bytes)", args.out.display(), yaml.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The shipped commodity-first, specialist-per-activity seed `models.yaml`.
+const SEED_MODELS_YAML: &str = include_str!("../data/seed-models.yaml");
+
+fn run_init_models(args: InitModelsArgs) -> Result<ExitCode> {
+    if args.dry_run {
+        print!("{SEED_MODELS_YAML}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args.out.exists() {
+        if !args.force {
+            anyhow::bail!(
+                "{} already exists. Pass --force to overwrite (a .bak copy is written first), \
+                 or --dry-run to inspect the seed.",
+                args.out.display()
+            );
+        }
+        // Preserve the existing file before overwriting — the operator may have
+        // customized it.
+        let bak = args.out.with_extension("yaml.bak");
+        std::fs::copy(&args.out, &bak)
+            .map_err(|e| anyhow::anyhow!("backing up {} failed: {e}", args.out.display()))?;
+        println!(
+            "backed up existing {} -> {}",
+            args.out.display(),
+            bak.display()
+        );
+    }
+    praxec_tui::migrate::write_atomic(SEED_MODELS_YAML, &args.out)
+        .map_err(|e| anyhow::anyhow!("write {} failed: {e}", args.out.display()))?;
+    println!(
+        "wrote commodity-first seed {} ({} bytes). Run `praxec doctor` to validate; the \
+         de-escalation flywheel will tune it from real runs.",
+        args.out.display(),
+        SEED_MODELS_YAML.len()
+    );
     Ok(ExitCode::SUCCESS)
 }
 
