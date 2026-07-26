@@ -204,6 +204,13 @@ pub struct WorkflowRuntime {
     /// set the knob — the executor default then governs, preserving
     /// multi-attempt escalation under the 180s-per-attempt default wall.
     pub(crate) auto_drive_step_budget_seconds: Option<u64>,
+    /// WS2 cost gate — the frontier cost cap ($/M output) injected onto
+    /// auto-driven agent steps (from `gateway.cost.frontier_cap_usd_per_m`).
+    /// `None` = no cost gate.
+    pub(crate) frontier_cap_usd_per_m: Option<f64>,
+    /// WS2 — human-approved frontier model allowlist (`"vendor:model-id"`), from
+    /// `gateway.cost.approve_frontier`. Models here are exempt from the gate.
+    pub(crate) approve_frontier: Vec<String>,
     /// The repo roots a run may operate on, from the config's `writable: true`
     /// repos (`/praxec/_writableRepos`). A top-level `start` resolves the run's
     /// mandatory [`crate::run_env::RepoRoot`] from this set (see
@@ -255,6 +262,8 @@ impl WorkflowRuntime {
             auto_drive_tools: Vec::new(),
             auto_drive_max_seconds: 180,
             auto_drive_step_budget_seconds: None,
+            frontier_cap_usd_per_m: None,
+            approve_frontier: Vec::new(),
             writable_repo_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             exclusive_pools: Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
         }
@@ -598,6 +607,16 @@ impl WorkflowRuntime {
             self.auto_drive_max_seconds = max_seconds;
             self.auto_drive_step_budget_seconds = Some(max_seconds);
         }
+        self
+    }
+
+    /// WS2 — arm the frontier cost gate for auto-driven agent steps: refuse any
+    /// model whose catalog output $/M is at/over `cap` unless it is in
+    /// `approve_frontier`. `cap = None` disarms the gate (the default). From
+    /// `gateway.cost.frontier_cap_usd_per_m` + `gateway.cost.approve_frontier`.
+    pub fn with_cost_gate(mut self, cap: Option<f64>, approve_frontier: Vec<String>) -> Self {
+        self.frontier_cap_usd_per_m = cap;
+        self.approve_frontier = approve_frontier;
         self
     }
 

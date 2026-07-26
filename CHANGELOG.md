@@ -12,6 +12,19 @@ covered by a stability commitment.
 
 ### Added
 
+- **Frontier-model cost gate — `$5/M` data-driven, human-approved (WS2).** A model
+  is *frontier* when its catalog output $/M is at/over `gateway.cost.frontier_cap_usd_per_m`
+  (default **5.0**, overridable). `doctor`/`check` warn `FRONTIER_LEAD` for any
+  frontier binding not in the `gateway.cost.approve_frontier` allowlist (a
+  frontier binding that IS allowlisted is an `info`). At runtime the agent
+  chain-walk **fails fast** (`FRONTIER_NOT_APPROVED`) before running any over-cap
+  model that isn't allowlisted — so auto-drive can never unilaterally spend on a
+  premium model no human approved (the uncontrolled-$120-burn class). The gate is
+  **on by default** at $5/M even without a `gateway.cost` block (commodity + mock
+  models are all under the cap, so it's inert for them); a human opts a specific
+  model in via the allowlist, or raises the cap. Preflight and runtime share one
+  `is_frontier` predicate, so they never disagree.
+
 - **Per-model reasoning effort in `models.yaml`, threaded end-to-end, fail-fast
   (WS1‑B).** A binding may now declare `effort: <low|medium|high|…>` — the
   reasoning level PAIRED with that specific model. Reasoning levels are not

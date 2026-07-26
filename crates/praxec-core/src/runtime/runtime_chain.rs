@@ -767,6 +767,16 @@ impl WorkflowRuntime {
                 if let Some(budget) = self.auto_drive_step_budget_seconds {
                     agent_config["step_budget_seconds"] = json!(budget);
                 }
+                // WS2 cost gate — carry the frontier cap + human allowlist onto
+                // the synthesized agent step so the executor's chain-walk refuses
+                // an over-cap model no human approved. Omitted when unset, so a
+                // config without `gateway.cost` has no gate (bit-identical).
+                if let Some(cap) = self.frontier_cap_usd_per_m {
+                    agent_config["frontier_cap_usd_per_m"] = json!(cap);
+                }
+                if !self.approve_frontier.is_empty() {
+                    agent_config["approve_frontier"] = json!(self.approve_frontier);
+                }
                 // Repo write-exclusion gate on the AUTO-DRIVE path.
                 //
                 // Read `owned_files` from the DECLARED executor (`def`), not the
