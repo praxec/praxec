@@ -36,6 +36,7 @@ sha2 = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 # SPEC §22.2 — load-time HTTP fetch for https:// script URIs.

@@ -67,6 +67,11 @@ thiserror = "2"
 # checkout and any worktree (a relative path dep can't satisfy both).
 execution-policy = { git = "https://github.com/matt-cochran/execution-policy.git", tag = "v0.0.6" }
 tokio = { version = "1", features = ["full"] }
+# `CancellationToken` — the rmcp `RequestContext.ct` type. Used to observe a
+# client-abort/disconnect inside the deterministic-chain drive so a cancelled
+# call stops burning tokens. Default features (the `sync` module is not
+# feature-gated). Same 0.7 line rmcp already resolves, so the type unifies.
+tokio-util = { version = "0.7", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }

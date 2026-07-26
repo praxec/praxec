@@ -6,6 +6,7 @@
 use anyhow::{anyhow, bail};
 use chrono::Utc;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::mapping::merge_output;
@@ -30,6 +31,23 @@ use crate::use_binding::{
 /// toward `livelock_budget`. `_`-prefixed = engine bookkeeping, excluded from
 /// the user-facing blackboard like `_while_iter` / `_agent_await`.
 pub(crate) const CHAIN_HOPS_TOTAL_KEY: &str = "_chain_hops_total";
+
+/// #70 — audit `event_type` for the LOOP-level liveness pulse, emitted once at
+/// the top of every deterministic-chain hop. The per-agent-turn pulse
+/// (`agent.heartbeat`, from the rig runner) only beats WHILE a single agent
+/// step is in flight; the deterministic hops BETWEEN agent steps (verdict
+/// scripts, commits, review routing, sub-workflow polls) emitted nothing, so a
+/// client streaming the audit bridge saw dead air. This rides the SAME audit
+/// sink, so `PeerBridgeAuditSink` forwards it to the client exactly like
+/// `agent.heartbeat`. Named alongside [`crate::runtime::WorkflowRuntime`]'s
+/// other chain events (`chain.step`, `chain.failed`, `chain.quarantined`).
+pub(crate) const CHAIN_HEARTBEAT_EVENT: &str = "chain.heartbeat";
+
+/// #70 — audit `event_type` recorded when a hop observes that the controlling
+/// MCP client aborted the in-flight call (its rmcp `CancellationToken` fired).
+/// Mirrors `chain.quarantined` as the terminal marker for the matching early
+/// return, but for a client abort rather than a livelock.
+pub(crate) const CHAIN_ABORTED_EVENT: &str = "chain.aborted";
 
 /// Default cumulative hop ceiling before a non-terminating run is quarantined
 /// as a livelock. Deliberately GENEROUS — legitimate flows finish in tens of
@@ -390,6 +408,12 @@ impl WorkflowRuntime {
     ///
     /// Returns a `ChainOutcome` — either `Completed` (normal stop) or
     /// `Failed` (executor/guard error with partial progress).
+    ///
+    /// `cancel` is the in-flight MCP call's abort token (rmcp
+    /// `RequestContext.ct`), threaded from the serve layer via the runtime's
+    /// cancel slot; `None` for non-serve callers (CLI, tests). It is polled at
+    /// the top of every hop so a cancelled/disconnected client stops the burn
+    /// BETWEEN hops rather than running the drive to completion.
     pub(crate) async fn run_deterministic_chain(
         &self,
         definition: &Value,
@@ -402,6 +426,13 @@ impl WorkflowRuntime {
         let mut steps: Vec<ChainStep> = Vec::new();
         let mut accumulated_evidence: Vec<Evidence> = Vec::new();
 
+        // #70 — the in-flight MCP call's abort token, read once from the shared
+        // cancel slot the serve layer stashed at `call_tool` time (see
+        // `WorkflowRuntime::set_cancel_token`). Cheap `Arc`-backed clone; `None`
+        // for non-serve callers (CLI, tests that never set it), which makes the
+        // per-hop cancellation check below inert.
+        let cancel = self.cancel_token();
+
         loop {
             // Keep this run's exclusive-pool leases alive while it is making
             // progress: a long auto-driven chain (several agent steps in one
@@ -409,6 +440,69 @@ impl WorkflowRuntime {
             // and cheap (no-op when the run holds no lease); this is the
             // refresh-on-progress that replaces a background heartbeat task.
             self.refresh_run_leases(&instance).await;
+
+            // #70 — LOOP-level cancellation. If the controlling MCP client
+            // aborted/disconnected, its rmcp cancellation token has fired.
+            // Observe it at the hop top (next to the livelock check below) and
+            // stop the drive immediately so a cancelled command stops burning
+            // tokens in the gaps between agent turns. NOT a durable cancel —
+            // the per-hop-committed instance is left resumable at its current
+            // position (see `ChainOutcome::Aborted`). Mirrors the
+            // livelock-quarantine early return's shape.
+            if cancel.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                self.record_or_self_event(
+                    instance
+                        .audit_event(CHAIN_ABORTED_EVENT)
+                        .with_correlation(correlation_id)
+                        .with_payload(json!({
+                            "state": instance.state,
+                            "definitionId": instance.definition_id,
+                            "chainDepth": steps.len(),
+                            "reason": "client_aborted",
+                        })),
+                )
+                .await;
+                let reason = format!(
+                    "client_aborted: the controlling MCP client cancelled or disconnected the \
+                     in-flight call at state '{}' after {} hop(s) — stopping the deterministic \
+                     drive to halt the token burn (the run is left resumable at its committed \
+                     position)",
+                    instance.state,
+                    steps.len()
+                );
+                return Ok(ChainOutcome::Aborted {
+                    partial: ChainResult {
+                        instance,
+                        steps,
+                        evidence: accumulated_evidence,
+                    },
+                    reason,
+                });
+            }
+
+            // #70 — LOOP-level liveness pulse: one `chain.heartbeat` per hop on
+            // the SAME audit sink the drive already uses, so `PeerBridgeAuditSink`
+            // forwards it to the client exactly like `agent.heartbeat`. This
+            // fills the dead-air gaps BETWEEN agent steps (verdict scripts,
+            // commits, review routing, sub-workflow polls) where the per-turn
+            // agent heartbeat is silent. Emit-only observability — a sink failure
+            // never affects the drive (see `record_or_self_event`).
+            self.record_or_self_event(
+                instance
+                    .audit_event(CHAIN_HEARTBEAT_EVENT)
+                    .with_correlation(correlation_id)
+                    .with_payload(json!({
+                        "state": instance.state,
+                        "definitionId": instance.definition_id,
+                        "chainDepth": steps.len(),
+                        "chainHopsTotal": instance
+                            .context
+                            .get(CHAIN_HOPS_TOTAL_KEY)
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    })),
+            )
+            .await;
 
             // Stop: terminal state
             if is_terminal(definition, &instance.state) {
@@ -1908,5 +2002,230 @@ mod tests {
             ),
             "reasoning"
         );
+    }
+}
+
+// ── #70 — loop-level cancellation + heartbeat over a real deterministic drive ─
+#[cfg(test)]
+mod cancellation_and_heartbeat_tests {
+    use super::{CHAIN_ABORTED_EVENT, CHAIN_HEARTBEAT_EVENT};
+    use crate::audit::{AuditSink, MemoryAuditSink};
+    use crate::guards::DefaultGuardEvaluator;
+    use crate::model::{Principal, StartWorkflow};
+    use crate::ports::{Executor, ExecutorRegistry, WorkflowStore};
+    use crate::runtime::WorkflowRuntime;
+    use crate::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    struct EmptyRegistry;
+    impl ExecutorRegistry for EmptyRegistry {
+        fn get(&self, _kind: &str) -> Option<Arc<dyn Executor>> {
+            None
+        }
+    }
+
+    /// Build a runtime over `cfg`, keeping handles to the store and the
+    /// (concrete) audit sink so a test can inspect committed state and the
+    /// emitted event stream.
+    fn runtime_with_audit(
+        cfg: &Value,
+    ) -> (
+        WorkflowRuntime,
+        Arc<InMemoryWorkflowStore>,
+        Arc<MemoryAuditSink>,
+    ) {
+        let definitions = Arc::new(ConfigDefinitionStore::from_config(cfg));
+        let store = Arc::new(InMemoryWorkflowStore::new());
+        let audit = Arc::new(MemoryAuditSink::new());
+        let runtime = WorkflowRuntime::new(
+            definitions,
+            store.clone(),
+            Arc::new(EmptyRegistry),
+            Arc::new(DefaultGuardEvaluator::new()),
+            audit.clone() as Arc<dyn AuditSink>,
+        );
+        (runtime, store, audit)
+    }
+
+    async fn start(runtime: &WorkflowRuntime, def: &str) -> Value {
+        runtime
+            .start(StartWorkflow {
+                definition_id: def.into(),
+                input: json!({}),
+                principal: Principal::anonymous(),
+                run_env: crate::RunEnv::for_test(),
+                depth: 0,
+                parent: None,
+            })
+            .await
+            .expect("start should succeed")
+    }
+
+    async fn events_of_type(audit: &MemoryAuditSink, kind: &str) -> Vec<crate::audit::AuditEvent> {
+        audit
+            .list_events()
+            .await
+            .expect("memory sink lists")
+            .into_iter()
+            .filter(|e| e.event_type == kind)
+            .collect()
+    }
+
+    /// A token already cancelled at the loop top stops the drive BEFORE any hop
+    /// executes: no `chain.step`, the instance is untouched at its initial
+    /// state, and — because a transport abort is not a decision to abandon the
+    /// mission — it is NOT durably cancelled (left resumable). Uses a
+    /// never-terminating a→b→a cycle so, absent the cancellation check, the
+    /// drive would have advanced (and eventually quarantined) rather than sit
+    /// still — proving the early return is what stopped it.
+    #[tokio::test]
+    async fn cancelled_token_at_loop_top_aborts_drive_without_executing_hops() {
+        let cfg = json!({
+            "version": "1.0.0",
+            "workflows": { "cycle": {
+                "version": "1.0.0",
+                "initialState": "a",
+                "livelockHopBudget": 5,
+                "maxChainDepth": 10,
+                "states": {
+                    "a": { "transitions": { "go":   { "target": "b", "actor": "deterministic" } } },
+                    "b": { "transitions": { "back": { "target": "a", "actor": "deterministic" } } }
+                }
+            }}
+        });
+        let (runtime, store, audit) = runtime_with_audit(&cfg);
+
+        // Pre-cancel the in-flight call's token, then stash it exactly as the
+        // serve layer does on `call_tool`.
+        let token = CancellationToken::new();
+        token.cancel();
+        runtime.set_cancel_token(token);
+
+        let response = start(&runtime, "cycle").await;
+        let id = response["workflow"]["id"].as_str().unwrap().to_string();
+
+        // The abort marker is surfaced on the response.
+        assert_eq!(
+            response["aborted"]["code"].as_str(),
+            Some("CLIENT_ABORTED"),
+            "response must carry the client-abort marker, got {response:#}"
+        );
+
+        let inst = store.load(&id).await.unwrap();
+        // No hop executed: still at the initial state, no chain steps.
+        assert_eq!(inst.state, "a", "no hop may execute after a loop-top abort");
+        assert!(
+            events_of_type(&audit, "chain.step").await.is_empty(),
+            "no chain.step may be emitted when the drive aborts before the first hop"
+        );
+        assert!(
+            inst.context.get("_chain_hops_total").is_none()
+                || inst.context.get("_chain_hops_total") == Some(&json!(0)),
+            "no cumulative hops may be recorded, got {:?}",
+            inst.context.get("_chain_hops_total")
+        );
+        // NOT durably cancelled — a transport abort leaves the run resumable.
+        assert!(
+            inst.cancelled_at.is_none(),
+            "a client abort must NOT durably cancel the mission (state {:?}, reason {:?})",
+            inst.state,
+            inst.cancelled_reason
+        );
+        // The abort was recorded for observability.
+        let aborted = events_of_type(&audit, CHAIN_ABORTED_EVENT).await;
+        assert_eq!(aborted.len(), 1, "exactly one chain.aborted must be emitted");
+        assert_eq!(aborted[0].payload["reason"].as_str(), Some("client_aborted"));
+    }
+
+    /// An un-cancelled token never stops the drive: the same cycle runs to its
+    /// livelock quarantine exactly as before the fix (the cancellation check is
+    /// inert when the token has not fired). Guards against the check firing on a
+    /// live token.
+    #[tokio::test]
+    async fn uncancelled_token_does_not_abort_the_drive() {
+        let cfg = json!({
+            "version": "1.0.0",
+            "workflows": { "cycle": {
+                "version": "1.0.0",
+                "initialState": "a",
+                "livelockHopBudget": 5,
+                "maxChainDepth": 1000,
+                "states": {
+                    "a": { "transitions": { "go":   { "target": "b", "actor": "deterministic" } } },
+                    "b": { "transitions": { "back": { "target": "a", "actor": "deterministic" } } }
+                }
+            }}
+        });
+        let (runtime, store, audit) = runtime_with_audit(&cfg);
+        // A live (un-cancelled) token, stashed like the serve layer would.
+        runtime.set_cancel_token(CancellationToken::new());
+
+        let response = start(&runtime, "cycle").await;
+        let id = response["workflow"]["id"].as_str().unwrap().to_string();
+
+        let inst = store.load(&id).await.unwrap();
+        // The drive ran to the livelock quarantine (5 hops), NOT aborted.
+        assert!(
+            events_of_type(&audit, CHAIN_ABORTED_EVENT).await.is_empty(),
+            "a live token must not trigger a chain.aborted"
+        );
+        assert!(
+            inst.cancelled_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("livelock_quarantine"),
+            "the un-aborted cycle must reach its livelock quarantine, got {:?}",
+            inst.cancelled_reason
+        );
+    }
+
+    /// A multi-hop deterministic drive emits one `chain.heartbeat` at the top of
+    /// every loop iteration — the loop-level pulse that fills the dead air
+    /// between agent turns. For a→b→c (two executing hops + the terminal-
+    /// detecting iteration) that is three pulses, in state order a, b, c, each
+    /// carrying the identifying payload.
+    #[tokio::test]
+    async fn chain_heartbeat_is_emitted_per_hop_during_a_multi_hop_drive() {
+        let cfg = json!({
+            "version": "1.0.0",
+            "workflows": { "line": {
+                "version": "1.0.0",
+                "initialState": "a",
+                "states": {
+                    "a": { "transitions": { "go": { "target": "b", "actor": "deterministic" } } },
+                    "b": { "transitions": { "go": { "target": "c", "actor": "deterministic" } } },
+                    "c": { "terminal": true }
+                }
+            }}
+        });
+        let (runtime, store, audit) = runtime_with_audit(&cfg);
+        // No token stashed → cancel slot is None → the check is inert.
+
+        let response = start(&runtime, "line").await;
+        let id = response["workflow"]["id"].as_str().unwrap().to_string();
+        assert_eq!(
+            store.load(&id).await.unwrap().state,
+            "c",
+            "the run must reach its terminal state"
+        );
+
+        let pulses = events_of_type(&audit, CHAIN_HEARTBEAT_EVENT).await;
+        let states: Vec<String> = pulses
+            .iter()
+            .map(|e| e.payload["state"].as_str().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(
+            states,
+            vec!["a", "b", "c"],
+            "one chain.heartbeat per hop, in state order (two hops + terminal iteration)"
+        );
+        // Each pulse carries the identifying payload used by an operator/client
+        // tailing the bridged stream.
+        for p in &pulses {
+            assert_eq!(p.payload["definitionId"].as_str(), Some("line"));
+            assert!(p.payload["chainDepth"].is_number());
+        }
     }
 }

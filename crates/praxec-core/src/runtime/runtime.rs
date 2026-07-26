@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::bail;
 use chrono::Utc;
 use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use serde::Serialize;
@@ -95,6 +96,17 @@ pub enum ChainOutcome {
     /// backstop, not an executor error, and the caller QUARANTINES the run
     /// (cancels it) so it cannot re-drive and burn the model indefinitely.
     Quarantined {
+        partial: ChainResult,
+        reason: String,
+    },
+    /// Chain stopped because the controlling MCP client ABORTED the in-flight
+    /// call (its rmcp `CancellationToken` fired on cancel/disconnect). Distinct
+    /// from `Quarantined`: a transport abort is NOT a decision to abandon the
+    /// run, so the caller does NOT durably cancel the mission — the run is left
+    /// resumable at its per-hop-committed position. The whole point is to STOP
+    /// the burn between hops the instant the client goes away; the response is
+    /// built for completeness even though the aborting client won't read it.
+    Aborted {
         partial: ChainResult,
         reason: String,
     },
@@ -235,6 +247,21 @@ pub struct WorkflowRuntime {
     /// core: the engine leases exclusive resources; config says which exist.
     pub(crate) exclusive_pools:
         Arc<std::sync::RwLock<std::collections::BTreeMap<String, Vec<std::path::PathBuf>>>>,
+    /// #70 — the in-flight MCP call's abort signal. The serve layer captures the
+    /// rmcp `RequestContext.ct` per `call_tool` (see
+    /// `PraxecServer::set_cancel_token`) and stashes it here; the
+    /// deterministic-chain drive reads it via [`Self::cancel_token`] and checks
+    /// it at the top of every hop, so a cancelled/disconnected client stops the
+    /// token burn between hops instead of running the drive to completion.
+    ///
+    /// A shared slot (not a per-`start`/`submit` argument) for the same reason
+    /// [`crate::runtime::WorkflowRuntime`]'s peer bridge is: the token lives on
+    /// the per-connection request context, not on the request payload, and
+    /// threading it through every `start`/`submit` call site (300+, none using
+    /// `Default`) would be pure mechanical churn. `None` for every non-serve
+    /// caller (CLI, tests) → the loop check is a no-op and behavior is
+    /// bit-identical.
+    pub(crate) cancel_slot: Arc<Mutex<Option<CancellationToken>>>,
 }
 
 impl WorkflowRuntime {
@@ -266,7 +293,29 @@ impl WorkflowRuntime {
             approve_frontier: Vec::new(),
             writable_repo_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             exclusive_pools: Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
+            cancel_slot: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// #70 — stash the in-flight MCP call's abort token (rmcp
+    /// `RequestContext.ct`). Takes `&self` so the long-lived shared runtime and
+    /// every handle cloned from it observe the set (the slot is a shared
+    /// `Arc<Mutex>`). Called by the serve layer on each `call_tool`, right where
+    /// it captures the progress peer. Non-serve callers never set it, so
+    /// [`Self::cancel_token`] stays `None` and the drive's cancellation check is
+    /// inert.
+    pub fn set_cancel_token(&self, token: CancellationToken) {
+        *self.cancel_slot.lock().expect("LOCK_POISONED: cancel_slot") = Some(token);
+    }
+
+    /// The in-flight call's abort token, if the serve layer stashed one. Cheap
+    /// `CancellationToken` clone (an `Arc` internally); the drive reads it once
+    /// per drive and polls `is_cancelled()` at each hop top.
+    pub(crate) fn cancel_token(&self) -> Option<CancellationToken> {
+        self.cancel_slot
+            .lock()
+            .expect("LOCK_POISONED: cancel_slot")
+            .clone()
     }
 
     /// Wire the config-derived exclusive-resource pools (pool name → member
@@ -1413,6 +1462,35 @@ impl WorkflowRuntime {
                     .await;
                 if !partial.steps.is_empty() {
                     response["chain"] = serde_json::to_value(&partial.steps)?;
+                }
+                Ok(response)
+            }
+            ChainOutcome::Aborted { partial, reason } => {
+                // #70 — the client aborted the in-flight `start` call. Stop the
+                // burn WITHOUT durably cancelling: a transport abort is not a
+                // decision to abandon the mission, so the per-hop-committed
+                // instance is left at its current (non-terminal) position and a
+                // later poll/re-drive resumes it. The response is built for
+                // completeness though the aborting client will not read it; the
+                // `aborted` marker records why the drive stopped short.
+                let mut response = self
+                    .response(
+                        &definition,
+                        &partial.instance,
+                        StatusHint::Started,
+                        None,
+                        &request.principal,
+                    )
+                    .await;
+                response["aborted"] = json!({
+                    "code": "CLIENT_ABORTED",
+                    "message": reason,
+                });
+                if !partial.steps.is_empty() {
+                    response["chain"] = serde_json::to_value(&partial.steps)?;
+                }
+                if !partial.evidence.is_empty() {
+                    response["evidence"] = serde_json::to_value(&partial.evidence)?;
                 }
                 Ok(response)
             }
