@@ -8,6 +8,184 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.32] — 2026-07-26 — worktree-proof dogfood substrate + adaptive flywheel
+
+A stabilization + capability release that makes *developing praxec through praxec*
+reliable — a trustworthy CI gate, worktree-churn-proof repo resolution, right-repo
+writes, heartbeating drives — and then extends the governed model-selection flywheel
+to be effort-aware and to fair-trial new models. Developed as two logical phases
+(substrate, then flywheel dogfooded on the locally-built substrate) and shipped as
+one version.
+
+### Added
+
+- **Identity-first, worktree-churn-proof writable repos.** A repo may now be
+  declared by durable identity + a discovery rule instead of a literal path:
+  ```yaml
+  repos:
+    - name: my-target
+      worktrees_of: /stable/anchor
+      writable: true
+  ```
+  At config-load and reload, discovery runs `git worktree list --porcelain` on the
+  anchor and matches each worktree's `praxec.repo.yaml` `name:` against the declared
+  name. Zero matches is a **legal boot state** (`REPO_IDENTITY_UNRESOLVED` diagnostic,
+  no root stamped — a pruned worktree simply drops out instead of hard-failing boot,
+  the headline win); exactly one match becomes a writable root keyed by name; two or
+  more is `REPO_IDENTITY_AMBIGUOUS` (hard error under `check`, skipped-with-warning at
+  serve — **never** auto-picked, since a wrong-repo write is corruption). A run
+  selector (`repoRoot` / `--repo-root`) now resolves a declared repo **name** first
+  (identity survives churn), then the existing exact-root / subpath-under-a-root
+  logic. `path:`/`uri:` entries are unchanged (a dead `path:` still fails loud).
+
+- **`repoRoot` selector on the two-tool `command` surface + `orchestrate` CLI.**
+  `praxec.command` starts could not select among multiple writable repos — the
+  reshape dropped the field, so a multi-writable config was always
+  `REPO_ROOT_AMBIGUOUS`. `command` now carries `repoRoot`, and the `orchestrate` CLI
+  gains `--repo-root`.
+
+- **Connection-arg path interpolation (`${repo:<name>.root}`, `${praxec.state_dir}`).**
+  MCP `connections:` args/env may now reference a named repo's current root or a
+  durable, worktree-independent operator-state dir, resolved at config-resolve time —
+  so a `--storage-state` path (auth credential material) no longer has to be a
+  brittle absolute pin that dies with a worktree. An unknown `${repo:…}` name is a
+  hard config error. Stub `praxec.repo.yaml` files may declare a `scaffold:` list of
+  repo-relative directories the engine creates idempotently when the root resolves
+  (directories only — credential files never auto-create; a missing one stays a
+  fail-fast).
+
+- **Effort-aware de-escalation flywheel.** `praxec cost propose` now keys evidence on
+  `(affinity, model, effort)` — the executor emits the ACTUAL applied per-hop
+  reasoning effort into `agent.completed`, so the flywheel distinguishes e.g.
+  `qwen3-coder@medium` from `@high` instead of lumping them.
+
+- **Fair-trial exploration in the flywheel.** `propose` now also surfaces an untried,
+  catalog-fit, under-cost-cap model (with less than the minimum evidence) for an
+  affinity as a governed recommendation — so a shifting model ecosystem's new
+  entrants actually get sampled, instead of the loop being pure exploit.
+
+### Fixed
+
+- **Client-abort is observed inside the multi-slice drive, with a between-hop
+  heartbeat (#70).** The auto-drive chain walker kept running after the MCP client
+  aborted, and emitted no pulse between agent turns. It now captures the rmcp
+  cancellation token (previously dropped) and, at each hop, stops on cancel with a
+  new typed `ChainOutcome::Aborted` (stops the token burn WITHOUT durably cancelling —
+  the run is left resumable) and emits a `chain.heartbeat` audit event that rides the
+  existing peer bridge to the client, filling the dead-air gaps.
+
+- **Snippet-input default now wins over an injected `null` (#71).** An optional
+  snippet input mapped to a scope path that resolves to `null` (the caller omitted
+  it) no longer defeats the schema `default` — `apply_schema_defaults` treats a
+  present-`null` as absent when a default is declared, so a later `use.inputs`
+  map-path read no longer fails as a spurious unresolved-arg permanent error.
+
+- **Build-loop writes to the deliverable's repo (#69, pack).** `cap.implement.build-loop`
+  is spawned with a `repoRoot` override so a child build-loop re-roots to the
+  deliverable's repo instead of inheriting the parent run's root (wrong-repo
+  corruption in a multi-repo program). Pack change; the engine already bounded the
+  per-spawn override.
+
+### Changed
+
+- **The nightly live-integration suite is green.** The nightly's blanket
+  `cargo test -- --include-ignored` was force-running four pattern-example walks that
+  can never pass in `praxec-core` (it has only a noop executor registry, so
+  specialized-executor outputs resolve to `null` and the typed-slot guard correctly
+  rejects them) — a false failure that auto-filed 17 tracking issues. Those four are
+  now gated behind a default-off `PRAXEC_WALK_WITH_REGISTRY` flag so
+  `--include-ignored` skips them loudly; their real coverage already lives in the
+  dedicated executor/guard tests, so nothing is lost.
+
+## [0.0.31] — 2026-07-26 — model cost & control: commodity-first, adaptive per-model selection
+
+### Added
+
+- **Commodity-first, specialist-per-activity starter `models.yaml` + `px init-models`.**
+  A shipped seed (`px init-models [--out .praxec/models.yaml] [--force]`) that
+  binds each activity to the model catalog's top scorer for that dimension, at
+  the effort it can actually do (WS1‑B): coding→qwen3‑coder, agentic→kimi‑k2.6,
+  reasoning→deepseek‑v4‑pro@high, review/prose→glm‑5.2, with frontier opt-in via
+  the `*-frontier` overrides + `gateway.cost.approve_frontier`. Every lead is
+  under the $5/M cap, so the WS2 gate is inert for them. These are educated-guess
+  PRIORS from the catalog (a data file — updating it re-seeds the guesses); the
+  governed de-escalation flywheel (`praxec cost propose`) then tunes them from
+  real acceptance evidence, so a shifting model ecosystem is absorbed
+  continuously rather than by a one-time benchmark.
+
+- **Frontier-model cost gate — `$5/M` data-driven, human-approved (WS2).** A model
+  is *frontier* when its catalog output $/M is at/over `gateway.cost.frontier_cap_usd_per_m`
+  (default **5.0**, overridable). `doctor`/`check` warn `FRONTIER_LEAD` for any
+  frontier binding not in the `gateway.cost.approve_frontier` allowlist (a
+  frontier binding that IS allowlisted is an `info`). At runtime the agent
+  chain-walk **fails fast** (`FRONTIER_NOT_APPROVED`) before running any over-cap
+  model that isn't allowlisted — so auto-drive can never unilaterally spend on a
+  premium model no human approved (the uncontrolled-$120-burn class). The gate is
+  **on by default** at $5/M even without a `gateway.cost` block (commodity + mock
+  models are all under the cap, so it's inert for them); a human opts a specific
+  model in via the allowlist, or raises the cap. Preflight and runtime share one
+  `is_frontier` predicate, so they never disagree.
+
+- **Per-model reasoning effort in `models.yaml`, threaded end-to-end, fail-fast
+  (WS1‑B).** A binding may now declare `effort: <low|medium|high|…>` — the
+  reasoning level PAIRED with that specific model. Reasoning levels are not
+  portable across models (a level one advertises another may not, and "high"
+  means different things to different models), so effort lives with the model and
+  each chain hop resolves its effort INDEPENDENTLY — never carried from a sibling
+  model. Per hop the applied effort is `binding.effort ?? state.reasoning_effort
+  ?? global default`, and if the resolved model does not advertise that level the
+  run **fails fast** (`REASONING_EFFORT_UNSUPPORTED`, permanent — it stops the
+  chain-walk rather than silently downgrading or escalating; a config error is
+  not a transient). The resolver now returns per-hop `ResolvedHop { model, effort
+  }` instead of bare model strings. The reasoning-config validator (WS1‑A) gains
+  per-binding coverage: it validates each binding's effective effort
+  (`binding.effort ?? global`) against the model, via the single shared
+  `effort_supported` predicate the runtime fail-fast also uses (so preflight and
+  runtime never disagree). A typo'd `effort:` is rejected at parse
+  (`INVALID_EFFORT`). The validator also checks each workflow state's
+  per-phase `reasoning_effort` against the models its affinity resolves to
+  (`STATE_REASONING_EFFORT_UNSUPPORTED`, G3) — skipping pool members that pair
+  their own effort (which wins).
+
+- **`doctor`/`check` now validate reasoning-effort configuration (WS1‑A).** A new
+  preflight check walks every model binding in `gateway.models_yaml` (`default` +
+  `activity` + `overrides`) and, for the effort it will actually run at (today
+  the global `tuning.default_effort`), verifies the reasoning param will form and
+  be honored. It closes a silent gap: the auto-drive path mapped effort to a
+  vendor param with no check that (a) the vendor is one praxec maps a param for —
+  only anthropic/openai/openrouter/gemini are, so Fireworks / the
+  OpenAI-compatible fleet / custom endpoints silently drop the effort
+  (`REASONING_VENDOR_UNMAPPED`) — or (b) the model's catalog `reasoning_levels`
+  advertises the requested level (`REASONING_LEVEL_UNSUPPORTED`, e.g. asking a
+  `[none, high]` model for `low`). Also flags a reasoning param sent to a
+  non-reasoning model (`REASONING_ON_NONREASONING_MODEL`) and a model absent from
+  the catalog (`REASONING_MODEL_UNKNOWN`). All findings are advisory (warn/info)
+  and never fail preflight. Findings de-duplicate per `(code, model)`. (Per-step
+  overrides and per-activity effort are a follow-up, WS1‑B.)
+
+### Changed
+
+- **Streaming liveness moved to the transport layer; the token dead-air watchdog
+  is retired (WS5).** The agent runner previously killed a turn whose stream
+  produced no *token* for `stall_seconds` (120 s). That watchdog was blind to
+  SSE keep-alive comments (OpenRouter emits `: OPENROUTER PROCESSING` while a
+  model reasons), so a model that was merely thinking looked identical to a hung
+  one — the root of the "reasoning models stall" reports. Liveness is now the
+  provider client's job, using rig's own facilities rather than a hand-rolled
+  timer: each rig client is built with a configured `reqwest` transport
+  (`read_timeout` 60 s, `tcp_keepalive` 30 s, `connect_timeout` 20 s) injected
+  via `ClientBuilder::http_client`. A genuinely dead socket surfaces as a
+  mid-stream transport error while keep-alive bytes keep a reasoning connection
+  alive. That transport error is now raised as a **retriable `Connection`
+  error** (previously it was folded into the transcript and silently yielded a
+  hollow `NoResult` that killed the whole model chain): the runner re-issues the
+  same turn on a fresh connection up to `MAX_RETRY_ATTEMPTS` (2), so an
+  intermittent provider blip becomes a bounded retry instead of a dead step, and
+  only a *persistent* failure escalates to the next model in the chain. Stream
+  ESTABLISHMENT is still bounded by `stall_timeout`; the whole-step budget
+  (`max_seconds`) remains the outer wall on a stream that stays alive but never
+  terminates. Upgrades `rig-core` 0.38 → 0.40.
+
 ## [0.0.30] — 2026-07-23 — Agent-walk exhaustion terminalizes the mission; four kernel potholes
 
 > Note on finding numbers: the agent-walk item below is the release-ledger's

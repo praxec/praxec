@@ -205,11 +205,18 @@ async fn submit_emits_audit_events_in_record_first_order() {
         "executor.succeeded",
         "workflow.transition",
         "workflow.transitioned",
+        // #70 — the loop-level liveness pulse emitted at the top of every
+        // deterministic-chain hop (fills the dead-air gaps between agent turns).
+        // Emit-only observability: it rides BETWEEN the §7.3 record-first state
+        // events, never reordering them — the record-first invariant this test
+        // guards is over the state-change events, which stay in the same order.
+        "chain.heartbeat",
         "chain.step",
         "executor.started",
         "executor.succeeded",
         "workflow.transition",
         "workflow.transitioned",
+        "chain.heartbeat",
         "chain.completed",
         "workflow.completed",
         "outcome.recorded",

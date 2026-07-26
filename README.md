@@ -37,41 +37,57 @@ this README covers what it is, how to install it, and how to use it.
 
 ## Install
 
-`cargo install` (from crates.io):
+**Quick install** — prebuilt binary for Linux / macOS:
 
 ```bash
-cargo install praxec
+curl -fsSL https://raw.githubusercontent.com/praxec/praxec/main/install.sh | sh
 ```
 
-Pre-built bundle — verify the `praxec` binary against the release's `checksums.sha256`:
+Downloads the `praxec` binary for your platform from the latest release, verifies
+its checksum, and installs it to `~/.local/bin`. Pin a version or directory with
+`PRAXEC_VERSION=v0.0.30` / `PRAXEC_BIN_DIR=...`.
+
+Or grab a prebuilt bundle manually — verify the `praxec` binary against the release's `checksums.sha256`:
 
 | Platform | Download |
 |----------|----------|
-| Linux x86_64 | [`.tar.gz`](https://github.com/praxec/praxec/releases/latest/download/praxec-x86_64-unknown-linux-gnu.tar.gz) |
-| Linux ARM64 | [`.tar.gz`](https://github.com/praxec/praxec/releases/latest/download/praxec-aarch64-unknown-linux-gnu.tar.gz) |
+| Linux x86_64 | [`.tar.gz`](https://github.com/praxec/praxec/releases/latest/download/praxec-x86_64-unknown-linux-musl.tar.gz) |
+| Linux ARM64 | [`.tar.gz`](https://github.com/praxec/praxec/releases/latest/download/praxec-aarch64-unknown-linux-musl.tar.gz) |
 | macOS x86_64 | [`.tar.gz`](https://github.com/praxec/praxec/releases/latest/download/praxec-x86_64-apple-darwin.tar.gz) |
 | macOS Apple Silicon | [`.tar.gz`](https://github.com/praxec/praxec/releases/latest/download/praxec-aarch64-apple-darwin.tar.gz) |
 | Windows x86_64 | [`.zip`](https://github.com/praxec/praxec/releases/latest/download/praxec-x86_64-pc-windows-msvc.zip) |
 
 All releases + checksums: [github.com/praxec/praxec/releases](https://github.com/praxec/praxec/releases/latest).
 
-Docker:
+`cargo install` (coming soon — not yet published to crates.io):
 
 ```bash
-docker run -v $(pwd)/gateway.yaml:/config/gateway.yaml ghcr.io/praxec/praxec
+# cargo install praxec
+```
+
+Docker (coming soon):
+
+```bash
+# docker run -v $(pwd)/gateway.yaml:/config/gateway.yaml ghcr.io/praxec/praxec
 ```
 
 Full matrix (binary verification, Docker, editor wiring): [Installation](https://praxec.dev/installation/).
 
 The `praxec` binary above is the gateway — the MCP server you wire into an agent
 host. The optional interactive control-plane TUI ships separately as the `px`
-binary (`cargo install praxec-tui`); you don't need it to run the gateway.
+binary (`cargo install praxec-tui`, coming soon); you don't need it to run the gateway.
 
 ## Quick start
 
 ```bash
 cat > hello.yaml <<'EOF'
 version: "1.0.0"
+gateway:
+  # Dev/testing: run with in-memory state + stderr audit. praxec refuses
+  # to start with ephemeral storage unless you opt in here. For production,
+  # drop this and set store.kind: sqlite + audit.sink: file for durable,
+  # queryable governance state.
+  allow_ephemeral: true
 proxy:
   expose:
     - name: hello.echo

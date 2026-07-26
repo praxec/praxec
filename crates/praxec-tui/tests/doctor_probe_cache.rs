@@ -143,6 +143,7 @@ async fn local_providers_are_skipped() {
             provider: p.clone(),
             model: "any".into(),
             features: ProviderFeatures::None,
+            effort: None,
         };
         let (status, _detail) = probe_binding(&client, &b).await;
         assert_eq!(status, ProbeStatus::Skipped, "{:?} should skip", p);
@@ -158,6 +159,7 @@ async fn custom_provider_is_skipped() {
         },
         model: "any".into(),
         features: ProviderFeatures::None,
+        effort: None,
     };
     let (status, _) = probe_binding(&client, &b).await;
     assert_eq!(status, ProbeStatus::Skipped);
@@ -175,6 +177,7 @@ async fn cloud_provider_without_credential_reports_no_credential() {
         provider: Provider::Known(ProviderId::Anthropic),
         model: "claude-sonnet-4-6".into(),
         features: ProviderFeatures::None,
+        effort: None,
     };
     let (status, detail) = probe_binding(&client, &b).await;
     assert_eq!(status, ProbeStatus::NoCredential);
@@ -195,6 +198,7 @@ async fn openrouter_is_probed_not_skipped() {
         provider: Provider::Known(ProviderId::Openrouter),
         model: "openai/gpt-4o".into(),
         features: ProviderFeatures::None,
+        effort: None,
     };
     let (status, detail) = probe_binding(&client, &b).await;
     assert_ne!(

@@ -349,6 +349,14 @@ pub struct ExecutorTelemetry {
     pub completion_tokens: u64,
     /// Computed USD cost, or `None` when the model isn't catalogued.
     pub cost_usd: Option<f64>,
+    /// WS1-B (#12) — the reasoning effort ACTUALLY APPLIED to this hop, resolved
+    /// independently by the chain-walk (the model's paired effort, else the
+    /// phase, else the global default). Carried up so the runtime can stamp it on
+    /// `agent.completed` PAIRED WITH the walked `model` — the de-escalation
+    /// flywheel keys on `(affinity, model, effort)`, and an escalated hop's
+    /// applied effort belongs to the model that actually ran, not the composer's
+    /// intent. `None` when no effort was applied (provider default).
+    pub effort: Option<String>,
 }
 
 /// Why an executor suspended its step instead of advancing — the typed,

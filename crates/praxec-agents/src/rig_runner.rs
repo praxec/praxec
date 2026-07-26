@@ -1280,12 +1280,20 @@ impl AgentSessionRunner for RigSessionRunner {
 /// `final_answer` envelope if present.
 ///
 /// `heartbeat`/`turn_index`: the run's liveness pulse. While the stream is
-/// silent, the stall watchdog's wait is chunked into [`HEARTBEAT_INTERVAL`]
-/// ticks; each expired tick that is still inside the stall window emits one
-/// within-turn `agent.heartbeat` (`phase: "waiting_on_model"`), so a single
-/// slow reasoning call shows a pulse instead of dead air. The stall semantics
-/// are unchanged: total silence ≥ `stall_timeout` still raises the same
-/// `ExecutorError::Timeout`.
+/// silent, the wait for the next event is chunked into [`HEARTBEAT_INTERVAL`]
+/// ticks; each expired tick emits one within-turn `agent.heartbeat`
+/// (`phase: "waiting_on_model"`), so a single slow reasoning call shows a pulse
+/// instead of dead air.
+///
+/// WS5 — inter-token silence is NOT killed here. Liveness is the transport's
+/// job: the provider client is built with a `read_timeout` (see
+/// `configured_http_client` in the provider factory) that errors a genuinely
+/// dead socket while SSE keep-alive bytes keep a merely-reasoning connection
+/// alive. Such a transport failure surfaces as a mid-stream `Err`, which this
+/// fn raises as a retriable `ExecutorError::Connection` (the run loop re-issues
+/// on a fresh connection, then chain-walks). `stall_timeout` now bounds only
+/// stream ESTABLISHMENT below; the whole-step budget (`session.timeout`) is the
+/// outer wall on a stream that stays alive but never terminates.
 async fn drain_turn(
     factory: &dyn ProviderFactory,
     model: &str,
@@ -1294,14 +1302,15 @@ async fn drain_turn(
     heartbeat: Option<&HeartbeatEmitter>,
     turn_index: u32,
 ) -> Result<TurnResult, ExecutorError> {
-    // Bound stream ESTABLISHMENT with the same stall window as inter-event
-    // silence. The no-progress watchdog below only starts its clock once the
-    // stream object exists — so a provider that accepts the request but never
-    // returns the first frame (connect-but-no-token, the hang-prone-lead
-    // failure shape) would otherwise be caught only by the whole-session wall
-    // (`max_seconds`, ~600s) and burn it once per model in the chain-walk.
-    // Timeout here surfaces as `ExecutorError::Timeout` (stall-class), so a
-    // first-frame hang escalates to the next model in ~`stall_timeout`.
+    // Bound stream ESTABLISHMENT: a factory that hangs building the stream
+    // object (a provider that connects eagerly and never returns, a wedged
+    // mock) is caught here in `stall_timeout` rather than only by the
+    // whole-session wall. Timeout here surfaces as `ExecutorError::Timeout`
+    // (excluded from same-model retry — a setup hang chain-walks to the next
+    // model, it doesn't re-probe the wedged one). NOTE: the real rig factory is
+    // lazy — the HTTP request fires on first `.next()` below, where a
+    // connect/first-frame hang is bounded by the transport `connect_timeout` /
+    // `read_timeout` and surfaces as a retriable `Connection` error, not here.
     let mut stream = match tokio::time::timeout(stall_timeout, factory.stream(model, turn)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => return Err(permanent(AgentErrorCode::ProviderError, e)),
@@ -1312,44 +1321,39 @@ async fn drain_turn(
     let mut final_answer = None;
     let mut usage = TurnUsage::default();
     let mut local_transcript = String::new();
-    // No-progress (stall) watchdog: bound the silence between stream events, not
-    // just the whole-run wall. ANY event (thinking/text/tool-call/usage) resets
-    // the window — so a streaming-but-slow model runs unbounded while a model
-    // that hangs at first token is caught in `stall_timeout` and surfaces as a
-    // Timeout the chain-walk escalates (rather than burning the full session
-    // budget on dead air). `None` from the inner wait = the stream went silent
-    // past the whole window. tokio's `Instant` (not std's) so paused-clock
-    // tests advance it with the timers.
+    // Tracks the time of the last stream event, purely to display "silent for
+    // Ns" in the heartbeat pulse below — it is NOT a kill timer (WS5: liveness
+    // is the transport's read_timeout, not a token-level watchdog). tokio's
+    // `Instant` (not std's) so paused-clock tests advance it with the timers.
     let mut last_event = tokio::time::Instant::now();
     'drain: loop {
-        // Wait for the next stream event in HEARTBEAT_INTERVAL-bounded ticks
-        // (never past the remaining stall window). An expired tick is NOT a
-        // stall yet — it pulses the heartbeat and keeps waiting; only total
-        // silence ≥ `stall_timeout` escalates.
+        // Wait for the next stream event in HEARTBEAT_INTERVAL-bounded ticks.
+        // An expired tick just pulses the heartbeat and keeps waiting; the
+        // stream itself is kept honest by the transport read_timeout (a dead
+        // socket surfaces below as an `Err`) and the whole-step budget.
         let item = 'wait: loop {
-            let silent = last_event.elapsed();
-            let remaining = stall_timeout.saturating_sub(silent);
-            if remaining.is_zero() {
-                local_transcript.push_str(&format!(
-                    "\n[stalled] no stream event for {}s — escalating\n",
-                    stall_timeout.as_secs()
-                ));
-                // ms, not `.as_secs()` — the field is milliseconds (Display "… ms").
-                return Err(ExecutorError::Timeout(stall_timeout.as_millis() as u64));
-            }
-            match tokio::time::timeout(remaining.min(HEARTBEAT_INTERVAL), stream.next()).await {
+            match tokio::time::timeout(HEARTBEAT_INTERVAL, stream.next()).await {
                 Ok(Some(item)) => break 'wait item,
                 Ok(None) => break 'drain, // stream ended normally
                 Err(_) => {
-                    // Tick expired, still inside the stall window: pulse (the
-                    // 0-CPU "waiting on a slow model" case an observer could
-                    // not previously distinguish from a hang), then re-check.
-                    let silent = last_event.elapsed();
-                    if silent < stall_timeout {
-                        if let Some(hb) = heartbeat {
-                            hb.emit(turn_index, "waiting_on_model", silent.as_secs())
-                                .await;
-                        }
+                    // WS5 — token-level quiet is NOT a stall, so we do NOT kill
+                    // here. LIVENESS is the transport's job: the provider client's
+                    // `read_timeout` errors a genuinely dead socket (surfacing
+                    // below as a stream `Err` we escalate), while SSE keep-alive
+                    // bytes keep a *reasoning* connection alive — which the drain,
+                    // seeing only token events, cannot distinguish from a hang.
+                    // The old token dead-air watchdog was blind to keep-alives and
+                    // killed a model that was merely reasoning (the "reasoning
+                    // models stall" defect). Pulse the heartbeat for observability
+                    // and keep waiting; the whole-step budget (`session.timeout`)
+                    // is the outer wall.
+                    if let Some(hb) = heartbeat {
+                        hb.emit(
+                            turn_index,
+                            "waiting_on_model",
+                            last_event.elapsed().as_secs(),
+                        )
+                        .await;
                     }
                     continue 'wait;
                 }
@@ -1431,9 +1435,22 @@ async fn drain_turn(
                 return Err(permanent(AgentErrorCode::ProviderError, message));
             }
             Ok(_) => {}
-            // A per-item transport error (defensible to fold): note it and keep
-            // draining — distinct from a provider-emitted Error event above.
-            Err(e) => local_transcript.push_str(&format!("\n[stream-error] {e}\n")),
+            // WS5 — a mid-stream `Err` is a TRANSPORT failure: the configured
+            // client's `read_timeout` firing on a genuinely dead socket, or a
+            // connection reset. The stream is finished either way, so folding it
+            // and draining on (the old behavior) only yielded a hollow NoResult
+            // that killed the whole model chain on a recoverable blip. Surface it
+            // as a retriable `Connection` error instead — the run loop re-issues
+            // the same turn on a FRESH connection (bounded by MAX_RETRY_ATTEMPTS),
+            // and only escalates to the next model if the silence persists. This
+            // is the "intermittent provider silence → bounded retry, not a dead
+            // step" fix; distinct from a provider-emitted Error event above
+            // (rate-limit/503/auth), which stays a permanent ProviderError.
+            Err(e) => {
+                return Err(ExecutorError::Connection(format!(
+                    "stream transport error: {e}"
+                )));
+            }
         }
     }
     Ok(TurnResult {

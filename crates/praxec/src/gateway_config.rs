@@ -173,6 +173,12 @@ pub(crate) enum Command {
         /// How to answer HITL gates with no human present: `auto-approve` | `decline`.
         #[arg(long, default_value = "auto-approve")]
         policy: String,
+        /// Select which declared writable repo is this run's `repo_root` when the
+        /// config declares more than one. Accepts a declared root, a
+        /// worktree/subpath under one, or a declared repo `name:`. Omit with a
+        /// single writable repo (it is used automatically).
+        #[arg(long)]
+        repo_root: Option<String>,
     },
     /// Make one governed *command* contract call (start / submit / define /
     /// cancel) against the config's store and print the JSON response. State

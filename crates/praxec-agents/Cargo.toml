@@ -19,7 +19,7 @@ praxec-core = { workspace = true }
 # ADR-0007 — the in-process rig runner reuses the llm-executor's ProviderFactory
 # (rig under the hood, one provider wiring) + rig's ToolDefinition.
 praxec-llm-executor = { workspace = true }
-rig = { package = "rig-core", version = "0.38" }
+rig = { package = "rig-core", version = "0.40" }
 # C5 — the external-tool bridge maps rmcp's wire `Tool` into rig's `ToolDefinition`
 # (protocol model types only; transports stay in the binary).
 rmcp = { workspace = true }

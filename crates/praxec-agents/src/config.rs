@@ -77,6 +77,21 @@ pub struct AgentExecutorConfig {
     /// Reasoning-effort hint passed through to the Aether session.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// WS2 cost gate — the frontier cost cap ($/M output). When set, the
+    /// chain-walk FAILS FAST before running any model whose catalog output $/M is
+    /// at/over this cap unless that model is in [`Self::approve_frontier`], so
+    /// auto-drive can never unilaterally spend on a premium model no human
+    /// approved. `None` = no cost gate (injected by the auto-drive composer from
+    /// `gateway.cost.frontier_cap_usd_per_m`; a directly-authored step opts out
+    /// by omission).
+    #[serde(default)]
+    pub frontier_cap_usd_per_m: Option<f64>,
+    /// WS2 — the human-approved frontier model allowlist (runnable
+    /// `"vendor:model-id"` strings). A model here is exempt from the cost gate —
+    /// the human deliberately opted THIS model in. From
+    /// `gateway.cost.approve_frontier`.
+    #[serde(default)]
+    pub approve_frontier: Vec<String>,
     /// Top-level keys the agent's `output` object must contain. Used by the
     /// runner to validate a salvaged text answer and to phrase in-session
     /// conformance feedback. Defaulted empty for directly-authored steps; the

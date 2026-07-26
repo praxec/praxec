@@ -336,6 +336,7 @@ mod u2_auth_probe_tests {
             provider: p,
             model: "test-model".into(),
             features: Default::default(),
+            effort: None,
         }
     }
 
@@ -383,6 +384,7 @@ mod u2_auth_probe_tests {
             },
             model: "any".into(),
             features: Default::default(),
+            effort: None,
         };
         let outcome = probe_binding(&client, &b).await;
         assert!(

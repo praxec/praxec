@@ -529,29 +529,39 @@ async fn health_check_succeeds_against_a_healthy_backend() {
 /// Fail-fast, not a silent lexical downgrade: the embedder reports; the caller decides.
 #[tokio::test]
 async fn health_check_fails_fast_against_a_dead_port() {
-    let addr = dead_port().await;
-    let emb = embedder_at(addr, 3, fast_policy());
+    // `dead_port()` binds :0 and drops the listener, so the port is free — but
+    // under parallel test load another listener can re-bind that exact ephemeral
+    // port in the window before we probe, making the "dead" port answer (Ok) and
+    // spuriously failing the test. Retry acquisition until the probe genuinely
+    // refuses, so we assert the connection-refused path deterministically instead
+    // of racing the OS ephemeral-port allocator.
+    for attempt in 0..16 {
+        let addr = dead_port().await;
+        let emb = embedder_at(addr, 3, fast_policy());
 
-    let started = Instant::now();
-    let err = emb
-        .health_check()
-        .await
-        .expect_err("a dead port is not healthy");
-    let elapsed = started.elapsed();
+        let started = Instant::now();
+        let result = emb.health_check().await;
+        let elapsed = started.elapsed();
 
-    match &err {
-        EmbeddingError::HealthCheckFailed(msg) => {
-            assert!(
-                msg.contains(&addr.to_string()),
-                "the error must name the endpoint it probed: {msg}"
-            );
+        match result {
+            // Rare reuse race: the freed port got re-bound and answered. Try a
+            // fresh dead port rather than assert on a live one.
+            Ok(()) => continue,
+            Err(EmbeddingError::HealthCheckFailed(msg)) => {
+                assert!(
+                    msg.contains(&addr.to_string()),
+                    "the error must name the endpoint it probed: {msg}"
+                );
+                assert!(
+                    elapsed < Duration::from_secs(3),
+                    "the probe must fail fast; took {elapsed:?}"
+                );
+                return;
+            }
+            Err(other) => panic!("expected HealthCheckFailed, got {other:?} (attempt {attempt})"),
         }
-        other => panic!("expected HealthCheckFailed, got {other:?}"),
     }
-    assert!(
-        elapsed < Duration::from_secs(3),
-        "the probe must fail fast; took {elapsed:?}"
-    );
+    panic!("could not obtain a refusing dead port after 16 attempts (ephemeral-port reuse)");
 }
 
 /// The probe is a real embed, so it also proves the *dimension contract* — the

@@ -2954,6 +2954,14 @@ fn load_resolved_with_repos_mode(
         .unwrap_or_else(|| PathBuf::from("."));
     let mut repo_diagnostics: Vec<Diagnostic> = Vec::new();
     let merged = merge_declared_repos(host, &parent_dir, mode, &mut repo_diagnostics)?;
+    // WS-B B2 — interpolate `${repo:<name>.root}` / `${praxec.state_dir}` path
+    // tokens into every connection's `args`/`env` HERE, AFTER repos loaded (so
+    // the name→root index `_writableRepos` stamps exists) and BEFORE resolve (so
+    // `praxec check`'s connection/tooling validation sees the resolved values).
+    // Config-resolve time is the ONLY correct site: connection children are
+    // process-cached across runs, so a run-scoped token in an arg would be
+    // structurally wrong. An unknown repo name is a HARD error in BOTH modes.
+    let merged = interpolate_connection_paths(merged)?;
     let (resolved, diagnostics) = resolve_with_diagnostics(merged)?;
     repo_diagnostics.extend(diagnostics);
     Ok((resolved, repo_diagnostics))
@@ -2995,10 +3003,11 @@ fn merge_declared_repos(
     // has `skipped < declared` yet still loads zero definitions.
     let mut loaded_definition_repos: usize = 0;
     let mut seen_namespaces: HashMap<String, String> = HashMap::new();
-    // SPEC §8.4 — (absolute root, push) of repos opted in as authoring write
-    // targets, carried forward to the gateway via the resolved config (see
-    // `stamp_writable_repos`).
-    let mut writable_repo_roots: Vec<(String, bool)> = Vec::new();
+    // SPEC §8.4 + WS-B B3 — (absolute root, push, optional identity name) of
+    // repos opted in as authoring write targets, carried forward to the gateway
+    // via the resolved config (see `stamp_writable_repos`). The `name` is the
+    // key the runtime's name→root selector index is built from.
+    let mut writable_repo_roots: Vec<(String, bool, Option<String>)> = Vec::new();
     // Spec A §5 — namespace → priority, carried into the merged config for
     // `hop_slot:` cap-resolution tie-breaking (see `stamp_repo_priority`).
     let mut repo_priorities: Vec<(String, i64)> = Vec::new();
@@ -3009,6 +3018,7 @@ fn merge_declared_repos(
 
     for RepoDecl {
         source,
+        name,
         writable,
         push,
         definitions,
@@ -3021,7 +3031,115 @@ fn merge_declared_repos(
         let entry_desc = match &source {
             RepoSource::Local(p) => p.display().to_string(),
             RepoSource::Remote { uri, .. } => uri.clone(),
+            RepoSource::WorktreesOf { anchor, name } => {
+                format!("worktrees_of:{} name:{name}", anchor.display())
+            }
         };
+        // WS-B B3 — identity-first, worktree-churn-proof resolution. A
+        // `worktrees_of:` entry declares a durable IDENTITY (`name`) + a stable
+        // `anchor` to enumerate worktrees of; the live writable root is the
+        // worktree carrying a matching `praxec.repo.yaml` stub. It contributes
+        // NO definitions (it is purely a writable run target, like the FB-2
+        // bare-writable path), so it is fully handled here and `continue`s
+        // before the manifest/registry load below.
+        if let RepoSource::WorktreesOf {
+            anchor,
+            name: repo_name,
+        } = &source
+        {
+            // Same base-dir convention as `Local`: a relative anchor resolves
+            // against the host config dir; an absolute one is used as-is.
+            let anchor = if anchor.is_absolute() {
+                anchor.clone()
+            } else {
+                host_dir.join(anchor)
+            };
+            match resolve_worktrees_of(&anchor, repo_name) {
+                WorktreeResolution::Resolved(path) => {
+                    // WS-B B4 — the resolved worktree is a writable root: scaffold
+                    // any `scaffold:` dirs its stub declares. Read the stub with the
+                    // minimal projection (we hold only the resolved root here, not a
+                    // loaded manifest — same reason `read_manifest_name` matched it).
+                    // An escaping entry is a HARD error in BOTH modes (config bug).
+                    let scaffold = crate::repo::read_manifest_scaffold(&path);
+                    crate::repo::create_scaffold_dirs(&path, &scaffold)?;
+                    writable_repo_roots.push((
+                        path.display().to_string(),
+                        push,
+                        Some(repo_name.clone()),
+                    ));
+                }
+                // 0 matches → declared-unresolved: a LEGAL boot state. Stamp NO
+                // writable root; boot SUCCEEDS. Recorded as a visible diagnostic
+                // (and a loud warn) so it is never silently inert — the operator
+                // (and `check`) can see the identity resolved to nothing.
+                WorktreeResolution::Unresolved { reason } => {
+                    tracing::warn!(
+                        entry = %entry_desc,
+                        reason = %reason,
+                        "REPO_IDENTITY_UNRESOLVED: `worktrees_of:` entry resolved to no live \
+                         worktree; no writable root stamped for it this run (boot continues)"
+                    );
+                    diagnostics.push(Diagnostic {
+                        severity: DiagnosticSeverity::Warn,
+                        code: "REPO_IDENTITY_UNRESOLVED".into(),
+                        message: format!(
+                            "repos entry '{entry_desc}' resolved to no live worktree: {reason}"
+                        ),
+                        location: None,
+                        suggestion: Some(
+                            "add or check out a worktree of the anchor carrying a \
+                             `praxec.repo.yaml` with this `name`, then reload."
+                                .into(),
+                        ),
+                    });
+                }
+                // 2+ matches → REPO_IDENTITY_AMBIGUOUS. NEVER auto-pick: a
+                // wrong-repo write is corruption (#69). Hard error in Strict
+                // (check/authoring); skip-with-loud-warn in Resilient (serve).
+                WorktreeResolution::Ambiguous { candidates } => {
+                    let listed = candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    match mode {
+                        RepoLoadMode::Strict => bail!(
+                            "REPO_IDENTITY_AMBIGUOUS: `worktrees_of:` entry '{entry_desc}' \
+                             matches {} worktrees carrying name '{repo_name}': {listed}. \
+                             A durable identity must resolve to exactly one worktree — remove or \
+                             rename the duplicate stub(s).",
+                            candidates.len()
+                        ),
+                        RepoLoadMode::Resilient => {
+                            tracing::warn!(
+                                entry = %entry_desc,
+                                candidates = %listed,
+                                "REPO_IDENTITY_AMBIGUOUS: `worktrees_of:` entry matches multiple \
+                                 worktrees; skipped (never auto-picked — a wrong-repo write is \
+                                 corruption, #69)"
+                            );
+                            diagnostics.push(Diagnostic {
+                                severity: DiagnosticSeverity::Warn,
+                                code: "REPO_IDENTITY_AMBIGUOUS".into(),
+                                message: format!(
+                                    "repos entry '{entry_desc}' matches {} worktrees carrying \
+                                     name '{repo_name}': {listed}. Skipped — never auto-picked.",
+                                    candidates.len()
+                                ),
+                                location: None,
+                                suggestion: Some(
+                                    "remove or rename the duplicate `praxec.repo.yaml` stub so \
+                                     the identity resolves to exactly one worktree."
+                                        .into(),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         // Resolve to a local path and load: a local dir relative to the host
         // config (same base-dir convention as `include:`), or a remote repo
         // imported (cloned/updated) into a cache under
@@ -3048,6 +3166,12 @@ fn merge_declared_repos(
                         .join(crate::repo_git::cache_dir_name(&uri));
                     crate::repo_git::clone_or_update(&uri, &gitref, &dest)
                         .with_context(|| format!("importing repo {uri}"))?
+                }
+                // WS-B B3 — a `worktrees_of:` source is fully resolved and
+                // `continue`d above; it never reaches this load path. Exhaustive
+                // arm keeps the match total (poka-yoke) — reaching it is a bug.
+                RepoSource::WorktreesOf { .. } => {
+                    unreachable!("WorktreesOf is resolved before the manifest load")
                 }
             };
             // FB-2 — a bare writable run target (`definitions: false`) ships no
@@ -3102,11 +3226,15 @@ fn merge_declared_repos(
         let Some((manifest, mut repo_value)) = manifest_and_registry else {
             // FB-2 bare writable run target: `parse_repo_entry` already
             // guaranteed `writable` here.
-            writable_repo_roots.push((repo_path.display().to_string(), push));
+            writable_repo_roots.push((repo_path.display().to_string(), push, name.clone()));
             continue;
         };
         if writable {
-            writable_repo_roots.push((repo_path.display().to_string(), push));
+            // WS-B B4 — a writable definition repo scaffolds any `scaffold:` dirs
+            // its manifest declares. An escaping entry is a HARD error in BOTH
+            // modes (a config bug, not a transient — never mode-skipped).
+            crate::repo::create_scaffold_dirs(&repo_path, &manifest.scaffold)?;
+            writable_repo_roots.push((repo_path.display().to_string(), push, name.clone()));
         }
         // V20 — namespace uniqueness across declared repos.
         if let Some(prev_name) =
@@ -3512,12 +3640,14 @@ fn stamp_repo_priority(config: &mut Value, priorities: Vec<(String, i64)>) {
     }
 }
 
-/// SPEC §8.4 — record repos declared `writable: true` under
-/// `/praxec/_writableRepos` as `{ root, push }` objects (internal
+/// SPEC §8.4 + WS-B B3 — record repos declared `writable: true` under
+/// `/praxec/_writableRepos` as `{ root, push, name? }` objects (internal
 /// resolved-config metadata, not an operator-authored key). The gateway reads
 /// this to build the repo-backed writable definition store for the authoring
-/// write path. No-op when empty.
-fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool)>) {
+/// write path AND the runtime's name→root selector index (from `name`, when
+/// present). The `name` key is OPTIONAL — the old `{ root, push }` shape still
+/// parses. No-op when empty.
+fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool, Option<String>)>) {
     if roots.is_empty() {
         return;
     }
@@ -3530,10 +3660,168 @@ fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool)>) {
     if let Some(fg) = praxec.as_object_mut() {
         let entries: Vec<Value> = roots
             .into_iter()
-            .map(|(root, push)| json!({ "root": root, "push": push }))
+            .map(|(root, push, name)| match name {
+                Some(n) => json!({ "root": root, "push": push, "name": n }),
+                None => json!({ "root": root, "push": push }),
+            })
             .collect();
         fg.insert("_writableRepos".into(), Value::Array(entries));
     }
+}
+
+/// WS-B B2 — the durable, worktree-INDEPENDENT operator-state directory that
+/// `${praxec.state_dir}` resolves to: `$XDG_STATE_HOME/praxec` when
+/// `XDG_STATE_HOME` is set (and non-empty), else `$HOME/.local/state/praxec`.
+/// This is the correct home for auth material (e.g. a `--storage-state` file):
+/// credential state must OUTLIVE the worktree it was captured in, so it can
+/// never live under a prunable `.praxec/…` worktree path. Always resolves
+/// (purely env-derived), so this token can never be the source of a config
+/// error — only `${repo:<name>.root}` can (an unknown name).
+fn praxec_state_dir() -> String {
+    state_dir_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+}
+
+/// Pure core of [`praxec_state_dir`] — the env lookups are injected so the
+/// resolution rule is unit-testable without mutating process env.
+fn state_dir_from(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> String {
+    let base = xdg_state_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(home.unwrap_or_default()).join(".local/state"));
+    base.join("praxec").display().to_string()
+}
+
+/// WS-B B2 — interpolate the two path tokens into every `connections.*.args`
+/// entry and `connections.*.env` value of the merged config. Runs at
+/// config-resolve time (see the call site in `load_resolved_with_repos_mode`):
+///   - `${repo:<name>.root}` → the current root of the declared writable repo
+///     named `<name>` (from the `_writableRepos` name→root data B3 stamped);
+///   - `${praxec.state_dir}` → [`praxec_state_dir`].
+///
+/// This removes the dead-absolute-pin footgun: an operator no longer hardcodes
+/// `/abs/worktree/.praxec/…` (which dies when the worktree is pruned) — they
+/// write `${repo:qa.root}/…` or `${praxec.state_dir}/…` and it re-resolves each
+/// load.
+///
+/// An unknown `${repo:<name>.root}` is a HARD config error (fail-fast) naming
+/// the token, the unknown repo, and the declared names — in BOTH strict and
+/// resilient load, because a typo'd token is a config bug, not a transient. A
+/// malformed `${repo:…}` (not `<name>.root`) or an unknown `${praxec.…}` is
+/// likewise a hard error. Any OTHER `${…}` is left verbatim — praxec claims only
+/// its own two token namespaces and never rewrites a foreign one.
+fn interpolate_connection_paths(mut config: Value) -> anyhow::Result<Value> {
+    // Name→root index over the writable repos B3 stamped. `BTreeMap` so the
+    // "declared names" error listing is deterministic.
+    let mut name_to_root: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    if let Some(arr) = config
+        .pointer("/praxec/_writableRepos")
+        .and_then(Value::as_array)
+    {
+        for e in arr {
+            if let (Some(name), Some(root)) = (
+                e.pointer("/name").and_then(Value::as_str),
+                e.pointer("/root").and_then(Value::as_str),
+            ) {
+                name_to_root.insert(name.to_string(), root.to_string());
+            }
+        }
+    }
+    let state_dir = praxec_state_dir();
+
+    let Some(conns) = config
+        .pointer_mut("/connections")
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(config);
+    };
+    for (conn_name, conn) in conns.iter_mut() {
+        if let Some(args) = conn.pointer_mut("/args").and_then(Value::as_array_mut) {
+            for a in args.iter_mut() {
+                if let Value::String(s) = a {
+                    *s = interpolate_path_tokens(s, conn_name, &name_to_root, &state_dir)?;
+                }
+            }
+        }
+        if let Some(env) = conn.pointer_mut("/env").and_then(Value::as_object_mut) {
+            for v in env.values_mut() {
+                if let Value::String(s) = v {
+                    *s = interpolate_path_tokens(s, conn_name, &name_to_root, &state_dir)?;
+                }
+            }
+        }
+    }
+    Ok(config)
+}
+
+/// WS-B B2 — replace every recognized `${…}` token inside one string. Substring
+/// (not whole-string) replacement, so a token composes with surrounding text
+/// (`${repo:qa.root}/.praxec/qa-auth`). See [`interpolate_connection_paths`] for
+/// the token grammar and error contract. `conn_name` is used only for messages.
+fn interpolate_path_tokens(
+    input: &str,
+    conn_name: &str,
+    name_to_root: &std::collections::BTreeMap<String, String>,
+    state_dir: &str,
+) -> anyhow::Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(close) = after.find('}') else {
+            // Unterminated `${` — nothing this owns; keep the remainder verbatim.
+            out.push_str(&rest[start..]);
+            return Ok(out);
+        };
+        let token = &after[..close];
+        let tail = &after[close + 1..];
+        if let Some(spec) = token.strip_prefix("repo:") {
+            let name = spec.strip_suffix(".root").ok_or_else(|| {
+                anyhow!(
+                    "INVALID_CONNECTION_PATH_TOKEN: connection '{conn_name}' uses \
+                     `${{repo:{spec}}}` — the only repo token form is `${{repo:<name>.root}}`."
+                )
+            })?;
+            let root = name_to_root.get(name).ok_or_else(|| {
+                let declared = if name_to_root.is_empty() {
+                    "(none declared)".to_string()
+                } else {
+                    name_to_root
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                anyhow!(
+                    "UNKNOWN_REPO_TOKEN: connection '{conn_name}' references \
+                     `${{repo:{name}.root}}`, but no writable repo named '{name}' is declared. \
+                     Declared writable repo names: {declared}. Add a `repos:` entry with \
+                     `name: {name}` and `writable: true`, or correct the token."
+                )
+            })?;
+            out.push_str(root);
+        } else if token == "praxec.state_dir" {
+            out.push_str(state_dir);
+        } else if token.starts_with("praxec.") {
+            bail!(
+                "UNKNOWN_PRAXEC_TOKEN: connection '{conn_name}' uses `${{{token}}}`; the only \
+                 praxec path token is `${{praxec.state_dir}}`."
+            );
+        } else {
+            // A foreign `${…}` (not one of praxec's two namespaces) — verbatim.
+            out.push('$');
+            out.push('{');
+            out.push_str(token);
+            out.push('}');
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Remove the `repos:` and `overrides:` top-level keys from `host` and
@@ -3542,6 +3830,13 @@ fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool)>) {
 /// or a remote URI to import) and whether it's an authoring write target.
 struct RepoDecl {
     source: RepoSource,
+    /// WS-B B3 — a durable IDENTITY for this repo, independent of any literal
+    /// filesystem path. Optional for `path:`/`uri:` entries (where it becomes a
+    /// name→root index key for the `resolve_run_repo_root` name selector);
+    /// MANDATORY for a `worktrees_of:` entry, whose whole resolution is by
+    /// identity (match the `name` in each enumerated worktree's
+    /// `praxec.repo.yaml` stub).
+    name: Option<String>,
     writable: bool,
     push: bool,
     /// FB-2 (SPEC §9) — whether this entry is a **definition repo** (carries a
@@ -3576,6 +3871,97 @@ enum RepoSource {
     Local(PathBuf),
     /// A remote git repo imported (cloned/updated) into a local cache.
     Remote { uri: String, gitref: String },
+    /// WS-B B3 — an IDENTITY + discovery rule, not a literal path. `anchor` is a
+    /// stable checkout whose git worktrees are enumerated at config-load; the
+    /// live writable root is the worktree whose `praxec.repo.yaml` stub declares
+    /// `name`. A worktree that is pruned/switched just drops out of the
+    /// enumeration (0 matches → declared-unresolved, a LEGAL boot state) instead
+    /// of dying as a dead `path:`. `name` is REQUIRED (poka-yoke enforced in
+    /// [`parse_repo_entry`]).
+    WorktreesOf { anchor: PathBuf, name: String },
+}
+
+/// WS-B B3 — outcome of resolving a `worktrees_of:` entry against the live git
+/// worktrees of its anchor. Three states, exactly mirroring the design: one
+/// live worktree carries the declared identity, none does, or several do.
+enum WorktreeResolution {
+    /// Exactly one enumerated worktree carries a `praxec.repo.yaml` whose `name`
+    /// equals the declared identity → its path is the writable root.
+    Resolved(PathBuf),
+    /// No enumerated worktree carries the declared identity (it was pruned /
+    /// switched, or the anchor could not be enumerated). A LEGAL boot state:
+    /// stamp NO writable root, record a diagnostic, boot succeeds. `reason`
+    /// explains which (for the diagnostic).
+    Unresolved { reason: String },
+    /// Two-or-more enumerated worktrees carry the declared identity. Never
+    /// auto-picked (a wrong-repo write is corruption, #69): a hard error in
+    /// Strict mode, skip-with-loud-warn in Resilient.
+    Ambiguous { candidates: Vec<PathBuf> },
+}
+
+/// WS-B B3 — enumerate the git worktrees of `anchor` and select the one whose
+/// `praxec.repo.yaml` stub declares `name`. The anchor itself appears in
+/// `git worktree list` and is eligible iff it, too, carries a matching stub.
+///
+/// This is the ONLY filesystem/`git` touch of identity-first resolution; it is
+/// deliberately churn-proof: a failure to run `git` or enumerate the anchor
+/// yields [`WorktreeResolution::Unresolved`] (a legal, diagnosable boot state),
+/// never a hard error — the whole point is that a gone worktree can never brick
+/// boot. Emitting an actual root stays behind [`crate::run_env::RepoRoot::new`]
+/// downstream (in the gateway), preserving the canonical-existing-dir invariant.
+fn resolve_worktrees_of(anchor: &Path, name: &str) -> WorktreeResolution {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(anchor)
+        .args(["worktree", "list", "--porcelain"])
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            return WorktreeResolution::Unresolved {
+                reason: format!(
+                    "`git worktree list` in anchor '{}' failed ({}): {}",
+                    anchor.display(),
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            };
+        }
+        Err(e) => {
+            return WorktreeResolution::Unresolved {
+                reason: format!(
+                    "could not run `git worktree list` in anchor '{}': {e}",
+                    anchor.display()
+                ),
+            };
+        }
+    };
+    // Porcelain format: each worktree paragraph starts with a `worktree <path>`
+    // line. That line is all identity discovery needs.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut matches: Vec<PathBuf> = Vec::new();
+    for line in stdout.lines() {
+        let Some(path) = line.strip_prefix("worktree ") else {
+            continue;
+        };
+        let wt = PathBuf::from(path.trim());
+        if crate::repo::read_manifest_name(&wt).as_deref() == Some(name) {
+            matches.push(wt);
+        }
+    }
+    match matches.len() {
+        0 => WorktreeResolution::Unresolved {
+            reason: format!(
+                "no worktree of anchor '{}' carries a `praxec.repo.yaml` declaring \
+                 name '{name}'",
+                anchor.display()
+            ),
+        },
+        1 => WorktreeResolution::Resolved(matches.pop().expect("len==1")),
+        _ => WorktreeResolution::Ambiguous {
+            candidates: matches,
+        },
+    }
 }
 
 fn take_repos_and_overrides(host: &mut Value) -> anyhow::Result<(Vec<RepoDecl>, HashSet<String>)> {
@@ -3704,13 +4090,29 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
             short_value_kind(other)
         ),
     };
-    // SPEC §9 — a repo is either local (`path`) or remote (`uri`, imported via
-    // git). Exactly one; a remote repo may pin a `ref` (default `main`).
+    // WS-B B3 — optional durable `name:` identity. A name→root index key for the
+    // `resolve_run_repo_root` name selector; REQUIRED for a `worktrees_of:` entry.
+    let name: Option<String> = match entry.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::String(_)) => {
+            bail!("INVALID_REPO_ENTRY: `repos[{index}].name` must be a non-empty string")
+        }
+        Some(other) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}].name` must be a string ({})",
+            short_value_kind(other)
+        ),
+    };
+    // SPEC §9 + WS-B B3 — a repo is declared by exactly one of: a local `path`, a
+    // remote `uri` (imported via git), or `worktrees_of:` (identity-first
+    // discovery of a live git worktree). A remote repo may pin a `ref`
+    // (default `main`).
     let path = entry.get("path").and_then(Value::as_str);
     let uri = entry.get("uri").and_then(Value::as_str);
-    let source = match (path, uri) {
-        (Some(p), None) => RepoSource::Local(expand_repo_path(p)),
-        (None, Some(u)) => {
+    let worktrees_of = entry.get("worktrees_of").and_then(Value::as_str);
+    let source = match (path, uri, worktrees_of) {
+        (Some(p), None, None) => RepoSource::Local(expand_repo_path(p)),
+        (None, Some(u), None) => {
             let gitref = entry
                 .get("ref")
                 .and_then(Value::as_str)
@@ -3721,18 +4123,54 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
                 gitref,
             }
         }
-        (Some(_), Some(_)) => bail!(
+        (None, None, Some(anchor)) => {
+            // A `worktrees_of:` entry is resolved by IDENTITY, so `name:` is
+            // mandatory — there is nothing to match a worktree stub against
+            // without it (poka-yoke against a silently unresolvable entry).
+            let repo_name = name.clone().ok_or_else(|| {
+                anyhow!(
+                    "INVALID_REPO_ENTRY: `repos[{index}]` uses `worktrees_of:` but declares no \
+                     `name:` — a worktrees_of repo is resolved by IDENTITY (the `name` in each \
+                     enumerated worktree's `praxec.repo.yaml`), so `name:` is REQUIRED."
+                )
+            })?;
+            // A discovered worktree is only ever a writable RUN TARGET; a
+            // read-only worktrees_of entry contributes nothing (same spirit as
+            // the `definitions: false ⇒ writable` rule).
+            if !writable {
+                bail!(
+                    "INVALID_REPO_ENTRY: `repos[{index}]` uses `worktrees_of:` without \
+                     `writable: true` — a discovered worktree is a writable run target and \
+                     contributes nothing otherwise. Add `writable: true`."
+                );
+            }
+            RepoSource::WorktreesOf {
+                anchor: expand_repo_path(anchor),
+                name: repo_name,
+            }
+        }
+        // `worktrees_of:` is mutually exclusive with a literal `path`/`uri` — a
+        // repo is discovered by identity OR pinned to a literal location.
+        (_, _, Some(_)) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}]` declares `worktrees_of:` together with \
+             `path:`/`uri:` — a repo is resolved by worktree identity OR a literal path/uri, \
+             not both."
+        ),
+        (Some(_), Some(_), None) => bail!(
             "INVALID_REPO_ENTRY: `repos[{index}]` declares both `path` and `uri` — \
              a repo is either local or remote, not both."
         ),
-        (None, None) => bail!(
-            "INVALID_REPO_ENTRY: `repos[{index}]` needs a `path` (local dir) or a `uri` \
-             (remote git repo to import), e.g. `- path: ~/repos/swe-core` or \
-             `- uri: git+https://github.com/acme/workflows@main`."
+        (None, None, None) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}]` needs a `path` (local dir), a `uri` \
+             (remote git repo to import), or `worktrees_of:` (identity-first worktree \
+             discovery), e.g. `- path: ~/repos/swe-core` or \
+             `- uri: git+https://github.com/acme/workflows@main` or \
+             `- worktrees_of: ~/repos/anchor` with `name:` + `writable: true`."
         ),
     };
     Ok(RepoDecl {
         source,
+        name,
         writable,
         push,
         definitions,
@@ -4096,6 +4534,131 @@ mod tests {
     // (The load-path integration tests live in tests/config_validation.rs;
     // these unit tests exercise `synthesize_input_schema` directly because the
     // snippet-home union is the fn's own contract — finding #10.)
+
+    // ── WS-B B2 — connection path-token interpolation ────────────────────────
+
+    fn names(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(n, r)| (n.to_string(), r.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn state_dir_prefers_xdg_then_falls_back_to_home() {
+        assert_eq!(
+            state_dir_from(Some("/xdg/state".into()), Some("/home/u".into())),
+            "/xdg/state/praxec",
+            "XDG_STATE_HOME wins when set"
+        );
+        assert_eq!(
+            state_dir_from(None, Some("/home/u".into())),
+            "/home/u/.local/state/praxec",
+            "falls back to $HOME/.local/state"
+        );
+        // Empty XDG is treated as unset (falls through to HOME).
+        assert_eq!(
+            state_dir_from(Some("".into()), Some("/home/u".into())),
+            "/home/u/.local/state/praxec",
+        );
+    }
+
+    #[test]
+    fn interpolate_resolves_repo_root_and_state_dir_tokens() {
+        let n = names(&[("qa", "/live/wt-a")]);
+        // repo root token composes with a trailing subpath.
+        assert_eq!(
+            interpolate_path_tokens("${repo:qa.root}/.praxec/qa-auth", "c", &n, "/state/praxec")
+                .unwrap(),
+            "/live/wt-a/.praxec/qa-auth"
+        );
+        // state_dir token — the durable, worktree-independent home for auth state.
+        assert_eq!(
+            interpolate_path_tokens(
+                "--storage-state=${praxec.state_dir}/qa-auth/storage-state.json",
+                "c",
+                &n,
+                "/state/praxec"
+            )
+            .unwrap(),
+            "--storage-state=/state/praxec/qa-auth/storage-state.json"
+        );
+        // A string with no token is returned verbatim; a foreign `${…}` passes
+        // through untouched (praxec claims only its own two namespaces).
+        assert_eq!(
+            interpolate_path_tokens("--flag ${OTHER}/x", "c", &n, "/state/praxec").unwrap(),
+            "--flag ${OTHER}/x"
+        );
+    }
+
+    #[test]
+    fn interpolate_unknown_repo_name_is_a_hard_error_listing_declared_names() {
+        let n = names(&[("qa", "/live/wt-a"), ("docs", "/live/wt-b")]);
+        let err = interpolate_path_tokens("${repo:nope.root}/x", "browser", &n, "/s")
+            .expect_err("unknown repo name must fail-fast");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("UNKNOWN_REPO_TOKEN"), "msg: {msg}");
+        assert!(msg.contains("nope"), "names the unknown repo: {msg}");
+        assert!(msg.contains("browser"), "names the connection: {msg}");
+        // Lists the declared names so the operator can see the typo.
+        assert!(
+            msg.contains("docs") && msg.contains("qa"),
+            "lists declared names: {msg}"
+        );
+    }
+
+    #[test]
+    fn interpolate_rejects_malformed_repo_and_unknown_praxec_tokens() {
+        let n = names(&[("qa", "/live/wt-a")]);
+        // `${repo:…}` that is not `<name>.root`.
+        let bad_repo = interpolate_path_tokens("${repo:qa.branch}", "c", &n, "/s")
+            .expect_err("malformed repo token fails");
+        assert!(
+            format!("{bad_repo:#}").contains("INVALID_CONNECTION_PATH_TOKEN"),
+            "{bad_repo:#}"
+        );
+        // A `${praxec.…}` other than state_dir is a typo, not a silent literal.
+        let bad_praxec = interpolate_path_tokens("${praxec.data_dir}", "c", &n, "/s")
+            .expect_err("unknown praxec token fails");
+        assert!(
+            format!("{bad_praxec:#}").contains("UNKNOWN_PRAXEC_TOKEN"),
+            "{bad_praxec:#}"
+        );
+    }
+
+    #[test]
+    fn interpolate_connection_paths_rewrites_args_and_env_over_the_merged_config() {
+        // End-to-end over the same shape `_writableRepos` stamps: a name→root
+        // entry plus a connection whose args/env carry both token kinds.
+        let cfg = json!({
+            "praxec": { "_writableRepos": [ { "root": "/live/wt-a", "push": false, "name": "qa" } ] },
+            "connections": {
+                "browser": {
+                    "kind": "mcp",
+                    "command": "playwright-mcp",
+                    "args": ["--storage-state", "${praxec.state_dir}/qa-auth/storage-state.json",
+                             "--out", "${repo:qa.root}/.praxec/qa-artifacts"],
+                    "env": { "PROFILE_DIR": "${repo:qa.root}/.praxec/profile" }
+                }
+            }
+        });
+        let out = interpolate_connection_paths(cfg).expect("interpolation succeeds");
+        let args = out.pointer("/connections/browser/args").unwrap();
+        assert_eq!(
+            args[1].as_str().unwrap().rsplit('/').next(),
+            Some("storage-state.json")
+        );
+        assert!(
+            args[1].as_str().unwrap().contains("/praxec/qa-auth/"),
+            "state_dir token: {args}"
+        );
+        assert_eq!(args[3].as_str(), Some("/live/wt-a/.praxec/qa-artifacts"));
+        assert_eq!(
+            out.pointer("/connections/browser/env/PROFILE_DIR")
+                .and_then(Value::as_str),
+            Some("/live/wt-a/.praxec/profile")
+        );
+    }
 
     #[test]
     fn snippet_inputs_feed_the_synthesized_input_schema() {

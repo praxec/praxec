@@ -51,6 +51,20 @@ pub struct ModelEntry {
     pub scores: AffinityScores,
 }
 
+/// The canonical model-identity normalization: the bare `model-id`, stripping
+/// any leading `vendor:`/`provider:` prefix. Model ids use `/` (not `:`), so the
+/// first `:` is the vendor/provider separator — everything after it is the id.
+///
+/// THE single normalization shared across the spine so two strings that name the
+/// same underlying model compare equal regardless of prefix source: the catalog
+/// writes `"{vendor}:{model}"` while `models.yaml` chains write
+/// `"{provider.display_name()}:{model}"`. The de-escalation flywheel's keying and
+/// its fair-trial catalog dedup both compare on this, so a `vendor:model` and a
+/// `provider:model` for the same model never double-count or double-propose.
+pub fn bare_model_id(model: &str) -> &str {
+    model.split_once(':').map(|(_, m)| m).unwrap_or(model)
+}
+
 impl ModelEntry {
     /// The runnable `provider:model-id` string (what the provider factory parses).
     pub fn model_string(&self) -> String {
@@ -89,6 +103,66 @@ pub fn model_catalog() -> ModelCatalog {
         DEFAULT_MODEL_CATALOG,
     )
 }
+
+/// WS1-B — does applying reasoning effort `level` to `model` produce a param the
+/// model can honor? THE single predicate shared by the preflight reasoning
+/// validator and the runtime fail-fast, so the two can never disagree (FM-4).
+///
+/// `model` may be the runnable `"vendor:model-id"` form or a bare `model-id`; a
+/// leading `vendor:` prefix is stripped before matching the catalog's bare
+/// `model` field (model ids use `/`, not `:`, so the first `:` is the vendor
+/// separator). `medium`/empty map to NO reasoning param, so they are always
+/// "supported" (nothing to honor). A model absent from the catalog returns
+/// `true` — a catalog gap is not a config error, so the runtime never fail-fasts
+/// on it (the validator surfaces it as an `info`).
+pub fn effort_supported(model: &str, level: &str) -> bool {
+    let level = level.trim();
+    if level.is_empty() || level.eq_ignore_ascii_case("medium") {
+        return true;
+    }
+    let bare = bare_model_id(model);
+    match model_catalog().models.iter().find(|m| m.model == bare) {
+        None => true,
+        Some(m) => {
+            let levels = &m.reasoning_levels;
+            // A NON-reasoning model (no levels, or only `none`) simply ignores a
+            // reasoning request and runs without reasoning — the level is moot,
+            // never a fail-fast (else every non-reasoning fallback in a chain
+            // would fail whenever the effort is non-`medium`). A REASONING model
+            // must genuinely advertise the requested level.
+            if levels.is_empty() || levels.iter().all(|l| l.eq_ignore_ascii_case("none")) {
+                true
+            } else {
+                levels.iter().any(|l| l.eq_ignore_ascii_case(level))
+            }
+        }
+    }
+}
+
+/// WS2 — the output $/M for `model` from the active catalog, or `None` if the
+/// model isn't catalogued. Accepts the runnable `"vendor:model-id"` form or a
+/// bare `model-id` (a leading `vendor:` is stripped, as in [`effort_supported`]).
+pub fn output_usd_per_million(model: &str) -> Option<f64> {
+    let bare = bare_model_id(model);
+    model_catalog()
+        .models
+        .iter()
+        .find(|m| m.model == bare)
+        .map(|m| m.output_usd_per_million)
+}
+
+/// WS2 — is `model` a FRONTIER (over-cap) model? True iff its catalog output
+/// $/M is `>= cap`. THE single predicate shared by the preflight `FRONTIER_LEAD`
+/// warning and the runtime cost gate, so they can never disagree. A model absent
+/// from the catalog has no known price → **not** frontier (never block on
+/// missing cost data — the validator surfaces the gap as an info instead).
+pub fn is_frontier(model: &str, cap_usd_per_million: f64) -> bool {
+    output_usd_per_million(model).is_some_and(|c| c >= cap_usd_per_million)
+}
+
+/// The default frontier cost cap ($/M output) — the `$5/M` line from the v0.0.31
+/// design. Data-driven + overridable via `gateway.cost.frontier_cap_usd_per_m`.
+pub const DEFAULT_FRONTIER_CAP_USD_PER_M: f64 = 5.0;
 
 /// Compute the realized USD cost for a model run given prompt + completion
 /// token counts, pricing it off the **active model catalog** (the same data the
@@ -317,6 +391,22 @@ pub fn pool_by_value<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effort_supported_gates_a_reasoning_model_on_its_advertised_levels() {
+        // A reasoning model must genuinely advertise the requested level.
+        assert!(effort_supported("z-ai/glm-5.2", "high")); // glm advertises high
+        assert!(!effort_supported("qwen/qwen3-coder", "high")); // qwen maxes at medium
+        assert!(effort_supported("qwen/qwen3-coder", "low")); // qwen has low
+        // A leading vendor prefix is stripped before matching the bare model id.
+        assert!(!effort_supported("openrouter:qwen/qwen3-coder", "high"));
+        // `medium`/empty send no param → always supported (nothing to honor).
+        assert!(effort_supported("qwen/qwen3-coder", "medium"));
+        assert!(effort_supported("qwen/qwen3-coder", ""));
+        // A model absent from the catalog can't be disproven → supported (the
+        // validator surfaces it as an info; the runtime never fail-fasts on it).
+        assert!(effort_supported("openrouter:made/up-model", "high"));
+    }
 
     #[test]
     fn shipped_catalog_parses_with_provenance() {

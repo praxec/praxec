@@ -455,6 +455,32 @@ async fn start_without_input_defaults_to_empty_object() {
     assert!(err.message.contains('x'));
 }
 
+// v0.0.32 (WS-B B1) — the two-tool `command` surface must forward the `repoRoot`
+// selector into start's repo-root resolution. Previously `CommandArgs` had no
+// such field and the start reshape dropped it, so a multi-writable config could
+// never be selected via `command` (always REPO_ROOT_AMBIGUOUS). Proof: a bogus
+// repoRoot fails inside `resolve_run_repo_root` — which runs BEFORE definition
+// validation — so the error names the repo root. If the field were still
+// dropped, the single test root would auto-select and the start would instead
+// fall through to an unknown-definition error, never mentioning the repo root.
+#[tokio::test]
+async fn command_start_forwards_repo_root_selector() {
+    let server = build_server();
+    let err = dispatch(
+        &server,
+        TOOL_COMMAND,
+        json!({ "definitionId": "wf.alpha", "repoRoot": "/no/such/dir/praxec-b1-xyz" }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.message.contains("REPO_ROOT"),
+        "a bogus repoRoot must surface a repo-root resolution error (proving the \
+         command surface forwards the selector), got: {}",
+        err.message
+    );
+}
+
 // ---------- praxec.query → get (workflowId alone) -------------------------
 
 #[tokio::test]

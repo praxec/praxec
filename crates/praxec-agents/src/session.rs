@@ -192,6 +192,17 @@ pub trait AgentSessionRunner: Send + Sync {
     }
 }
 
+/// One hop of a resolved model chain: the runnable `"provider:model"` string
+/// plus the reasoning effort PAIRED with that model in `models.yaml` (WS1-B).
+/// Effort is non-portable across models, so it travels WITH each hop and is
+/// never carried onto the next. `None` = this model declares no effort of its
+/// own; the caller's phase/global effort applies, re-validated for THIS model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedHop {
+    pub model: String,
+    pub effort: Option<String>,
+}
+
 /// Resolves a config `ModelBinding` (agent name / affinity) to a
 /// `"provider:model"` string. The binary wires an models.yaml-backed impl
 /// (the same resolution the llm executor uses); tests inject a stub.
@@ -199,15 +210,23 @@ pub trait AgentSessionRunner: Send + Sync {
 pub trait AgentModelResolver: Send + Sync {
     async fn resolve(&self, binding: &ModelBinding) -> Result<String, ExecutorError>;
 
-    /// Returns the ordered model-id chain to try, cheapest-effective first.
+    /// Returns the ordered model chain to try, cheapest-effective first — each
+    /// hop paired with its model-specific reasoning effort ([`ResolvedHop`]).
     ///
-    /// The default wraps [`resolve`](Self::resolve) as a single-element chain,
-    /// so existing test doubles and the `RejectingAgentModelResolver` need no
-    /// changes. A models.yaml-backed implementation overrides this with the
-    /// full walk over every binding in the affinity list, enabling the
+    /// The default wraps [`resolve`](Self::resolve) as a single-element chain
+    /// with no paired effort, so existing test doubles and the
+    /// `RejectingAgentModelResolver` need no changes. A models.yaml-backed
+    /// implementation overrides this with the full walk over every binding in
+    /// the affinity list, carrying each binding's `effort`, enabling the
     /// executor to escalate through the chain on failure.
-    async fn resolve_chain(&self, binding: &ModelBinding) -> Result<Vec<String>, ExecutorError> {
-        Ok(vec![self.resolve(binding).await?])
+    async fn resolve_chain(
+        &self,
+        binding: &ModelBinding,
+    ) -> Result<Vec<ResolvedHop>, ExecutorError> {
+        Ok(vec![ResolvedHop {
+            model: self.resolve(binding).await?,
+            effort: None,
+        }])
     }
 }
 
@@ -234,7 +253,18 @@ pub mod testing {
             Self::with_outcome(AgentRunOutcome::Completed(result))
         }
         pub fn no_result() -> Self {
-            Self::with_outcome(AgentRunOutcome::NoResult)
+            // Empty transcript = genuinely produced nothing → AGENT_NO_RESULT.
+            // (A run that produced output but never finalized is NOT_CONVERGING;
+            // see `not_converging()`.)
+            Self::with_outcome_transcript(AgentRunOutcome::NoResult, String::new())
+        }
+        /// (WS3) Ran and produced output but never emitted a conforming
+        /// `final_answer` → AGENT_NOT_CONVERGING, distinct from `no_result`.
+        pub fn not_converging() -> Self {
+            Self::with_outcome_transcript(
+                AgentRunOutcome::NoResult,
+                "{\"kind\":\"text\",\"message\":\"worked but never finalized\"}".into(),
+            )
         }
         pub fn timed_out() -> Self {
             Self::with_outcome(AgentRunOutcome::TimedOut)
@@ -246,10 +276,16 @@ pub mod testing {
             }))
         }
         fn with_outcome(outcome: AgentRunOutcome) -> Self {
+            Self::with_outcome_transcript(
+                outcome,
+                "{\"kind\":\"text\",\"message\":\"mock\"}".into(),
+            )
+        }
+        fn with_outcome_transcript(outcome: AgentRunOutcome, transcript: String) -> Self {
             Self {
                 report: AgentRunReport {
                     outcome,
-                    transcript: "{\"kind\":\"text\",\"message\":\"mock\"}".into(),
+                    transcript,
                     model: "mock:model".into(),
                     prompt_tokens: 0,
                     completion_tokens: 0,

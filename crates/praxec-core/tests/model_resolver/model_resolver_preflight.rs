@@ -99,6 +99,7 @@ async fn probe_present_key_but_unreachable_endpoint_warns_not_fails() {
         provider: Provider::Known(ProviderId::Anthropic),
         model: "claude-sonnet-4-6".into(),
         features: ProviderFeatures::None,
+        effort: None,
     };
     let client = probe_client();
     let outcome = probe_binding(&client, &b).await;
@@ -122,6 +123,7 @@ async fn probe_without_credential_reports_missing() {
         provider: Provider::Known(ProviderId::Openai),
         model: "gpt-5".into(),
         features: ProviderFeatures::None,
+        effort: None,
     };
     let client = probe_client();
     let outcome = probe_binding(&client, &b).await;
@@ -144,6 +146,7 @@ async fn probe_ollama_no_credential_required_returns_ok() {
         provider: Provider::Known(ProviderId::Ollama),
         model: "llama3".into(),
         features: ProviderFeatures::None,
+        effort: None,
     };
     let client = probe_client();
     assert!(matches!(
@@ -234,6 +237,7 @@ fn primary_rate_limit_logs_warning_but_passes() {
         provider: Provider::Known(ProviderId::Anthropic),
         model: "claude-sonnet-4-6".into(),
         features: ProviderFeatures::None,
+        effort: None,
     };
     let outcome = PreflightOutcome::Warn {
         class: FailureClass::RateLimit429,
@@ -252,6 +256,7 @@ fn primary_auth_401_blocks_startup() {
         provider: Provider::Known(ProviderId::Anthropic),
         model: "claude-sonnet-4-6".into(),
         features: ProviderFeatures::None,
+        effort: None,
     };
     let outcome = PreflightOutcome::Fail {
         class: FailureClass::Auth401,

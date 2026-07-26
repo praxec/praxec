@@ -12,12 +12,15 @@
 //! the right typed client (the cockpit pattern). The factory maps rig's stream to
 //! the executor's provider-agnostic [`StreamEvent`]s **lazily** — each event is
 //! forwarded as it arrives (via an `async_stream` generator), not pre-collected.
-//! Laziness is load-bearing: the agent runner's per-event stall watchdog can only
-//! bound inter-event silence if the underlying model wait actually happens while
-//! the consumer polls `.next()`. An earlier version drained the whole turn into a
-//! `Vec` before returning, which moved every token (and any first-token hang) to
-//! *before* the watchdog saw the stream — so a hung reasoning call sat at 0 CPU
-//! until the whole-session wall, and the advertised stall timeout never fired.
+//! Laziness is load-bearing: the underlying model wait must happen while the
+//! consumer polls `.next()`, so that (a) the runner's per-event `agent.heartbeat`
+//! pulses during a slow reasoning call instead of showing dead air, and (b) a
+//! genuinely dead socket surfaces as a mid-stream transport `Err` (the client's
+//! `read_timeout`, see [`configured_http_client`]) the runner can retry, rather
+//! than blocking a whole-turn drain before anyone sees the stream. An earlier
+//! version drained the whole turn into a `Vec` before returning, which moved
+//! every token (and any first-token hang) to *before* the consumer polled — so a
+//! hung call sat at 0 CPU with no pulse until the whole-session wall.
 //! The trailing token-usage aggregate + `Done` are emitted after the stream ends.
 
 use async_trait::async_trait;
@@ -105,6 +108,34 @@ fn resolve_api_key(creds: Credentials, fallback: &str, account: Option<&str>) ->
         .unwrap_or_else(|_| "praxec-test".to_string())
 }
 
+/// WS5 — a `reqwest::Client` tuned for streaming LLM calls, injected into rig's
+/// clients via `ClientBuilder::http_client`. This is the STANDARD, transport-level
+/// liveness/outage signal (rig owns it — we don't hand-roll it):
+/// - `read_timeout`: a genuinely dead socket (no bytes at all for this long)
+///   surfaces as a retriable transport error. A healthy-but-slow call is left
+///   alone — provider deltas AND SSE keep-alive comments both count as bytes, so
+///   a model that is merely reasoning does not trip it. This replaces the old
+///   token dead-air watchdog, which couldn't tell "provider silent" from "model
+///   reasoning" and turned recoverable blips into hard failures.
+/// - `tcp_keepalive`: probes a wedged connection at the TCP layer.
+/// - `connect_timeout`: bounds a hung dial.
+const HTTP_READ_TIMEOUT_SECS: u64 = 60;
+const HTTP_CONNECT_TIMEOUT_SECS: u64 = 20;
+const HTTP_TCP_KEEPALIVE_SECS: u64 = 30;
+
+// Use rig's re-exported client type so it's exactly the type rig's
+// `HttpClientExt` (and thus `ClientBuilder::http_client`) is implemented for —
+// the workspace also pulls a different reqwest major, so naming reqwest
+// directly risks a type-identity mismatch.
+fn configured_http_client() -> rig::http_client::Result<rig::http_client::ReqwestClient> {
+    rig::http_client::ReqwestClient::builder()
+        .read_timeout(std::time::Duration::from_secs(HTTP_READ_TIMEOUT_SECS))
+        .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .tcp_keepalive(std::time::Duration::from_secs(HTTP_TCP_KEEPALIVE_SECS))
+        .build()
+        .map_err(|e| rig::http_client::Error::Instance(Box::new(e)))
+}
+
 #[async_trait]
 impl ProviderFactory for DefaultProviderFactory {
     async fn stream(
@@ -179,12 +210,26 @@ impl ProviderFactory for DefaultProviderFactory {
                         "OPENAI_API_KEY",
                         account,
                     );
-                    run!(openai_completions_client(&base, &key))
+                    let http = configured_http_client().map_err(provider_factory_err)?;
+                    run!(openai_completions_client(&base, &key, http))
                 }
                 None => run!(openai::Client::from_env()),
             },
             Some(ProviderId::Gemini) => run!(gemini::Client::from_env()),
-            Some(ProviderId::Openrouter) => run!(openrouter::Client::from_env()),
+            Some(ProviderId::Openrouter) => {
+                let key = resolve_api_key(
+                    ProviderId::Openrouter.credentials(),
+                    "OPENROUTER_API_KEY",
+                    account,
+                );
+                let http = configured_http_client().map_err(provider_factory_err)?;
+                run!(
+                    openrouter::Client::builder()
+                        .api_key(key.as_str())
+                        .http_client(http)
+                        .build()
+                )
+            }
             Some(ProviderId::Ollama) => run!(ollama::Client::from_env()),
             // US OpenAI-compatible fleet (Fireworks, …) — one shared
             // completions client at the descriptor's base URL, keyed by the
@@ -202,7 +247,8 @@ impl ProviderFactory for DefaultProviderFactory {
                     ));
                 };
                 let key = resolve_api_key(d.credentials, "OPENAI_API_KEY", account);
-                run!(openai_completions_client(base, &key))
+                let http = configured_http_client().map_err(provider_factory_err)?;
+                run!(openai_completions_client(base, &key, http))
             }
             _ => {
                 return Err(ExecutorError::Llm(
@@ -244,10 +290,12 @@ fn pick_base(praxec: Option<String>, openai: Option<String>) -> Option<String> {
 fn openai_completions_client(
     base: &str,
     key: &str,
+    http: rig::http_client::ReqwestClient,
 ) -> Result<openai::CompletionsClient, rig::client::ProviderClientError> {
     openai::CompletionsClient::builder()
         .api_key(key)
         .base_url(base)
+        .http_client(http)
         .build()
         .map_err(Into::into)
 }
@@ -323,13 +371,14 @@ where
         }
 
         // The final aggregate carries token usage (set as the stream drains).
-        if let Some(u) = stream.response.token_usage() {
-            yield Ok(StreamEvent::Usage(TokenUsage {
-                input_tokens: u.input_tokens,
-                output_tokens: u.output_tokens,
-                reasoning_tokens: None,
-            }));
-        }
+        // rig 0.40: `token_usage()` returns `Usage` directly (was `Option<Usage>`
+        // in 0.38). Zero usage simply contributes zero — never a failure.
+        let u = stream.response.token_usage();
+        yield Ok(StreamEvent::Usage(TokenUsage {
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            reasoning_tokens: None,
+        }));
         yield Ok(StreamEvent::Done { stop_reason: None });
     }
 }

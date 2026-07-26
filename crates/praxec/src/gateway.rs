@@ -88,9 +88,10 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             model,
             max_steps,
             policy,
+            repo_root,
         } => {
             orchestrate(
-                config, workflow, definition, input, model, max_steps, policy, overlays,
+                config, workflow, definition, input, model, max_steps, policy, repo_root, overlays,
             )
             .await
         }
@@ -443,15 +444,43 @@ fn init_tracing(log_format: &str) {
 /// interactive/dev use is unaffected — only a deliberate `serve` with
 /// non-durable storage is stopped.
 fn guard_durable_serve(config: &Value) -> anyhow::Result<()> {
-    let env_opt_in = std::env::var("PRAXEC_ALLOW_EPHEMERAL")
-        .map(|v| !matches!(v.as_str(), "" | "0" | "false"))
-        .unwrap_or(false);
+    // Env-aware (honors the PRAXEC_ALLOW_EPHEMERAL escape hatch), exactly as
+    // `doctor` does — the two share `durability_problems` so a serve-refusal
+    // and a clean doctor/health report can never disagree.
+    let problems = durability_problems(config, true);
+    if !problems.is_empty() {
+        anyhow::bail!(
+            "refusing to serve with ephemeral / non-durable storage:\n  - {}\n\n\
+             Configure durable storage for production, or set \
+             `gateway.allow_ephemeral: true` (or env PRAXEC_ALLOW_EPHEMERAL=1) to \
+             override for dev/testing.",
+            problems.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// The durability problems that would make a long-running `serve` refuse to
+/// start (empty = servable). Single source of truth shared by `serve`
+/// (fail-fast), `doctor` (health), and `check` (static validation) so those
+/// three surfaces can never disagree about whether a config is servable — the
+/// exact "check says ok but serve refuses" gap this closes.
+///
+/// `consider_env_optin`: honor the runtime `PRAXEC_ALLOW_EPHEMERAL` escape
+/// hatch. `serve`/`doctor` pass `true` (they run in the same environment a
+/// serve would, so they match serve precisely); static `check` passes `false`
+/// — it validates the config file itself, independent of any one shell's env.
+fn durability_problems(config: &Value, consider_env_optin: bool) -> Vec<String> {
+    let env_opt_in = consider_env_optin
+        && std::env::var("PRAXEC_ALLOW_EPHEMERAL")
+            .map(|v| !matches!(v.as_str(), "" | "0" | "false"))
+            .unwrap_or(false);
     let config_opt_in = config
         .pointer("/gateway/allow_ephemeral")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if env_opt_in || config_opt_in {
-        return Ok(());
+        return Vec::new();
     }
 
     // Absent store/audit config defaults to memory/stderr respectively — both
@@ -506,16 +535,7 @@ fn guard_durable_serve(config: &Value) -> anyhow::Result<()> {
         }
     }
 
-    if !problems.is_empty() {
-        anyhow::bail!(
-            "refusing to serve with ephemeral / non-durable storage:\n  - {}\n\n\
-             Configure durable storage for production, or set \
-             `gateway.allow_ephemeral: true` (or env PRAXEC_ALLOW_EPHEMERAL=1) to \
-             override for dev/testing.",
-            problems.join("\n  - ")
-        );
-    }
-    Ok(())
+    problems
 }
 
 /// ADR-0009 — drive a workflow instance to its outcomes headlessly. Builds the
@@ -531,6 +551,7 @@ async fn orchestrate(
     model: String,
     max_steps: usize,
     policy: String,
+    repo_root: Option<String>,
     overlays: GatewayOverlays,
 ) -> anyhow::Result<()> {
     use praxec_agents::orchestrator::{
@@ -558,9 +579,10 @@ async fn orchestrate(
             let input_value: Value = serde_json::from_str(&input)
                 .map_err(|e| anyhow::anyhow!("--input is not valid JSON: {e}"))?;
             // v0.0.21 — resolve the run's mandatory repo_root from the declared
-            // writable repos (single one auto-selects; a multi-repo CLI selector
-            // is a follow-on).
-            let repo_root = runtime.resolve_run_repo_root(None)?;
+            // writable repos (single one auto-selects). v0.0.32 — an explicit
+            // `--repo-root` selector picks one when several are declared (a
+            // declared root, a subpath/worktree under one, or a declared name).
+            let repo_root = runtime.resolve_run_repo_root(repo_root.as_deref())?;
             let resp = runtime
                 .start(StartWorkflow {
                     definition_id: def.clone(),
@@ -765,7 +787,7 @@ async fn build_runtime_for_orchestrate(
         audit.clone(),
     )
     .with_evidence(evidence)
-    .with_writable_repo_roots(writable_repo_roots_from_config(config)?)
+    .with_writable_repos(writable_repo_roots_from_config(config)?)
     .with_repo_locks(repo_locks)
     .with_exclusive_pools(exclusive_pools_from_config(config))
     .with_lock_scheduler(lock_scheduler)
@@ -802,6 +824,28 @@ async fn build_runtime_for_orchestrate(
             .pointer("/praxec/agents/auto_drive_max_seconds")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+    )
+    // WS2 — arm the frontier cost gate. Default-ON at the $5/M cap even without a
+    // `gateway.cost` block, so a fresh config can never auto-drive a premium
+    // model no human approved (commodity + mock models are all under the cap, so
+    // this is inert for them). Raise the cap or allowlist a model to permit it.
+    .with_cost_gate(
+        Some(
+            config
+                .pointer("/gateway/cost/frontier_cap_usd_per_m")
+                .and_then(Value::as_f64)
+                .unwrap_or(praxec_core::model_catalog::DEFAULT_FRONTIER_CAP_USD_PER_M),
+        ),
+        config
+            .pointer("/gateway/cost/approve_frontier")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     );
     // C1 — late-bind the runtime into the `kind: workflow` executor.
     workflow_handle.set_runtime(runtime.clone());
@@ -930,7 +974,7 @@ async fn build_oneshot_server(
         audit.clone(),
     )
     .with_evidence(evidence)
-    .with_writable_repo_roots(writable_repo_roots_from_config(config)?)
+    .with_writable_repos(writable_repo_roots_from_config(config)?)
     .with_repo_locks(repo_locks)
     .with_exclusive_pools(exclusive_pools_from_config(config))
     .with_lock_scheduler(lock_scheduler)
@@ -967,6 +1011,27 @@ async fn build_oneshot_server(
             .pointer("/praxec/agents/auto_drive_max_seconds")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+    )
+    // WS2 — arm the frontier cost gate on the CLI/`command` runtime too (this is
+    // the second of two near-identical build sites; the live dogfood caught that
+    // only the serve site had it). Default-ON at $5/M; see the other site.
+    .with_cost_gate(
+        Some(
+            config
+                .pointer("/gateway/cost/frontier_cap_usd_per_m")
+                .and_then(Value::as_f64)
+                .unwrap_or(praxec_core::model_catalog::DEFAULT_FRONTIER_CAP_USD_PER_M),
+        ),
+        config
+            .pointer("/gateway/cost/approve_frontier")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     );
     // C1 — late-bind the runtime into the `kind: workflow` executor now that the
     // runtime (built around the registry) exists. Without this, every
@@ -1528,8 +1593,8 @@ async fn reload_gated(
     // (`RepoRoot::new`: path missing) drops the reload to REPAIR-ONLY exactly like a
     // contract-dirty edit — never a half-swap. Applied to the live runtime only on
     // full build success (in the Ok arm below), atomic with the other swaps.
-    let new_writable_roots = match writable_repo_roots_from_config(&new_config) {
-        Ok(roots) => roots,
+    let new_writable = match writable_repo_roots_from_config(&new_config) {
+        Ok(set) => set,
         Err(e) => {
             let msg = format!("WRITABLE_REPO_INVALID: {e}");
             tracing::error!(error = %e, "reload writable-repo set is invalid — dropping to repair-only; previous set kept live");
@@ -1578,8 +1643,11 @@ async fn reload_gated(
             swappable_registry.swap(new_registry);
             // FB-1 — swap the writable repo set into the live runtime, atomic with
             // the definitions/executors above. Now `reload: true` rewires run
-            // repo_root resolution without a restart.
-            runtime.set_writable_repo_roots(new_writable_roots);
+            // repo_root resolution without a restart. WS-B B3 — the name→root
+            // index re-derives here too (discovery reran via config resolution),
+            // so an identity selector tracks the current worktree after reload.
+            runtime.set_writable_repo_roots(new_writable.roots);
+            runtime.set_writable_repo_names(new_writable.by_name);
             // Re-derive exclusive-resource pools from the new connections, atomic
             // with the swaps above, so a reload can add/resize a browser pool
             // without a restart.
@@ -1725,6 +1793,32 @@ async fn build_hot_components(
     Ok((definitions, executors, discovery, registry, workflow_handle))
 }
 
+/// v0.0.21 + WS-B B3 — the run-ambient repo set derived from
+/// `/praxec/_writableRepos`: the ordered writable roots AND a name→root index
+/// (from each entry's optional `name`) for the identity-first
+/// `resolve_run_repo_root` selector. Set as a pair into the runtime so they
+/// re-derive together on reload.
+#[derive(Debug)]
+struct WritableRepoSet {
+    roots: Vec<RepoRoot>,
+    by_name: std::collections::BTreeMap<String, RepoRoot>,
+}
+
+/// Gateway-side convenience: wire a whole [`WritableRepoSet`] (ordered roots +
+/// name→root index) into the runtime builder in one call. Kept here (not in
+/// praxec-core) so core's `with_writable_repo_roots(Vec<RepoRoot>)` signature —
+/// which the entire test suite calls — is untouched.
+trait WithWritableRepos {
+    fn with_writable_repos(self, set: WritableRepoSet) -> Self;
+}
+
+impl WithWritableRepos for WorkflowRuntime {
+    fn with_writable_repos(self, set: WritableRepoSet) -> Self {
+        self.with_writable_repo_roots(set.roots)
+            .with_writable_repo_names(set.by_name)
+    }
+}
+
 /// v0.0.21 — the run-ambient repo-root set: the config's `writable: true` repos
 /// (`/praxec/_writableRepos`), each validated as a canonical absolute existing
 /// directory via [`RepoRoot::new`]. A top-level `start` resolves the run's
@@ -1732,8 +1826,16 @@ async fn build_hot_components(
 /// a boot error — a run's root must be real, not a hopeful string. An empty set
 /// (no writable repo declared) is allowed at boot but makes every `start` fail
 /// fast (the mandatory-repo precondition).
-fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<Vec<RepoRoot>> {
+///
+/// WS-B B3 — an entry that carries a `name` is ALSO indexed by that durable
+/// identity. Note a `worktrees_of:` entry that resolved to NO live worktree
+/// stamps NO `_writableRepos` entry at all (config-load), so it never reaches
+/// here — that is precisely why a pruned/switched worktree no longer hard-fails
+/// boot: there is no dead path for `RepoRoot::new` to reject.
+fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<WritableRepoSet> {
     let mut out = Vec::new();
+    let mut by_name: std::collections::BTreeMap<String, RepoRoot> =
+        std::collections::BTreeMap::new();
     // Accumulate EVERY invalid root before failing. Short-circuiting on the
     // first one costs the operator a reboot per broken path to discover the
     // next; the fail-fast is the same, the diagnostic is one pass.
@@ -1745,7 +1847,14 @@ fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<Vec<RepoRoo
         for e in arr {
             if let Some(root) = e.pointer("/root").and_then(Value::as_str) {
                 match RepoRoot::new(root) {
-                    Ok(rr) => out.push(rr),
+                    Ok(rr) => {
+                        // WS-B B3 — index by durable identity when present, so the
+                        // name selector resolves to this (current) root.
+                        if let Some(name) = e.pointer("/name").and_then(Value::as_str) {
+                            by_name.insert(name.to_string(), rr.clone());
+                        }
+                        out.push(rr);
+                    }
                     Err(err) => {
                         invalid.push(format!("`{root}` is invalid: {err}"));
                     }
@@ -1761,7 +1870,10 @@ fn writable_repo_roots_from_config(config: &Value) -> anyhow::Result<Vec<RepoRoo
             invalid.join("; ")
         ));
     }
-    Ok(out)
+    Ok(WritableRepoSet {
+        roots: out,
+        by_name,
+    })
 }
 
 /// Derive the exclusive-resource pools from `connections:` — every `kind: mcp`
@@ -2244,10 +2356,34 @@ fn doctor(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config(&config_path)?;
     let report = crate::preflight::preflight(&config);
     print!("{}", crate::preflight::format_report(&report));
+
+    // Durability parity with `serve`: report the SAME env-aware condition serve
+    // fails fast on, so `doctor` (the health command) can never greenlight a
+    // config that `serve` would refuse to start on.
+    let durability = durability_problems(&config, true);
+    if durability.is_empty() {
+        println!("durable storage: ok");
+    } else {
+        println!("durable storage: DEGRADED — `serve` will refuse to start:");
+        for p in &durability {
+            println!("  - {p}");
+        }
+        println!(
+            "  fix: configure durable storage (store.kind: sqlite + audit.sink: file), \
+             or set gateway.allow_ephemeral: true (env PRAXEC_ALLOW_EPHEMERAL=1) for dev/testing."
+        );
+    }
+
     if !report.ok {
         anyhow::bail!(
             "doctor: required provider credential(s) missing — a drive against this \
              config would fail at the first model call"
+        );
+    }
+    if !durability.is_empty() {
+        anyhow::bail!(
+            "doctor: this config would start a DEGRADED gateway — durable storage is not \
+             configured and ephemeral operation is not permitted (see `durable storage` above)"
         );
     }
     Ok(())
@@ -2339,8 +2475,16 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
     // CMP-002 — the same suite `serve` enforces at startup (validate_workflows
     // + executor-kind doctor + feature-gated cost / kind:llm config doctors).
     let diagnostics = collect_diagnostics_with(&config, extra_diagnostics);
+    // Durability parity with `serve` — static / config-only: `check` validates
+    // the file itself, so it does NOT consult the runtime PRAXEC_ALLOW_EPHEMERAL
+    // env hatch (`doctor` does). A WARNING, not an error: the config may
+    // legitimately be served with the env opt-in set elsewhere. This surfaces
+    // the "serve will refuse this" condition that `check` used to hide behind
+    // `validation: ok`.
+    let durability = durability_problems(&config, false);
     let errors = diagnostics.iter().filter(|d| d.is_error()).count();
-    let warnings = diagnostics.iter().filter(|d| !d.is_error()).count();
+    let warnings =
+        diagnostics.iter().filter(|d| !d.is_error()).count() + usize::from(!durability.is_empty());
     let soft_warnings = soft_diagnostics.len();
 
     if !diagnostics.is_empty() {
@@ -2348,6 +2492,20 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
         for d in &diagnostics {
             println!("  {d}");
         }
+    }
+    // Durability warning — the config-level condition `serve` fails fast on.
+    if !durability.is_empty() {
+        println!();
+        println!(
+            "  warn[EPHEMERAL_STORAGE]: `serve` will refuse to start this config (it starts DEGRADED):"
+        );
+        for p in &durability {
+            println!("    - {p}");
+        }
+        println!(
+            "    set gateway.allow_ephemeral: true (or env PRAXEC_ALLOW_EPHEMERAL=1) to serve \
+             ephemerally for dev/testing, or configure durable storage."
+        );
     }
     // SPEC §5.4.2 / audit-resolution C.2 — print soft diagnostics under
     // their own banner so operators see them even when the rest of
@@ -2369,7 +2527,7 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
             println!("  warn[{}]{loc}: {}{suggestion}", d.code, d.message);
         }
     }
-    if !diagnostics.is_empty() || !soft_diagnostics.is_empty() {
+    if !diagnostics.is_empty() || !soft_diagnostics.is_empty() || !durability.is_empty() {
         println!();
         println!(
             "validation: {} error(s), {} warning(s), {} soft warning(s)",
@@ -3225,7 +3383,14 @@ fn load_current_chains(
     use praxec_core::model_resolver::config::{Binding, ModelsFile};
     let mf = ModelsFile::from_path(std::path::Path::new(models_yaml))
         .map_err(|e| anyhow::anyhow!("loading models.yaml {models_yaml}: {e}"))?;
-    let model_string = |b: &Binding| format!("{}:{}", b.provider.display_name(), b.model);
+    // (#12) Each chain rung is a `model@effort` identity: fold the binding's
+    // WS1-B `.effort` in so the base-lookup and candidate filter in `propose`
+    // compare against the exactly-keyed `(affinity, model, effort)` evidence
+    // bucket — the SAME model at two efforts is two rungs.
+    let model_string = |b: &Binding| {
+        let model = format!("{}:{}", b.provider.display_name(), b.model);
+        praxec_core::deescalation::chain_identity(&model, b.effort.as_deref())
+    };
     let mut chains = std::collections::BTreeMap::new();
     for aff in affinities {
         // overrides are Pool<Binding>, default is Vec<Binding>; unify to a slice.
@@ -3287,8 +3452,20 @@ async fn cost_propose_cmd(
         stats.iter().map(|s| s.affinity.clone()).collect();
     let chains = load_current_chains(models_yaml, &affinities)?;
 
-    let params = DeescalationParams::from_tuning();
-    let proposals = propose(&stats, &chains, &params);
+    // (#13) Thread the active model catalog + the configured frontier cost cap
+    // into `propose` so it can surface fair-trial candidates. The cap defaults to
+    // the catalog's shipped line and is overridden by
+    // `gateway.cost.frontier_cap_usd_per_m` — the SAME knob the runtime cost gate
+    // reads, so a trial never nominates a model the runtime would refuse.
+    let mut params = DeescalationParams::from_tuning();
+    if let Some(cap) = config
+        .pointer("/gateway/cost/frontier_cap_usd_per_m")
+        .and_then(Value::as_f64)
+    {
+        params.frontier_cap_usd_per_m = cap;
+    }
+    let catalog = praxec_core::model_catalog::model_catalog().models;
+    let proposals = propose(&stats, &chains, &params, &catalog);
 
     // Pair each proposal with the concrete chain edit it implies.
     let edits: Vec<(&praxec_core::deescalation::Proposal, Vec<String>)> = proposals
@@ -3353,6 +3530,7 @@ fn print_proposals_human(
         let tag = match p.direction {
             Direction::Lower => "LOWER",
             Direction::Raise => "RAISE",
+            Direction::Trial => "TRIAL",
         };
         println!(
             "\n  [{tag}] {}: {} → {}",
@@ -3705,9 +3883,9 @@ mod tests {
     use super::{
         GatewayOverlays, ack_guards_used, aggregate_calls, build_audit_sink, build_evidence_store,
         build_hot_components, build_runtime_for_orchestrate, build_workflow_store,
-        drive_outcome_to_result, guard_durable_serve, headless_policy_from, is_ephemeral_path,
-        maybe_enable_authoring, maybe_enable_sandbox, reload_gated, require_file_sink_for_follow,
-        resolve_embedder, tail_dir_once,
+        drive_outcome_to_result, durability_problems, guard_durable_serve, headless_policy_from,
+        is_ephemeral_path, maybe_enable_authoring, maybe_enable_sandbox, reload_gated,
+        require_file_sink_for_follow, resolve_embedder, tail_dir_once,
     };
     use praxec_agents::orchestrator::DriveOutcome;
     use praxec_agents::orchestrator::HeadlessPolicy;
@@ -4251,8 +4429,8 @@ mod tests {
         let config = json!({
             "praxec": { "_writableRepos": [{ "root": dir.path().display().to_string() }] }
         });
-        let roots = super::writable_repo_roots_from_config(&config).expect("all roots resolve");
-        assert_eq!(roots.len(), 1);
+        let set = super::writable_repo_roots_from_config(&config).expect("all roots resolve");
+        assert_eq!(set.roots.len(), 1);
     }
 
     /// #9 — `sync` reads the config's `repos:`, skips non-git local paths and
@@ -4655,6 +4833,63 @@ mod tests {
             err.contains("sqlite"),
             "must point at the durable backend: {err}"
         );
+    }
+
+    #[test]
+    fn durability_problems_config_only_flags_default_ephemeral() {
+        // The static `check` surface (consider_env_optin=false): an empty config
+        // defaults to memory store + stderr audit — both flagged, env-independent.
+        let p = durability_problems(&json!({}), false);
+        assert!(
+            p.iter().any(|s| s.contains("store.kind")),
+            "must flag the memory store: {p:?}"
+        );
+        assert!(
+            p.iter().any(|s| s.contains("audit.sink")),
+            "must flag the stderr audit: {p:?}"
+        );
+    }
+
+    #[test]
+    fn durability_problems_config_optin_clears_both_modes() {
+        // gateway.allow_ephemeral is a config-level opt-in, so it clears the
+        // problems whether or not the env hatch is consulted.
+        let cfg = json!({ "gateway": { "allow_ephemeral": true } });
+        assert!(durability_problems(&cfg, false).is_empty(), "static mode");
+        assert!(durability_problems(&cfg, true).is_empty(), "env-aware mode");
+    }
+
+    #[test]
+    fn durability_problems_clear_on_durable_config() {
+        let cfg = json!({
+            "store": { "kind": "sqlite", "path": "/var/lib/praxec/x.db" },
+            "audit": { "sink": "file", "path": "/var/lib/praxec/audit" }
+        });
+        assert!(durability_problems(&cfg, false).is_empty());
+        assert!(durability_problems(&cfg, true).is_empty());
+    }
+
+    #[test]
+    fn serve_guard_and_durability_problems_never_disagree() {
+        // The whole point of the shared function: `serve`'s refusal and the
+        // assessment `doctor`/`check` read can't diverge. (Env-robust: if
+        // PRAXEC_ALLOW_EPHEMERAL is set in this env, BOTH sides clear together.)
+        for cfg in [
+            json!({}),
+            json!({ "store": { "kind": "file", "path": "/tmp/s" } }),
+            json!({ "gateway": { "allow_ephemeral": true } }),
+            json!({
+                "store": { "kind": "sqlite", "path": "/var/lib/praxec/x.db" },
+                "audit": { "sink": "file", "path": "/var/lib/praxec/a" }
+            }),
+        ] {
+            let refused = guard_durable_serve(&cfg).is_err();
+            let has_problems = !durability_problems(&cfg, true).is_empty();
+            assert_eq!(
+                refused, has_problems,
+                "serve refusal must match durability_problems for {cfg}"
+            );
+        }
     }
 
     #[test]

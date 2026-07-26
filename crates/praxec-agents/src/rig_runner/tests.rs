@@ -1063,10 +1063,10 @@ async fn tool_setup_timeout_honors_session_value() {
     assert!(matches!(result, Err(ExecutorError::Timeout(2_000))));
 }
 
-/// A factory whose stream hangs forever without ever yielding an event —
-/// stands in for a "thinking" model that stalls at first token. Counts how
-/// many times `stream` is invoked so the test can prove a stall escalates
-/// (one attempt) rather than wastefully re-running the same hung model.
+/// A factory whose stream ESTABLISHES (`Ok` returns) then hangs forever without
+/// yielding an event — a connection that stays open but goes silent. Counts
+/// `stream` invocations so the test can prove the whole-step budget bounds it
+/// and the hung model is issued exactly once (not re-issued in-session).
 struct StallingFactory {
     calls: std::sync::atomic::AtomicUsize,
 }
@@ -1082,34 +1082,122 @@ impl ProviderFactory for StallingFactory {
     }
 }
 
-/// The no-progress watchdog: a model that produces NO stream event must be
-/// caught by the per-turn `stall_timeout` (30s) — NOT left to burn the whole
-/// 600s total budget — and the stall must escalate (surface as a Timeout the
-/// chain-walk treats as infrastructure), running the hung model exactly once
-/// rather than re-issuing it through the same-model transient-retry path.
+/// WS5 — a stream that ESTABLISHES but then stays silent forever (a wedged
+/// connection the transport keeps alive) is NOT killed by a token-level
+/// watchdog anymore: token-level quiet is indistinguishable from a model that
+/// is merely reasoning behind SSE keep-alives, and killing it there is the
+/// "reasoning models stall" defect. The backstop is the whole-step budget
+/// (`session.timeout`): the run ends as `TimedOut`, and the hung model is
+/// issued exactly once (a session-wall cancellation does not re-issue the turn).
 #[tokio::test(start_paused = true)]
-async fn a_stalled_stream_is_caught_by_the_no_progress_watchdog_and_does_not_retry() {
+async fn a_forever_silent_stream_is_bounded_by_the_session_wall_not_a_token_watchdog() {
     let factory = Arc::new(StallingFactory {
         calls: std::sync::atomic::AtomicUsize::new(0),
     });
     let mut s = session(vec![]); // no tools → tool setup skipped
-    s.timeout = Duration::from_secs(600); // total budget — must NOT be what fires
-    s.stall_timeout = Duration::from_secs(30); // the watchdog window
+    s.timeout = Duration::from_secs(600); // the whole-step budget — the sole backstop now
+    s.stall_timeout = Duration::from_secs(30); // no longer a kill timer for an established stream
     let runner = RigSessionRunner::new(factory.clone());
-    let result = runner.run(s).await;
-    // Fires at the 30s stall window, not the 600s wall, and surfaces as a
-    // Timeout (→ NetworkTimeout → chain-walk escalates to the next model).
+    let report = runner
+        .run(s)
+        .await
+        .expect("a session-wall timeout returns an outcome, not an error");
     assert!(
-        // ms, not seconds — the 30s stall window surfaces as Timeout(30_000).
-        matches!(result, Err(ExecutorError::Timeout(30_000))),
-        "a stalled stream must time out at the 30s stall window, got {result:?}"
+        matches!(report.outcome, AgentRunOutcome::TimedOut),
+        "a forever-silent established stream must end at the session wall, got {:?}",
+        report.outcome
     );
-    // Escalate, don't re-hang: the same-model retry path must NOT re-issue a
-    // stalled model (that would burn another stall window per attempt).
+    // Issued once: a session-wall cancel does not re-issue the turn (no wasteful
+    // per-attempt re-hang).
     assert_eq!(
         factory.calls.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "a stalled model must escalate after one attempt, not retry in-session"
+        "the hung model is issued exactly once, not re-issued in-session"
+    );
+}
+
+/// A scripted factory that COUNTS `stream()` calls — each call pops the next
+/// scripted turn's events (an exhausted script yields an empty stream). Lets a
+/// test prove the bounded transport-retry behavior (WS5) by call count.
+struct CountingScriptedFactory {
+    turns: Mutex<std::collections::VecDeque<Vec<Result<StreamEvent, String>>>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl CountingScriptedFactory {
+    fn new(turns: Vec<Vec<Result<StreamEvent, String>>>) -> Self {
+        Self {
+            turns: Mutex::new(turns.into_iter().collect()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+    fn call_count(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+#[async_trait]
+impl ProviderFactory for CountingScriptedFactory {
+    async fn stream(
+        &self,
+        _model: &str,
+        _turn: TurnRequest,
+    ) -> Result<BoxStream<'static, Result<StreamEvent, String>>, ExecutorError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let events = self.turns.lock().unwrap().pop_front().unwrap_or_default();
+        Ok(Box::pin(stream::iter(events)))
+    }
+}
+
+/// WS5 — an INTERMITTENT transport failure (the client `read_timeout` firing on
+/// a briefly-dead socket) surfaces as a mid-stream `Err`, which the runner
+/// raises as a retriable `Connection` error and RE-ISSUES on a fresh
+/// connection. A blip that clears on the next attempt must let the run COMPLETE
+/// — the whole point of the fix: a recoverable blip is not a dead step.
+#[tokio::test(start_paused = true)]
+async fn an_intermittent_transport_error_is_retried_and_the_run_recovers() {
+    let factory = Arc::new(CountingScriptedFactory::new(vec![
+        vec![Err("read timeout".into())], // attempt 1: transport blip
+        vec![Ok(final_answer(
+            r#"{"status":"success","output":{"ok":true}}"#,
+        ))], // attempt 2: recovered
+    ]));
+    let runner = RigSessionRunner::new(factory.clone());
+    let report = runner
+        .run(session(vec![]))
+        .await
+        .expect("a recovered blip completes the run");
+    assert!(
+        matches!(report.outcome, AgentRunOutcome::Completed(_)),
+        "an intermittent transport error must be retried and recover, got {:?}",
+        report.outcome
+    );
+    assert_eq!(
+        factory.call_count(),
+        2,
+        "one blip + one successful re-issue on a fresh connection"
+    );
+}
+
+/// WS5 — a PERSISTENT transport failure is retried a BOUNDED number of times
+/// (`MAX_RETRY_ATTEMPTS` = 2) and then escalates as a `Connection` error (the
+/// chain-walk moves to the next model) — never an unbounded retry loop, never a
+/// hollow NoResult that hides the transport failure.
+#[tokio::test(start_paused = true)]
+async fn a_persistent_transport_error_escalates_after_bounded_retries() {
+    let factory = Arc::new(CountingScriptedFactory::new(vec![
+        vec![Err("read timeout".into())],
+        vec![Err("read timeout".into())],
+        vec![Err("read timeout".into())],
+    ]));
+    let runner = RigSessionRunner::new(factory.clone());
+    let result = runner.run(session(vec![])).await;
+    assert!(
+        matches!(result, Err(ExecutorError::Connection(_))),
+        "a persistent transport error must escalate as a Connection error, got {result:?}"
+    );
+    assert_eq!(
+        factory.call_count(),
+        3,
+        "initial attempt + MAX_RETRY_ATTEMPTS (2) re-issues, then escalate"
     );
 }
 

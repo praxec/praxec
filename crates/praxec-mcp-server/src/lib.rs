@@ -1294,6 +1294,12 @@ impl ServerHandler for PraxecServer {
         // #18 — capture the connected peer so the bridged audit sink can push
         // events recorded DURING this (possibly long) call to the client.
         self.progress_peer.set(context.peer.clone());
+        // #70 — capture THIS call's abort token (rmcp `RequestContext.ct`, a
+        // tokio CancellationToken that fires on client cancel/disconnect) so the
+        // deterministic-chain drive can observe it between hops and stop burning
+        // tokens the instant the client goes away. Non-serve callers (CLI) never
+        // reach here, so the runtime's cancel slot stays `None` for them.
+        self.runtime.set_cancel_token(context.ct.clone());
         // P6b — lazy staleness recheck BEFORE dispatch: if the operator edited
         // the config on disk (and the TTL elapsed), the gated reload runs now,
         // so THIS request already sees the new config. Within the TTL window

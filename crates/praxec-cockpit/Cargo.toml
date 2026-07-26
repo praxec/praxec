@@ -34,7 +34,7 @@ dirs = "5"
 # The in-process Mission Control LLM driver (the central cockpit tool): rig drives
 # the chat loop (one LLM lib across the cockpit — the same crate the embeddings
 # use), tokio runs it off the UI thread, futures drains the streams.
-rig = { package = "rig-core", version = "0.38" }
+rig = { package = "rig-core", version = "0.40" }
 tokio = { workspace = true }
 futures = { workspace = true }
 # The shared embedding model is picked at startup (the bootstrap gate) and powers

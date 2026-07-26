@@ -2014,6 +2014,37 @@ impl WorkflowRuntime {
                 }
                 Ok(DispatchOutcome::terminal(response))
             }
+            ChainOutcome::Aborted { partial, reason } => {
+                // #70 — the client aborted the in-flight `submit` call. Stop the
+                // burn WITHOUT durably cancelling (a transport abort is not a
+                // decision to abandon the mission); the per-hop-committed
+                // instance is left resumable at its current position. Respond
+                // terminal for THIS dispatch (no further chained LLM turns) with
+                // the abort marker; the aborting client will not read it, but the
+                // response keeps the shape consistent with every other arm.
+                let mut response = self
+                    .response(
+                        &definition,
+                        &partial.instance,
+                        StatusHint::Executed,
+                        None,
+                        &request.principal,
+                    )
+                    .await;
+                response["aborted"] = json!({
+                    "code": "CLIENT_ABORTED",
+                    "message": reason,
+                });
+                let mut all_evidence = accumulated_evidence;
+                all_evidence.extend(partial.evidence);
+                if !all_evidence.is_empty() {
+                    response["evidence"] = serde_json::to_value(&all_evidence)?;
+                }
+                if !partial.steps.is_empty() {
+                    response["chain"] = serde_json::to_value(&partial.steps)?;
+                }
+                Ok(DispatchOutcome::terminal(response))
+            }
         }
     }
 }

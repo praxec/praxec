@@ -153,20 +153,30 @@ pub fn resolve_affinity_to_model(resolver: &Resolver, affinity: &str) -> Option<
 }
 
 /// Resolve an `affinity:` string to an **ordered** list of
-/// `"provider:model-id"` strings — the full chain the `Resolver::walk`
-/// returns, with every binding mapped to its canonical prefix, cheapest-
-/// effective first.
+/// `("provider:model-id", effort)` pairs — the full chain the `Resolver::walk`
+/// returns, with every binding mapped to its canonical prefix and its
+/// model-paired reasoning `effort` (WS1-B), cheapest-effective first.
+///
+/// The `effort` is the binding's own [`Binding::effort`] — non-portable across
+/// models, so it travels WITH each hop rather than being smeared across the
+/// chain. `None` = the model declares no effort of its own.
 ///
 /// Returns an **empty `Vec`** when the affinity doesn't parse or the walk
 /// fails, mirroring [`resolve_affinity_to_model`]'s `None` handling but as
 /// a vec so callers can cheaply check `chain.is_empty()`.
-pub fn resolve_affinity_to_chain(resolver: &Resolver, affinity: &str) -> Vec<String> {
+pub fn resolve_affinity_to_chain(
+    resolver: &Resolver,
+    affinity: &str,
+) -> Vec<(String, Option<String>)> {
+    let hop = |b: &praxec_core::model_resolver::config::Binding| {
+        (
+            format!("{}:{}", provider_prefix(&b.provider), b.model),
+            b.effort.clone(),
+        )
+    };
     // Open activity key wins: a full `activity:` chain keyed by any string.
     if let Some(bindings) = resolver.file().activity.get(affinity) {
-        return bindings
-            .iter()
-            .map(|b| format!("{}:{}", provider_prefix(&b.provider), b.model))
-            .collect();
+        return bindings.iter().map(hop).collect();
     }
     let Ok(delegate) = ModelRef::parse(affinity) else {
         return Vec::new();
@@ -174,10 +184,7 @@ pub fn resolve_affinity_to_chain(resolver: &Resolver, affinity: &str) -> Vec<Str
     let Ok((bindings, _level)) = resolver.walk(&delegate) else {
         return Vec::new();
     };
-    bindings
-        .iter()
-        .map(|b| format!("{}:{}", provider_prefix(&b.provider), b.model))
-        .collect()
+    bindings.iter().map(hop).collect()
 }
 
 /// Map a config [`Provider`] to the prefix the `LlmExecutor`'s
