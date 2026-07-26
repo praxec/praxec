@@ -121,6 +121,31 @@ pub fn load_manifest(repo_root: &Path) -> anyhow::Result<RepoManifest> {
     Ok(manifest)
 }
 
+/// Cheaply read the `name:` field of a `praxec.repo.yaml` at `worktree_root`,
+/// WITHOUT the full [`load_repo`] (no layout walk, no registry build). Used by
+/// identity-first worktree discovery (`worktrees_of:`) to test whether a given
+/// worktree carries a repo stub declaring a particular `name`.
+///
+/// Returns `None` — never an error — when the stub is absent or unreadable: a
+/// worktree lacking a matching stub is simply not a candidate, and discovery
+/// must not hard-fail boot just because one enumerated worktree has no manifest
+/// (that is the whole worktree-churn-proofing point). A present-but-malformed
+/// stub is likewise a non-candidate here; `check`/`load_repo` surface it loudly
+/// where the repo is actually consumed.
+pub fn read_manifest_name(worktree_root: &Path) -> Option<String> {
+    /// Minimal projection of `praxec.repo.yaml`: only the identity field. Not
+    /// `deny_unknown_fields` — discovery reads solely `name` and ignores the
+    /// rest, so a schema-newer stub still matches by identity.
+    #[derive(Deserialize)]
+    struct NameOnly {
+        name: String,
+    }
+    let manifest_path = worktree_root.join("praxec.repo.yaml");
+    let text = std::fs::read_to_string(&manifest_path).ok()?;
+    let parsed: NameOnly = serde_yaml::from_str(&text).ok()?;
+    Some(parsed.name)
+}
+
 /// Top-level config blocks whose entries are subject to namespace prefixing
 /// when loaded from a repo. Order matters only for stable error messages;
 /// the merged value is order-independent.

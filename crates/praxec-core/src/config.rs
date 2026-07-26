@@ -2995,10 +2995,11 @@ fn merge_declared_repos(
     // has `skipped < declared` yet still loads zero definitions.
     let mut loaded_definition_repos: usize = 0;
     let mut seen_namespaces: HashMap<String, String> = HashMap::new();
-    // SPEC §8.4 — (absolute root, push) of repos opted in as authoring write
-    // targets, carried forward to the gateway via the resolved config (see
-    // `stamp_writable_repos`).
-    let mut writable_repo_roots: Vec<(String, bool)> = Vec::new();
+    // SPEC §8.4 + WS-B B3 — (absolute root, push, optional identity name) of
+    // repos opted in as authoring write targets, carried forward to the gateway
+    // via the resolved config (see `stamp_writable_repos`). The `name` is the
+    // key the runtime's name→root selector index is built from.
+    let mut writable_repo_roots: Vec<(String, bool, Option<String>)> = Vec::new();
     // Spec A §5 — namespace → priority, carried into the merged config for
     // `hop_slot:` cap-resolution tie-breaking (see `stamp_repo_priority`).
     let mut repo_priorities: Vec<(String, i64)> = Vec::new();
@@ -3009,6 +3010,7 @@ fn merge_declared_repos(
 
     for RepoDecl {
         source,
+        name,
         writable,
         push,
         definitions,
@@ -3021,7 +3023,104 @@ fn merge_declared_repos(
         let entry_desc = match &source {
             RepoSource::Local(p) => p.display().to_string(),
             RepoSource::Remote { uri, .. } => uri.clone(),
+            RepoSource::WorktreesOf { anchor, name } => {
+                format!("worktrees_of:{} name:{name}", anchor.display())
+            }
         };
+        // WS-B B3 — identity-first, worktree-churn-proof resolution. A
+        // `worktrees_of:` entry declares a durable IDENTITY (`name`) + a stable
+        // `anchor` to enumerate worktrees of; the live writable root is the
+        // worktree carrying a matching `praxec.repo.yaml` stub. It contributes
+        // NO definitions (it is purely a writable run target, like the FB-2
+        // bare-writable path), so it is fully handled here and `continue`s
+        // before the manifest/registry load below.
+        if let RepoSource::WorktreesOf { anchor, name: repo_name } = &source {
+            // Same base-dir convention as `Local`: a relative anchor resolves
+            // against the host config dir; an absolute one is used as-is.
+            let anchor = if anchor.is_absolute() {
+                anchor.clone()
+            } else {
+                host_dir.join(anchor)
+            };
+            match resolve_worktrees_of(&anchor, repo_name) {
+                WorktreeResolution::Resolved(path) => {
+                    writable_repo_roots.push((
+                        path.display().to_string(),
+                        push,
+                        Some(repo_name.clone()),
+                    ));
+                }
+                // 0 matches → declared-unresolved: a LEGAL boot state. Stamp NO
+                // writable root; boot SUCCEEDS. Recorded as a visible diagnostic
+                // (and a loud warn) so it is never silently inert — the operator
+                // (and `check`) can see the identity resolved to nothing.
+                WorktreeResolution::Unresolved { reason } => {
+                    tracing::warn!(
+                        entry = %entry_desc,
+                        reason = %reason,
+                        "REPO_IDENTITY_UNRESOLVED: `worktrees_of:` entry resolved to no live \
+                         worktree; no writable root stamped for it this run (boot continues)"
+                    );
+                    diagnostics.push(Diagnostic {
+                        severity: DiagnosticSeverity::Warn,
+                        code: "REPO_IDENTITY_UNRESOLVED".into(),
+                        message: format!(
+                            "repos entry '{entry_desc}' resolved to no live worktree: {reason}"
+                        ),
+                        location: None,
+                        suggestion: Some(
+                            "add or check out a worktree of the anchor carrying a \
+                             `praxec.repo.yaml` with this `name`, then reload."
+                                .into(),
+                        ),
+                    });
+                }
+                // 2+ matches → REPO_IDENTITY_AMBIGUOUS. NEVER auto-pick: a
+                // wrong-repo write is corruption (#69). Hard error in Strict
+                // (check/authoring); skip-with-loud-warn in Resilient (serve).
+                WorktreeResolution::Ambiguous { candidates } => {
+                    let listed = candidates
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    match mode {
+                        RepoLoadMode::Strict => bail!(
+                            "REPO_IDENTITY_AMBIGUOUS: `worktrees_of:` entry '{entry_desc}' \
+                             matches {} worktrees carrying name '{repo_name}': {listed}. \
+                             A durable identity must resolve to exactly one worktree — remove or \
+                             rename the duplicate stub(s).",
+                            candidates.len()
+                        ),
+                        RepoLoadMode::Resilient => {
+                            tracing::warn!(
+                                entry = %entry_desc,
+                                candidates = %listed,
+                                "REPO_IDENTITY_AMBIGUOUS: `worktrees_of:` entry matches multiple \
+                                 worktrees; skipped (never auto-picked — a wrong-repo write is \
+                                 corruption, #69)"
+                            );
+                            diagnostics.push(Diagnostic {
+                                severity: DiagnosticSeverity::Warn,
+                                code: "REPO_IDENTITY_AMBIGUOUS".into(),
+                                message: format!(
+                                    "repos entry '{entry_desc}' matches {} worktrees carrying \
+                                     name '{repo_name}': {listed}. Skipped — never auto-picked.",
+                                    candidates.len()
+                                ),
+                                location: None,
+                                suggestion: Some(
+                                    "remove or rename the duplicate `praxec.repo.yaml` stub so \
+                                     the identity resolves to exactly one worktree."
+                                        .into(),
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         // Resolve to a local path and load: a local dir relative to the host
         // config (same base-dir convention as `include:`), or a remote repo
         // imported (cloned/updated) into a cache under
@@ -3048,6 +3147,12 @@ fn merge_declared_repos(
                         .join(crate::repo_git::cache_dir_name(&uri));
                     crate::repo_git::clone_or_update(&uri, &gitref, &dest)
                         .with_context(|| format!("importing repo {uri}"))?
+                }
+                // WS-B B3 — a `worktrees_of:` source is fully resolved and
+                // `continue`d above; it never reaches this load path. Exhaustive
+                // arm keeps the match total (poka-yoke) — reaching it is a bug.
+                RepoSource::WorktreesOf { .. } => {
+                    unreachable!("WorktreesOf is resolved before the manifest load")
                 }
             };
             // FB-2 — a bare writable run target (`definitions: false`) ships no
@@ -3102,11 +3207,11 @@ fn merge_declared_repos(
         let Some((manifest, mut repo_value)) = manifest_and_registry else {
             // FB-2 bare writable run target: `parse_repo_entry` already
             // guaranteed `writable` here.
-            writable_repo_roots.push((repo_path.display().to_string(), push));
+            writable_repo_roots.push((repo_path.display().to_string(), push, name.clone()));
             continue;
         };
         if writable {
-            writable_repo_roots.push((repo_path.display().to_string(), push));
+            writable_repo_roots.push((repo_path.display().to_string(), push, name.clone()));
         }
         // V20 — namespace uniqueness across declared repos.
         if let Some(prev_name) =
@@ -3512,12 +3617,14 @@ fn stamp_repo_priority(config: &mut Value, priorities: Vec<(String, i64)>) {
     }
 }
 
-/// SPEC §8.4 — record repos declared `writable: true` under
-/// `/praxec/_writableRepos` as `{ root, push }` objects (internal
+/// SPEC §8.4 + WS-B B3 — record repos declared `writable: true` under
+/// `/praxec/_writableRepos` as `{ root, push, name? }` objects (internal
 /// resolved-config metadata, not an operator-authored key). The gateway reads
 /// this to build the repo-backed writable definition store for the authoring
-/// write path. No-op when empty.
-fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool)>) {
+/// write path AND the runtime's name→root selector index (from `name`, when
+/// present). The `name` key is OPTIONAL — the old `{ root, push }` shape still
+/// parses. No-op when empty.
+fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool, Option<String>)>) {
     if roots.is_empty() {
         return;
     }
@@ -3530,7 +3637,10 @@ fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool)>) {
     if let Some(fg) = praxec.as_object_mut() {
         let entries: Vec<Value> = roots
             .into_iter()
-            .map(|(root, push)| json!({ "root": root, "push": push }))
+            .map(|(root, push, name)| match name {
+                Some(n) => json!({ "root": root, "push": push, "name": n }),
+                None => json!({ "root": root, "push": push }),
+            })
             .collect();
         fg.insert("_writableRepos".into(), Value::Array(entries));
     }
@@ -3542,6 +3652,13 @@ fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool)>) {
 /// or a remote URI to import) and whether it's an authoring write target.
 struct RepoDecl {
     source: RepoSource,
+    /// WS-B B3 — a durable IDENTITY for this repo, independent of any literal
+    /// filesystem path. Optional for `path:`/`uri:` entries (where it becomes a
+    /// name→root index key for the `resolve_run_repo_root` name selector);
+    /// MANDATORY for a `worktrees_of:` entry, whose whole resolution is by
+    /// identity (match the `name` in each enumerated worktree's
+    /// `praxec.repo.yaml` stub).
+    name: Option<String>,
     writable: bool,
     push: bool,
     /// FB-2 (SPEC §9) — whether this entry is a **definition repo** (carries a
@@ -3576,6 +3693,97 @@ enum RepoSource {
     Local(PathBuf),
     /// A remote git repo imported (cloned/updated) into a local cache.
     Remote { uri: String, gitref: String },
+    /// WS-B B3 — an IDENTITY + discovery rule, not a literal path. `anchor` is a
+    /// stable checkout whose git worktrees are enumerated at config-load; the
+    /// live writable root is the worktree whose `praxec.repo.yaml` stub declares
+    /// `name`. A worktree that is pruned/switched just drops out of the
+    /// enumeration (0 matches → declared-unresolved, a LEGAL boot state) instead
+    /// of dying as a dead `path:`. `name` is REQUIRED (poka-yoke enforced in
+    /// [`parse_repo_entry`]).
+    WorktreesOf { anchor: PathBuf, name: String },
+}
+
+/// WS-B B3 — outcome of resolving a `worktrees_of:` entry against the live git
+/// worktrees of its anchor. Three states, exactly mirroring the design: one
+/// live worktree carries the declared identity, none does, or several do.
+enum WorktreeResolution {
+    /// Exactly one enumerated worktree carries a `praxec.repo.yaml` whose `name`
+    /// equals the declared identity → its path is the writable root.
+    Resolved(PathBuf),
+    /// No enumerated worktree carries the declared identity (it was pruned /
+    /// switched, or the anchor could not be enumerated). A LEGAL boot state:
+    /// stamp NO writable root, record a diagnostic, boot succeeds. `reason`
+    /// explains which (for the diagnostic).
+    Unresolved { reason: String },
+    /// Two-or-more enumerated worktrees carry the declared identity. Never
+    /// auto-picked (a wrong-repo write is corruption, #69): a hard error in
+    /// Strict mode, skip-with-loud-warn in Resilient.
+    Ambiguous { candidates: Vec<PathBuf> },
+}
+
+/// WS-B B3 — enumerate the git worktrees of `anchor` and select the one whose
+/// `praxec.repo.yaml` stub declares `name`. The anchor itself appears in
+/// `git worktree list` and is eligible iff it, too, carries a matching stub.
+///
+/// This is the ONLY filesystem/`git` touch of identity-first resolution; it is
+/// deliberately churn-proof: a failure to run `git` or enumerate the anchor
+/// yields [`WorktreeResolution::Unresolved`] (a legal, diagnosable boot state),
+/// never a hard error — the whole point is that a gone worktree can never brick
+/// boot. Emitting an actual root stays behind [`crate::run_env::RepoRoot::new`]
+/// downstream (in the gateway), preserving the canonical-existing-dir invariant.
+fn resolve_worktrees_of(anchor: &Path, name: &str) -> WorktreeResolution {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(anchor)
+        .args(["worktree", "list", "--porcelain"])
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            return WorktreeResolution::Unresolved {
+                reason: format!(
+                    "`git worktree list` in anchor '{}' failed ({}): {}",
+                    anchor.display(),
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            };
+        }
+        Err(e) => {
+            return WorktreeResolution::Unresolved {
+                reason: format!(
+                    "could not run `git worktree list` in anchor '{}': {e}",
+                    anchor.display()
+                ),
+            };
+        }
+    };
+    // Porcelain format: each worktree paragraph starts with a `worktree <path>`
+    // line. That line is all identity discovery needs.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut matches: Vec<PathBuf> = Vec::new();
+    for line in stdout.lines() {
+        let Some(path) = line.strip_prefix("worktree ") else {
+            continue;
+        };
+        let wt = PathBuf::from(path.trim());
+        if crate::repo::read_manifest_name(&wt).as_deref() == Some(name) {
+            matches.push(wt);
+        }
+    }
+    match matches.len() {
+        0 => WorktreeResolution::Unresolved {
+            reason: format!(
+                "no worktree of anchor '{}' carries a `praxec.repo.yaml` declaring \
+                 name '{name}'",
+                anchor.display()
+            ),
+        },
+        1 => WorktreeResolution::Resolved(matches.pop().expect("len==1")),
+        _ => WorktreeResolution::Ambiguous {
+            candidates: matches,
+        },
+    }
 }
 
 fn take_repos_and_overrides(host: &mut Value) -> anyhow::Result<(Vec<RepoDecl>, HashSet<String>)> {
@@ -3704,13 +3912,29 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
             short_value_kind(other)
         ),
     };
-    // SPEC §9 — a repo is either local (`path`) or remote (`uri`, imported via
-    // git). Exactly one; a remote repo may pin a `ref` (default `main`).
+    // WS-B B3 — optional durable `name:` identity. A name→root index key for the
+    // `resolve_run_repo_root` name selector; REQUIRED for a `worktrees_of:` entry.
+    let name: Option<String> = match entry.get("name") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::String(_)) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}].name` must be a non-empty string"
+        ),
+        Some(other) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}].name` must be a string ({})",
+            short_value_kind(other)
+        ),
+    };
+    // SPEC §9 + WS-B B3 — a repo is declared by exactly one of: a local `path`, a
+    // remote `uri` (imported via git), or `worktrees_of:` (identity-first
+    // discovery of a live git worktree). A remote repo may pin a `ref`
+    // (default `main`).
     let path = entry.get("path").and_then(Value::as_str);
     let uri = entry.get("uri").and_then(Value::as_str);
-    let source = match (path, uri) {
-        (Some(p), None) => RepoSource::Local(expand_repo_path(p)),
-        (None, Some(u)) => {
+    let worktrees_of = entry.get("worktrees_of").and_then(Value::as_str);
+    let source = match (path, uri, worktrees_of) {
+        (Some(p), None, None) => RepoSource::Local(expand_repo_path(p)),
+        (None, Some(u), None) => {
             let gitref = entry
                 .get("ref")
                 .and_then(Value::as_str)
@@ -3721,18 +3945,54 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
                 gitref,
             }
         }
-        (Some(_), Some(_)) => bail!(
+        (None, None, Some(anchor)) => {
+            // A `worktrees_of:` entry is resolved by IDENTITY, so `name:` is
+            // mandatory — there is nothing to match a worktree stub against
+            // without it (poka-yoke against a silently unresolvable entry).
+            let repo_name = name.clone().ok_or_else(|| {
+                anyhow!(
+                    "INVALID_REPO_ENTRY: `repos[{index}]` uses `worktrees_of:` but declares no \
+                     `name:` — a worktrees_of repo is resolved by IDENTITY (the `name` in each \
+                     enumerated worktree's `praxec.repo.yaml`), so `name:` is REQUIRED."
+                )
+            })?;
+            // A discovered worktree is only ever a writable RUN TARGET; a
+            // read-only worktrees_of entry contributes nothing (same spirit as
+            // the `definitions: false ⇒ writable` rule).
+            if !writable {
+                bail!(
+                    "INVALID_REPO_ENTRY: `repos[{index}]` uses `worktrees_of:` without \
+                     `writable: true` — a discovered worktree is a writable run target and \
+                     contributes nothing otherwise. Add `writable: true`."
+                );
+            }
+            RepoSource::WorktreesOf {
+                anchor: expand_repo_path(anchor),
+                name: repo_name,
+            }
+        }
+        // `worktrees_of:` is mutually exclusive with a literal `path`/`uri` — a
+        // repo is discovered by identity OR pinned to a literal location.
+        (_, _, Some(_)) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}]` declares `worktrees_of:` together with \
+             `path:`/`uri:` — a repo is resolved by worktree identity OR a literal path/uri, \
+             not both."
+        ),
+        (Some(_), Some(_), None) => bail!(
             "INVALID_REPO_ENTRY: `repos[{index}]` declares both `path` and `uri` — \
              a repo is either local or remote, not both."
         ),
-        (None, None) => bail!(
-            "INVALID_REPO_ENTRY: `repos[{index}]` needs a `path` (local dir) or a `uri` \
-             (remote git repo to import), e.g. `- path: ~/repos/swe-core` or \
-             `- uri: git+https://github.com/acme/workflows@main`."
+        (None, None, None) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}]` needs a `path` (local dir), a `uri` \
+             (remote git repo to import), or `worktrees_of:` (identity-first worktree \
+             discovery), e.g. `- path: ~/repos/swe-core` or \
+             `- uri: git+https://github.com/acme/workflows@main` or \
+             `- worktrees_of: ~/repos/anchor` with `name:` + `writable: true`."
         ),
     };
     Ok(RepoDecl {
         source,
+        name,
         writable,
         push,
         definitions,

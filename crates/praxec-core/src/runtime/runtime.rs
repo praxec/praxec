@@ -236,6 +236,16 @@ pub struct WorkflowRuntime {
     /// wrappers' `RwLock<Arc<…>>` idiom. Reads (per run `start`) take a read
     /// lock; a reload takes a write lock via [`set_writable_repo_roots`].
     pub(crate) writable_repo_roots: Arc<std::sync::RwLock<Vec<crate::run_env::RepoRoot>>>,
+    /// WS-B B3 — parallel name→root index over the SAME writable repos, keyed by
+    /// each repo's durable identity (`name:` in config, carried in
+    /// `_writableRepos`). A `resolve_run_repo_root(Some(name))` selector resolves
+    /// here FIRST — an identity resolves to whatever worktree currently backs it,
+    /// so a run selector survives worktree churn even though the underlying path
+    /// changed. Empty when no writable repo declared a `name`. Hot-swappable and
+    /// re-derived on reload alongside `writable_repo_roots` (they are set as a
+    /// pair from the same resolved config).
+    pub(crate) writable_repo_names:
+        Arc<std::sync::RwLock<std::collections::BTreeMap<String, crate::run_env::RepoRoot>>>,
     /// Exclusive-resource pools: `pool name -> member lock-keys`, derived from
     /// the config's `connections:` (each `exclusive: true` mcp connection tagged
     /// with a `pool:`). A flow declaring `exclusive_pools: [browser]` leases ONE
@@ -292,6 +302,9 @@ impl WorkflowRuntime {
             frontier_cap_usd_per_m: None,
             approve_frontier: Vec::new(),
             writable_repo_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
+            writable_repo_names: Arc::new(std::sync::RwLock::new(
+                std::collections::BTreeMap::new(),
+            )),
             exclusive_pools: Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
             cancel_slot: Arc::new(Mutex::new(None)),
         }
@@ -542,6 +555,33 @@ impl WorkflowRuntime {
             .expect("LOCK_POISONED: writable_repo_roots") = roots;
     }
 
+    /// WS-B B3 — wire the config-declared name→root index (from the `name` field
+    /// of `/praxec/_writableRepos`) that the `resolve_run_repo_root` name selector
+    /// resolves against. A companion to [`Self::with_writable_repo_roots`] — kept
+    /// separate so the many `with_writable_repo_roots(vec![RepoRoot::for_test()])`
+    /// callers need no change (the index defaults empty).
+    pub fn with_writable_repo_names(
+        mut self,
+        names: std::collections::BTreeMap<String, crate::run_env::RepoRoot>,
+    ) -> Self {
+        self.writable_repo_names = Arc::new(std::sync::RwLock::new(names));
+        self
+    }
+
+    /// WS-B B3 — hot-swap the name→root index from a re-derived config, the
+    /// companion to [`Self::set_writable_repo_roots`]. `reload_gated` calls both
+    /// (atomic with the other reload swaps) so identity resolution re-derives on
+    /// reload. Takes `&self`: the shared runtime and every cloned handle see it.
+    pub fn set_writable_repo_names(
+        &self,
+        names: std::collections::BTreeMap<String, crate::run_env::RepoRoot>,
+    ) {
+        *self
+            .writable_repo_names
+            .write()
+            .expect("LOCK_POISONED: writable_repo_names") = names;
+    }
+
     /// The canonical paths of the currently-live writable repos — for the reload
     /// response so the operator sees what actually got wired, not a bare "reloaded".
     pub fn writable_repo_roots_snapshot(&self) -> Vec<String> {
@@ -561,8 +601,11 @@ impl WorkflowRuntime {
     /// - N declared → require `selector` to name one of them (or a subpath),
     ///   else fail listing the choices.
     ///
-    /// The selector resolves against the declared roots by canonical path:
-    /// either the exact canonical path of a declared root, OR (FB-3) a
+    /// The selector resolves in priority order: first as a declared repo NAME
+    /// (WS-B B3 — identity-first; the name→root index resolves to the repo's
+    /// current discovered root, surviving worktree churn), then against the
+    /// declared roots by canonical path: either the exact canonical path of a
+    /// declared root, OR (FB-3) a
     /// **worktree / subpath UNDER** a declared root — so an operator can scope a
     /// run to a git worktree or subdirectory of an already-declared repo without
     /// pre-declaring every such path. Still bounded by the allowlist: a selector
@@ -587,6 +630,19 @@ impl WorkflowRuntime {
         }
         match selector {
             Some(sel) => {
+                // WS-B B3 — a declared repo NAME resolves FIRST, ahead of any path
+                // interpretation: an identity resolves to whatever worktree
+                // currently backs it, so a run selector survives worktree churn.
+                // No filesystem touch — the index already holds a validated root.
+                {
+                    let names = self
+                        .writable_repo_names
+                        .read()
+                        .expect("LOCK_POISONED: writable_repo_names");
+                    if let Some(r) = names.get(sel) {
+                        return Ok(r.clone());
+                    }
+                }
                 // Fast path: an exact match against a declared canonical root —
                 // no filesystem touch.
                 if let Some(r) = roots.iter().find(|r| r.as_str() == sel) {
@@ -2227,5 +2283,40 @@ mod writable_repo_tests {
             handle.resolve_run_repo_root(None).is_ok(),
             "a runtime clone must see the swap"
         );
+    }
+
+    /// WS-B B3 — a `name:` selector resolves to the repo's discovered root via
+    /// the name index, taking PRIORITY over path interpretation.
+    #[test]
+    fn name_selector_resolves_via_the_name_index() {
+        let td = tempfile::TempDir::new().unwrap();
+        let root = RepoRoot::new(td.path()).unwrap();
+        let mut names = std::collections::BTreeMap::new();
+        names.insert("autopilot-qa-target".to_string(), root.clone());
+        let rt = runtime_with_roots(vec![root.clone()]).with_writable_repo_names(names);
+        // A bare identity — NOT a filesystem path — resolves to the current root.
+        let got = rt
+            .resolve_run_repo_root(Some("autopilot-qa-target"))
+            .expect("a declared name resolves to its discovered root");
+        assert_eq!(got, root);
+    }
+
+    /// WS-B B3 — the name index wins even when a same-named path interpretation
+    /// would otherwise apply: name lookup is checked first and returns before any
+    /// canonicalization is attempted (a bare name is not a valid path anyway, but
+    /// the priority is the contract).
+    #[test]
+    fn name_selector_takes_priority_over_path_interpretation() {
+        let td = tempfile::TempDir::new().unwrap();
+        let declared = RepoRoot::new(td.path()).unwrap();
+        // The identity points at a DIFFERENT valid directory than the declared
+        // root — proving the name index (not the path allowlist) resolved it.
+        let other = tempfile::TempDir::new().unwrap();
+        let other_root = RepoRoot::new(other.path()).unwrap();
+        let mut names = std::collections::BTreeMap::new();
+        names.insert("qa".to_string(), other_root.clone());
+        let rt = runtime_with_roots(vec![declared]).with_writable_repo_names(names);
+        let got = rt.resolve_run_repo_root(Some("qa")).unwrap();
+        assert_eq!(got, other_root, "the name index must resolve, not the path");
     }
 }
