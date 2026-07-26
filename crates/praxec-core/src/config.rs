@@ -3042,7 +3042,11 @@ fn merge_declared_repos(
         // NO definitions (it is purely a writable run target, like the FB-2
         // bare-writable path), so it is fully handled here and `continue`s
         // before the manifest/registry load below.
-        if let RepoSource::WorktreesOf { anchor, name: repo_name } = &source {
+        if let RepoSource::WorktreesOf {
+            anchor,
+            name: repo_name,
+        } = &source
+        {
             // Same base-dir convention as `Local`: a relative anchor resolves
             // against the host config dir; an absolute one is used as-is.
             let anchor = if anchor.is_absolute() {
@@ -3674,10 +3678,7 @@ fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool, Option<Str
 /// (purely env-derived), so this token can never be the source of a config
 /// error — only `${repo:<name>.root}` can (an unknown name).
 fn praxec_state_dir() -> String {
-    state_dir_from(
-        std::env::var_os("XDG_STATE_HOME"),
-        std::env::var_os("HOME"),
-    )
+    state_dir_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
 }
 
 /// Pure core of [`praxec_state_dir`] — the env lookups are injected so the
@@ -4094,9 +4095,9 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
     let name: Option<String> = match entry.get("name") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        Some(Value::String(_)) => bail!(
-            "INVALID_REPO_ENTRY: `repos[{index}].name` must be a non-empty string"
-        ),
+        Some(Value::String(_)) => {
+            bail!("INVALID_REPO_ENTRY: `repos[{index}].name` must be a non-empty string")
+        }
         Some(other) => bail!(
             "INVALID_REPO_ENTRY: `repos[{index}].name` must be a string ({})",
             short_value_kind(other)
@@ -4643,11 +4644,18 @@ mod tests {
         });
         let out = interpolate_connection_paths(cfg).expect("interpolation succeeds");
         let args = out.pointer("/connections/browser/args").unwrap();
-        assert_eq!(args[1].as_str().unwrap().rsplit('/').next(), Some("storage-state.json"));
-        assert!(args[1].as_str().unwrap().contains("/praxec/qa-auth/"), "state_dir token: {args}");
+        assert_eq!(
+            args[1].as_str().unwrap().rsplit('/').next(),
+            Some("storage-state.json")
+        );
+        assert!(
+            args[1].as_str().unwrap().contains("/praxec/qa-auth/"),
+            "state_dir token: {args}"
+        );
         assert_eq!(args[3].as_str(), Some("/live/wt-a/.praxec/qa-artifacts"));
         assert_eq!(
-            out.pointer("/connections/browser/env/PROFILE_DIR").and_then(Value::as_str),
+            out.pointer("/connections/browser/env/PROFILE_DIR")
+                .and_then(Value::as_str),
             Some("/live/wt-a/.praxec/profile")
         );
     }

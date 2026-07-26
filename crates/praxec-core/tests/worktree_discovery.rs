@@ -113,7 +113,10 @@ fn discovers_the_worktree_carrying_the_matching_stub() {
     let anchor = init_anchor(base.path());
     // Add a worktree and give it the identity stub (the anchor itself has none).
     let wt = base.path().join("wt-live");
-    git(&anchor, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "live"]);
+    git(
+        &anchor,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "live"],
+    );
     write_stub(&wt, "autopilot-qa-target");
 
     let (config, _diags) =
@@ -141,7 +144,10 @@ fn zero_matches_is_a_legal_boot_state_with_a_diagnostic() {
     let anchor = init_anchor(base.path());
     // A worktree WITHOUT the matching stub → no candidate.
     let wt = base.path().join("wt-other");
-    git(&anchor, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "other"]);
+    git(
+        &anchor,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "other"],
+    );
     write_stub(&wt, "some-other-repo");
 
     let (config, diags) =
@@ -170,7 +176,10 @@ fn two_matches_is_ambiguous_hard_in_strict_skipped_in_resilient() {
     let anchor = init_anchor(base.path());
     for (dir, branch) in [("wt-a", "a"), ("wt-b", "b")] {
         let wt = base.path().join(dir);
-        git(&anchor, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", branch]);
+        git(
+            &anchor,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", branch],
+        );
         write_stub(&wt, "dup-identity");
     }
 
@@ -184,8 +193,8 @@ fn two_matches_is_ambiguous_hard_in_strict_skipped_in_resilient() {
     );
 
     // Resilient → load succeeds, no root, diagnostic recorded (never auto-picked).
-    let (config, diags) =
-        resolve_config(base.path(), &anchor, "dup-identity", true).expect("resilient load succeeds");
+    let (config, diags) = resolve_config(base.path(), &anchor, "dup-identity", true)
+        .expect("resilient load succeeds");
     assert!(
         writable_roots(&config).is_empty(),
         "an ambiguous identity must never auto-pick a root"
@@ -208,7 +217,10 @@ fn a_pruned_worktree_does_not_fail_boot() {
     let base = tempfile::TempDir::new().unwrap();
     let anchor = init_anchor(base.path());
     let wt = base.path().join("wt-ephemeral");
-    git(&anchor, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "eph"]);
+    git(
+        &anchor,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "eph"],
+    );
     write_stub(&wt, "autopilot-qa-target");
 
     // Baseline: it resolves while the worktree lives.
@@ -217,7 +229,10 @@ fn a_pruned_worktree_does_not_fail_boot() {
     assert_eq!(writable_roots(&before).len(), 1);
 
     // Prune the worktree — the declared literal path is now GONE.
-    git(&anchor, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+    git(
+        &anchor,
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+    );
     assert!(!wt.exists(), "worktree dir must be gone after remove");
 
     // The headline win: boot (config load) STILL SUCCEEDS, with no root stamped.

@@ -10,9 +10,11 @@
 //! Three pure layers, each independently testable:
 //! 1. [`observations_from_audit`] — correlate `agent.invoked` / `agent.completed`
 //!    / `chain.failed` events (by `correlation_id`) into per-step outcomes.
-//! 2. [`aggregate`] — roll observations up per `(affinity, model)`: run count,
-//!    pass-rate, mean realized cost. (Affinity is the `models.yaml` key — the
-//!    unit the base actually configures; the steps it covers are evidence.)
+//! 2. [`aggregate`] — roll observations up per `(affinity, model, effort)`: run
+//!    count, pass-rate, mean realized cost. (Affinity is the `models.yaml` key —
+//!    the unit the base actually configures; the steps it covers are evidence.)
+//!    Effort is part of the identity (#12): reasoning levels aren't portable
+//!    across models, so `model@medium` and `model@high` are distinct evidence.
 //! 3. [`propose`] — the **conservative** decision. Lowering requires the cheaper
 //!    model's pass-rate to be *at or above* the base's AND material savings;
 //!    a marginal value gain is NOT enough — keep the stronger model. Raising
@@ -36,17 +38,30 @@ pub struct StepObservation {
     pub step: String,
     /// The `provider:model` that ran.
     pub model: String,
+    /// (#12) The reasoning effort the model ACTUALLY ran under — read from
+    /// `agent.completed` (so it's paired with the WALKED model, which an
+    /// escalated hop can make differ from the composer's intent), `None` when the
+    /// run applied no effort (provider default) or failed before completing.
+    /// Effort is non-portable across models, so `qwen3-coder@medium` and
+    /// `@high` are DISTINCT observations — never lumped.
+    pub effort: Option<String>,
     /// Cleared its independent acceptance bar (advanced) vs failed / aborted.
     pub passed: bool,
     /// Realized USD for the step (`None` on failure / uncatalogued).
     pub cost_usd: Option<f64>,
 }
 
-/// Aggregate stats for one `(affinity, model)` pair.
+/// Aggregate stats for one `(affinity, model, effort)` triple. Effort is part of
+/// the identity (#12): the same model at two reasoning efforts rolls up into two
+/// distinct buckets, so the flywheel proposes against the exact `model@effort`
+/// the base is configured to run.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ModelStats {
     pub affinity: String,
     pub model: String,
+    /// (#12) The reasoning effort these runs applied (`None` = provider default);
+    /// part of the rollup key, so `model@medium` and `model@high` never merge.
+    pub effort: Option<String>,
     pub runs: usize,
     pub passes: usize,
     /// `passes / runs`.
@@ -65,6 +80,13 @@ pub enum Direction {
     Lower,
     /// Stronger base — the current base is chronically failing its bar.
     Raise,
+    /// (#13) FAIR-TRIAL exploration — a catalog-fit, under-cost-cap model with too
+    /// little evidence to exploit yet. Pure-exploit `Lower`/`Raise` can only ever
+    /// re-rank models that already have runs, so a shifting ecosystem's new/better
+    /// entrants would never be sampled. This surfaces one such entrant per
+    /// affinity as a governed proposal to ADD it to the chain for evidence — never
+    /// auto-applied, never displacing the proven base.
+    Trial,
 }
 
 /// A governed proposal to change one affinity's base model. Carries the evidence
@@ -97,10 +119,18 @@ pub struct DeescalationParams {
     pub raise_max_pass_rate: f64,
     /// Minimum fractional savings to justify lowering (the conservatism guard).
     pub material_savings_pct: f64,
+    /// (#13) The frontier cost cap ($/M output) a fair-trial candidate must sit
+    /// UNDER. Same line the runtime cost gate enforces — a trial never nominates a
+    /// premium model no human approved. Sourced from
+    /// `gateway.cost.frontier_cap_usd_per_m`, defaulting to
+    /// [`DEFAULT_FRONTIER_CAP_USD_PER_M`](crate::model_catalog::DEFAULT_FRONTIER_CAP_USD_PER_M).
+    pub frontier_cap_usd_per_m: f64,
 }
 
 impl DeescalationParams {
-    /// Load the thresholds from the active tuning (override-aware).
+    /// Load the thresholds from the active tuning (override-aware). The frontier
+    /// cap defaults to the catalog's shipped line; the gateway overrides it from
+    /// `gateway.cost.frontier_cap_usd_per_m` when configured.
     pub fn from_tuning() -> Self {
         let d = &crate::tuning::tuning().deescalation;
         Self {
@@ -108,8 +138,47 @@ impl DeescalationParams {
             lower_min_pass_rate: d.lower_min_pass_rate,
             raise_max_pass_rate: d.raise_max_pass_rate,
             material_savings_pct: d.material_savings_pct,
+            frontier_cap_usd_per_m: crate::model_catalog::DEFAULT_FRONTIER_CAP_USD_PER_M,
         }
     }
+}
+
+/// (#12) Build the canonical **chain-identity** string for a model paired with
+/// its applied reasoning effort: `"model@effort"`, or bare `"model"` when no
+/// effort is paired. This is the unit the flywheel keys on — the SAME model at
+/// two efforts is two identities — and the exact form `load_current_chains`
+/// writes into each `models.yaml` chain rung, so a proposal's `from`/`to` and the
+/// evidence compare on one representation.
+pub fn chain_identity(model: &str, effort: Option<&str>) -> String {
+    match effort.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => format!("{model}@{e}"),
+        None => model.to_string(),
+    }
+}
+
+/// Normalize a chain-identity string to its canonical `(bare-model-id, effort)`
+/// comparison key: split off any `@effort` suffix, strip any leading
+/// `vendor:`/`provider:` prefix via [`model_catalog::bare_model_id`], and
+/// lower-case the effort. THE normalization shared by the flywheel's keying and
+/// the fair-trial catalog dedup (#13) — a catalog `vendor:model` and a chain
+/// `provider:model` for the same underlying model therefore compare equal.
+///
+/// [`model_catalog::bare_model_id`]: crate::model_catalog::bare_model_id
+fn identity_key(identity: &str) -> (String, String) {
+    let (model, effort) = match identity.rsplit_once('@') {
+        Some((m, e)) => (m, e),
+        None => (identity, ""),
+    };
+    (
+        crate::model_catalog::bare_model_id(model).to_string(),
+        effort.trim().to_ascii_lowercase(),
+    )
+}
+
+/// Do two chain-identity strings name the same `model@effort` after
+/// normalization (see [`identity_key`])?
+fn same_identity(a: &str, b: &str) -> bool {
+    identity_key(a) == identity_key(b)
 }
 
 /// Correlate audit events into per-step outcomes. A correlation that carries an
@@ -121,8 +190,10 @@ pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
     struct Acc {
         /// (step, affinity, model) from `agent.invoked`.
         invoked: Option<(String, String, String)>,
-        /// (model, cost) from `agent.completed`.
-        completed: Option<(String, Option<f64>)>,
+        /// (model, cost, effort) from `agent.completed`. Model+effort come from
+        /// the SAME event so they're paired — the walked model and the effort it
+        /// actually ran under (#12).
+        completed: Option<(String, Option<f64>, Option<String>)>,
         failed: bool,
     }
     let str_field = |p: &Value, k: &str| {
@@ -146,10 +217,17 @@ pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
             "agent.completed" => {
                 let p = &e.payload;
                 let cost = p.get("cost_usd").and_then(Value::as_f64);
+                // Effort is read HERE (beside the walked model), never from
+                // `agent.invoked`: on an escalated hop the completed model differs
+                // from the composer's, and effort belongs to the model that ran.
+                let effort = p
+                    .get("reasoning_effort")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 by_cor
                     .entry(e.correlation_id.clone())
                     .or_default()
-                    .completed = Some((str_field(p, "model"), cost));
+                    .completed = Some((str_field(p, "model"), cost, effort));
             }
             "chain.failed" => {
                 by_cor.entry(e.correlation_id.clone()).or_default().failed = true;
@@ -164,16 +242,20 @@ pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
             continue;
         };
         // Passed iff its `agent.completed` fired; failed iff a `chain.failed`
-        // fired instead; otherwise still in flight — neither, so skip.
-        let (passed, model, cost) = match acc.completed {
-            Some((model, cost)) => (true, model, cost),
-            None if acc.failed => (false, inv_model, None),
+        // fired instead; otherwise still in flight — neither, so skip. On a PASS
+        // model+cost+effort all come from `agent.completed` (the actual walked
+        // hop); on a FAILURE the model falls back to `agent.invoked` and there's
+        // no realized cost or applied effort.
+        let (passed, model, cost, effort) = match acc.completed {
+            Some((model, cost, effort)) => (true, model, cost, effort),
+            None if acc.failed => (false, inv_model, None, None),
             None => continue,
         };
         out.push(StepObservation {
             affinity,
             step,
             model,
+            effort,
             passed,
             cost_usd: cost,
         });
@@ -181,7 +263,7 @@ pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
     out
 }
 
-/// Roll observations up per `(affinity, model)`.
+/// Roll observations up per `(affinity, model, effort)` (#12).
 pub fn aggregate(observations: &[StepObservation]) -> Vec<ModelStats> {
     #[derive(Default)]
     struct Acc {
@@ -191,10 +273,11 @@ pub fn aggregate(observations: &[StepObservation]) -> Vec<ModelStats> {
         priced: usize,
         steps: BTreeSet<String>,
     }
-    let mut map: BTreeMap<(String, String), Acc> = BTreeMap::new();
+    // Effort is part of the key: the same model at two efforts is two buckets.
+    let mut map: BTreeMap<(String, String, Option<String>), Acc> = BTreeMap::new();
     for o in observations {
         let a = map
-            .entry((o.affinity.clone(), o.model.clone()))
+            .entry((o.affinity.clone(), o.model.clone(), o.effort.clone()))
             .or_default();
         a.runs += 1;
         if o.passed {
@@ -207,9 +290,10 @@ pub fn aggregate(observations: &[StepObservation]) -> Vec<ModelStats> {
         a.steps.insert(o.step.clone());
     }
     map.into_iter()
-        .map(|((affinity, model), a)| ModelStats {
+        .map(|((affinity, model, effort), a)| ModelStats {
             affinity,
             model,
+            effort,
             runs: a.runs,
             passes: a.passes,
             pass_rate: if a.runs > 0 {
@@ -228,23 +312,30 @@ pub fn aggregate(observations: &[StepObservation]) -> Vec<ModelStats> {
 }
 
 /// The conservative bidirectional decision. `current_chains` maps each affinity
-/// to its ordered `models.yaml` chain (base first). Returns one proposal per
-/// affinity that warrants a change; affinities at a healthy, well-priced base
+/// to its ordered `models.yaml` chain (base first — each rung a
+/// [`chain_identity`] `model@effort` string). `catalog` is the active model
+/// catalog, consulted ONLY for the fair-trial exploration (#13) — pass `&[]` to
+/// disable it and get pure exploit. Returns one proposal per affinity per
+/// dimension that warrants a change; affinities at a healthy, well-priced base
 /// (or with a only-marginally-cheaper alternative) yield nothing.
 pub fn propose(
     stats: &[ModelStats],
     current_chains: &BTreeMap<String, Vec<String>>,
     params: &DeescalationParams,
+    catalog: &[crate::model_catalog::ModelEntry],
 ) -> Vec<Proposal> {
     let mut out = Vec::new();
     for (affinity, chain) in current_chains {
         let Some(base_model) = chain.first() else {
             continue;
         };
-        let Some(base) = stats
-            .iter()
-            .find(|s| &s.affinity == affinity && &s.model == base_model)
-        else {
+        // Match the base by NORMALIZED `model@effort` identity (#12), so the base
+        // whose chain rung carries an effort is found against the exactly-keyed
+        // stats bucket — and a vendor/provider prefix mismatch never mis-matches.
+        let Some(base) = stats.iter().find(|s| {
+            &s.affinity == affinity
+                && same_identity(&chain_identity(&s.model, s.effort.as_deref()), base_model)
+        }) else {
             continue;
         };
         // Not enough evidence on the base to move it either way.
@@ -254,7 +345,9 @@ pub fn propose(
         let candidates: Vec<&ModelStats> = stats
             .iter()
             .filter(|s| {
-                &s.affinity == affinity && &s.model != base_model && s.runs >= params.min_runs
+                &s.affinity == affinity
+                    && !same_identity(&chain_identity(&s.model, s.effort.as_deref()), base_model)
+                    && s.runs >= params.min_runs
             })
             .collect();
 
@@ -298,7 +391,7 @@ pub fn propose(
                     affinity: affinity.clone(),
                     direction: Direction::Raise,
                     from_model: base_model.clone(),
-                    to_model: cand.model.clone(),
+                    to_model: chain_identity(&cand.model, cand.effort.as_deref()),
                     base_runs: base.runs,
                     base_pass_rate: base.pass_rate,
                     base_mean_cost_usd: base.mean_cost_usd,
@@ -370,7 +463,7 @@ pub fn propose(
                     affinity: affinity.clone(),
                     direction: Direction::Lower,
                     from_model: base_model.clone(),
-                    to_model: cand.model.clone(),
+                    to_model: chain_identity(&cand.model, cand.effort.as_deref()),
                     base_runs: base.runs,
                     base_pass_rate: base.pass_rate,
                     base_mean_cost_usd: base.mean_cost_usd,
@@ -393,14 +486,147 @@ pub fn propose(
         }
         // else: ambiguous middle band (failing bar ≤ pass-rate < healthy bar) —
         // leave the base alone.
+
+        // ── FAIR-TRIAL exploration (#13) ─────────────────────────────────────
+        // Exploit (above) can only ever re-rank models that already have runs; a
+        // zero-evidence catalog entrant could never surface, so a shifting
+        // ecosystem's new/better models would never be sampled. Independently of
+        // the exploit outcome, surface AT MOST ONE catalog-fit, under-cost-cap,
+        // not-yet-charted, under-evidenced model for this affinity as a governed
+        // `Trial` — the human decides whether to spend evidence on it. Reached
+        // only for affinities with a well-evidenced base (the `continue`s above),
+        // so we explore alternatives to something proven, never noise.
+        if let Some(trial) = fair_trial(affinity, chain, base, stats, params, catalog) {
+            out.push(trial);
+        }
     }
     out
 }
 
+/// (#13) Pick the affinity's best-fit untried fair-trial candidate: the
+/// highest-dimension-score catalog model that (a) fits the affinity, (b) sits
+/// UNDER the frontier cost cap, (c) is not already a rung of this chain, (d) has
+/// `< min_runs` evidence for this affinity, and (e) is runnable (its vendor is
+/// reachable). Returns a governed `Trial` proposal, or `None` when no entrant
+/// qualifies. At most one per affinity per run.
+fn fair_trial(
+    affinity: &str,
+    chain: &[String],
+    base: &ModelStats,
+    stats: &[ModelStats],
+    params: &DeescalationParams,
+    catalog: &[crate::model_catalog::ModelEntry],
+) -> Option<Proposal> {
+    use crate::model_catalog::bare_model_id;
+    use crate::model_resolver::Affinity;
+
+    // A dimension we can't parse into an `Affinity` has no fit signal — skip
+    // (never guess). `models.yaml` keys are affinity names, so this is the
+    // normal path for the built-in dimensions and a clean no-op for a bespoke key.
+    let aff: Affinity = affinity.parse().ok()?;
+
+    // Models already charted in this chain — compared on the normalized bare id
+    // (a catalog `vendor:model` must dedup against a chain `provider:model`).
+    let charted: BTreeSet<String> = chain.iter().map(|c| identity_key(c).0).collect();
+
+    // The most evidence any effort of a model has for THIS affinity — used to
+    // exclude models already fairly tried (`>= min_runs`).
+    let evidence_for = |bare: &str| -> usize {
+        stats
+            .iter()
+            .filter(|s| s.affinity == affinity && bare_model_id(&s.model) == bare)
+            .map(|s| s.runs)
+            .max()
+            .unwrap_or(0)
+    };
+
+    let mut best: Option<(&crate::model_catalog::ModelEntry, f64)> = None;
+    for m in catalog {
+        let bare = &m.model;
+        if charted.contains(bare.as_str()) {
+            continue; // already in the chain — nothing to trial
+        }
+        if evidence_for(bare) >= params.min_runs {
+            continue; // already fairly tried — exploit handles it
+        }
+        // Over the cost cap — a human must approve premium spend. Read the
+        // entry's OWN catalog price (the same number `is_frontier` reads for the
+        // active catalog; `>= cap` is the frontier line, per WS2).
+        if m.output_usd_per_million >= params.frontier_cap_usd_per_m {
+            continue;
+        }
+        // An agent base drives tools; a non-tool-calling model can't be one.
+        if !m.tools {
+            continue;
+        }
+        // Only nominate a model we can actually run (key present / local).
+        if !crate::model_catalog::vendor_available(&m.vendor) {
+            continue;
+        }
+        // Fit for THIS affinity's dimension: the model must show real strength
+        // (score > 0), not merely inherit overall intelligence — a fair trial is
+        // a *targeted* bet, not a random draw.
+        let score = aff.score(&m.scores, 0.0);
+        if score <= 0.0 {
+            continue;
+        }
+        let improves = match best {
+            None => true,
+            Some((_, bs)) => score > bs,
+        };
+        if improves {
+            best = Some((m, score));
+        }
+    }
+    let (cand, score) = best?;
+    Some(Proposal {
+        affinity: affinity.to_string(),
+        direction: Direction::Trial,
+        from_model: chain_identity(&base.model, base.effort.as_deref()),
+        to_model: cand.model_string(),
+        base_runs: base.runs,
+        base_pass_rate: base.pass_rate,
+        base_mean_cost_usd: base.mean_cost_usd,
+        candidate_runs: 0,
+        candidate_pass_rate: 0.0,
+        // Untried → no realized per-run cost yet. Its catalog $/M rate rides in
+        // the rationale (the fair-trial is about GETTING this evidence).
+        candidate_mean_cost_usd: None,
+        savings_pct: None,
+        rationale: format!(
+            "{} is a catalog-fit ({} score {:.0}), under-cap (< ${:.2}/M) model with no \
+             evidence yet for '{}' — trial it against the proven base {} ({:.0}% over {} runs) \
+             to sample a possibly-better/cheaper option. Governed: added as a chain rung only on \
+             human approval, never auto-applied.",
+            cand.model_string(),
+            affinity,
+            score,
+            params.frontier_cap_usd_per_m,
+            affinity,
+            base.model,
+            base.pass_rate * 100.0,
+            base.runs,
+        ),
+    })
+}
+
 /// Rewrite an affinity's chain to enact a proposal: the new base goes first.
 /// **Lower** keeps the old base as a higher escalation rung; **Raise** drops the
-/// failing base (escalation only ratchets up).
+/// failing base (escalation only ratchets up). **Trial** (#13) is additive: it
+/// keeps the proven chain untouched and APPENDS the trial model as a new lowest
+/// rung, so the candidate accrues evidence without displacing the base — the
+/// conservative, reversible enactment for an exploration bet.
 pub fn apply_to_chain(proposal: &Proposal, old_chain: &[String]) -> Vec<String> {
+    if proposal.direction == Direction::Trial {
+        let mut new_chain = old_chain.to_vec();
+        if !new_chain
+            .iter()
+            .any(|m| same_identity(m, &proposal.to_model))
+        {
+            new_chain.push(proposal.to_model.clone());
+        }
+        return new_chain;
+    }
     let mut new_chain = vec![proposal.to_model.clone()];
     for m in old_chain {
         if m == &proposal.to_model {
@@ -425,6 +651,7 @@ mod tests {
             lower_min_pass_rate: 0.9,
             raise_max_pass_rate: 0.6,
             material_savings_pct: 0.25,
+            frontier_cap_usd_per_m: 5.0,
         }
     }
 
@@ -435,9 +662,22 @@ mod tests {
         pass_rate: f64,
         mean_cost: Option<f64>,
     ) -> ModelStats {
+        stat_effort(affinity, model, None, runs, pass_rate, mean_cost)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stat_effort(
+        affinity: &str,
+        model: &str,
+        effort: Option<&str>,
+        runs: usize,
+        pass_rate: f64,
+        mean_cost: Option<f64>,
+    ) -> ModelStats {
         ModelStats {
             affinity: affinity.into(),
             model: model.into(),
+            effort: effort.map(str::to_string),
             runs,
             passes: (runs as f64 * pass_rate).round() as usize,
             pass_rate,
@@ -463,7 +703,7 @@ mod tests {
             stat("reasoning", "v:cheap", 10, 0.95, Some(0.50)),
         ];
         let ch = chains(&[("reasoning", &["v:base", "v:ceiling"])]);
-        let props = propose(&stats, &ch, &params());
+        let props = propose(&stats, &ch, &params(), &[]);
         assert_eq!(props.len(), 1, "expected one proposal: {props:?}");
         let p = &props[0];
         assert_eq!(p.direction, Direction::Lower);
@@ -481,7 +721,7 @@ mod tests {
             stat("reasoning", "v:cheap", 10, 0.95, Some(0.92)),
         ];
         let ch = chains(&[("reasoning", &["v:base"])]);
-        assert!(propose(&stats, &ch, &params()).is_empty());
+        assert!(propose(&stats, &ch, &params(), &[]).is_empty());
     }
 
     #[test]
@@ -493,7 +733,7 @@ mod tests {
             stat("reasoning", "v:cheap", 10, 0.70, Some(0.40)),
         ];
         let ch = chains(&[("reasoning", &["v:base"])]);
-        assert!(propose(&stats, &ch, &params()).is_empty());
+        assert!(propose(&stats, &ch, &params(), &[]).is_empty());
     }
 
     #[test]
@@ -505,7 +745,7 @@ mod tests {
             stat("reasoning", "v:cheapB", 10, 0.96, Some(0.50)),
         ];
         let ch = chains(&[("reasoning", &["v:base"])]);
-        let props = propose(&stats, &ch, &params());
+        let props = propose(&stats, &ch, &params(), &[]);
         assert_eq!(props.len(), 1);
         assert_eq!(props[0].to_model, "v:cheapB");
     }
@@ -518,7 +758,7 @@ mod tests {
             stat("reasoning", "v:strong", 10, 0.95, Some(3.00)),
         ];
         let ch = chains(&[("reasoning", &["v:base", "v:strong"])]);
-        let props = propose(&stats, &ch, &params());
+        let props = propose(&stats, &ch, &params(), &[]);
         assert_eq!(props.len(), 1);
         let p = &props[0];
         assert_eq!(p.direction, Direction::Raise);
@@ -532,7 +772,7 @@ mod tests {
         // own chain (the next rung), flagged as no-evidence for the human.
         let stats = vec![stat("reasoning", "v:base", 10, 0.40, Some(1.00))];
         let ch = chains(&[("reasoning", &["v:base", "v:ceiling"])]);
-        let props = propose(&stats, &ch, &params());
+        let props = propose(&stats, &ch, &params(), &[]);
         assert_eq!(props.len(), 1);
         assert_eq!(props[0].direction, Direction::Raise);
         assert_eq!(props[0].to_model, "v:ceiling");
@@ -545,7 +785,7 @@ mod tests {
         // no materially-cheaper qualifier → leave it alone.
         let stats = vec![stat("reasoning", "v:base", 10, 0.75, Some(1.00))];
         let ch = chains(&[("reasoning", &["v:base", "v:ceiling"])]);
-        assert!(propose(&stats, &ch, &params()).is_empty());
+        assert!(propose(&stats, &ch, &params(), &[]).is_empty());
     }
 
     #[test]
@@ -556,7 +796,7 @@ mod tests {
             stat("reasoning", "v:cheap", 2, 1.0, Some(0.40)),
         ];
         let ch = chains(&[("reasoning", &["v:base", "v:ceiling"])]);
-        assert!(propose(&stats, &ch, &params()).is_empty());
+        assert!(propose(&stats, &ch, &params(), &[]).is_empty());
     }
 
     // ── chain rewrite ───────────────────────────────────────────────────────
@@ -603,6 +843,7 @@ mod tests {
                 affinity: "reasoning".into(),
                 step: "draft".into(),
                 model: "v:base".into(),
+                effort: None,
                 passed: true,
                 cost_usd: Some(1.0),
             },
@@ -610,6 +851,7 @@ mod tests {
                 affinity: "reasoning".into(),
                 step: "review".into(),
                 model: "v:base".into(),
+                effort: None,
                 passed: true,
                 cost_usd: Some(3.0),
             },
@@ -617,6 +859,7 @@ mod tests {
                 affinity: "reasoning".into(),
                 step: "draft".into(),
                 model: "v:base".into(),
+                effort: None,
                 passed: false,
                 cost_usd: None,
             },
@@ -648,6 +891,17 @@ mod tests {
             .with_payload(json!({
                 "transition": step, "duration_ms": 10, "model": model,
                 "prompt_tokens": 1000, "completion_tokens": 100, "cost_usd": cost,
+            }))
+    }
+    /// `agent.completed` carrying the applied `reasoning_effort` (#12) — the walked
+    /// model + the effort it actually ran under, paired on the SAME event.
+    fn completed_effort(cor: &str, step: &str, model: &str, cost: f64, effort: &str) -> AuditEvent {
+        AuditEvent::new("agent.completed")
+            .with_correlation(cor)
+            .with_payload(json!({
+                "transition": step, "duration_ms": 10, "model": model,
+                "prompt_tokens": 1000, "completion_tokens": 100, "cost_usd": cost,
+                "reasoning_effort": effort,
             }))
     }
     fn failed(cor: &str, step: &str) -> AuditEvent {
@@ -702,9 +956,197 @@ mod tests {
         let obs = observations_from_audit(&events);
         let stats = aggregate(&obs);
         let ch = chains(&[("reasoning", &["v:base", "v:ceiling"])]);
-        let props = propose(&stats, &ch, &params());
+        let props = propose(&stats, &ch, &params(), &[]);
         assert_eq!(props.len(), 1);
         assert_eq!(props[0].direction, Direction::Lower);
         assert_eq!(props[0].to_model, "v:cheap");
+    }
+
+    // ── #12 effort-aware keying ───────────────────────────────────────────────
+
+    #[test]
+    fn same_model_at_two_efforts_yields_two_buckets() {
+        // The SAME model at `medium` vs `high` must be two distinct
+        // (affinity, model, effort) buckets — never lumped.
+        let mut events = Vec::new();
+        for i in 0..3 {
+            let c = format!("med_{i}");
+            events.push(invoked(&c, "draft", "reasoning", "v:base"));
+            events.push(completed_effort(&c, "draft", "v:base", 1.0, "medium"));
+        }
+        for i in 0..3 {
+            let c = format!("high_{i}");
+            events.push(invoked(&c, "draft", "reasoning", "v:base"));
+            events.push(completed_effort(&c, "draft", "v:base", 2.0, "high"));
+        }
+        let stats = aggregate(&observations_from_audit(&events));
+        assert_eq!(stats.len(), 2, "two effort buckets expected: {stats:?}");
+        let med = stats
+            .iter()
+            .find(|s| s.effort.as_deref() == Some("medium"))
+            .unwrap();
+        let high = stats
+            .iter()
+            .find(|s| s.effort.as_deref() == Some("high"))
+            .unwrap();
+        assert_eq!(med.runs, 3);
+        assert_eq!(high.runs, 3);
+        assert!((med.mean_cost_usd.unwrap() - 1.0).abs() < 1e-9);
+        assert!((high.mean_cost_usd.unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn escalated_pass_keys_on_walked_models_effort_not_composers() {
+        // A hop that ESCALATES: `agent.invoked` records the composer's intent
+        // (`v:base` @ its phase effort), but the run walked to `v:strong` and the
+        // `agent.completed` records the WALKED model + the effort IT ran under
+        // (`high`). The observation must key on the completed pair, never the
+        // invoked one — else it mis-attributes evidence to the wrong model@effort.
+        let events = vec![
+            invoked("cor_esc", "draft", "reasoning", "v:base"),
+            completed_effort("cor_esc", "draft", "v:strong", 3.0, "high"),
+        ];
+        let obs = observations_from_audit(&events);
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].model, "v:strong", "walked model, not composer's");
+        assert_eq!(obs[0].effort.as_deref(), Some("high"));
+        assert!(obs[0].passed);
+    }
+
+    #[test]
+    fn base_lookup_matches_on_model_and_effort_identity() {
+        // Base is `v:base@high`; only the high-effort bucket clears the bar and a
+        // cheaper high-effort model qualifies. The chain rung carries `@high`, so
+        // the base-lookup must find the high bucket (not the medium one).
+        let stats = vec![
+            stat_effort("reasoning", "v:base", Some("high"), 10, 0.95, Some(1.00)),
+            stat_effort("reasoning", "v:base", Some("medium"), 10, 0.40, Some(0.50)),
+            stat_effort("reasoning", "v:cheap", Some("high"), 10, 0.95, Some(0.40)),
+        ];
+        let ch = chains(&[("reasoning", &["v:base@high", "v:ceiling"])]);
+        let props = propose(&stats, &ch, &params(), &[]);
+        assert_eq!(props.len(), 1, "{props:?}");
+        assert_eq!(props[0].direction, Direction::Lower);
+        assert_eq!(props[0].from_model, "v:base@high");
+        assert_eq!(props[0].to_model, "v:cheap@high");
+    }
+
+    // ── #13 fair-trial exploration ────────────────────────────────────────────
+
+    /// A tiny catalog: a fit, under-cap, tool-capable, locally-runnable entrant
+    /// (`fit-cheap`) and an over-cap frontier model (`too-dear`). Vendor `ollama`
+    /// is keyless, so `vendor_available` is true in the test env.
+    fn trial_catalog() -> Vec<crate::model_catalog::ModelEntry> {
+        use crate::model_resolver::AffinityScores;
+        let entry = |vendor: &str, model: &str, out_usd: f64, reasoning: f64| {
+            crate::model_catalog::ModelEntry {
+                vendor: vendor.into(),
+                model: model.into(),
+                input_usd_per_million: 0.0,
+                output_usd_per_million: out_usd,
+                context: 0,
+                intelligence: 50.0,
+                speed_tps: 0.0,
+                tools: true,
+                reasoning_levels: vec![],
+                local: true,
+                scores: AffinityScores {
+                    reasoning,
+                    ..Default::default()
+                },
+            }
+        };
+        vec![
+            entry("ollama", "fit-cheap", 1.0, 60.0), // fit + under $5/M cap
+            entry("ollama", "too-dear", 9.0, 90.0),  // fit but OVER the cap
+        ]
+    }
+
+    #[test]
+    fn fair_trial_surfaces_a_fit_undercap_untried_entrant() {
+        // Healthy, evidenced base in the ambiguous-nothing-to-exploit case; the
+        // catalog holds an untried fit+under-cap model → one governed Trial.
+        let stats = vec![stat("reasoning", "local:proven", 10, 0.95, Some(2.0))];
+        let ch = chains(&[("reasoning", &["local:proven"])]);
+        let props = propose(&stats, &ch, &params(), &trial_catalog());
+        let trials: Vec<_> = props
+            .iter()
+            .filter(|p| p.direction == Direction::Trial)
+            .collect();
+        assert_eq!(trials.len(), 1, "one fair-trial expected: {props:?}");
+        let t = trials[0];
+        assert_eq!(t.to_model, "ollama:fit-cheap");
+        // Untried → zero candidate evidence (this is what the trial gathers).
+        assert_eq!(t.candidate_runs, 0);
+        // The over-cap `too-dear` is NOT nominated.
+        assert!(!props.iter().any(|p| p.to_model == "ollama:too-dear"));
+    }
+
+    #[test]
+    fn fair_trial_skips_already_charted_or_over_cap_models() {
+        // `fit-cheap` is ALREADY a chain rung, and `too-dear` is over the cap →
+        // no entrant qualifies, so no Trial is surfaced.
+        let stats = vec![stat("reasoning", "local:proven", 10, 0.95, Some(2.0))];
+        let ch = chains(&[("reasoning", &["local:proven", "local:fit-cheap"])]);
+        let props = propose(&stats, &ch, &params(), &trial_catalog());
+        assert!(
+            !props.iter().any(|p| p.direction == Direction::Trial),
+            "no trial when the only fit model is already charted: {props:?}"
+        );
+    }
+
+    #[test]
+    fn fair_trial_is_governed_and_additive_never_displaces_base() {
+        // A Trial's chain edit APPENDS the candidate as a new lowest rung — the
+        // proven base stays first (never auto-swapped).
+        let stats = vec![stat("reasoning", "local:proven", 10, 0.95, Some(2.0))];
+        let ch = chains(&[("reasoning", &["local:proven"])]);
+        let props = propose(&stats, &ch, &params(), &trial_catalog());
+        let t = props
+            .iter()
+            .find(|p| p.direction == Direction::Trial)
+            .unwrap();
+        let old = ch.get("reasoning").unwrap();
+        let new_chain = apply_to_chain(t, old);
+        assert_eq!(new_chain, vec!["local:proven", "ollama:fit-cheap"]);
+        // The base is untouched at the head — a Trial never displaces it.
+        assert_eq!(new_chain.first().unwrap(), "local:proven");
+    }
+
+    #[test]
+    fn fair_trial_disabled_with_empty_catalog() {
+        // Pure-exploit when no catalog is threaded in (backward-compatible).
+        let stats = vec![stat("reasoning", "local:proven", 10, 0.95, Some(2.0))];
+        let ch = chains(&[("reasoning", &["local:proven"])]);
+        assert!(propose(&stats, &ch, &params(), &[]).is_empty());
+    }
+
+    // ── shared model-identity normalization ───────────────────────────────────
+
+    #[test]
+    fn identity_normalizes_across_vendor_and_provider_prefixes() {
+        // A catalog `vendor:model` and a chain `provider:model` for the SAME
+        // underlying model-id compare equal (prefix stripped), and effort is
+        // folded into the key so `model@high` != `model@medium`.
+        assert!(same_identity("openai:gpt-x", "openrouter:gpt-x"));
+        assert!(same_identity("v:base", "v:base"));
+        assert!(!same_identity("v:base@high", "v:base@medium"));
+        assert!(same_identity("v:base@high", "other-provider:base@high"));
+        // identity_key strips the prefix and lower-cases the effort.
+        assert_eq!(
+            identity_key("provider:qwen/qwen3-coder@HIGH"),
+            ("qwen/qwen3-coder".to_string(), "high".to_string())
+        );
+        // A vendor:model catalog entrant dedups against a provider:model chain
+        // rung so it is never fair-trialed when already charted.
+        let stats = vec![stat("reasoning", "prov:proven", 10, 0.95, Some(2.0))];
+        // chain rung under a DIFFERENT prefix but same bare id as the catalog's
+        // `local:fit-cheap`.
+        let ch = chains(&[("reasoning", &["prov:proven", "other:fit-cheap"])]);
+        let props = propose(&stats, &ch, &params(), &trial_catalog());
+        assert!(
+            !props.iter().any(|p| p.direction == Direction::Trial),
+            "fit-cheap is charted under a different prefix — must dedup: {props:?}"
+        );
     }
 }

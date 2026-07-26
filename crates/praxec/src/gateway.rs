@@ -3383,7 +3383,14 @@ fn load_current_chains(
     use praxec_core::model_resolver::config::{Binding, ModelsFile};
     let mf = ModelsFile::from_path(std::path::Path::new(models_yaml))
         .map_err(|e| anyhow::anyhow!("loading models.yaml {models_yaml}: {e}"))?;
-    let model_string = |b: &Binding| format!("{}:{}", b.provider.display_name(), b.model);
+    // (#12) Each chain rung is a `model@effort` identity: fold the binding's
+    // WS1-B `.effort` in so the base-lookup and candidate filter in `propose`
+    // compare against the exactly-keyed `(affinity, model, effort)` evidence
+    // bucket — the SAME model at two efforts is two rungs.
+    let model_string = |b: &Binding| {
+        let model = format!("{}:{}", b.provider.display_name(), b.model);
+        praxec_core::deescalation::chain_identity(&model, b.effort.as_deref())
+    };
     let mut chains = std::collections::BTreeMap::new();
     for aff in affinities {
         // overrides are Pool<Binding>, default is Vec<Binding>; unify to a slice.
@@ -3445,8 +3452,20 @@ async fn cost_propose_cmd(
         stats.iter().map(|s| s.affinity.clone()).collect();
     let chains = load_current_chains(models_yaml, &affinities)?;
 
-    let params = DeescalationParams::from_tuning();
-    let proposals = propose(&stats, &chains, &params);
+    // (#13) Thread the active model catalog + the configured frontier cost cap
+    // into `propose` so it can surface fair-trial candidates. The cap defaults to
+    // the catalog's shipped line and is overridden by
+    // `gateway.cost.frontier_cap_usd_per_m` — the SAME knob the runtime cost gate
+    // reads, so a trial never nominates a model the runtime would refuse.
+    let mut params = DeescalationParams::from_tuning();
+    if let Some(cap) = config
+        .pointer("/gateway/cost/frontier_cap_usd_per_m")
+        .and_then(Value::as_f64)
+    {
+        params.frontier_cap_usd_per_m = cap;
+    }
+    let catalog = praxec_core::model_catalog::model_catalog().models;
+    let proposals = propose(&stats, &chains, &params, &catalog);
 
     // Pair each proposal with the concrete chain edit it implies.
     let edits: Vec<(&praxec_core::deescalation::Proposal, Vec<String>)> = proposals
@@ -3511,6 +3530,7 @@ fn print_proposals_human(
         let tag = match p.direction {
             Direction::Lower => "LOWER",
             Direction::Raise => "RAISE",
+            Direction::Trial => "TRIAL",
         };
         println!(
             "\n  [{tag}] {}: {} → {}",

@@ -302,9 +302,9 @@ impl WorkflowRuntime {
             frontier_cap_usd_per_m: None,
             approve_frontier: Vec::new(),
             writable_repo_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
-            writable_repo_names: Arc::new(std::sync::RwLock::new(
-                std::collections::BTreeMap::new(),
-            )),
+            writable_repo_names: Arc::new(
+                std::sync::RwLock::new(std::collections::BTreeMap::new()),
+            ),
             exclusive_pools: Arc::new(std::sync::RwLock::new(std::collections::BTreeMap::new())),
             cancel_slot: Arc::new(Mutex::new(None)),
         }

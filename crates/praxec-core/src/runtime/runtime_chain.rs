@@ -957,15 +957,28 @@ impl WorkflowRuntime {
                         // audit so every governed run is cost-attributable.
                         // `cost_usd` is `null` when the model isn't catalogued —
                         // degrade gracefully, never block the run.
-                        let (model, prompt_tokens, completion_tokens, cost_usd) =
+                        // WS1-B (#12) `reasoning_effort`: the effort the walked
+                        // model ACTUALLY ran under (stamped by the executor's
+                        // chain-walk on the winning hop). Paired here with THIS
+                        // model — not the composer's `agent.invoked` intent — so the
+                        // de-escalation flywheel keys `(affinity, model, effort)` on
+                        // the model that actually ran, even when the hop escalated.
+                        let (model, prompt_tokens, completion_tokens, cost_usd, reasoning_effort) =
                             match &result.telemetry {
                                 Some(t) => (
                                     Value::from(t.model.clone()),
                                     Value::from(t.prompt_tokens),
                                     Value::from(t.completion_tokens),
                                     t.cost_usd.map(Value::from).unwrap_or(Value::Null),
+                                    t.effort.clone().map(Value::from).unwrap_or(Value::Null),
                                 ),
-                                None => (Value::Null, Value::Null, Value::Null, Value::Null),
+                                None => (
+                                    Value::Null,
+                                    Value::Null,
+                                    Value::Null,
+                                    Value::Null,
+                                    Value::Null,
+                                ),
                             };
                         self.record_or_self_event(
                             instance
@@ -979,6 +992,7 @@ impl WorkflowRuntime {
                                     "prompt_tokens": prompt_tokens,
                                     "completion_tokens": completion_tokens,
                                     "cost_usd": cost_usd,
+                                    "reasoning_effort": reasoning_effort,
                                 })),
                         )
                         .await;
@@ -2135,8 +2149,15 @@ mod cancellation_and_heartbeat_tests {
         );
         // The abort was recorded for observability.
         let aborted = events_of_type(&audit, CHAIN_ABORTED_EVENT).await;
-        assert_eq!(aborted.len(), 1, "exactly one chain.aborted must be emitted");
-        assert_eq!(aborted[0].payload["reason"].as_str(), Some("client_aborted"));
+        assert_eq!(
+            aborted.len(),
+            1,
+            "exactly one chain.aborted must be emitted"
+        );
+        assert_eq!(
+            aborted[0].payload["reason"].as_str(),
+            Some("client_aborted")
+        );
     }
 
     /// An un-cancelled token never stops the drive: the same cycle runs to its

@@ -499,8 +499,7 @@ fn connection_state_dir_token_resolves_under_the_operator_state_dir() {
     // `${praxec.state_dir}` resolves env-derived — the durable home for auth
     // material (credential state must outlive a prunable worktree).
     let td = TempDir::new().unwrap();
-    let host =
-        "version: \"1.0.0\"\nconnections:\n  browser:\n    kind: mcp\n    command: playwright-mcp\n    env:\n      STORAGE: \"${praxec.state_dir}/qa-auth/storage-state.json\"\n";
+    let host = "version: \"1.0.0\"\nconnections:\n  browser:\n    kind: mcp\n    command: playwright-mcp\n    env:\n      STORAGE: \"${praxec.state_dir}/qa-auth/storage-state.json\"\n";
     let path = write_host(&td, host);
     let (config, _diags) = load_resolved_with_repos(&path).expect("state_dir token loads");
     let v = config
@@ -561,7 +560,10 @@ fn scaffold_dirs_are_created_when_a_writable_repo_root_resolves() {
     assert!(repo.path().join(".praxec/qa-artifacts").is_dir());
     // No credential file was minted — only the directory exists.
     assert!(
-        !repo.path().join(".praxec/qa-auth/storage-state.json").exists(),
+        !repo
+            .path()
+            .join(".praxec/qa-auth/storage-state.json")
+            .exists(),
         "scaffold must never create a file"
     );
 }

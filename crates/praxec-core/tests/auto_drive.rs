@@ -181,6 +181,9 @@ async fn agent_completed_carries_cost_telemetry() {
             prompt_tokens: 1200,
             completion_tokens: 340,
             cost_usd: Some(0.123),
+            // #12 — the applied reasoning effort rides up on the telemetry and is
+            // stamped onto `agent.completed` (asserted below).
+            effort: Some("high".into()),
         },
     ));
     let (runtime, audit) = build_runtime_with_executor(
@@ -215,6 +218,9 @@ async fn agent_completed_carries_cost_telemetry() {
     // The affinity the agent was resolved under rides along, so the cost
     // report can attribute spend to the kind of work without a join.
     assert_eq!(p["affinity"], "reasoning");
+    // #12 — the applied reasoning effort is stamped on `agent.completed`, paired
+    // with the walked model, so the de-escalation flywheel keys on `model@effort`.
+    assert_eq!(p["reasoning_effort"], "high");
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +866,7 @@ async fn agent_completed_cost_is_null_for_uncatalogued_model() {
             prompt_tokens: 10,
             completion_tokens: 5,
             cost_usd: None,
+            effort: None,
         },
     ));
     let (runtime, audit) = build_runtime_with_executor(
@@ -886,6 +893,11 @@ async fn agent_completed_cost_is_null_for_uncatalogued_model() {
         .expect("an agent.completed event must be recorded");
     assert_eq!(completed.payload["cost_usd"], serde_json::Value::Null);
     assert_eq!(completed.payload["completion_tokens"], 5);
+    // #12 — no applied effort ⇒ `reasoning_effort` is null (never omitted).
+    assert_eq!(
+        completed.payload["reasoning_effort"],
+        serde_json::Value::Null
+    );
 }
 
 /// (finding #12) A configured `auto_drive_max_seconds` must bound the WHOLE
