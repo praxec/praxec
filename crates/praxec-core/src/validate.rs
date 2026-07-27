@@ -50,6 +50,12 @@ pub fn validate_workflows(config: &Value) -> Vec<Diagnostic> {
         .map(|m| m.keys().map(String::as_str).collect())
         .unwrap_or_default();
 
+    // V29 + V29-optional over `proxy.expose[]`. Run BEFORE the workflows
+    // early-return: a pack config can expose proxy capabilities with no
+    // `workflows:` block of its own, and those exposures are exactly where the
+    // bare-optional-arg-binding bug (frontrails proxy start) lives.
+    validate_proxy_exposure_arg_scopes(config, &mut diagnostics);
+
     let Some(workflows) = config.pointer("/workflows").and_then(Value::as_object) else {
         return diagnostics;
     };
@@ -2753,10 +2759,12 @@ fn validate_executor_arg_scopes(id: &str, def: &Value, out: &mut Vec<Diagnostic>
             // `{ "$optional": ... }` binding is still scope-checked: `$optional`
             // omits an ABSENT path at runtime, but a WRONG-ROOT path (a typo) can
             // never resolve and must be caught at load, exactly as a bare path is.
+            let required = required_arg_names(t_def.get("inputSchema"));
             for field in ["map", "query"] {
                 if let Some(obj) = exec.get(field).and_then(Value::as_object) {
                     for v in obj.values() {
                         check_arg_scope_tree(id, &loc(field), v, out);
+                        check_optional_arg_bindings(id, &loc(field), v, &required, out);
                     }
                 }
             }
@@ -2799,6 +2807,114 @@ fn check_arg_scope_tree(id: &str, loc: &str, value: &Value, out: &mut Vec<Diagno
             }
         }
         _ => {}
+    }
+}
+
+/// The `required` property names declared by an `inputSchema` (empty when the
+/// schema is absent or declares none). Used to decide whether a `$.arguments.X`
+/// map binding may legally be absent at call time.
+fn required_arg_names(schema: Option<&Value>) -> HashSet<&str> {
+    schema
+        .and_then(|s| s.get("required"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// The top-level `arguments` field of a `$.arguments.<field>[...]` operand, or
+/// `None` for `$.arguments` (the whole object — always present) or any operand
+/// not rooted at `$.arguments.`. `$.arguments.params.sub` → `params`.
+fn optional_arguments_field(s: &str) -> Option<&str> {
+    let rest = s.trim().strip_prefix("$.arguments.")?;
+    let field = rest.split(['.', '[']).next().unwrap_or(rest);
+    (!field.is_empty()).then_some(field)
+}
+
+/// V29-optional poka-yoke — flag a BARE `$.arguments.<field>` map binding whose
+/// `<field>` is not in the exposure/transition `required` list.
+///
+/// The engine holds BOTH facts at load: the declared `required` set and the map
+/// binding. A bare optional binding is a latent runtime hard-fail — when a caller
+/// omits the optional arg, the strict input-map resolver ([`mcp::resolve_template`])
+/// raises `MCP_MAP_BINDING_UNRESOLVED` / `CHAIN_FAILED` at call time (the
+/// frontrails proxy-start bug). So force an explicit authoring decision here:
+/// mark the arg `required`, or wrap the binding `{ "$optional": "..." }` (which
+/// omits the key when the value is absent). A binding already wrapped in a
+/// sole-key `$optional` is the sanctioned opt-out and is skipped — mirroring the
+/// runtime's own `$optional` handling.
+fn check_optional_arg_bindings(
+    id: &str,
+    loc: &str,
+    value: &Value,
+    required: &HashSet<&str>,
+    out: &mut Vec<Diagnostic>,
+) {
+    match value {
+        Value::String(s) => {
+            if let Some(field) = optional_arguments_field(s) {
+                if !required.contains(field) {
+                    out.push(Diagnostic::Error(format!(
+                        "BARE_OPTIONAL_ARG_BINDING: workflow '{id}' {loc}: binding '{s}' reads \
+                         `$.arguments.{field}`, but '{field}' is not in this input's `required` \
+                         list — a caller may omit it, and the strict input map then fails \
+                         MCP_MAP_BINDING_UNRESOLVED at call time. Make the intent explicit: add \
+                         '{field}' to `required`, or wrap the binding as \
+                         `{{ \"$optional\": \"{s}\" }}` so an absent value omits the key instead \
+                         of hard-failing (SPEC §5.3, V29-optional)."
+                    )));
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                check_optional_arg_bindings(id, loc, v, required, out);
+            }
+        }
+        Value::Object(obj) => {
+            // A sole-key `$optional` wrapper is the sanctioned opt-out — its inner
+            // template is intentionally omittable, so stop descending here.
+            if obj.len() == 1 && obj.contains_key("$optional") {
+                return;
+            }
+            for v in obj.values() {
+                check_optional_arg_bindings(id, loc, v, required, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// V29 + V29-optional over `proxy.expose[]`. Proxy exposures carry the same
+/// `inputSchema` + `executor.{map,query}` shape as a transition but live OUTSIDE
+/// `workflows.*`, so [`validate_executor_arg_scopes`] never reaches them — and the
+/// engine-compiled `proxy_default` surface (built from exactly these entries,
+/// declared or imported via `with_imports`) is the one place the frontrails
+/// proxy-start bug actually lives. Apply the same scope + optional-arg checks the
+/// transition path applies, so a bare optional binding fails `check`/`doctor`
+/// rather than a caller's session at runtime.
+fn validate_proxy_exposure_arg_scopes(config: &Value, out: &mut Vec<Diagnostic>) {
+    let Some(exposures) = config.pointer("/proxy/expose").and_then(Value::as_array) else {
+        return;
+    };
+    let id = crate::proxy_workflow::DEFAULT_PROXY_WORKFLOW_ID;
+    for exposure in exposures {
+        let Some(exec) = exposure.get("executor") else {
+            continue;
+        };
+        let name = exposure
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("<unnamed>");
+        let required = required_arg_names(exposure.get("inputSchema"));
+        for field in ["map", "query"] {
+            if let Some(obj) = exec.get(field).and_then(Value::as_object) {
+                let loc = format!("exposure '{name}' executor {field}");
+                for v in obj.values() {
+                    check_arg_scope_tree(id, &loc, v, out);
+                    check_optional_arg_bindings(id, &loc, v, &required, out);
+                }
+            }
+        }
     }
 }
 
@@ -4921,6 +5037,135 @@ mod tests {
             v29_errors(&good).is_empty(),
             "valid $optional binding must pass: {:?}",
             v29_errors(&good)
+        );
+    }
+
+    fn bare_optional_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("BARE_OPTIONAL_ARG_BINDING"))
+            .collect()
+    }
+
+    fn mcp_map_transition(input_schema: Value, map: Value) -> Value {
+        json!({ "workflows": { "wf": {
+            "initialState": "s",
+            "states": {
+                "s": { "transitions": { "m": {
+                    "target": "done", "actor": "deterministic",
+                    "inputSchema": input_schema,
+                    "executor": { "kind": "mcp", "connection": "c", "tool": "t", "map": map } } } },
+                "done": { "terminal": true }
+            }
+        }}})
+    }
+
+    #[test]
+    fn bare_optional_arg_binding_is_flagged_on_a_transition() {
+        // `params` is a declared-but-OPTIONAL property (absent from `required`),
+        // so a bare `$.arguments.params` map binding is a latent runtime hard-fail.
+        let cfg = mcp_map_transition(
+            json!({ "type": "object", "properties": { "params": { "type": "object" } } }),
+            json!({ "action": "certify", "params": "$.arguments.params" }),
+        );
+        let d = bare_optional_errors(&cfg);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("params"), "{}", d[0]);
+    }
+
+    #[test]
+    fn required_arg_binding_is_not_flagged() {
+        // Same binding, but `params` is `required` — a caller cannot omit it, so
+        // the bare binding is safe and must NOT be flagged.
+        let cfg = mcp_map_transition(
+            json!({ "type": "object", "required": ["params"],
+                    "properties": { "params": { "type": "object" } } }),
+            json!({ "action": "certify", "params": "$.arguments.params" }),
+        );
+        assert!(
+            bare_optional_errors(&cfg).is_empty(),
+            "{:?}",
+            bare_optional_errors(&cfg)
+        );
+    }
+
+    #[test]
+    fn optional_wrapped_binding_is_not_flagged() {
+        // The sanctioned opt-out: `$optional` makes an absent value omit the key,
+        // so an optional `params` wrapped in `$optional` is legal.
+        let cfg = mcp_map_transition(
+            json!({ "type": "object", "properties": { "params": { "type": "object" } } }),
+            json!({ "action": "certify", "params": { "$optional": "$.arguments.params" } }),
+        );
+        assert!(
+            bare_optional_errors(&cfg).is_empty(),
+            "{:?}",
+            bare_optional_errors(&cfg)
+        );
+    }
+
+    #[test]
+    fn nested_optional_arg_field_is_flagged() {
+        // `$.arguments.params.sub` still keys off the OPTIONAL top-level `params`;
+        // if `params` is absent the whole path is unresolvable.
+        let cfg = mcp_map_transition(
+            json!({ "type": "object", "properties": { "params": { "type": "object" } } }),
+            json!({ "action": "x", "sub": "$.arguments.params.sub" }),
+        );
+        assert_eq!(
+            bare_optional_errors(&cfg).len(),
+            1,
+            "{:?}",
+            bare_optional_errors(&cfg)
+        );
+    }
+
+    #[test]
+    fn bare_optional_arg_binding_is_flagged_on_a_proxy_exposure() {
+        // The frontrails proxy-start bug: exposures live OUTSIDE `workflows.*`, so
+        // this coverage is what makes the poka-yoke fire on the real config. Note
+        // there is NO `workflows:` block — a pure pack config still gets validated.
+        let cfg = json!({ "proxy": { "expose": [
+            {
+                "name": "intentos.certify",
+                "inputSchema": { "type": "object", "properties": { "params": { "type": "object" } } },
+                "executor": { "kind": "mcp", "connection": "intentos", "tool": "intentos",
+                              "map": { "action": "certify", "params": "$.arguments.params" } }
+            }
+        ]}});
+        let d = bare_optional_errors(&cfg);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].contains("intentos.certify") && d[0].contains("params"),
+            "{}",
+            d[0]
+        );
+    }
+
+    #[test]
+    fn proxy_exposure_required_or_optional_wrapped_is_ok() {
+        // Required arg (intentos.propose shape) and `$optional`-wrapped arg both pass.
+        let cfg = json!({ "proxy": { "expose": [
+            {
+                "name": "intentos.propose",
+                "inputSchema": { "type": "object", "required": ["params"],
+                                 "properties": { "params": { "type": "object" } } },
+                "executor": { "kind": "mcp", "connection": "intentos", "tool": "intentos",
+                              "map": { "action": "propose", "params": "$.arguments.params" } }
+            },
+            {
+                "name": "intentos.navigate",
+                "inputSchema": { "type": "object", "properties": { "params": { "type": "object" } } },
+                "executor": { "kind": "mcp", "connection": "intentos", "tool": "intentos",
+                              "map": { "action": "navigate", "params": { "$optional": "$.arguments.params" } } }
+            }
+        ]}});
+        assert!(
+            bare_optional_errors(&cfg).is_empty(),
+            "{:?}",
+            bare_optional_errors(&cfg)
         );
     }
 
