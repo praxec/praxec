@@ -8,6 +8,40 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.33] — 2026-07-27 — clean proxy start + optional map bindings
+
+A focused fix release: a proxy session (`proxy_default`) can now start cleanly
+against a pack that exposes params-taking capabilities. Two independent engine
+defects surfaced by starting a proxy over the FrontRails pack, plus a poka-yoke
+so the class can't be re-authored.
+
+### Added
+
+- **`$optional` map binding.** A sole-key map operator
+  `{ "$optional": "$.arguments.params" }` omits the target key when its source
+  path is absent, instead of hard-failing `MCP_MAP_BINDING_UNRESOLVED`. Bare
+  `$.` paths still fail fast (CMP-034 unchanged) — opting out is explicit, never
+  a silent fallback. Lets an optional argument actually be optional.
+- **V29-optional load-time check (poka-yoke).** `check` / `doctor` now reject a
+  **bare** `$.arguments.X` executor `map:`/`query:` binding whose `X` is not in
+  the input's `required` list — the exact latent runtime hard-fail above, caught
+  at authoring time. The remedy is explicit: mark `X` required, or wrap it in
+  `$optional`. Coverage extends to `proxy.expose[]` (validated before the
+  `workflows` early-return), since proxy exposures — where the bug lived — sit
+  outside `workflows.*`.
+
+### Fixed
+
+- **Proxy surface is caller-driven; never auto-fired at start.** The
+  engine-compiled proxy workflow now carries `proxySurface: true`, and the
+  start-chain keys off it to **never** auto-drive an exposed capability. With
+  `auto_drive_agents` on, the previous behavior ran a reasoning agent to
+  synthesize arguments for a capability nobody requested — firing it at session
+  start, burning budget, and hard-failing for any params-taking exposure invoked
+  with none. A proxy session now parks in `ready` with its links and the caller
+  chooses. This is the keystone that lets a proxy start without pre-supplying
+  args to every exposed verb.
+
 ## [0.0.32] — 2026-07-26 — worktree-proof dogfood substrate + adaptive flywheel
 
 A stabilization + capability release that makes *developing praxec through praxec*
