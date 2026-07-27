@@ -573,21 +573,34 @@ impl WorkflowRuntime {
                 .filter(|(_, t)| t.get("actor").and_then(Value::as_str) == Some("deterministic"))
                 .collect();
 
+            // A generated proxy surface is CALLER-DRIVEN: a flat menu of exposed
+            // capabilities with no goal, every transition self-looping. It must
+            // never be auto-driven — doing so runs a reasoning agent to
+            // synthesize args for a capability the caller never requested,
+            // firing it at session start and (for a params-taking cap called
+            // argless) hard-failing before the caller can act. See
+            // `proxy_workflow::compile_proxy_workflow_from_exposures`.
+            let caller_driven_surface = definition
+                .get("proxySurface")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
             // (1b) Auto-drivable agent transitions: skill-surfacing `actor: agent`
             // moves the gateway can drive itself via the `kind: agent` executor
             // when `auto_drive_agents` is on (excluding the conventional
             // `escalate` bail-out). This is what makes the v0.6 cap/orchestrator
             // composition model executable end-to-end: a sub-workflow's agent
             // state advances under the kind:workflow poll instead of hanging.
-            let agent_drivable: Vec<(&String, &Value)> = if self.auto_drive_agents {
-                transitions
-                    .iter()
-                    .filter(|(_, t)| t.get("actor").and_then(Value::as_str) == Some("agent"))
-                    .filter(|(name, _)| name.as_str() != "escalate")
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            let agent_drivable: Vec<(&String, &Value)> =
+                if self.auto_drive_agents && !caller_driven_surface {
+                    transitions
+                        .iter()
+                        .filter(|(_, t)| t.get("actor").and_then(Value::as_str) == Some("agent"))
+                        .filter(|(name, _)| name.as_str() != "escalate")
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             // Deterministic transitions take precedence; auto-drive only kicks in
             // when there are none to fire first.
             let use_agent_drive = deterministic.is_empty() && !agent_drivable.is_empty();
