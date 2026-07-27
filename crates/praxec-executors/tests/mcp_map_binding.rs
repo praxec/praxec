@@ -99,6 +99,66 @@ async fn literal_and_nested_map_bindings_are_templated_not_rejected() {
     }
 }
 
+// ── `$optional` binding: absent path OMITS the key, does NOT fail ────────────
+//
+// The apex-gate ergonomics fix. A capability whose param is optional declares
+// the binding as `{ "$optional": "$.arguments.params" }`. When the caller omits
+// `params`, the key is dropped from the rendered arguments and the tool is
+// called without it — instead of the fail-fast MCP_MAP_BINDING_UNRESOLVED that a
+// bare `"$.arguments.params"` would raise. This is poka-yoke, NOT a fallback:
+// the author explicitly marks the binding optional; a bare path stays fail-fast.
+
+#[tokio::test]
+async fn optional_binding_omits_absent_key_instead_of_failing() {
+    let exec = McpExecutor::new(McpConnections::default());
+    // `params` is absent from every scope; `action` is a literal. With
+    // `$optional`, render_args must succeed and drop `params` — so the only
+    // error possible is the (expected) missing live connection, NEVER a
+    // map-binding error.
+    let result = exec
+        .execute(req(
+            json!({
+                "kind": "mcp",
+                "connection": "anything",
+                "tool": "intentos",
+                "map": {
+                    "action": "certify",
+                    "params": { "$optional": "$.arguments.params" }
+                }
+            }),
+            json!({}),
+        ))
+        .await;
+    if let Err(e) = result {
+        let s = format!("{e:?}");
+        assert!(
+            !s.contains("MCP_MAP_BINDING_UNRESOLVED") && !s.contains("INVALID_MCP_MAP"),
+            "absent optional binding must omit the key, not error; got: {s}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bare_path_still_fails_fast_when_absent() {
+    // The fail-fast contract for REQUIRED (bare) bindings is unchanged: an
+    // absent bare path is still MCP_MAP_BINDING_UNRESOLVED. `$optional` is the
+    // ONLY way to opt a binding out of fail-fast.
+    let exec = McpExecutor::new(McpConnections::default());
+    let err = exec
+        .execute(req(
+            json!({
+                "kind": "mcp",
+                "connection": "anything",
+                "tool": "intentos",
+                "map": { "action": "certify", "params": "$.arguments.params" }
+            }),
+            json!({}),
+        ))
+        .await
+        .expect_err("a bare absent path must still fail fast");
+    assert!(format!("{err:?}").contains("MCP_MAP_BINDING_UNRESOLVED"));
+}
+
 // ── No `map:` declared → raw-args pass-through (no map error) ─────────────────
 //
 // With no `map:`, render_args returns Ok(None) and the executor passes the raw

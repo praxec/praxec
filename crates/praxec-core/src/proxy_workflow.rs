@@ -84,6 +84,17 @@ fn compile_proxy_workflow_from_exposures(exposures: &[Value]) -> Option<Value> {
     Some(json!({
         "version": "0",
         "description": "Generated null-op workflow for configurable proxy exposures.",
+        // CALLER-DRIVEN surface. A proxy is a flat menu of exposed capabilities
+        // the CALLER chooses among — it has no goal to advance toward and every
+        // transition self-loops (`ready -> ready`). The start-chain must NEVER
+        // auto-drive it: with `auto_drive_agents` on, auto-driving would run a
+        // reasoning agent to synthesize arguments for a capability nobody asked
+        // for (firing it at session start, burning the budget, and — for a
+        // params-taking capability called with none — hard-failing before the
+        // caller can act). `run_deterministic_chain` keys off this flag to leave
+        // the session parked in `ready` with its links. (Companion to the
+        // `$optional` map-binding fix; together they let a proxy start cleanly.)
+        "proxySurface": true,
         "initialState": DEFAULT_PROXY_STATE,
         "states": {
             DEFAULT_PROXY_STATE: {
@@ -131,6 +142,19 @@ mod tests {
             ]}
         });
         let _ = compile_proxy_workflow(&cfg);
+    }
+
+    #[test]
+    fn compiled_proxy_is_marked_caller_driven() {
+        // The generated surface must carry `proxySurface: true` so the
+        // start-chain leaves it caller-driven (never auto-fires an exposure).
+        let cfg = json!({
+            "proxy": { "expose": [
+                { "name": "certify", "executor": { "kind": "noop" } }
+            ]}
+        });
+        let wf = compile_proxy_workflow(&cfg).expect("proxy workflow");
+        assert_eq!(wf.get("proxySurface").and_then(Value::as_bool), Some(true));
     }
 
     #[test]

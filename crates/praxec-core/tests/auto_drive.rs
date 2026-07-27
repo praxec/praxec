@@ -53,6 +53,62 @@ async fn auto_drive_on_advances_through_agent_state() {
     assert_eq!(resp["workflow"]["state"], "c");
 }
 
+/// A generated proxy surface (`proxySurface: true`) is CALLER-DRIVEN: even with
+/// auto-drive ON, starting it must PARK in `ready` and surface its links — it
+/// must NEVER auto-fire an exposed capability. Regression: `proxy_default`
+/// auto-fired the apex gate at session start, running a reasoning agent to
+/// synthesize args for a capability nobody asked for — burning the budget and
+/// hard-failing an argless params-taking capability before the caller could act.
+#[tokio::test]
+async fn proxy_surface_is_not_auto_driven_even_with_auto_drive_on() {
+    let cfg = json!({
+        "version": "1.0.0",
+        "workflows": {
+            "proxy_default": {
+                "proxySurface": true,
+                "initialState": "ready",
+                "states": {
+                    "ready": {
+                        "transitions": {
+                            "certify": { "target": "ready", "actor": "agent",
+                                         "executor": { "kind": "noop" } },
+                            "status":  { "target": "ready", "actor": "agent",
+                                         "executor": { "kind": "noop" } }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    let exec = std::sync::Arc::new(FixedExecutor::new(json!({})));
+    let (runtime, _audit) = build_runtime_with_executor(
+        cfg,
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec![], 180);
+    let resp = runtime
+        .start(StartWorkflow {
+            definition_id: "proxy_default".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        resp["workflow"]["state"], "ready",
+        "a proxy surface must park in `ready`, not auto-drive an exposed capability"
+    );
+    // Nothing was fired — the executor was never invoked at start.
+    assert_eq!(
+        exec.count(),
+        0,
+        "no exposed capability may run before the caller picks one"
+    );
+}
+
 /// The composed agent step must instruct the model to call `final_answer`
 /// (matching the runner's result contract) — NOT "return JSON text, no prose",
 /// which made the model skip the tool and yield AGENT_NO_RESULT — and must pass

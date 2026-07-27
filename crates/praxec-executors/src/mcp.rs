@@ -618,10 +618,20 @@ impl Executor for McpExecutor {
 ///   (e.g. `params: { path: "$.workflow.input.target_path", max_groups: 5 }`)
 ///   — which a flat string-only binding could not express.
 ///
+/// An optional binding whose `$.` path did not resolve is OMITTED, not failed:
+/// wrap it as `{ "$optional": "$.scope.path" }`. Everything inside `$optional`
+/// resolves in "soft" mode — an unresolved `$.` path yields "absent" (the key /
+/// element is dropped) instead of MCP_MAP_BINDING_UNRESOLVED. This is the ONLY
+/// opt-out: a BARE path stays fail-fast (CMP-034), so a typo'd required binding
+/// can never silently vanish. Poka-yoke, not a fallback — the author declares
+/// the optionality explicitly.
+const OPTIONAL_OP: &str = "$optional";
+
 /// Returns:
 /// - `Ok(None)` when no `map:` is declared — raw `arguments` pass through.
-/// - `Ok(Some(obj))` when every `$.` path resolved.
-/// - `Err(..)` when `map:` is not an object, or a `$.` path is unresolvable.
+/// - `Ok(Some(obj))` when every REQUIRED `$.` path resolved (absent `$optional`
+///   bindings are dropped from the object).
+/// - `Err(..)` when `map:` is not an object, or a bare `$.` path is unresolvable.
 fn render_args(
     map: Option<&Value>,
     request: &ExecuteRequest,
@@ -632,61 +642,90 @@ fn render_args(
     let map = map.as_object().ok_or_else(|| {
         ExecutorError::Permanent(
             "INVALID_MCP_MAP: executor `map` must be an object of `{ targetArg: <template> }` \
-             bindings, where a template is a `$.scope.path` string, a literal, or a nested \
-             object/array of those."
+             bindings, where a template is a `$.scope.path` string, a literal, a nested \
+             object/array of those, or `{ \"$optional\": <template> }` to omit an absent path."
                 .into(),
         )
     })?;
     let mut out = serde_json::Map::new();
     for (target, source) in map {
-        out.insert(target.clone(), resolve_template(source, request, target)?);
+        // A top-level binding that resolves to "absent" (an `$optional` whose
+        // path did not resolve) is dropped — the tool is called without the key.
+        if let Some(v) = resolve_template(source, request, target, false)? {
+            out.insert(target.clone(), v);
+        }
     }
     Ok(Some(Value::Object(out)))
 }
 
 /// Recursively resolve a `map:` template value. `$.`-prefixed strings are scope
-/// paths (resolved or fail-fast); objects/arrays are walked; everything else is
-/// a literal. `path` is the dotted binding location, used only for error
-/// messages.
+/// paths; objects/arrays are walked; everything else is a literal. A
+/// `{ "$optional": <template> }` wrapper softens its subtree (unresolved paths
+/// within become "absent" and are dropped) — see [`OPTIONAL_OP`].
+///
+/// Returns `Ok(None)` when the value resolves to "absent" (a dropped
+/// `$optional` path); `Ok(Some(v))` for a resolved value; `Err(..)` when a bare
+/// (non-soft) `$.` path is unresolvable. `soft` propagates the `$optional`
+/// context down the tree. `path` is the dotted binding location, used only for
+/// error messages.
 fn resolve_template(
     value: &Value,
     request: &ExecuteRequest,
     path: &str,
-) -> Result<Value, ExecutorError> {
+    soft: bool,
+) -> Result<Option<Value>, ExecutorError> {
     match value {
-        Value::String(s) if s.starts_with("$.") => praxec_core::mapping::read_in_scopes(
-            s,
-            &request.arguments,
-            &request.workflow.context,
-            &request.workflow.input,
-            None,
-            Some(&request.workflow.run_env),
-        )
-        .ok_or_else(|| {
-            ExecutorError::Permanent(format!(
-                "MCP_MAP_BINDING_UNRESOLVED: `map` binding `{path}: {s}` did not resolve \
-                 against the available scopes (arguments / context / input). Refusing to call \
-                 the tool with the wrong arguments."
-            ))
-        }),
-        // Literal string / number / bool / null — passed through verbatim.
-        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => Ok(value.clone()),
+        // `{ "$optional": <template> }` — resolve the inner template in soft
+        // mode. Sole-key form only (matches the operator convention in
+        // `mapping::resolve_value`); a multi-key object is a plain object.
+        Value::Object(obj) if obj.len() == 1 && obj.contains_key(OPTIONAL_OP) => {
+            resolve_template(&obj[OPTIONAL_OP], request, path, true)
+        }
+        Value::String(s) if s.starts_with("$.") => {
+            match praxec_core::mapping::read_in_scopes(
+                s,
+                &request.arguments,
+                &request.workflow.context,
+                &request.workflow.input,
+                None,
+                Some(&request.workflow.run_env),
+            ) {
+                Some(v) => Ok(Some(v)),
+                // Soft (inside `$optional`): absent path → omit. Otherwise
+                // fail-fast (CMP-034 — never call the tool with wrong args).
+                None if soft => Ok(None),
+                None => Err(ExecutorError::Permanent(format!(
+                    "MCP_MAP_BINDING_UNRESOLVED: `map` binding `{path}: {s}` did not resolve \
+                     against the available scopes (arguments / context / input). Refusing to \
+                     call the tool with the wrong arguments. (Declare it \
+                     `{{ \"$optional\": \"{s}\" }}` if the tool accepts it absent.)"
+                ))),
+            }
+        }
+        // Literal string / number / bool / null — passed through verbatim. A
+        // literal is never "absent", so `$optional` over a literal is a no-op.
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {
+            Ok(Some(value.clone()))
+        }
         Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
-                out.push(resolve_template(item, request, &format!("{path}[{i}]"))?);
+                // A dropped `$optional` element is omitted from the array.
+                if let Some(v) = resolve_template(item, request, &format!("{path}[{i}]"), soft)? {
+                    out.push(v);
+                }
             }
-            Ok(Value::Array(out))
+            Ok(Some(Value::Array(out)))
         }
         Value::Object(obj) => {
             let mut out = serde_json::Map::new();
             for (k, v) in obj {
-                out.insert(
-                    k.clone(),
-                    resolve_template(v, request, &format!("{path}.{k}"))?,
-                );
+                // A dropped `$optional` value omits its key from the object.
+                if let Some(rv) = resolve_template(v, request, &format!("{path}.{k}"), soft)? {
+                    out.insert(k.clone(), rv);
+                }
             }
-            Ok(Value::Object(out))
+            Ok(Some(Value::Object(out)))
         }
     }
 }
@@ -963,6 +1002,61 @@ mod render_args_tests {
         let map = json!({ "items": ["one", "$.context.b", 3] });
         let out = render_args(Some(&map), &r).unwrap().unwrap();
         assert_eq!(out["items"], json!(["one", "two", 3]));
+    }
+
+    // `$optional` wrapping a path that RESOLVES includes the value verbatim.
+    #[test]
+    fn optional_binding_includes_present_value() {
+        let r = req(
+            json!({}),
+            json!({}),
+            json!({ "params": { "target_id": "v7" } }),
+        );
+        let map = json!({
+            "action": "certify",
+            "params": { "$optional": "$.arguments.params" }
+        });
+        let out = render_args(Some(&map), &r).unwrap().unwrap();
+        assert_eq!(
+            out,
+            json!({ "action": "certify", "params": { "target_id": "v7" } })
+        );
+    }
+
+    // `$optional` wrapping an ABSENT path drops ONLY that key — the sibling
+    // literal survives. This is the certify-with-no-params ergonomics fix.
+    #[test]
+    fn optional_binding_absent_drops_only_that_key() {
+        let r = req(json!({}), json!({}), json!({}));
+        let map = json!({
+            "action": "certify",
+            "params": { "$optional": "$.arguments.params" }
+        });
+        let out = render_args(Some(&map), &r).unwrap().unwrap();
+        assert_eq!(out, json!({ "action": "certify" }));
+    }
+
+    // `$optional` wrapping a LITERAL always includes it — a literal is never
+    // "absent", so the operator is a no-op over literals.
+    #[test]
+    fn optional_binding_over_a_literal_is_always_included() {
+        let r = req(json!({}), json!({}), json!({}));
+        let map = json!({ "mode": { "$optional": "fast" } });
+        let out = render_args(Some(&map), &r).unwrap().unwrap();
+        assert_eq!(out, json!({ "mode": "fast" }));
+    }
+
+    // A bare (non-`$optional`) absent path STILL fails fast — `$optional` is the
+    // only opt-out, so a typo'd required binding can never silently vanish.
+    #[test]
+    fn bare_absent_path_still_fails_fast_alongside_optional() {
+        let r = req(json!({}), json!({}), json!({}));
+        let map = json!({
+            "params": { "$optional": "$.arguments.params" },
+            "required": "$.arguments.must_exist"
+        });
+        let err = render_args(Some(&map), &r).unwrap_err();
+        assert!(format!("{err:?}").contains("MCP_MAP_BINDING_UNRESOLVED"));
     }
 }
 
