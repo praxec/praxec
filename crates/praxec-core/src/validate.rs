@@ -2748,11 +2748,15 @@ fn validate_executor_arg_scopes(id: &str, def: &Value, out: &mut Vec<Diagnostic>
                     check_arg_scope(id, &loc("args"), a, out);
                 }
             }
-            // mcp `map:` / rest `query:` — object of path strings.
+            // mcp `map:` / rest `query:` — object of templates. Recurse each
+            // value so a `$.` path nested inside an object/array or wrapped in a
+            // `{ "$optional": ... }` binding is still scope-checked: `$optional`
+            // omits an ABSENT path at runtime, but a WRONG-ROOT path (a typo) can
+            // never resolve and must be caught at load, exactly as a bare path is.
             for field in ["map", "query"] {
                 if let Some(obj) = exec.get(field).and_then(Value::as_object) {
                     for v in obj.values() {
-                        check_arg_scope(id, &loc(field), v, out);
+                        check_arg_scope_tree(id, &loc(field), v, out);
                     }
                 }
             }
@@ -4874,6 +4878,49 @@ mod tests {
             d.len(),
             2,
             "both the map and the nested body operand: {d:?}"
+        );
+    }
+
+    #[test]
+    fn v29_checks_paths_inside_optional_map_bindings() {
+        // `$optional` omits an ABSENT path at runtime, but a WRONG-ROOT path
+        // (`$.input.*` is not `$.workflow.input.*`) can never resolve and must
+        // still be flagged — otherwise a typo'd optional silently always-omits.
+        let bad = json!({ "workflows": { "wf": {
+            "initialState": "s",
+            "states": {
+                "s": { "transitions": {
+                    "m": { "target": "done", "actor": "deterministic",
+                           "executor": { "kind": "mcp", "connection": "c", "tool": "t",
+                                         "map": { "p": { "$optional": "$.input.bad" } } } }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        assert_eq!(
+            v29_errors(&bad).len(),
+            1,
+            "optional wrapper must not hide a wrong-root path"
+        );
+
+        // A VALID scope wrapped in `$optional` (present-or-absent at runtime) is
+        // legal — its scope resolves, so no diagnostic.
+        let good = json!({ "workflows": { "wf": {
+            "initialState": "s",
+            "states": {
+                "s": { "transitions": {
+                    "m": { "target": "done", "actor": "deterministic",
+                           "executor": { "kind": "mcp", "connection": "c", "tool": "t",
+                                         "map": { "action": "certify",
+                                                  "params": { "$optional": "$.arguments.params" } } } }
+                }},
+                "done": { "terminal": true }
+            }
+        }}});
+        assert!(
+            v29_errors(&good).is_empty(),
+            "valid $optional binding must pass: {:?}",
+            v29_errors(&good)
         );
     }
 
