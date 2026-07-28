@@ -50,9 +50,15 @@ jobs:
 
     publish:
         name: cargo publish (tag-triggered)
-        # The `if` keeps this job strictly tag-triggered now that the
-        # workflow also fires on pull_request for the dry-run gate above.
-        if: github.event_name == 'push'
+        # Strictly tag-triggered (the workflow also fires on pull_request
+        # for the dry-run gate above) AND gated behind an explicit opt-in:
+        # crates.io publishing stays OFF until this repo sets the
+        # `PUBLISH_CRATES` Actions *variable* to `true` (Settings → Secrets
+        # and variables → Actions → Variables) and adds the `CRATES_IO_TOKEN`
+        # secret. Without the flag the job SKIPS (green) instead of failing on
+        # an empty token — don't attempt what can't succeed. (`vars` is
+        # readable in a job `if`; `secrets` is not, hence a variable flag.)
+        if: github.event_name == 'push' && vars.PUBLISH_CRATES == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 45
         steps:
