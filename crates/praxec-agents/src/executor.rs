@@ -479,6 +479,10 @@ impl AgentExecutor {
             expected_output_keys: cfg.expected_output_keys.clone(),
             expected_output_types: cfg.expected_output_types.clone(),
             await_enabled: cfg.await_enabled,
+            // Coding-evidence forcing function: a coding leaf's `final_answer`
+            // must be backed by real `write_file`/`edit_file` calls (see the
+            // runner's write tally). Non-coding leaves leave this false.
+            requires_file_write: cfg.requires_file_write,
             // The identity the runtime stamps on `agent.invoked` — carried so
             // the runner's in-run `agent.heartbeat` events join the same
             // workflow + correlation in the audit stream.
@@ -560,6 +564,21 @@ impl AgentExecutor {
             // distinct from a genuinely empty NoResult, and carries the partial
             // work rather than discarding it. Both classify as Capability
             // (escalate to a stronger model), so the walk is unchanged.
+            // Coding-evidence forcing function: a success with zero file writes,
+            // after the runner's bounded in-context correction. Escalatable
+            // (Capability) like NoResult/NotConverging so the chain-walk hands the
+            // work to the next model — the automated "swap the lead coder". The
+            // burned tokens rode in on the report (this is an OUTCOME, not a
+            // runner Err), so the wasted spend is attributed to this model.
+            AgentRunOutcome::NoFileWrites => Err(permanent(
+                AgentErrorCode::NoFileWrites,
+                format!(
+                    "agent reported success on a coding deliverable but made no successful \
+                     write_file/edit_file call across the run, even after in-context correction \
+                     — escalating to the next model. Partial work: {}",
+                    partial_tail(&report.transcript)
+                ),
+            )),
             AgentRunOutcome::NoResult => {
                 if report.transcript.trim().is_empty() {
                     Err(permanent(
@@ -1418,6 +1437,69 @@ mod tests {
             !msg.contains("AGENT_NO_RESULT"),
             "a run that did work must not be mislabeled NoResult: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn no_file_writes_outcome_maps_to_escalatable_error_with_partial_work() {
+        // Coding-evidence forcing function: the runner reports the NoFileWrites
+        // OUTCOME; the executor maps it to the escalatable AGENT_NO_FILE_WRITES
+        // and carries the partial work (never a bare NoResult).
+        let exec = exec_with(MockSessionRunner::no_file_writes());
+        let err = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "g" }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("a zero-write coding success → escalatable error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("AGENT_NO_FILE_WRITES"), "got {msg}");
+        assert!(
+            msg.contains("Partial work"),
+            "partial work must be surfaced: {msg}"
+        );
+    }
+
+    /// Honest accounting: because NoFileWrites is an OUTCOME (not a runner Err),
+    /// the burned tokens survive onto the `agent.model_attempt` event — so the
+    /// wasted spend is attributed to the model that narrated instead of writing,
+    /// exactly the "glm burned $1.88 for nothing" case the flywheel must see.
+    #[tokio::test]
+    async fn a_no_file_writes_attempt_records_its_burned_tokens() {
+        let audit = praxec_core::audit::MemoryAuditSink::new();
+        let exec = AgentExecutor::new(
+            Arc::new(MockSessionRunner::no_file_writes()),
+            Arc::new(MockModelResolver("anthropic:claude-sonnet-4-6".into())),
+        )
+        .with_audit_sink(Arc::new(audit.clone()));
+        let _ = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "g" }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("zero-write coding success escalates");
+
+        let attempts: Vec<_> = audit
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.event_type == AGENT_MODEL_ATTEMPT_EVENT)
+            .collect();
+        assert_eq!(attempts.len(), 1, "one failed attempt recorded");
+        assert_eq!(attempts[0].payload["outcome"], json!("Capability"));
+        assert!(
+            attempts[0].payload["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("AGENT_NO_FILE_WRITES")),
+            "carries its typed error: {:#}",
+            attempts[0].payload
+        );
+        assert_eq!(
+            attempts[0].payload["prompt_tokens"],
+            json!(800),
+            "the burned tokens must survive the outcome→error map (honest accounting)"
+        );
+        assert_eq!(attempts[0].payload["completion_tokens"], json!(200));
     }
 
     #[tokio::test]
