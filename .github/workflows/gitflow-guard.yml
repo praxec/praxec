@@ -2,16 +2,18 @@ name: gitflow guard
 
 # Enforces the branch flow: feature -> dev -> main.
 # `main` is the release branch; it may only advance by merging `dev`.
-# This job fails any pull request into `main` whose source branch is not `dev`,
-# so a stray feature branch cannot merge straight to `main`.
 #
-# Note: for `pull_request`, the workflow file is taken from the PR head branch,
-# so this guard is effective as soon as it lands on `dev` (which is the only
-# legal head for a `main` PR anyway).
+# Runs on EVERY pull request (and re-runs when the base branch is changed, via
+# `edited`), but only ENFORCES the head-is-dev rule for PRs into `main`. For a
+# PR into `dev` (or any non-main base) it passes immediately — so a dev-targeted
+# PR gets a clean green check instead of a stale red left over from a wrong-base
+# open + retarget, and a `dev` ruleset that requires this status is satisfied.
+#
+# Note: for `pull_request`, the workflow file is taken from the PR head branch.
 
 on:
     pull_request:
-        branches: [main]
+        types: [opened, reopened, synchronize, edited]
 
 permissions:
     contents: read
@@ -21,13 +23,18 @@ jobs:
         name: main only accepts merges from dev
         runs-on: ubuntu-latest
         steps:
-            - name: Verify PR source is dev
+            - name: Verify a PR into main comes from dev
               env:
+                  BASE_REF: ${{ github.event.pull_request.base.ref }}
                   HEAD_REF: ${{ github.event.pull_request.head.ref }}
               run: |
+                  if [ "$BASE_REF" != "main" ]; then
+                      echo "OK: PR targets '$BASE_REF', not 'main' — gitflow guard is N/A here."
+                      exit 0
+                  fi
                   if [ "$HEAD_REF" != "dev" ]; then
                       echo "::error::PRs into 'main' must come from 'dev' (got '$HEAD_REF')."
-                      echo "gitflow: feature -> dev -> main. Merge your work into 'dev' first, then open dev -> main."
+                      echo "gitflow: feature -> dev -> main. Merge into 'dev' first, then open dev -> main."
                       exit 1
                   fi
                   echo "OK: PR head is 'dev'."
