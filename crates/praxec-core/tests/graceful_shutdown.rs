@@ -148,3 +148,73 @@ async fn drain_allows_inflight_submit_and_get() {
         .unwrap();
     assert_eq!(submitted["workflow"]["state"], "done");
 }
+
+#[tokio::test]
+async fn halt_run_submit_durably_cancels_the_run() {
+    let rt = build_runtime();
+    let start = rt
+        .start(StartWorkflow {
+            definition_id: "drain_demo".to_string(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+    let wf_id = start["workflow"]["id"].as_str().unwrap().to_string();
+
+    // The kill switch: submitting `halt_run` durably cancels the run — even with a
+    // STALE expectedVersion (the intercept skips the CAS on purpose so halting an
+    // auto-chain whose version churns every hop is never denied for staleness),
+    // and even though `drain_demo` never declared the transition (the submit path
+    // intercepts it by name, before the transition lookup).
+    let resp = rt
+        .submit(SubmitTransition {
+            workflow_id: wf_id.clone(),
+            expected_version: 999, // stale on purpose
+            transition: "halt_run".to_string(),
+            arguments: json!({ "reason": "operator stopped a runaway" }),
+            principal: Principal::anonymous(),
+            summary: None,
+            trace_id: None,
+            run_id: None,
+        })
+        .await
+        .unwrap();
+    // A cancelled mission resolves `failed` with reason `cancelled`; the halt
+    // carries the WORKFLOW_HALTED code.
+    assert_eq!(resp["result"]["status"], "failed", "{resp:#}");
+    assert_eq!(resp["result"]["reason"], "cancelled");
+    assert_eq!(resp["error"]["code"], "WORKFLOW_HALTED");
+
+    // get confirms the durable cancel.
+    let got = rt
+        .get(GetWorkflow {
+            workflow_id: wf_id.clone(),
+            principal: Principal::anonymous(),
+            trace_id: None,
+            run_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(got["result"]["status"], "failed");
+    assert_eq!(got["result"]["reason"], "cancelled");
+
+    // Any later normal submit is refused WORKFLOW_CANCELLED — the run is stopped.
+    let err = rt
+        .submit(SubmitTransition {
+            workflow_id: wf_id,
+            expected_version: 1,
+            transition: "go".to_string(),
+            arguments: json!({}),
+            principal: Principal::anonymous(),
+            summary: None,
+            trace_id: None,
+            run_id: None,
+        })
+        .await
+        .expect_err("a cancelled run refuses further submits");
+    assert!(err.to_string().contains("WORKFLOW_CANCELLED"), "{err}");
+}

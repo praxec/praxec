@@ -8,6 +8,143 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.40] — 2026-07-28 — install works on a minimal box + provider-key setup
+
+Fixes a real fresh-machine install failure (a box with only POSIX `/bin/sh` — no
+`curl`, no `bash`) and adds a guided LLM-provider-key setup.
+
+### Fixed
+
+- **`install.sh` no longer hard-requires `curl`.** It now fetches with **curl or
+  wget** (busybox wget works), and preflight-checks its few genuine deps (`tar`,
+  `awk`, `mktemp`) with an actionable package-manager hint
+  (`apt-get`/`apk`/`dnf`/`pacman`/`brew`) instead of a bare `-sh: X: not found`.
+  It was already POSIX `sh`; this closes the fetch-tool + preflight gaps. The PATH
+  advice now shows the copy-paste `~/.profile` fix.
+- **README install one-liners.** Both curl and wget forms, plus a "neither? install
+  one" note. (The `packs` `setup.sh` bash→POSIX-sh rewrite ships as a companion PR
+  in the packs repo.)
+
+### Added
+
+- **`configure-providers.sh`** — a POSIX-`sh`, idempotent LLM-provider-key setup
+  (the shell twin of `px set-provider-keys`, for boxes with only the `praxec`
+  binary). Interactive, or non-interactive via `--provider <slug> --from-env` /
+  `--key-stdin` / `--list`. Writes `~/.config/praxec/providers.env` (0600, XDG
+  path the engine reads), and **validates** the key against the provider's models
+  endpoint (401/403 → refuse; flaky network → warn + save). An exported env var
+  still overrides the file.
+
+### Notes
+
+- This release also carries the at-scale hardening from 0.0.37–0.0.39 to the
+  release binaries (cost accounting + flywheel-sees-losing-attempts, grounding V39
+  forcing-function, `halt_run` kill switch).
+- **Designed, queued for a follow-up:** governed self-update (`flow.self-update`
+  as a praxec-meta pack + small engine enablers), and the fuller clean-startup
+  path (a `praxec init` that writes a starter gateway.yaml + seeds models.yaml so a
+  binary-only user isn't blocked on the unshipped `px`).
+
+## [0.0.39] — 2026-07-28 — discoverable kill switch (halt_run)
+
+Last of the at-scale hardening sequence. Closes the control-plane gap: a runaway
+(a mis-grounded scan, a wrong-repo flow) had no exposed way to stop it.
+
+### Added
+
+- **`halt_run` kill switch.** A workflow that declares `enable_halt: true` gets a
+  `halt_run` transition injected into every non-terminal state — a legal next move
+  that appears in the response `links`, so an operator/agent always has a way to
+  stop the run. Submitting it routes to the durable `WorkflowRuntime::cancel`,
+  **skipping the expectedVersion CAS** (halting an auto-chain whose version churns
+  every hop must not be denied for staleness) and idempotent on an
+  already-cancelled run. `cancel` bumps the version, so an in-flight auto-drive
+  dies at its next hop-commit and every later submit is refused
+  `WORKFLOW_CANCELLED`. Opt-in (default off), so non-halt workflows stay
+  byte-identical; a `proxySurface` menu is skipped.
+
+### Notes
+
+- **Scope, honestly.** The gap report also named park-and-return `start` and
+  immediate in-flight model-call abort. **Park-and-return is subsumed** by the
+  0.0.36 progress heartbeat — the idle-timeout abort it existed to prevent no
+  longer happens, and detaching `start` is a high-regression-risk behavioral API
+  change not worth taking on its own. **Immediate abort is bounded**, not
+  unbounded: the 0.0.36 per-attempt step budget caps each model attempt, so a
+  halted run's in-flight hop finishes within one per-attempt wall (set it short to
+  bound the zombie), then the version-bump backstop stops the drive. A true
+  select!-based abort of the in-flight future (killing the hop mid-call) is a
+  clean follow-up on the async model-await stack, deliberately not rushed here to
+  hold the no-regressions bar.
+
+## [0.0.38] — 2026-07-28 — grounding forcing-function (V39): the marker is mandatory
+
+Closes the last opt-in gap in the grounding poka-yoke. V38 (0.0.34) made a
+`role: grounding` state tool-closed; V38(d) (0.0.35) made it target a mandatory
+`path_grounding` verification gate. But the marker itself was optional — a review
+cap could enumerate a repo's surfaces from an *unmarked* agent state and escape
+all of it (the original fabrication vector, re-run without the marker).
+
+### Added
+
+- **V39 `GROUNDING_ROLE_REQUIRED`.** A `verb: review` capability whose agent
+  transition emits a repo-grounding-**shaped** output (a field named
+  `grounded_surfaces`/`grounded_paths`/`surfaces`, or an array-of-objects with a
+  `paths` array — the surface shape `path_grounding` verifies), in a state NOT
+  marked `role: grounding`, is now a hard load error. So a repo-grounding review
+  cap **cannot load** without opting into the grounding envelope. Detection is on
+  the STRONG shape only — ordinary review findings (`{file, line, comment}`) are
+  never flagged (no false positives). The remedy is explicit: add `role: grounding`
+  (and satisfy V38), or rename the field out of the grounding vocabulary.
+
+### Notes
+
+- Together with V38 (tool-closure) + V38(d) (mandatory `path_grounding` gate), the
+  grounding poka-yoke is now **author-independent**: V39 forces the marker, and the
+  marker forces both tool-closure and path-verification — a repo-grounding review
+  cap that skips verification is unrepresentable.
+- Non-retroactive, like V38: fires only on the strong grounding shape in an
+  unmarked review state, which no shipped cap has (the ux caps are already
+  `role: grounding`).
+- On the spec's separate engine "re-hash at the acceptance seam" gate: it is
+  **subsumed** — V38(d) already makes the verification gate mandatory for every
+  marked state. A redundant engine-side re-hash would need a per-transition
+  path-pointer declaration to avoid false-positively flagging non-path output
+  fields; it is deliberately not added rather than lower the bar with an
+  ambiguous hot-path check. Content-hash evidence emission from the existing
+  `path_grounding` gate is an available follow-up.
+
+## [0.0.37] — 2026-07-28 — honest cost accounting + flywheel sees losing attempts
+
+Second of the at-scale hardening sequence. Both fixes ride one small change:
+`agent.model_attempt` now carries the attempt's tokens, priced cost, and applied
+reasoning effort (a FAILED attempt still burned tokens — before, they were
+captured in-process and dropped at the emit seam).
+
+### Added
+
+- **Cost report counts failed/aborted attempts (real spend).** The report read
+  only `agent.completed` — the winning step — so a step where a non-converging
+  model burned 12 min + tokens before falling back showed only the fallback's
+  cost. It now aggregates the wasted spend from `agent.model_attempt` (any
+  non-`success`/`suspended` outcome), attributes it per model (`wasted_by_model`
+  — the burn lands on the culprit, not the fallback), and reports `total_spend_usd`
+  = succeeded + wasted. `total_cost_usd` stays the succeeded-steps figure so the
+  value-prop counterfactual remains apples-to-apples. Legacy token-less attempts
+  are counted as `unpriced_failed_attempts`, never fabricated as $0.
+
+- **De-escalation flywheel now sees losing attempts.** It correlated only
+  `agent.invoked`/`agent.completed`/`chain.failed`, so when a model failed the
+  structured-output contract and a fallback succeeded, the correlation logged one
+  PASS for the fallback and **zero** negative evidence against the failing model —
+  it could never learn a model can't emit the contract. Each contract-failure
+  attempt (`AGENT_NOT_CONVERGING`/`NO_RESULT`/`RESULT_FAILED`) now becomes a FAILED
+  observation keyed on the attempt's own `(affinity, model, effort)`, so a
+  chronically non-converging base's real pass-rate is visible and the existing
+  governed (human-approved) demotion path can act. `BudgetExceeded` cuts are
+  excluded (that's the wall, not the model); `success` attempts aren't
+  double-counted (their spend/pass is on `agent.completed`).
+
 ## [0.0.36] — 2026-07-28 — live progress heartbeat + fallback-budget de-aliasing
 
 First of a sequence hardening praxec for long at-scale runs (the "8 gaps"

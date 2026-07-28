@@ -885,6 +885,40 @@ impl WorkflowRuntime {
 
         let correlation_id = format!("cor_{}", Uuid::new_v4().simple());
 
+        // Kill switch (`halt_run`): route to the durable cancel, deliberately
+        // SKIPPING the expectedVersion CAS — halting an auto-chain whose version
+        // churns every hop must not be denied for staleness. Placed BEFORE the
+        // WORKFLOW_CANCELLED bail so halting an already-cancelled run is an
+        // idempotent success, not an error. `cancel` bumps the version, so an
+        // in-flight auto-drive dies at its next hop-commit and every later submit
+        // is refused WORKFLOW_CANCELLED.
+        if request.transition == crate::config::HALT_TRANSITION {
+            let reason = request
+                .arguments
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!(
+                        "halted via {} by {}",
+                        crate::config::HALT_TRANSITION,
+                        request.principal.subject
+                    )
+                });
+            self.cancel(&request.workflow_id, &reason).await?;
+            let cancelled = self.store.load(&request.workflow_id).await?;
+            return Ok(DispatchOutcome::terminal(
+                self.response(
+                    &definition,
+                    &cancelled,
+                    StatusHint::Cancelled,
+                    Some(json!({ "code": "WORKFLOW_HALTED", "message": reason })),
+                    &request.principal,
+                )
+                .await,
+            ));
+        }
+
         // T24 — cancelled workflows refuse submit. The caller sees
         // WORKFLOW_CANCELLED with the original reason in the error
         // body so retry loops don't loop forever.

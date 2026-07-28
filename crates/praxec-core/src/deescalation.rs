@@ -195,6 +195,12 @@ pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
         /// actually ran under (#12).
         completed: Option<(String, Option<f64>, Option<String>)>,
         failed: bool,
+        /// (model, effort) of each attempt that FAILED the structured-output
+        /// contract (AGENT_NOT_CONVERGING / NO_RESULT / RESULT_FAILED). Only the
+        /// WINNER reaches `agent.completed`, so without these a model that can't
+        /// emit the contract stays invisible to the flywheel and keeps getting
+        /// routed contract-critical work. Each becomes a FAILED observation.
+        contract_failed: Vec<(String, Option<String>)>,
     }
     let str_field = |p: &Value, k: &str| {
         p.get(k)
@@ -232,6 +238,31 @@ pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
             "chain.failed" => {
                 by_cor.entry(e.correlation_id.clone()).or_default().failed = true;
             }
+            "agent.model_attempt" => {
+                let p = &e.payload;
+                // Match on the STABLE wire-code prefix of `error`, not the Debug
+                // `outcome` string. A `success`/`suspended` attempt has no such
+                // error, so it is naturally excluded (its spend/pass is on
+                // `agent.completed`). A `BudgetExceeded` cut is NOT a contract
+                // failure — the per-attempt wall, not the model — so it is excluded.
+                let is_contract_failure =
+                    p.get("error").and_then(Value::as_str).is_some_and(|err| {
+                        err.starts_with("AGENT_NOT_CONVERGING")
+                            || err.starts_with("AGENT_NO_RESULT")
+                            || err.starts_with("AGENT_RESULT_FAILED")
+                    });
+                if is_contract_failure {
+                    let effort = p
+                        .get("reasoning_effort")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    by_cor
+                        .entry(e.correlation_id.clone())
+                        .or_default()
+                        .contract_failed
+                        .push((str_field(p, "model"), effort));
+                }
+            }
             _ => {}
         }
     }
@@ -241,6 +272,21 @@ pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
         let Some((step, affinity, inv_model)) = acc.invoked else {
             continue;
         };
+        // Contract-failure attempts → one FAILED observation each, keyed on the
+        // attempt's OWN (model, effort) so a losing model's real pass-rate is
+        // seen even when the correlation ultimately succeeded via a fallback.
+        // These are terminal facts about that attempt, independent of the
+        // correlation's final outcome, so they're emitted regardless.
+        for (model, effort) in &acc.contract_failed {
+            out.push(StepObservation {
+                affinity: affinity.clone(),
+                step: step.clone(),
+                model: model.clone(),
+                effort: effort.clone(),
+                passed: false,
+                cost_usd: None,
+            });
+        }
         // Passed iff its `agent.completed` fired; failed iff a `chain.failed`
         // fired instead; otherwise still in flight — neither, so skip. On a PASS
         // model+cost+effort all come from `agent.completed` (the actual walked
@@ -911,6 +957,47 @@ mod tests {
                 "fromState": "s", "transition": step, "chainDepth": 1,
                 "errorClass": "OUTPUT_TYPE_MISMATCH", "message": "bar failed",
             }))
+    }
+
+    /// A contract-FAILED `agent.model_attempt` (a non-converging model that then
+    /// fell back). Carries the stable wire-code `error` prefix + the effort it ran.
+    fn contract_attempt(cor: &str, model: &str, effort: &str) -> AuditEvent {
+        AuditEvent::new("agent.model_attempt")
+            .with_correlation(cor)
+            .with_payload(json!({
+                "attempt_index": 0, "model": model, "outcome": "Capability",
+                "error": "AGENT_NOT_CONVERGING: emitted status:success 4x, never the contract",
+                "duration_ms": 720_000, "reasoning_effort": effort,
+            }))
+    }
+
+    #[test]
+    fn a_contract_failed_attempt_becomes_a_negative_observation_for_that_model() {
+        // The step SUCCEEDED via a fallback (deepseek completes), but glm burned
+        // the contract first. The flywheel must see glm's failure, not just the win.
+        let events = vec![
+            invoked("cor_1", "scan", "reasoning", "glm"),
+            contract_attempt("cor_1", "glm", "high"),
+            completed_effort("cor_1", "scan", "deepseek", 0.11, "high"),
+        ];
+        let obs = observations_from_audit(&events);
+        assert_eq!(
+            obs.len(),
+            2,
+            "one failed (glm) + one passed (deepseek): {obs:?}"
+        );
+        let glm = obs.iter().find(|o| o.model == "glm").expect("glm observed");
+        assert!(
+            !glm.passed,
+            "glm's contract failure is a NEGATIVE observation"
+        );
+        assert_eq!(glm.effort.as_deref(), Some("high"));
+        assert_eq!(glm.affinity, "reasoning");
+        let dsk = obs
+            .iter()
+            .find(|o| o.model == "deepseek")
+            .expect("deepseek observed");
+        assert!(dsk.passed, "the fallback that completed passed");
     }
 
     #[test]
