@@ -956,12 +956,13 @@ async fn agent_completed_cost_is_null_for_uncatalogued_model() {
     );
 }
 
-/// (finding #12) A configured `auto_drive_max_seconds` must bound the WHOLE
-/// synthesized step, not just each attempt's wall: the composed `kind: agent`
-/// config carries it as `step_budget_seconds` too. Without it the executor
-/// falls back to its own `DEFAULT_STEP_BUDGET_SECONDS` (900s) chain-walk
-/// budget and cuts a step whose configured allowance is larger — observed live
-/// as `AGENT_STEP_BUDGET_EXHAUSTED` at exactly 900s under a 1800s allowance.
+/// (finding #12 + de-alias) A configured `auto_drive_max_seconds` bounds each
+/// ATTEMPT (`max_seconds`), and the whole chain-walk POOL (`step_budget_seconds`)
+/// is a MULTIPLE of it — strictly larger than the per-attempt wall, so a slow
+/// first model can't own the entire budget and starve the fallback rungs. The
+/// pool is still >= the operator's allowance (finding #12: never leave the
+/// executor's 900s default to cut a larger step short), just no longer ALIASED
+/// equal to the per-attempt wall.
 #[tokio::test]
 async fn auto_drive_max_seconds_flows_to_the_step_budget() {
     let exec = std::sync::Arc::new(CapturingExecutor::new(json!({})));
@@ -988,9 +989,10 @@ async fn auto_drive_max_seconds_flows_to_the_step_budget() {
     assert_eq!(config["max_seconds"], json!(1800));
     assert_eq!(
         config["step_budget_seconds"],
-        json!(1800),
-        "the operator's wall allowance must bound the whole chain-walk, \
-         not leave the executor's 900s default to cut the step short"
+        json!(5400),
+        "the chain-walk pool must be a MULTIPLE of the per-attempt wall (>= the \
+         operator's allowance), so the fallback chain isn't starved by a slow \
+         first attempt — de-aliased from the old pool == per-attempt-wall"
     );
 }
 
