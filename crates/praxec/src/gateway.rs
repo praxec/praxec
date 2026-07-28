@@ -825,6 +825,11 @@ async fn build_runtime_for_orchestrate(
             .and_then(Value::as_u64)
             .unwrap_or(0),
     )
+    .with_auto_drive_step_budget_seconds(
+        config
+            .pointer("/praxec/agents/auto_drive_step_budget_seconds")
+            .and_then(Value::as_u64),
+    )
     // WS2 — arm the frontier cost gate. Default-ON at the $5/M cap even without a
     // `gateway.cost` block, so a fresh config can never auto-drive a premium
     // model no human approved (commodity + mock models are all under the cap, so
@@ -1011,6 +1016,11 @@ async fn build_oneshot_server(
             .pointer("/praxec/agents/auto_drive_max_seconds")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+    )
+    .with_auto_drive_step_budget_seconds(
+        config
+            .pointer("/praxec/agents/auto_drive_step_budget_seconds")
+            .and_then(Value::as_u64),
     )
     // WS2 — arm the frontier cost gate on the CLI/`command` runtime too (this is
     // the second of two near-identical build sites; the live dogfood caught that

@@ -710,7 +710,27 @@ impl WorkflowRuntime {
         self.auto_drive_tools = tools;
         if max_seconds > 0 {
             self.auto_drive_max_seconds = max_seconds;
-            self.auto_drive_step_budget_seconds = Some(max_seconds);
+            // De-alias (fallback-chain starvation). `max_seconds` is the
+            // PER-ATTEMPT wall; the whole chain-walk POOL must be LARGER, or a
+            // slow first model (one burning its full per-attempt wall) owns the
+            // entire budget and starves every fallback rung. Default the pool to
+            // a multiple of the per-attempt wall — strictly >= the old aliased
+            // value, so finding #12's "honor the operator's allowance" holds and
+            // existing configs only GAIN fallback runway. An operator can pin the
+            // pool explicitly with `with_auto_drive_step_budget_seconds`.
+            self.auto_drive_step_budget_seconds = Some(max_seconds.saturating_mul(3).max(900));
+        }
+        self
+    }
+
+    /// Pin the whole chain-walk step budget (the pool the fallback chain shares),
+    /// SEPARATELY from the per-attempt wall (`auto_drive_max_seconds`). `None`
+    /// keeps the derived default. This is what lets an operator run a SHORT
+    /// per-attempt wall (cut a non-converging model fast) under a LARGE pool
+    /// (so the fallback chain still has runway) — the two were conflated before.
+    pub fn with_auto_drive_step_budget_seconds(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|s| *s > 0) {
+            self.auto_drive_step_budget_seconds = Some(s);
         }
         self
     }
@@ -2010,6 +2030,29 @@ mod reap_tests {
                 "done": { "terminal": true }
             }
         })
+    }
+
+    #[test]
+    fn step_budget_de_aliases_from_per_attempt_wall() {
+        let store = Arc::new(InMemoryWorkflowStore::new());
+        // Default per-attempt wall (180) → pool defaults to a multiple (>= 900),
+        // so a slow first model can't own the whole budget and starve fallback.
+        let rt = runtime(store.clone()).with_auto_drive_agents(true, "reasoning", vec![], 180);
+        assert_eq!(rt.auto_drive_max_seconds, 180);
+        assert_eq!(rt.auto_drive_step_budget_seconds, Some(900));
+
+        // A large per-attempt wall keeps the pool STRICTLY larger (3×), not equal
+        // — the old aliasing that let the first attempt own the whole pool.
+        let rt = runtime(store.clone()).with_auto_drive_agents(true, "reasoning", vec![], 1800);
+        assert_eq!(rt.auto_drive_step_budget_seconds, Some(5400));
+
+        // Explicit override pins the pool independently of the per-attempt wall
+        // (short wall to cut a non-converging model fast, large pool for fallback).
+        let rt = runtime(store)
+            .with_auto_drive_agents(true, "reasoning", vec![], 180)
+            .with_auto_drive_step_budget_seconds(Some(1800));
+        assert_eq!(rt.auto_drive_max_seconds, 180);
+        assert_eq!(rt.auto_drive_step_budget_seconds, Some(1800));
     }
 
     #[tokio::test]
