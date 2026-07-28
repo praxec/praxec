@@ -27,6 +27,14 @@ on:
 jobs:
     image:
         name: build & push image (GHCR)
+        # Gated behind an explicit opt-in: GHCR/MCP-Registry publishing stays
+        # OFF until this repo sets the `PUBLISH_MCP` Actions *variable* to
+        # `true` (Settings → Secrets and variables → Actions → Variables).
+        # Without the flag both jobs SKIP (green) instead of failing — the
+        # `registry` job `needs: image`, so skipping `image` skips it too.
+        # Before enabling, the Dockerfile `gateway` target must build (a prior
+        # tag failed here on `cargo build --release -p praxec`, exit 101).
+        if: vars.PUBLISH_MCP == 'true'
         runs-on: ubuntu-latest
         permissions:
             contents: read
