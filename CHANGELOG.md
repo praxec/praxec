@@ -8,6 +8,37 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.37] — 2026-07-28 — honest cost accounting + flywheel sees losing attempts
+
+Second of the at-scale hardening sequence. Both fixes ride one small change:
+`agent.model_attempt` now carries the attempt's tokens, priced cost, and applied
+reasoning effort (a FAILED attempt still burned tokens — before, they were
+captured in-process and dropped at the emit seam).
+
+### Added
+
+- **Cost report counts failed/aborted attempts (real spend).** The report read
+  only `agent.completed` — the winning step — so a step where a non-converging
+  model burned 12 min + tokens before falling back showed only the fallback's
+  cost. It now aggregates the wasted spend from `agent.model_attempt` (any
+  non-`success`/`suspended` outcome), attributes it per model (`wasted_by_model`
+  — the burn lands on the culprit, not the fallback), and reports `total_spend_usd`
+  = succeeded + wasted. `total_cost_usd` stays the succeeded-steps figure so the
+  value-prop counterfactual remains apples-to-apples. Legacy token-less attempts
+  are counted as `unpriced_failed_attempts`, never fabricated as $0.
+
+- **De-escalation flywheel now sees losing attempts.** It correlated only
+  `agent.invoked`/`agent.completed`/`chain.failed`, so when a model failed the
+  structured-output contract and a fallback succeeded, the correlation logged one
+  PASS for the fallback and **zero** negative evidence against the failing model —
+  it could never learn a model can't emit the contract. Each contract-failure
+  attempt (`AGENT_NOT_CONVERGING`/`NO_RESULT`/`RESULT_FAILED`) now becomes a FAILED
+  observation keyed on the attempt's own `(affinity, model, effort)`, so a
+  chronically non-converging base's real pass-rate is visible and the existing
+  governed (human-approved) demotion path can act. `BudgetExceeded` cuts are
+  excluded (that's the wall, not the model); `success` attempts aren't
+  double-counted (their spend/pass is on `agent.completed`).
+
 ## [0.0.36] — 2026-07-28 — live progress heartbeat + fallback-budget de-aliasing
 
 First of a sequence hardening praxec for long at-scale runs (the "8 gaps"

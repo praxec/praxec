@@ -254,6 +254,7 @@ impl AgentExecutor {
     /// Record one attempt's end in the audit stream. Infallible by design:
     /// pure observability, so a missing sink or a sink error is dropped rather
     /// than failing the run it narrates (mirrors the runner's heartbeat).
+    #[allow(clippy::too_many_arguments)]
     async fn emit_model_attempt(
         &self,
         request: &ExecuteRequest,
@@ -262,9 +263,26 @@ impl AgentExecutor {
         outcome: &str,
         error: Option<&str>,
         duration: Duration,
+        // Tokens the attempt spent, when a runner report was produced (Some even
+        // on a FAILED attempt — a non-converging model still burned tokens). None
+        // when no report reached us (pre-run fail-fast / runner error) — recorded
+        // as `null`, legibly unpriced, never fabricated zeros. Lets the cost
+        // report count real spend on failed attempts (not just the winner).
+        prompt_tokens: Option<u64>,
+        completion_tokens: Option<u64>,
+        // The reasoning effort THIS attempt ran under (paired with the model),
+        // so the de-escalation flywheel can key a failed-attempt observation on
+        // `(affinity, model, effort)` — the same triple it aggregates the winner
+        // on. Without it a losing model is invisible to the flywheel.
+        reasoning_effort: Option<&str>,
     ) {
         let Some(sink) = &self.audit else {
             return;
+        };
+        // Price the attempt from the catalog; `null` when uncatalogued or unknown.
+        let cost_usd = match (prompt_tokens, completion_tokens) {
+            (Some(p), Some(c)) => praxec_core::model_catalog::cost_usd(model, p, c),
+            _ => None,
         };
         let mut event = AuditEvent::new(AGENT_MODEL_ATTEMPT_EVENT)
             .with_workflow(request.workflow.id.clone())
@@ -275,6 +293,10 @@ impl AgentExecutor {
                 "error": error,
                 "duration_ms": duration.as_millis() as u64,
                 "transition": request.transition,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "cost_usd": cost_usd,
+                "reasoning_effort": reasoning_effort,
             }));
         if let Some(c) = &request.correlation_id {
             event = event.with_correlation(c.clone());
@@ -398,7 +420,10 @@ impl AgentExecutor {
         // model's paired effort (already fail-fast-validated) — so this fn keeps
         // its signature and the session build below is unchanged.
         wall_cap: Duration,
-    ) -> Result<ExecuteResult, ExecutorError> {
+        // Tokens spent (when a report was produced, even on failure) + the mapped
+        // result. Returning the tokens lets the walk loop emit a FAILED attempt's
+        // real spend on `agent.model_attempt`, not just the winner's.
+    ) -> (Option<(u64, u64)>, Result<ExecuteResult, ExecutorError>) {
         let (max_seconds, stall_seconds) = effective_attempt_windows(cfg, wall_cap);
         // Tool-setup bound: the step's call-level override or the 60s default,
         // clamped to this attempt's wall.
@@ -428,12 +453,16 @@ impl AgentExecutor {
                 .or_else(|| t.strip_prefix(crate::file_tools::FILE_CONNECTION_PREFIX));
             root.is_some_and(|r| !std::path::Path::new(r).is_absolute())
         }) {
-            return Err(ExecutorError::Permanent(format!(
-                "FILE_TOOL_ROOT_UNRESOLVED: agent-leaf tool `{bad}` did not resolve to an absolute \
-                 repo root (its `$.run.repo_root` / legacy `$.workflow.input.repo_path` template \
-                 rendered empty or relative). A file-touching leaf requires a real root; refusing \
-                 to dispatch with no filesystem rather than exhausting the step budget."
-            )));
+            return (
+                None,
+                Err(ExecutorError::Permanent(format!(
+                    "FILE_TOOL_ROOT_UNRESOLVED: agent-leaf tool `{bad}` did not resolve to an \
+                     absolute repo root (its `$.run.repo_root` / legacy \
+                     `$.workflow.input.repo_path` template rendered empty or relative). A \
+                     file-touching leaf requires a real root; refusing to dispatch with no \
+                     filesystem rather than exhausting the step budget."
+                ))),
+            );
         }
         let session = AgentSession {
             model: model.to_string(),
@@ -460,8 +489,14 @@ impl AgentExecutor {
             },
         };
 
-        let report = self.runner.run(session).await?;
-        Self::result_from_report(report, max_seconds)
+        let report = match self.runner.run(session).await {
+            Ok(r) => r,
+            Err(e) => return (None, Err(e)),
+        };
+        // Tokens survive the map — result_from_report consumes `report` and drops
+        // them on its failure branches, so capture them first.
+        let tokens = Some((report.prompt_tokens, report.completion_tokens));
+        (tokens, Self::result_from_report(report, max_seconds))
     }
 
     /// Map one runner report onto the executor result contract — shared by the
@@ -827,7 +862,7 @@ impl Executor for AgentExecutor {
             // the outcome so the terminal summary shows configured vs clamped.
             let (attempt_wall, attempt_stall) = effective_attempt_windows(&attempt_cfg, remaining);
             let attempt_start = tokio::time::Instant::now();
-            match self
+            let (attempt_tokens, attempt_outcome) = self
                 .run_one(
                     model,
                     &attempt_cfg,
@@ -836,8 +871,12 @@ impl Executor for AgentExecutor {
                     &user_prompt,
                     remaining,
                 )
-                .await
-            {
+                .await;
+            let (p_tokens, c_tokens) = match attempt_tokens {
+                Some((p, c)) => (Some(p), Some(c)),
+                None => (None, None),
+            };
+            match attempt_outcome {
                 Ok(result) => {
                     self.breaker.on_success(model);
                     let outcome = if result.suspend.is_some() {
@@ -852,6 +891,9 @@ impl Executor for AgentExecutor {
                         outcome,
                         None,
                         attempt_start.elapsed(),
+                        p_tokens,
+                        c_tokens,
+                        applied_effort.as_deref(),
                     )
                     .await;
                     let mut result = result;
@@ -879,6 +921,9 @@ impl Executor for AgentExecutor {
                         &format!("{class:?}"),
                         Some(&e.to_string()),
                         attempt_duration,
+                        p_tokens,
+                        c_tokens,
+                        applied_effort.as_deref(),
                     )
                     .await;
                     attempts.push(AttemptRecord {
