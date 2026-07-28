@@ -8,6 +8,38 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.39] — 2026-07-28 — discoverable kill switch (halt_run)
+
+Last of the at-scale hardening sequence. Closes the control-plane gap: a runaway
+(a mis-grounded scan, a wrong-repo flow) had no exposed way to stop it.
+
+### Added
+
+- **`halt_run` kill switch.** A workflow that declares `enable_halt: true` gets a
+  `halt_run` transition injected into every non-terminal state — a legal next move
+  that appears in the response `links`, so an operator/agent always has a way to
+  stop the run. Submitting it routes to the durable `WorkflowRuntime::cancel`,
+  **skipping the expectedVersion CAS** (halting an auto-chain whose version churns
+  every hop must not be denied for staleness) and idempotent on an
+  already-cancelled run. `cancel` bumps the version, so an in-flight auto-drive
+  dies at its next hop-commit and every later submit is refused
+  `WORKFLOW_CANCELLED`. Opt-in (default off), so non-halt workflows stay
+  byte-identical; a `proxySurface` menu is skipped.
+
+### Notes
+
+- **Scope, honestly.** The gap report also named park-and-return `start` and
+  immediate in-flight model-call abort. **Park-and-return is subsumed** by the
+  0.0.36 progress heartbeat — the idle-timeout abort it existed to prevent no
+  longer happens, and detaching `start` is a high-regression-risk behavioral API
+  change not worth taking on its own. **Immediate abort is bounded**, not
+  unbounded: the 0.0.36 per-attempt step budget caps each model attempt, so a
+  halted run's in-flight hop finishes within one per-attempt wall (set it short to
+  bound the zombie), then the version-bump backstop stops the drive. A true
+  select!-based abort of the in-flight future (killing the hop mid-call) is a
+  clean follow-up on the async model-await stack, deliberately not rushed here to
+  hold the no-regressions bar.
+
 ## [0.0.38] — 2026-07-28 — grounding forcing-function (V39): the marker is mandatory
 
 Closes the last opt-in gap in the grounding poka-yoke. V38 (0.0.34) made a

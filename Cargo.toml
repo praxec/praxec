@@ -16,21 +16,21 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.38"
+version = "0.0.39"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/praxec/praxec"
 
 [workspace.dependencies]
-praxec-core = { path = "crates/praxec-core", version = "0.0.38" }
-praxec-executors = { path = "crates/praxec-executors", version = "0.0.38" }
-praxec-mcp-server = { path = "crates/praxec-mcp-server", version = "0.0.38" }
-praxec-test = { path = "crates/praxec-test", version = "0.0.38" }
-praxec-llm-executor = { path = "crates/praxec-llm-executor", version = "0.0.38" }
-praxec-agents = { path = "crates/praxec-agents", version = "0.0.38" }
-praxec-cockpit = { path = "crates/praxec-cockpit", version = "0.0.38" }
-praxec-embeddings = { path = "crates/praxec-embeddings", version = "0.0.38" }
+praxec-core = { path = "crates/praxec-core", version = "0.0.39" }
+praxec-executors = { path = "crates/praxec-executors", version = "0.0.39" }
+praxec-mcp-server = { path = "crates/praxec-mcp-server", version = "0.0.39" }
+praxec-test = { path = "crates/praxec-test", version = "0.0.39" }
+praxec-llm-executor = { path = "crates/praxec-llm-executor", version = "0.0.39" }
+praxec-agents = { path = "crates/praxec-agents", version = "0.0.39" }
+praxec-cockpit = { path = "crates/praxec-cockpit", version = "0.0.39" }
+praxec-embeddings = { path = "crates/praxec-embeddings", version = "0.0.39" }
 # praxec-tui and praxec-agents are workspace members in this repo.
 # The praxec-pro-gateway binary was retired; its wiring was folded into
 # the praxec binary behind the default-on `agents` cargo feature.

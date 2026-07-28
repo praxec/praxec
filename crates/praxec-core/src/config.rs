@@ -473,6 +473,16 @@ pub fn resolve_with_diagnostics(mut config: Value) -> anyhow::Result<(Value, Vec
     //           clarifying questions without per-state authoring burden.
     inject_human_ask_transitions(&mut config);
 
+    // 7-quater-bis. A discoverable, durable KILL SWITCH. When a workflow declares
+    // `enable_halt: true`, inject a `halt_run` transition into every non-terminal
+    // state — so an operator/agent driving a runaway (a mis-grounded scan, a
+    // wrong-repo flow) always has a legal next move to stop it. It routes to the
+    // durable `WorkflowRuntime::cancel` (which bumps the version, so an in-flight
+    // auto-drive dies at its next hop-commit), and every later submit is refused
+    // WORKFLOW_CANCELLED. Opt-in (default off) so non-halt workflows stay
+    // byte-identical — mirrors `enable_human_ask`.
+    inject_halt_transitions(&mut config);
+
     // 7-quinquies-pre. SPEC §30.5 durability — merge any lexicon terms that a
     //              prior run persisted to disk into the authored `lexicon:`
     //              block BEFORE validate/stamp/pending-detection, so a term
@@ -1472,6 +1482,81 @@ fn inject_human_ask_transitions(config: &mut Value) {
                                 "type": "string",
                                 "minLength": 1,
                                 "description": "The human's answer."
+                            }
+                        }
+                    }
+                }),
+            );
+        }
+    }
+}
+
+/// The reserved transition name of the injected kill switch.
+pub const HALT_TRANSITION: &str = "halt_run";
+
+/// A discoverable, durable KILL SWITCH — inject a `halt_run` transition into
+/// every non-terminal state of every workflow that opts in with
+/// `enable_halt: true`. It is an `actor: agent` transition (anyone may halt — no
+/// human gate) that the submit path intercepts and routes to the durable
+/// `WorkflowRuntime::cancel`. A `proxySurface` definition (a caller-driven menu)
+/// is skipped, and an operator-authored `halt_run` is never clobbered.
+fn inject_halt_transitions(config: &mut Value) {
+    use serde_json::json;
+    let Some(workflows) = config
+        .pointer_mut("/workflows")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for (_id, def) in workflows {
+        if def.get("enable_halt").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        // A proxy surface is a caller-driven menu — never auto-driven, nothing to
+        // halt; leave it byte-identical.
+        if def.get("proxySurface").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(states) = def.pointer_mut("/states").and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for (state_name, state_def) in states {
+            if state_def
+                .get("terminal")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(state_obj) = state_def.as_object_mut() else {
+                continue;
+            };
+            let transitions = state_obj
+                .entry("transitions")
+                .or_insert(Value::Object(Default::default()))
+                .as_object_mut()
+                .expect("transitions must be an object");
+            // Operator override — don't clobber an authored `halt_run`.
+            if transitions.contains_key(HALT_TRANSITION) {
+                continue;
+            }
+            transitions.insert(
+                HALT_TRANSITION.to_string(),
+                json!({
+                    "target":      state_name,          // self-loop; the submit path intercepts it
+                    "actor":       "agent",             // anyone may halt (no human gate)
+                    "purpose":     "halt",
+                    "lightweight": true,
+                    "description": "Stop this run permanently. Durable and irreversible.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["reason"],
+                        "properties": {
+                            "reason": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": 2000,
+                                "description": "Why the run is being stopped (recorded on the cancel)."
                             }
                         }
                     }
@@ -4529,6 +4614,50 @@ fn rewrite_executors_in_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inject_halt_adds_kill_switch_only_when_enabled() {
+        use serde_json::json;
+        let mut cfg = json!({ "workflows": {
+            "wf_on":  { "enable_halt": true, "states": {
+                "s": { "transitions": {} },
+                "done": { "terminal": true }
+            }},
+            "wf_off": { "states": { "s": { "transitions": {} } } },
+            "wf_proxy": { "enable_halt": true, "proxySurface": true, "states": {
+                "ready": { "transitions": {} }
+            }},
+        }});
+        inject_halt_transitions(&mut cfg);
+
+        // enabled → halt_run injected into the NON-terminal state only.
+        let h = cfg
+            .pointer("/workflows/wf_on/states/s/transitions/halt_run")
+            .expect("halt_run injected");
+        assert!(
+            cfg.pointer("/workflows/wf_on/states/done/transitions/halt_run")
+                .is_none(),
+            "never on a terminal state"
+        );
+        // it self-loops (intercepted at submit) + requires a reason.
+        assert_eq!(h.get("target").and_then(Value::as_str), Some("s"));
+        assert_eq!(h.get("actor").and_then(Value::as_str), Some("agent"));
+        assert_eq!(
+            h.pointer("/inputSchema/required/0").and_then(Value::as_str),
+            Some("reason")
+        );
+
+        // disabled → byte-identical (no kill switch).
+        assert!(
+            cfg.pointer("/workflows/wf_off/states/s/transitions/halt_run")
+                .is_none()
+        );
+        // a caller-driven proxy surface is skipped even when enabled.
+        assert!(
+            cfg.pointer("/workflows/wf_proxy/states/ready/transitions/halt_run")
+                .is_none()
+        );
+    }
 
     // ── inputs: / snippet.inputs → inputSchema synthesis ─────────────────────
     // (The load-path integration tests live in tests/config_validation.rs;
