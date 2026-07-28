@@ -8,6 +8,35 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.35] — 2026-07-28 — grounding must be path-verified (mandatory, not optional)
+
+Completes the V38 grounding poka-yoke. v0.0.34 made a `role: grounding` step
+*tool-closed* (it can't reach an external fetcher). But a model can still
+hallucinate repo-relative paths from memory using only file tools — and whether
+those paths were checked to exist was left to each pack to remember to wire. This
+release makes the check **mandatory at load**.
+
+### Added
+
+- **V38(d) — `GROUNDING_UNVERIFIED`.** A `role: grounding` state is now invalid
+  unless every `actor: agent` transition out of it targets a state that runs a
+  deterministic `path_grounding` gate — the check that each grounded path EXISTS
+  under `$.run.repo_root` (`PATH_NOT_GROUNDED` → `CHAIN_FAILED`). So a grounding
+  step can no longer ship tool-closed-but-unverified: a hallucinated surface path
+  can never pass downstream. `check` / `doctor` / reload / serve all reject the
+  gap, naming the transition and the fix.
+
+### Notes
+
+- Still non-retroactive: fires only on the `role: grounding` marker, which only
+  the two hardened ux caps declare (both already wire the gate → both pass).
+- Honest remaining scope: this makes verification mandatory for any step *marked*
+  `role: grounding`. Making the marker itself mandatory for every repo-grounding
+  review cap (so a new cap can't skip it), plus the runtime evidence-binding gate
+  and cancel/park, remain staged — the higher-risk hot-path pieces. Deterministic
+  gates prove the engine *read* real files, never that a model's findings *derive*
+  from them.
+
 ## [0.0.34] — 2026-07-27 — grounding integrity: no external-fetch during grounding
 
 A safety release closing a **fabricated-review** failure: a UX-review capability,
