@@ -57,6 +57,15 @@ fn collect_paths(v: &Value, out: &mut Vec<String>) {
             if let Some(Value::String(p)) = o.get("path").or_else(|| o.get("file")) {
                 out.push(p.clone());
             }
+            // `paths: [..]` (plural) — the grounded-SURFACE shape ({ id, paths,
+            // entry, notes }) a review cap's grounding step emits. Without this,
+            // a surface list would flatten to zero paths and (fail-closed) trip
+            // PATH_GROUNDING_EMPTY rather than actually checking each file.
+            if let Some(arr) = o.get("paths").and_then(Value::as_array) {
+                for e in arr {
+                    collect_paths(e, out);
+                }
+            }
         }
         _ => {}
     }
@@ -384,5 +393,21 @@ mod tests {
         collect_paths(&json!({ "path": "e.rs" }), &mut out);
         assert_eq!(out, vec!["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]);
         let _ = PathBuf::new();
+    }
+
+    #[test]
+    fn collect_paths_handles_grounded_surface_shape() {
+        // The review-cap grounding shape: [{ id, paths: [..] }, ..]. Every path
+        // in every surface must be gathered so path_grounding checks them all.
+        let mut out = Vec::new();
+        collect_paths(
+            &json!([
+                { "id": "s1", "paths": ["src/App.tsx", "src/App.css"], "entry": "/" },
+                { "id": "s2", "paths": ["src/Login.tsx"] },
+                { "id": "s3", "paths": [] }
+            ]),
+            &mut out,
+        );
+        assert_eq!(out, vec!["src/App.tsx", "src/App.css", "src/Login.tsx"]);
     }
 }
