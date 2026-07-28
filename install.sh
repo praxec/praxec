@@ -21,8 +21,32 @@ say()  { printf '\033[1;36m▸\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
-command -v curl >/dev/null 2>&1 || die "curl is required"
-command -v tar  >/dev/null 2>&1 || die "tar is required"
+# Package-manager hint so every missing-dependency message is actionable
+# instead of a bare `-sh: X: not found`.
+pkg_hint() {
+  if   command -v apt-get >/dev/null 2>&1; then echo "apt-get install -y $1"
+  elif command -v apk     >/dev/null 2>&1; then echo "apk add $1"
+  elif command -v dnf     >/dev/null 2>&1; then echo "dnf install -y $1"
+  elif command -v pacman  >/dev/null 2>&1; then echo "pacman -S $1"
+  elif command -v brew    >/dev/null 2>&1; then echo "brew install $1"
+  else echo "install '$1' with your system package manager"; fi
+}
+need() { command -v "$1" >/dev/null 2>&1 || die "'$1' is required — $(pkg_hint "$1")"; }
+
+# Fetch tool: curl OR wget (busybox wget works). A minimal box may have neither —
+# the one-liner needs one to have fetched THIS script, but be explicit anyway.
+if command -v curl >/dev/null 2>&1; then
+  fetch() { curl -fsSL "$1" -o "$2"; }
+elif command -v wget >/dev/null 2>&1; then
+  fetch() { wget -qO "$2" "$1"; }
+else
+  die "need 'curl' or 'wget' to download praxec ($(pkg_hint curl) — or $(pkg_hint wget)).
+Or download a release tarball from https://github.com/$REPO/releases on another
+machine and copy its 'praxec' binary into $BIN_DIR."
+fi
+need tar
+need mktemp
+need awk
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -45,12 +69,12 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 say "Downloading $asset ($VERSION)"
-curl -fsSL "$base/$asset" -o "$tmp/$asset" || die "download failed: $base/$asset"
+fetch "$base/$asset" "$tmp/$asset" || die "download failed: $base/$asset"
 
 # Verify against the release's checksums.sha256. The asset is only installed
 # if its hash matches; a missing checksums file is a loud warning, not a
 # silent skip.
-if curl -fsSL "$base/checksums.sha256" -o "$tmp/checksums.sha256" 2>/dev/null; then
+if fetch "$base/checksums.sha256" "$tmp/checksums.sha256" 2>/dev/null; then
   want="$(awk -v a="$asset" '$2 == a {print $1}' "$tmp/checksums.sha256")"
   [ -n "$want" ] || die "no checksum entry for $asset in checksums.sha256"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -91,7 +115,7 @@ fi
 case ":$PATH:" in
   *":$BIN_DIR:"*) : ;;
   *)
-    warn "$BIN_DIR is not on your PATH. Add it to your shell profile:"
-    printf '    export PATH="%s:$PATH"\n' "$BIN_DIR" >&2
+    warn "$BIN_DIR is not on your PATH. Add it to your shell profile, e.g.:"
+    printf '    echo '\''export PATH="%s:$PATH"'\'' >> ~/.profile && . ~/.profile\n' "$BIN_DIR" >&2
     ;;
 esac

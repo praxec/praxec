@@ -8,6 +8,43 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.40] — 2026-07-28 — install works on a minimal box + provider-key setup
+
+Fixes a real fresh-machine install failure (a box with only POSIX `/bin/sh` — no
+`curl`, no `bash`) and adds a guided LLM-provider-key setup.
+
+### Fixed
+
+- **`install.sh` no longer hard-requires `curl`.** It now fetches with **curl or
+  wget** (busybox wget works), and preflight-checks its few genuine deps (`tar`,
+  `awk`, `mktemp`) with an actionable package-manager hint
+  (`apt-get`/`apk`/`dnf`/`pacman`/`brew`) instead of a bare `-sh: X: not found`.
+  It was already POSIX `sh`; this closes the fetch-tool + preflight gaps. The PATH
+  advice now shows the copy-paste `~/.profile` fix.
+- **README install one-liners.** Both curl and wget forms, plus a "neither? install
+  one" note. (The `packs` `setup.sh` bash→POSIX-sh rewrite ships as a companion PR
+  in the packs repo.)
+
+### Added
+
+- **`configure-providers.sh`** — a POSIX-`sh`, idempotent LLM-provider-key setup
+  (the shell twin of `px set-provider-keys`, for boxes with only the `praxec`
+  binary). Interactive, or non-interactive via `--provider <slug> --from-env` /
+  `--key-stdin` / `--list`. Writes `~/.config/praxec/providers.env` (0600, XDG
+  path the engine reads), and **validates** the key against the provider's models
+  endpoint (401/403 → refuse; flaky network → warn + save). An exported env var
+  still overrides the file.
+
+### Notes
+
+- This release also carries the at-scale hardening from 0.0.37–0.0.39 to the
+  release binaries (cost accounting + flywheel-sees-losing-attempts, grounding V39
+  forcing-function, `halt_run` kill switch).
+- **Designed, queued for a follow-up:** governed self-update (`flow.self-update`
+  as a praxec-meta pack + small engine enablers), and the fuller clean-startup
+  path (a `praxec init` that writes a starter gateway.yaml + seeds models.yaml so a
+  binary-only user isn't blocked on the unshipped `px`).
+
 ## [0.0.39] — 2026-07-28 — discoverable kill switch (halt_run)
 
 Last of the at-scale hardening sequence. Closes the control-plane gap: a runaway

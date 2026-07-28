@@ -39,13 +39,33 @@ this README covers what it is, how to install it, and how to use it.
 
 **Quick install** — prebuilt binary for Linux / macOS:
 
-```bash
+```sh
+# with curl:
 curl -fsSL https://raw.githubusercontent.com/praxec/praxec/main/install.sh | sh
+# or with wget (minimal boxes without curl — busybox wget works):
+wget -qO- https://raw.githubusercontent.com/praxec/praxec/main/install.sh | sh
 ```
 
-Downloads the `praxec` binary for your platform from the latest release, verifies
-its checksum, and installs it to `~/.local/bin`. Pin a version or directory with
+The installer is POSIX `sh` (runs under dash/busybox), fetches with curl **or**
+wget, and preflight-checks its few tools (`tar`, `awk`, `mktemp`) with a
+package-manager hint instead of a bare `not found`. It downloads the `praxec`
+binary for your platform from the latest release, verifies its checksum, and
+installs it to `~/.local/bin`. Pin a version or directory with
 `PRAXEC_VERSION=v0.0.30` / `PRAXEC_BIN_DIR=...`.
+
+Neither curl nor wget? Install one (`apt-get install -y curl` / `apk add curl`),
+or download a release bundle from the table below on another machine.
+
+**Set an LLM provider key** (praxec's governed agents need one):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/praxec/praxec/main/configure-providers.sh | sh
+```
+
+Interactive (or non-interactive: `--provider openrouter --from-env`, `--key-stdin`,
+`--list`). Writes to `~/.config/praxec/providers.env` (0600), validates the key
+against the provider's models endpoint, and is idempotent. An exported
+`OPENROUTER_API_KEY` (etc.) in your shell overrides the file.
 
 Or grab a prebuilt bundle manually — verify the `praxec` binary against the release's `checksums.sha256`:
 
@@ -111,7 +131,8 @@ Beyond a single tool, get a complete **workflow pack** and every MCP tool it nee
 provisioned and wired in one step:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/praxec/packs/main/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/praxec/packs/main/setup.sh | sh
+# or: wget -qO- https://raw.githubusercontent.com/praxec/packs/main/setup.sh | sh
 ```
 
 That pulls the `cognitive-architectures` pack (a SWE-lifecycle library) plus its tools
