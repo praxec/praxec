@@ -34,6 +34,12 @@ pub const AGENT_COMPLETED: &str = "agent.completed";
 /// de-escalation loop uses).
 pub const AGENT_INVOKED: &str = "agent.invoked";
 
+/// Per-model-attempt event. A FAILED attempt (a non-converging model that fell
+/// back) still burned tokens — its spend never reaches `agent.completed` (only
+/// the winner's does), so counting these is what makes the report see the REAL
+/// spend, not just the successful step.
+pub const AGENT_MODEL_ATTEMPT: &str = "agent.model_attempt";
+
 /// Scoping for the report: restrict to one workflow run and/or a time window.
 #[derive(Debug, Clone, Default)]
 pub struct ReportOptions {
@@ -98,6 +104,27 @@ pub struct CostReport {
     pub by_affinity: Vec<GroupCost>,
     /// `None` when no ceiling model can be determined or no comparable runs.
     pub counterfactual: Option<Counterfactual>,
+    /// Failed/aborted model attempts in scope — spend that never became a result
+    /// (e.g. a non-converging model that fell back). Zero for pre-0.0.37 logs
+    /// (which carry no per-attempt token data).
+    pub failed_attempts: usize,
+    /// Failed attempts whose model/tokens couldn't be priced (uncatalogued or
+    /// legacy token-less event) — counted, but excluded from `wasted_cost_usd`.
+    pub unpriced_failed_attempts: usize,
+    pub wasted_prompt_tokens: u64,
+    pub wasted_completion_tokens: u64,
+    pub wasted_duration_ms: u64,
+    /// Realized USD burned on failed/aborted attempts (a lower bound — a hard
+    /// timeout can drop the final turn's tokens; `wasted_duration_ms` still shows
+    /// the wall time).
+    pub wasted_cost_usd: f64,
+    /// `total_cost_usd + wasted_cost_usd` — the REAL spend incl. failed attempts.
+    /// `total_cost_usd` stays the succeeded-steps figure so the value-prop
+    /// counterfactual remains apples-to-apples.
+    pub total_spend_usd: f64,
+    /// Wasted spend rolled up per model, most expensive first — attributes the
+    /// burn to the culprit (e.g. the non-converging model), not the fallback.
+    pub wasted_by_model: Vec<GroupCost>,
 }
 
 /// The **ceiling** model: the most-capable catalogued model (max `intelligence`,
@@ -281,6 +308,74 @@ pub fn build_cost_report(
     report.by_step = finalize(by_step);
     report.by_affinity = finalize(by_affinity);
 
+    // 2b. Wasted attempts: a FAILED/aborted `agent.model_attempt` (outcome
+    // neither `success` nor `suspended`) burned real tokens that never became a
+    // result. The winner's spend already arrived via `agent.completed` above, so
+    // counting only NON-winning outcomes here can't double-count. This is the
+    // "glm-5.2 burned 12 min + tokens, report showed only the fallback" fix.
+    let mut wasted_by_model: BTreeMap<String, GroupAcc> = BTreeMap::new();
+    for e in events {
+        if e.event_type != AGENT_MODEL_ATTEMPT {
+            continue;
+        }
+        if let Some(wf) = &opts.workflow {
+            if e.workflow_id.as_deref() != Some(wf.as_str()) {
+                continue;
+            }
+        }
+        if let Some(since) = opts.since {
+            if e.timestamp < since {
+                continue;
+            }
+        }
+        let p = &e.payload;
+        let outcome = p.get("outcome").and_then(Value::as_str).unwrap_or("");
+        if outcome == "success" || outcome == "suspended" {
+            continue; // the winner's spend is on agent.completed — don't re-count
+        }
+        let model = p.get("model").and_then(Value::as_str).map(str::to_string);
+        // A pre-0.0.37 attempt event has no token keys → unpriced (not $0-priced).
+        let has_tokens = p.get("prompt_tokens").is_some();
+        let prompt_tokens = p.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let completion_tokens = p
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let duration_ms = p.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
+        let cost_usd = if has_tokens {
+            p.get("cost_usd").and_then(Value::as_f64).or_else(|| {
+                model
+                    .as_deref()
+                    .and_then(|m| cost_usd_in(models, m, prompt_tokens, completion_tokens))
+            })
+        } else {
+            None
+        };
+        report.failed_attempts += 1;
+        report.wasted_prompt_tokens += prompt_tokens;
+        report.wasted_completion_tokens += completion_tokens;
+        report.wasted_duration_ms += duration_ms;
+        match cost_usd {
+            Some(c) => report.wasted_cost_usd += c,
+            None => report.unpriced_failed_attempts += 1,
+        }
+        let r = Run {
+            transition: String::new(),
+            affinity: None,
+            model: model.clone(),
+            prompt_tokens,
+            completion_tokens,
+            duration_ms,
+            cost_usd,
+        };
+        wasted_by_model
+            .entry(model.unwrap_or_else(|| "(unknown)".into()))
+            .or_default()
+            .add(&r);
+    }
+    report.wasted_by_model = finalize(wasted_by_model);
+    report.total_spend_usd = report.total_cost_usd + report.wasted_cost_usd;
+
     // 3. Counterfactual: reprice each comparable run (known realized cost) at the
     // ceiling model, apples-to-apples over the same set.
     if let Some(ceiling) = ceiling_model(models) {
@@ -328,6 +423,23 @@ pub fn render_human(r: &CostReport) -> String {
         r.runs, r.priced_runs
     );
     let _ = writeln!(s, "  total realized cost: ${:.4}", r.total_cost_usd);
+    if r.failed_attempts > 0 {
+        let _ = writeln!(
+            s,
+            "  real spend incl. failed attempts: ${:.4} (${:.4} wasted across {} failed attempt(s))",
+            r.total_spend_usd, r.wasted_cost_usd, r.failed_attempts
+        );
+        for g in &r.wasted_by_model {
+            let _ = writeln!(
+                s,
+                "    wasted · {}: ${:.4} ({} attempt(s), {:.1}s)",
+                g.key,
+                g.cost_usd,
+                g.runs,
+                g.duration_ms as f64 / 1000.0
+            );
+        }
+    }
     let _ = writeln!(
         s,
         "  tokens: {} prompt / {} completion",
@@ -444,6 +556,84 @@ mod tests {
                 "state": "working",
                 "affinity": affinity,
             }))
+    }
+
+    /// A FAILED `agent.model_attempt`. `tokens` None ⇒ a legacy (pre-0.0.37)
+    /// event carrying no token keys → unpriced.
+    fn attempt(
+        wf: &str,
+        model_str: &str,
+        outcome: &str,
+        tokens: Option<(u64, u64)>,
+        cost: Option<f64>,
+    ) -> AuditEvent {
+        let mut payload = serde_json::Map::new();
+        payload.insert("model".into(), json!(model_str));
+        payload.insert("outcome".into(), json!(outcome));
+        payload.insert("duration_ms".into(), json!(720_000));
+        if let Some((p, c)) = tokens {
+            payload.insert("prompt_tokens".into(), json!(p));
+            payload.insert("completion_tokens".into(), json!(c));
+            payload.insert(
+                "cost_usd".into(),
+                match cost {
+                    Some(c) => json!(c),
+                    None => Value::Null,
+                },
+            );
+        }
+        AuditEvent::new(AGENT_MODEL_ATTEMPT)
+            .with_workflow(wf)
+            .with_payload(Value::Object(payload))
+    }
+
+    #[test]
+    fn counts_wasted_spend_on_failed_attempts() {
+        let models = vec![model("base", 56.0, 1.0, 3.0)];
+        let events = vec![
+            // the winning step (a fallback succeeded) — via agent.completed.
+            completed("wf1", "scan", "v:base", 1_000_000, 1_000_000, Some(4.00)),
+            // a non-converging model burned tokens then fell back → WASTED.
+            attempt(
+                "wf1",
+                "v:base",
+                "Capability",
+                Some((500_000, 100_000)),
+                Some(0.80),
+            ),
+            // a SUCCESS attempt must NOT be double-counted (its spend is on completed).
+            attempt(
+                "wf1",
+                "v:base",
+                "success",
+                Some((1_000_000, 1_000_000)),
+                Some(4.00),
+            ),
+        ];
+        let r = build_cost_report(&events, &models, &ReportOptions::default());
+        assert_eq!(r.total_cost_usd, 4.00, "succeeded-step figure unchanged");
+        assert_eq!(
+            r.failed_attempts, 1,
+            "only the Capability attempt is wasted"
+        );
+        assert!((r.wasted_cost_usd - 0.80).abs() < 1e-9);
+        assert!(
+            (r.total_spend_usd - 4.80).abs() < 1e-9,
+            "real spend incl. waste"
+        );
+        assert_eq!(r.wasted_by_model.len(), 1);
+        assert_eq!(r.wasted_by_model[0].key, "v:base");
+        assert!(render_human(&r).contains("wasted"));
+    }
+
+    #[test]
+    fn legacy_tokenless_failed_attempt_is_unpriced_not_zero() {
+        let models = vec![model("base", 56.0, 1.0, 3.0)];
+        let events = vec![attempt("wf1", "v:base", "Capability", None, None)];
+        let r = build_cost_report(&events, &models, &ReportOptions::default());
+        assert_eq!(r.failed_attempts, 1);
+        assert_eq!(r.unpriced_failed_attempts, 1);
+        assert_eq!(r.wasted_cost_usd, 0.0, "unpriced, never fabricated $0");
     }
 
     #[test]
