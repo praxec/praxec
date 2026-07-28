@@ -1294,6 +1294,11 @@ impl ServerHandler for PraxecServer {
         // #18 — capture the connected peer so the bridged audit sink can push
         // events recorded DURING this (possibly long) call to the client.
         self.progress_peer.set(context.peer.clone());
+        // Capture THIS call's `_meta.progressToken` so the bridge emits
+        // `notifications/progress` per event — the channel that keeps the client's
+        // idle timer reset during a long auto-drive (logging notifications don't).
+        self.progress_peer
+            .set_progress_token(context.meta.get_progress_token());
         // #70 — capture THIS call's abort token (rmcp `RequestContext.ct`, a
         // tokio CancellationToken that fires on client cancel/disconnect) so the
         // deterministic-chain drive can observe it between hops and stop burning
