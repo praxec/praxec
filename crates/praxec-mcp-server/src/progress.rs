@@ -13,11 +13,14 @@
 //! Scoped to the serve path only (wired in `build_oneshot_server`); CLI
 //! `command`/`check`/`observe` have no peer and keep the bare sink.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rmcp::Peer;
-use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
+use rmcp::model::{
+    LoggingLevel, LoggingMessageNotificationParam, ProgressNotificationParam, ProgressToken,
+};
 use rmcp::service::RoleServer;
 use serde_json::json;
 
@@ -30,19 +33,50 @@ use praxec_core::audit::{AuditEvent, AuditSink};
 ///
 /// [`PraxecServer`]: crate::PraxecServer
 #[derive(Clone, Default)]
-pub struct ProgressPeer(Arc<Mutex<Option<Peer<RoleServer>>>>);
+pub struct ProgressPeer {
+    peer: Arc<Mutex<Option<Peer<RoleServer>>>>,
+    /// THIS call's `_meta.progressToken`, if the client requested progress.
+    /// `notifications/progress` on this token is what resets the client's idle
+    /// timeout during a long auto-drive (logging notifications don't) — so a
+    /// multi-minute run with live sub-workflow events never trips the abort.
+    token: Arc<Mutex<Option<ProgressToken>>>,
+    /// Monotonic progress counter — MCP requires `progress` to strictly increase
+    /// per token. Reset per call in [`Self::set_progress_token`].
+    counter: Arc<AtomicU64>,
+}
 
 impl ProgressPeer {
     /// Record the connected peer (idempotent; cheap `Peer` clone). Called by the
     /// server on each `call_tool` so the bridge always has the live peer.
     pub fn set(&self, peer: Peer<RoleServer>) {
-        if let Ok(mut slot) = self.0.lock() {
+        if let Ok(mut slot) = self.peer.lock() {
             *slot = Some(peer);
         }
     }
 
+    /// Capture THIS call's progress token (and reset the counter). `None` when
+    /// the client did not request progress — then only the durable record +
+    /// best-effort logging happen, no progress push.
+    pub fn set_progress_token(&self, token: Option<ProgressToken>) {
+        if let Ok(mut slot) = self.token.lock() {
+            *slot = token;
+        }
+        self.counter.store(0, Ordering::Relaxed);
+    }
+
     fn get(&self) -> Option<Peer<RoleServer>> {
-        self.0.lock().ok().and_then(|slot| slot.as_ref().cloned())
+        self.peer
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().cloned())
+    }
+
+    fn token(&self) -> Option<ProgressToken> {
+        self.token.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    fn next_progress(&self) -> f64 {
+        self.counter.fetch_add(1, Ordering::Relaxed) as f64 + 1.0
     }
 
     /// The connected upstream peer, if a `call_tool` is (or was) in flight.
@@ -69,6 +103,31 @@ impl AuditSink for PeerBridgeAuditSink {
         let result = self.inner.record(event.clone()).await;
 
         if let Some(peer) = self.peer.get() {
+            // Progress notification FIRST — this is the channel that resets the
+            // client's idle timeout. Every audit event (each transition hop /
+            // agent step / sub-workflow — they all carry `workflow_id` +
+            // `parent_workflow_id` + `depth`) becomes a heartbeat, so a long
+            // auto-drive with live nested activity never trips the client abort.
+            // Only possible when the client requested progress (sent a token).
+            if let Some(progress_token) = self.peer.token() {
+                let _ = peer
+                    .notify_progress(ProgressNotificationParam {
+                        progress_token,
+                        progress: self.peer.next_progress(),
+                        total: None,
+                        message: Some(match &event.workflow_id {
+                            Some(id) => format!("{} · {id}", event.event_type),
+                            None => event.event_type.clone(),
+                        }),
+                    })
+                    .await;
+            }
+
+            // Also mirror to the logging channel (unchanged) for clients that
+            // consume it. Best-effort; ignore send errors (client gone).
+            // TODO(SEP-2577): rmcp deprecated logging notifications with no
+            // replacement — the progress channel above is now the live heartbeat
+            // and the durable audit record is the source of truth.
             let data = json!({
                 "event_type": event.event_type,
                 "workflow_id": event.workflow_id,
@@ -76,10 +135,6 @@ impl AuditSink for PeerBridgeAuditSink {
                 "timestamp": event.timestamp,
                 "payload": event.payload,
             });
-            // Best-effort push; ignore send errors (client gone / not subscribed).
-            // TODO(SEP-2577): rmcp deprecated logging notifications with no
-            // replacement yet — the durable audit record above is the source of
-            // truth. Migrate when rmcp ships an alternative transport.
             #[allow(deprecated)]
             let _ = peer
                 .notify_logging_message(LoggingMessageNotificationParam {

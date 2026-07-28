@@ -8,6 +8,34 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.36] — 2026-07-28 — live progress heartbeat + fallback-budget de-aliasing
+
+First of a sequence hardening praxec for long at-scale runs (the "8 gaps"
+field report). Two here; cost/demote, cancel/park, and the grounding forcing
+function follow in 0.0.37–0.0.39.
+
+### Fixed
+
+- **MCP progress heartbeat — long auto-drives no longer trip the client idle
+  timeout.** The push-observability bridge already forwarded every audit event
+  (each transition hop / agent step / sub-workflow — they carry `workflow_id` +
+  `parent_workflow_id` + `depth`, so the whole nested tree streams) to the
+  connected client, but as a **logging** notification, which clients don't treat
+  as activity. It now also emits `notifications/progress` on the call's
+  `progressToken`, monotonic per call — the channel that actually resets the idle
+  timer. A minutes-long run with live sub-workflow activity stays alive instead of
+  being aborted mid-flight (the run kept going server-side; only the caller's view
+  died). Serve-path only; no token → unchanged.
+
+- **Fallback-chain step-budget de-aliased (starvation).** `auto_drive_max_seconds`
+  is the PER-ATTEMPT wall; it was also aliased as the whole chain-walk POOL, so a
+  slow first model (e.g. one burning its full wall before falling back) owned the
+  entire budget and starved the fallback rungs. The pool now defaults to a
+  multiple of the per-attempt wall (`max(wall×3, 900)`) — strictly ≥ the old
+  value, so no run loses budget — and a new `praxec.agents.auto_drive_step_budget_seconds`
+  pins it explicitly, letting an operator run a SHORT per-attempt wall (cut a
+  non-converging model fast) under a LARGE pool (fallback keeps runway).
+
 ## [0.0.35] — 2026-07-28 — grounding must be path-verified (mandatory, not optional)
 
 Completes the V38 grounding poka-yoke. v0.0.34 made a `role: grounding` step
