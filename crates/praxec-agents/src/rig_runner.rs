@@ -161,13 +161,36 @@ result. If you determine the task cannot be completed, call `final_answer` with 
 finish with a plain text message — an answer that does not go through \
 `final_answer` is not recorded and the run fails.";
 
+/// The PREVENT layer for a coding deliverable (`requires_file_write`): injected
+/// into the system message only when the session must produce real edits. The
+/// base [`COMPLETION_PROTOCOL`] describes "done" purely as a `final_answer`
+/// call — a coding model can satisfy it by *narrating* the edits it "made"
+/// without ever calling a write tool (the glm-5.2 empty-worktree signature).
+/// This clause states, up front and every turn, that success means the edits
+/// actually landed via the write tools — so the DETECT/correct backstop in the
+/// loop is the exception, not the norm.
+pub const CODING_WRITE_PROTOCOL: &str = "\
+This is a CODING task: success REQUIRES that you actually change files on disk. \
+Read the relevant files first (read_file / search_file / read_range), then make \
+every change by calling `write_file` or `edit_file` — do NOT paste edited code \
+into your message or describe changes you have not written. A `final_answer` \
+that reports success while you have called no `write_file`/`edit_file` this run \
+is a FAILED run: you will be told to actually write the files, and if you still \
+do not, the task is handed to another model.";
+
 /// Compose the effective system message: the always-on [`COMPLETION_PROTOCOL`]
-/// followed by the session's skill-derived system prompt (when present). The
-/// protocol leads so it is never buried beneath a long skill body.
-fn compose_system_message(skills: &Option<String>) -> String {
+/// (plus the [`CODING_WRITE_PROTOCOL`] for a coding session) followed by the
+/// session's skill-derived system prompt (when present). The protocol(s) lead so
+/// they are never buried beneath a long skill body.
+fn compose_system_message(skills: &Option<String>, requires_file_write: bool) -> String {
+    let mut head = COMPLETION_PROTOCOL.to_string();
+    if requires_file_write {
+        head.push_str("\n\n");
+        head.push_str(CODING_WRITE_PROTOCOL);
+    }
     match skills {
-        Some(s) if !s.trim().is_empty() => format!("{COMPLETION_PROTOCOL}\n\n{s}"),
-        _ => COMPLETION_PROTOCOL.to_string(),
+        Some(s) if !s.trim().is_empty() => format!("{head}\n\n{s}"),
+        _ => head,
     }
 }
 
@@ -327,6 +350,21 @@ fn conformance_feedback(
     }
 }
 
+/// The in-context corrective steer when a coding session (`requires_file_write`)
+/// tries to finish having written no files. Unlike a model swap this preserves
+/// the conversation: the model keeps everything it has read and reasoned, and is
+/// pointed straight at the missing action. Used at every acceptance point (a
+/// conforming `final_answer`, a salvaged prose answer) before the bounded budget
+/// of these nudges is spent and the run escalates.
+fn write_evidence_feedback() -> String {
+    "You called `final_answer` (or answered) reporting success, but you have not made any \
+     `write_file` or `edit_file` call this run — so no files were actually changed and the work \
+     does not exist on disk. Do NOT finish yet. Read the target file(s) if you have not, then \
+     apply every change by calling `write_file`/`edit_file`. Only after the edits are written may \
+     you call `final_answer`."
+        .to_string()
+}
+
 pub struct RigSessionRunner {
     // pub(crate): the builder/`final_answer_tool` impl block lives in `tool_budget`
     // after the StructureOS decomposition, so these fields are now cross-module.
@@ -418,6 +456,13 @@ enum LoopEnd {
     Suspended(AgentSuspension),
     /// Turn budget exhausted without a result.
     Exhausted,
+    /// Coding-evidence forcing function: a coding deliverable reached a success
+    /// (final_answer / salvage / sign-off) with zero file writes, and the bounded
+    /// in-context correction was already spent. Carried as an outcome (not an
+    /// `Err`) so the run's token usage survives into the report and the wasted
+    /// spend is attributed to the model — the executor maps this to the
+    /// escalatable `AGENT_NO_FILE_WRITES`.
+    NoFileWrites,
 }
 
 impl RigSessionRunner {
@@ -668,6 +713,17 @@ impl RigSessionRunner {
         // restriction is the portable steer; the cost-ascending failover chain
         // remains the ultimate termination guarantee.
         let mut stalled_no_progress = false;
+        // Coding-evidence forcing function state (only meaningful when
+        // `session.requires_file_write`). `writes_seen` counts SUCCESSFUL
+        // `write_file`/`edit_file` dispatches across the whole run — the
+        // deterministic "the worktree actually changed" signal (not the model's
+        // self-reported, fabricable `files_written`). `write_nudges` bounds the
+        // in-context re-prompts: we redirect the SAME model up to
+        // `MAX_WRITE_NUDGES` times (preserving its context) before conceding the
+        // model can't be made to write and escalating via `AGENT_NO_FILE_WRITES`.
+        const MAX_WRITE_NUDGES: u32 = 2;
+        let mut writes_seen: u32 = 0;
+        let mut write_nudges: u32 = 0;
         for _turn in start_turn..self.max_turns {
             // Observability: the per-turn liveness pulse. Every turn boundary
             // lands one `agent.heartbeat` in the audit stream, so an operator
@@ -786,6 +842,31 @@ impl RigSessionRunner {
                     &env.session.expected_output_keys,
                     &env.session.expected_output_types,
                 ) {
+                    // Coding-evidence forcing function: a conforming success is
+                    // still illegal if this is a coding deliverable and the run
+                    // has written no files. Correct the SAME model in-context
+                    // (bounded), then escalate — never accept a narrated success
+                    // on an empty worktree.
+                    if env.session.requires_file_write && writes_seen == 0 {
+                        if write_nudges < MAX_WRITE_NUDGES {
+                            write_nudges += 1;
+                            transcript.push_str(
+                                "\n[final_answer with zero file writes → write-evidence feedback]\n",
+                            );
+                            history.push(input.clone());
+                            history.push(Message::Assistant {
+                                id: None,
+                                content: OneOrMany::one(AssistantContent::text(
+                                    serde_json::to_string(&answer.output).unwrap_or_default(),
+                                )),
+                            });
+                            input = Message::user(write_evidence_feedback());
+                            continue;
+                        }
+                        transcript
+                            .push_str("\n[write-evidence budget spent → AGENT_NO_FILE_WRITES]\n");
+                        return Ok(LoopEnd::NoFileWrites);
+                    }
                     return Ok(LoopEnd::Answer(answer));
                 }
                 transcript.push_str("\n[non-conforming final_answer → contract feedback]\n");
@@ -811,6 +892,33 @@ impl RigSessionRunner {
                     &env.session.expected_output_keys,
                     &env.session.expected_output_types,
                 ) {
+                    // Same coding-evidence gate as the `final_answer` path: a
+                    // salvaged prose "success" with zero writes is a narrated
+                    // success — correct in-context, then escalate.
+                    if env.session.requires_file_write && writes_seen == 0 {
+                        if write_nudges < MAX_WRITE_NUDGES {
+                            write_nudges += 1;
+                            transcript.push_str(
+                                "\n[salvaged answer with zero file writes → write-evidence \
+                                 feedback]\n",
+                            );
+                            history.push(input.clone());
+                            let said = if result.text.is_empty() {
+                                "(no content)".to_string()
+                            } else {
+                                result.text.clone()
+                            };
+                            history.push(Message::Assistant {
+                                id: None,
+                                content: OneOrMany::one(AssistantContent::text(said)),
+                            });
+                            input = Message::user(write_evidence_feedback());
+                            continue;
+                        }
+                        transcript
+                            .push_str("\n[write-evidence budget spent → AGENT_NO_FILE_WRITES]\n");
+                        return Ok(LoopEnd::NoFileWrites);
+                    }
                     transcript.push_str("\n[salvaged-text-answer]\n");
                     return Ok(LoopEnd::Answer(answer));
                 }
@@ -894,13 +1002,25 @@ impl RigSessionRunner {
                 } else {
                     let raw = match env.tool_conn.get(&c.name) {
                         Some((conn, real)) => {
+                            // Coding-evidence tally: a write counts ONLY when the
+                            // file host returned Ok (an actual mutation) — a
+                            // refused/escaped/no-match write is an `Err` and is not
+                            // evidence. Resolved real name, never the sanitized
+                            // `c.name`.
+                            let is_write = matches!(real.as_str(), "write_file" | "edit_file");
                             match tokio::time::timeout(
                                 TOOL_CALL_TIMEOUT,
                                 host.call(conn, real, &c.arguments),
                             )
                             .await
                             {
-                                Ok(r) => r.unwrap_or_else(|e| format!("ERROR: {e}")),
+                                Ok(Ok(msg)) => {
+                                    if is_write {
+                                        writes_seen += 1;
+                                    }
+                                    msg
+                                }
+                                Ok(Err(e)) => format!("ERROR: {e}"),
                                 // Non-fatal: the model sees the timeout as this
                                 // tool's output and can proceed/finish; the run
                                 // stays bounded by the session wall.
@@ -950,6 +1070,16 @@ impl RigSessionRunner {
             .sign_off_ceremony(env, history, &input, transcript, total_usage)
             .await
         {
+            // The ceremony rescues a model that did real work but never signed
+            // off — but on a coding deliverable with zero writes there is no work
+            // to rescue (the worktree is pristine). Refuse the false success and
+            // escalate rather than let the ceremony launder it into a pass.
+            if env.session.requires_file_write && writes_seen == 0 {
+                transcript.push_str(
+                    "\n[sign-off ceremony answer with zero file writes → AGENT_NO_FILE_WRITES]\n",
+                );
+                return Ok(LoopEnd::NoFileWrites);
+            }
             return Ok(LoopEnd::Answer(answer));
         }
         Ok(LoopEnd::Exhausted) // turn budget exhausted, even after the sign-off attempt
@@ -1083,7 +1213,8 @@ impl RigSessionRunner {
         }
         let (base_tools, tool_conn) = self.prepare_tools(&session).await?;
         let reasoning = Self::reasoning_for(&session);
-        let system_message = compose_system_message(&session.system_prompt);
+        let system_message =
+            compose_system_message(&session.system_prompt, session.requires_file_write);
         // FIDELITY LIMIT (documented): the spill store is per-process, so
         // `spill_read` handles minted before the park are unreadable after a
         // power cycle — such a read returns the normal "ERROR: unknown slot"
@@ -1136,6 +1267,7 @@ impl RigSessionRunner {
             Ok(Ok(LoopEnd::Answer(answer))) => AgentRunOutcome::Completed(answer),
             Ok(Ok(LoopEnd::Suspended(s))) => AgentRunOutcome::Suspended(s),
             Ok(Ok(LoopEnd::Exhausted)) => AgentRunOutcome::NoResult,
+            Ok(Ok(LoopEnd::NoFileWrites)) => AgentRunOutcome::NoFileWrites,
             Ok(Err(e)) => {
                 return Err(e);
             }
@@ -1212,7 +1344,10 @@ impl AgentSessionRunner for RigSessionRunner {
 
         // The runner-owned completion protocol rides in the system message every
         // turn (see COMPLETION_PROTOCOL) — the structural fix for AGENT_NO_RESULT.
-        let system_message = compose_system_message(&session.system_prompt);
+        // A coding session additionally carries the CODING_WRITE_PROTOCOL prevent
+        // clause.
+        let system_message =
+            compose_system_message(&session.system_prompt, session.requires_file_write);
 
         // The run's liveness pulse — only when an audit sink is wired.
         let heartbeat = self
@@ -1246,6 +1381,7 @@ impl AgentSessionRunner for RigSessionRunner {
             // parked (park-then-report ordering inside `park_and_suspend`).
             Ok(Ok(LoopEnd::Suspended(s))) => AgentRunOutcome::Suspended(s),
             Ok(Ok(LoopEnd::Exhausted)) => AgentRunOutcome::NoResult,
+            Ok(Ok(LoopEnd::NoFileWrites)) => AgentRunOutcome::NoFileWrites,
             // A typed failure (malformed final_answer, provider Error, …) must
             // NOT be downgraded to NoResult — propagate it so the step fails with
             // the real cause (AGENTS-02/AGENTS-03), not a silent empty result.

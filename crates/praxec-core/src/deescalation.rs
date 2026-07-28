@@ -196,7 +196,8 @@ pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
         completed: Option<(String, Option<f64>, Option<String>)>,
         failed: bool,
         /// (model, effort) of each attempt that FAILED the structured-output
-        /// contract (AGENT_NOT_CONVERGING / NO_RESULT / RESULT_FAILED). Only the
+        /// contract (AGENT_NOT_CONVERGING / NO_RESULT / RESULT_FAILED /
+        /// NO_FILE_WRITES). Only the
         /// WINNER reaches `agent.completed`, so without these a model that can't
         /// emit the contract stays invisible to the flywheel and keeps getting
         /// routed contract-critical work. Each becomes a FAILED observation.
@@ -250,6 +251,12 @@ pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
                         err.starts_with("AGENT_NOT_CONVERGING")
                             || err.starts_with("AGENT_NO_RESULT")
                             || err.starts_with("AGENT_RESULT_FAILED")
+                            // A coding leaf that reported success but wrote no file
+                            // (after in-context correction) is a contract failure of
+                            // that model too — so the flywheel demotes a lead coder
+                            // that narrates instead of writing, and stops routing it
+                            // contract-critical coding work.
+                            || err.starts_with("AGENT_NO_FILE_WRITES")
                     });
                 if is_contract_failure {
                     let effort = p
@@ -969,6 +976,38 @@ mod tests {
                 "error": "AGENT_NOT_CONVERGING: emitted status:success 4x, never the contract",
                 "duration_ms": 720_000, "reasoning_effort": effort,
             }))
+    }
+
+    /// The coding-evidence forcing function feeds the flywheel: a lead coder that
+    /// reported success but wrote no file (AGENT_NO_FILE_WRITES) is a negative
+    /// observation, so the flywheel demotes it exactly like a NOT_CONVERGING model
+    /// — the durable version of the manual "swap glm for deepseek".
+    #[test]
+    fn a_no_file_writes_attempt_becomes_a_negative_observation() {
+        let no_write_attempt = AuditEvent::new("agent.model_attempt")
+            .with_correlation("cor_c")
+            .with_payload(json!({
+                "attempt_index": 0, "model": "glm", "outcome": "Capability",
+                "error": "AGENT_NO_FILE_WRITES: reported success but wrote no file",
+                "duration_ms": 253_000, "reasoning_effort": "low",
+            }));
+        let events = vec![
+            invoked("cor_c", "implement", "coding", "glm"),
+            no_write_attempt,
+            completed_effort("cor_c", "implement", "deepseek", 0.11, "low"),
+        ];
+        let obs = observations_from_audit(&events);
+        let glm = obs.iter().find(|o| o.model == "glm").expect("glm observed");
+        assert!(
+            !glm.passed,
+            "a narrated success on an empty worktree is a NEGATIVE observation"
+        );
+        assert_eq!(glm.effort.as_deref(), Some("low"));
+        let dsk = obs
+            .iter()
+            .find(|o| o.model == "deepseek")
+            .expect("deepseek observed");
+        assert!(dsk.passed, "the fallback that actually wrote passed");
     }
 
     #[test]
