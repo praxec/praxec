@@ -481,7 +481,7 @@ fn validate_grounding_scopes(
                 continue;
             }
             if role == "grounding" {
-                validate_grounding_state(id, state_name, state_def, out);
+                validate_grounding_state(id, state_name, state_def, states, out);
             }
         }
     }
@@ -491,8 +491,46 @@ fn validate_grounding_state(
     id: &str,
     state_name: &str,
     state_def: &Value,
+    states: &serde_json::Map<String, Value>,
     out: &mut Vec<Diagnostic>,
 ) {
+    // (d) The grounded output MUST be path-verified. (a)/(b) close external
+    // fetch, but a model can still HALLUCINATE repo-relative paths from memory
+    // using only file tools. So every agent transition out of a grounding state
+    // must target a state that runs a deterministic `path_grounding` gate — the
+    // check that each referenced path EXISTS under `$.run.repo_root`
+    // (PATH_NOT_GROUNDED → CHAIN_FAILED). This makes verification mandatory at
+    // load rather than left to each pack to remember to wire.
+    if let Some(transitions) = state_def.pointer("/transitions").and_then(Value::as_object) {
+        for (t_name, t) in transitions {
+            let is_agent = t.get("actor").and_then(Value::as_str).unwrap_or("agent") == "agent";
+            if !is_agent {
+                continue;
+            }
+            let target = t.get("target").and_then(Value::as_str);
+            let target_verifies = target
+                .and_then(|tg| states.get(tg))
+                .and_then(|ts| ts.pointer("/transitions").and_then(Value::as_object))
+                .is_some_and(|tts| {
+                    tts.values().any(|tt| {
+                        tt.pointer("/executor/kind").and_then(Value::as_str)
+                            == Some("path_grounding")
+                    })
+                });
+            if !target_verifies {
+                out.push(Diagnostic::Error(format!(
+                    "GROUNDING_UNVERIFIED: workflow '{id}' state '{state_name}' (role: grounding) transition \
+                     '{t_name}' targets '{}', which does not run a `path_grounding` gate. A grounding step is \
+                     tool-closed, but a model can still hallucinate repo paths — every grounded output must be \
+                     checked to EXIST under `$.run.repo_root` before it is used. Route this transition through a \
+                     deterministic `path_grounding` state (`executor: {{ kind: path_grounding, groundedPaths: \
+                     [\"$.context.<field>\"] }}`) (V38).",
+                    target.unwrap_or("<none>")
+                )));
+            }
+        }
+    }
+
     // (c) The marker must constrain a real agent step. Default actor is `agent`,
     // so a transition with no `actor` counts (mirrors validate.rs elsewhere).
     let has_agent_transition = state_def
@@ -5318,16 +5356,20 @@ mod tests {
                 m.contains("GROUNDING_SCOPE_BREACH")
                     || m.contains("GROUNDING_TOOLS_UNDECLARED")
                     || m.contains("GROUNDING_ROLE_MISUSE")
+                    || m.contains("GROUNDING_UNVERIFIED")
                     || m.contains("STATE_ROLE_UNKNOWN")
             })
             .collect()
     }
 
     fn grounding_state_wf(role: Value, tools: Option<Value>) -> Value {
+        // Routes grounding → verify (a path_grounding gate) → done, so V38(d)
+        // (GROUNDING_UNVERIFIED) is satisfied and the (a)/(b)/(c) tests isolate
+        // the tool-scope rules. A separate test exercises the missing-gate case.
         let mut state = json!({
             "transitions": {
                 "submit_surfaces": {
-                    "target": "done", "actor": "agent",
+                    "target": "verify", "actor": "agent",
                     "executor": { "kind": "noop" },
                     "output": { "surfaces": "$.arguments.surfaces" }
                 }
@@ -5343,8 +5385,37 @@ mod tests {
             "verb": "review",
             "snippet": { "outputs": {} },
             "initialState": "g",
-            "states": { "g": state, "done": { "terminal": true } }
+            "states": {
+                "g": state,
+                "verify": { "transitions": { "v": {
+                    "target": "done", "actor": "deterministic",
+                    "executor": { "kind": "path_grounding", "groundedPaths": ["$.context.surfaces"] } } } },
+                "done": { "terminal": true }
+            }
         }}})
+    }
+
+    #[test]
+    fn grounding_agent_transition_without_path_grounding_target_is_rejected() {
+        // A tool-closed grounding step whose agent transition targets a state
+        // with NO path_grounding gate — hallucinated paths would pass straight
+        // through. V38(d) rejects it.
+        let wf = json!({ "workflows": { "cap.review.x": {
+            "verb": "review",
+            "snippet": { "outputs": {} },
+            "initialState": "g",
+            "states": {
+                "g": { "role": "grounding", "tools": ["file-ro:{{ $.run.repo_root }}"],
+                       "transitions": { "submit_surfaces": {
+                           "target": "done", "actor": "agent",
+                           "executor": { "kind": "noop" },
+                           "output": { "surfaces": "$.arguments.surfaces" } } } },
+                "done": { "terminal": true }
+            }
+        }}});
+        let d = v38_errors(&wf);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("GROUNDING_UNVERIFIED"), "{}", d[0]);
     }
 
     #[test]
