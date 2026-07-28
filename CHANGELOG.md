@@ -8,6 +8,43 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.38] — 2026-07-28 — grounding forcing-function (V39): the marker is mandatory
+
+Closes the last opt-in gap in the grounding poka-yoke. V38 (0.0.34) made a
+`role: grounding` state tool-closed; V38(d) (0.0.35) made it target a mandatory
+`path_grounding` verification gate. But the marker itself was optional — a review
+cap could enumerate a repo's surfaces from an *unmarked* agent state and escape
+all of it (the original fabrication vector, re-run without the marker).
+
+### Added
+
+- **V39 `GROUNDING_ROLE_REQUIRED`.** A `verb: review` capability whose agent
+  transition emits a repo-grounding-**shaped** output (a field named
+  `grounded_surfaces`/`grounded_paths`/`surfaces`, or an array-of-objects with a
+  `paths` array — the surface shape `path_grounding` verifies), in a state NOT
+  marked `role: grounding`, is now a hard load error. So a repo-grounding review
+  cap **cannot load** without opting into the grounding envelope. Detection is on
+  the STRONG shape only — ordinary review findings (`{file, line, comment}`) are
+  never flagged (no false positives). The remedy is explicit: add `role: grounding`
+  (and satisfy V38), or rename the field out of the grounding vocabulary.
+
+### Notes
+
+- Together with V38 (tool-closure) + V38(d) (mandatory `path_grounding` gate), the
+  grounding poka-yoke is now **author-independent**: V39 forces the marker, and the
+  marker forces both tool-closure and path-verification — a repo-grounding review
+  cap that skips verification is unrepresentable.
+- Non-retroactive, like V38: fires only on the strong grounding shape in an
+  unmarked review state, which no shipped cap has (the ux caps are already
+  `role: grounding`).
+- On the spec's separate engine "re-hash at the acceptance seam" gate: it is
+  **subsumed** — V38(d) already makes the verification gate mandatory for every
+  marked state. A redundant engine-side re-hash would need a per-transition
+  path-pointer declaration to avoid false-positively flagging non-path output
+  fields; it is deliberately not added rather than lower the bar with an
+  ambiguous hot-path check. Content-hash evidence emission from the existing
+  `path_grounding` gate is an available follow-up.
+
 ## [0.0.37] — 2026-07-28 — honest cost accounting + flywheel sees losing attempts
 
 Second of the at-scale hardening sequence. Both fixes ride one small change:

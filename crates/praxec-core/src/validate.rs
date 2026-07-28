@@ -607,6 +607,83 @@ fn is_repo_local_grounding_tool(tool: &str) -> bool {
     tail.is_empty() || (tail.starts_with('/') && !tail.contains(".."))
 }
 
+/// Output field names that unambiguously denote a repo-grounding enumeration —
+/// the vocabulary reserved for the grounding envelope. `paths`/`surfaces` are
+/// normalized (lowercase, `-`→`_`) before comparison.
+const GROUNDING_OUTPUT_NAMES: &[&str] = &["grounded_surfaces", "grounded_paths", "surfaces"];
+
+/// V39 — the grounding FORCING function. V38 makes a `role: grounding` state
+/// tool-closed + path-verified, but the marker is opt-in: a review cap could
+/// enumerate a repo's surfaces from an *unmarked* agent state and escape it all.
+/// This makes the marker mandatory: a `verb: review` cap whose agent transition
+/// emits a repo-grounding-SHAPED output, in a state NOT marked `role: grounding`,
+/// is a hard load error. Together with V38 (tool-closure) + V38(d) (mandatory
+/// path_grounding gate), the class is author-independent — a repo-grounding
+/// review cap that skips verification cannot load.
+fn v39_repo_grounding_requires_role(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
+    if def.get("verb").and_then(Value::as_str) != Some("review") {
+        return; // scope: review caps (the fabrication-prone class)
+    }
+    let Some(states) = def.get("states").and_then(Value::as_object) else {
+        return;
+    };
+    for (state_name, state_def) in states {
+        // Already inside the grounding envelope — V38 governs it.
+        if state_def.get("role").and_then(Value::as_str) == Some("grounding") {
+            continue;
+        }
+        let Some(transitions) = state_def.pointer("/transitions").and_then(Value::as_object) else {
+            continue;
+        };
+        for (t_name, t) in transitions {
+            let is_agent = t.get("actor").and_then(Value::as_str).unwrap_or("agent") == "agent";
+            if !is_agent {
+                continue;
+            }
+            let Some(props) = t
+                .pointer("/inputSchema/properties")
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            if let Some(field) = grounding_shaped_output(props) {
+                out.push(Diagnostic::Error(format!(
+                    "GROUNDING_ROLE_REQUIRED: workflow '{id}' state '{state_name}' transition '{t_name}' \
+                     emits a repo-grounding-shaped output ('{field}') from an agent, but the state is not \
+                     marked `role: grounding`. A review cap that grounds the run's repo must opt into the \
+                     grounding envelope (V38 tool-closure + path_grounding verification) — an unmarked \
+                     grounding step could fabricate a review of a phantom, same-named project. Add \
+                     `role: grounding` (and satisfy V38), or — if this cap reviews only passed-in material \
+                     — rename the output field out of the grounding vocabulary (V39)."
+                )));
+            }
+        }
+    }
+}
+
+/// The STRONG grounding-output shape (unambiguous, no false positives on ordinary
+/// review findings): a property named in the grounding vocabulary, OR an
+/// array-of-objects declaring a `paths: array` item property (the surface shape
+/// `path_grounding` was built to verify). Returns the offending field name.
+fn grounding_shaped_output(props: &serde_json::Map<String, Value>) -> Option<&str> {
+    for (name, schema) in props {
+        let norm = name.to_ascii_lowercase().replace('-', "_");
+        if GROUNDING_OUTPUT_NAMES.contains(&norm.as_str()) {
+            return Some(name);
+        }
+        if schema.get("type").and_then(Value::as_str) == Some("array") {
+            let has_paths_array = schema
+                .pointer("/items/properties/paths/type")
+                .and_then(Value::as_str)
+                == Some("array");
+            if has_paths_array {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
 /// Parse a guard expression of the exact shape `$.some.path == 'literal'`
 /// into `(path, string_literal)`. Returns `None` for anything else (range
 /// comparisons, boolean/number equality, conjunctions, non-expr guards) —
@@ -714,6 +791,7 @@ fn validate_one_workflow(
             v2_id_matches_verb_name(id, def, out);
             validate_snippet(id, def, out); // V3/V4/V5
             v6_primary_executor_verb_shape(id, def, out);
+            v39_repo_grounding_requires_role(id, def, out);
             v10_capability_does_not_invoke_workflow(id, def, out);
             // SPEC §6.2 — `lifecycle:` is a closed enum. A typo'd token
             // (e.g. `stabel`) would otherwise coerce to `experimental` in
@@ -5499,6 +5577,108 @@ mod tests {
         // this test must be updated in lockstep.
         assert_eq!(FILE_TOOL_PREFIX, "file:");
         assert_eq!(FILE_RO_TOOL_PREFIX, "file-ro:");
+    }
+
+    fn v39_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message().to_string())
+            .filter(|m| m.contains("GROUNDING_ROLE_REQUIRED"))
+            .collect()
+    }
+
+    /// A `verb: review` cap whose agent transition emits `output_props`, with an
+    /// optional `role` on the emitting state.
+    fn review_cap_with_agent_output(role: Option<&str>, output_props: Value) -> Value {
+        let mut state = json!({
+            "transitions": { "submit": {
+                "target": "done", "actor": "agent",
+                "executor": { "kind": "noop" },
+                "inputSchema": { "type": "object", "properties": output_props }
+            }}
+        });
+        if let Some(r) = role {
+            // A grounding-marked state needs tools + a path_grounding target to
+            // satisfy V38; route through a verify state so only V39 is isolated.
+            let obj = state.as_object_mut().unwrap();
+            obj.insert("role".into(), json!(r));
+            obj.insert("tools".into(), json!(["file-ro:{{ $.run.repo_root }}"]));
+            obj["transitions"]["submit"]["target"] = json!("verify");
+        }
+        let mut states = json!({ "g": state, "done": { "terminal": true } });
+        if role.is_some() {
+            states.as_object_mut().unwrap().insert(
+                "verify".into(),
+                json!({ "transitions": { "v": {
+                    "target": "done", "actor": "deterministic",
+                    "executor": { "kind": "path_grounding", "groundedPaths": ["$.context.surfaces"] } } } }),
+            );
+        }
+        json!({ "workflows": { "cap.review.x": {
+            "verb": "review",
+            "snippet": { "outputs": {} },
+            "initialState": "g",
+            "states": states
+        }}})
+    }
+
+    #[test]
+    fn review_cap_with_unmarked_grounding_output_is_rejected() {
+        // The named-vocabulary trigger.
+        let d = v39_errors(&review_cap_with_agent_output(
+            None,
+            json!({ "grounded_surfaces": { "type": "array" } }),
+        ));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("grounded_surfaces"), "{}", d[0]);
+
+        // The paths-array-of-objects shape trigger (a different field name).
+        let d = v39_errors(&review_cap_with_agent_output(
+            None,
+            json!({ "walk": { "type": "array", "items": { "type": "object",
+                     "properties": { "paths": { "type": "array" } } } } }),
+        ));
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn review_cap_marked_role_grounding_is_not_v39_flagged() {
+        // Marked → V38 governs it; V39 stands down (no double-flag).
+        let d = v39_errors(&review_cap_with_agent_output(
+            Some("grounding"),
+            json!({ "grounded_surfaces": { "type": "array" } }),
+        ));
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn review_cap_with_ordinary_findings_output_is_clean() {
+        // A plain findings output ({file, line, comment}) is NOT the grounding
+        // shape — no `paths` array — so V39 must not fire (no false positive).
+        let d = v39_errors(&review_cap_with_agent_output(
+            None,
+            json!({ "findings": { "type": "array", "items": { "type": "object",
+                     "properties": { "file": { "type": "string" }, "comment": { "type": "string" } } } } }),
+        ));
+        assert!(d.is_empty(), "{d:?}");
+    }
+
+    #[test]
+    fn non_review_cap_with_grounding_output_is_not_v39_scoped() {
+        // V39 is scoped to review caps; a plan cap is out of scope here.
+        let wf = json!({ "workflows": { "cap.plan.x": {
+            "verb": "plan",
+            "snippet": { "outputs": {} },
+            "initialState": "g",
+            "states": {
+                "g": { "transitions": { "submit": {
+                    "target": "done", "actor": "agent", "executor": { "kind": "noop" },
+                    "inputSchema": { "type": "object", "properties": { "grounded_surfaces": { "type": "array" } } } } } },
+                "done": { "terminal": true }
+            }
+        }}});
+        assert!(v39_errors(&wf).is_empty(), "{:?}", v39_errors(&wf));
     }
 
     #[test]
