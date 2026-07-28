@@ -8,6 +8,51 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.34] — 2026-07-27 — grounding integrity: no external-fetch during grounding
+
+A safety release closing a **fabricated-review** failure: a UX-review capability,
+started against a real repo, grounded on and reviewed a *same-named public npm
+package* (a crypto CLI) instead of the target — it never read the repo, produced a
+full findings set, and reported `success` silently. Root cause: the grounding
+agent's step declared no `tools:`, so it inherited the gateway-wide tool set
+(every wired connection, including external-fetch MCPs) and matched on the repo
+*name*. This release makes that mechanism unrepresentable.
+
+### Added
+
+- **V38 grounding-scope poka-yoke.** A state may declare the closed-vocab marker
+  `role: grounding`. A grounding state is now **invalid at load** (`check` /
+  `doctor` / reload / serve all reject it) unless it (a) declares `tools:`
+  explicitly — an absent key silently inherits the gateway-wide auto-drive tool
+  set, the exact vector — (b) every tool is a repo-local
+  `file:`/`file-ro:{{ $.run.repo_root }}` reader, and (c) it has an `actor: agent`
+  transition. Because per-state `tools:` *replaces* the global set at runtime, a
+  validated grounding leaf **physically has no external tool to call** — it cannot
+  fetch a same-named public project. New errors: `GROUNDING_SCOPE_BREACH`,
+  `GROUNDING_TOOLS_UNDECLARED`, `GROUNDING_ROLE_MISUSE`, `STATE_ROLE_UNKNOWN` — each
+  names the offending step/tool and the exact fix.
+
+### Changed
+
+- **`path_grounding` now understands the grounded-surface shape.** Its
+  `collect_paths` gathers a `paths: [..]` (plural) array on a surface object
+  (`{ id, paths, entry, notes }`), so the existing deterministic path-existence
+  gate can verify every file a review's grounding step claims — any path not under
+  `$.run.repo_root` fails closed (`PATH_NOT_GROUNDED` → `CHAIN_FAILED`) before the
+  scan runs.
+
+### Notes
+
+- The companion pack fix (cognitive-architectures-max `cap.review.ux-matrix-scan`)
+  adopts `role: grounding` + repo-local tools and wires the `path_grounding` gate,
+  closing the incident on both vectors (external-fetch *and* path hallucination).
+- Honest scope: this makes external-fetch grounding unrepresentable for any step
+  marked `role: grounding`, and closes the affected cap. A follow-up makes the
+  marker + path-verification **mandatory** for every review cap (so a new cap can't
+  skip it), and adds the runtime success-requires-evidence gate. Deterministic gates
+  prove the engine *read* the real files; they do not prove a model's findings
+  *derive* from them — that inch stays with finding-level quote-evidence + human review.
+
 ## [0.0.33] — 2026-07-27 — clean proxy start + optional map bindings
 
 A focused fix release: a proxy session (`proxy_default`) can now start cleanly
