@@ -133,6 +133,7 @@ pub fn validate_workflows(config: &Value) -> Vec<Diagnostic> {
     validate_no_reference_cycles(workflows, &mut diagnostics);
     validate_exclusive_leases(config, workflows, &mut diagnostics);
     validate_reasoning_efforts(workflows, &mut diagnostics);
+    validate_grounding_scopes(workflows, &mut diagnostics);
 
     diagnostics
 }
@@ -427,6 +428,145 @@ fn leased_pool_token(tool: &str) -> Option<&str> {
     let t = tool.trim();
     let inner = t.strip_prefix("{{")?.strip_suffix("}}")?.trim();
     inner.strip_prefix("$.run.leased.")
+}
+
+/// Closed vocabulary of per-state `role:` markers. A `role:` the engine does not
+/// know is a hard load error (`STATE_ROLE_UNKNOWN`) so a typo can never silently
+/// un-type a state — the same poka-yoke posture as `hop_slot`'s closed names.
+const KNOWN_STATE_ROLES: &[&str] = &["grounding"];
+
+/// The two repo-local file-tool prefixes (mirrored from
+/// `praxec_agents::file_tools`; praxec-core cannot depend on praxec-agents, so
+/// the two string literals are duplicated and pinned by
+/// `grounding_tool_prefixes_match_file_tools_crate`). A `file:`/`file-ro:` tool
+/// routes to the sandboxed on-disk reader; every other entry routes to an MCP
+/// connection (external reach).
+const FILE_TOOL_PREFIX: &str = "file:";
+const FILE_RO_TOOL_PREFIX: &str = "file-ro:";
+
+/// V38 — the grounding-scope poka-yoke. A state may declare the closed-vocab
+/// marker `role: grounding`. A grounding step's job is to enumerate the surfaces
+/// of the run's OWN repo; it must be *physically unable* to read anything else.
+///
+/// The failure this makes unrepresentable: a grounding agent with an external
+/// tool (`opensrc`/`corpus`/`github-mcp`) in scope matched on the repo NAME and
+/// grounded on a same-named public package, fabricating an entire review of a
+/// codebase it never read. The vector was an ABSENT `tools:` key — which
+/// silently inherits the gateway-wide auto-drive tool set (every wired
+/// connection). So a `role: grounding` state is INVALID unless it (a) declares
+/// `tools:` explicitly, (b) every tool is a `file:`/`file-ro:` reader rooted at
+/// the run-ambient `$.run.repo_root` template, and (c) it actually has an
+/// `actor: agent` transition (else the marker constrains nothing). Because
+/// per-state `tools:` REPLACES the global set at runtime (`runtime_chain`), a
+/// validated grounding leaf physically has no external tool to call — the
+/// constraint is enforced by existing machinery; V38 only makes the unsafe
+/// shape unloadable.
+fn validate_grounding_scopes(
+    workflows: &serde_json::Map<String, Value>,
+    out: &mut Vec<Diagnostic>,
+) {
+    for (id, def) in workflows {
+        let Some(states) = def.get("states").and_then(Value::as_object) else {
+            continue;
+        };
+        for (state_name, state_def) in states {
+            let Some(role) = state_def.get("role").and_then(Value::as_str) else {
+                continue;
+            };
+            if !KNOWN_STATE_ROLES.contains(&role) {
+                out.push(Diagnostic::Error(format!(
+                    "STATE_ROLE_UNKNOWN: workflow '{id}' state '{state_name}' declares `role: {role}`, \
+                     which is not a known state role. Valid roles: {KNOWN_STATE_ROLES:?} (V38)."
+                )));
+                continue;
+            }
+            if role == "grounding" {
+                validate_grounding_state(id, state_name, state_def, out);
+            }
+        }
+    }
+}
+
+fn validate_grounding_state(
+    id: &str,
+    state_name: &str,
+    state_def: &Value,
+    out: &mut Vec<Diagnostic>,
+) {
+    // (c) The marker must constrain a real agent step. Default actor is `agent`,
+    // so a transition with no `actor` counts (mirrors validate.rs elsewhere).
+    let has_agent_transition = state_def
+        .pointer("/transitions")
+        .and_then(Value::as_object)
+        .is_some_and(|ts| {
+            ts.values()
+                .any(|t| t.get("actor").and_then(Value::as_str).unwrap_or("agent") == "agent")
+        });
+    if !has_agent_transition {
+        out.push(Diagnostic::Error(format!(
+            "GROUNDING_ROLE_MISUSE: workflow '{id}' state '{state_name}' is `role: grounding` but has no \
+             `actor: agent` transition — the marker would constrain nothing. Remove `role: grounding`, or \
+             make the grounding step an agent transition (V38)."
+        )));
+    }
+
+    // (a) An absent `tools:` inherits the gateway-wide auto-drive tool set — the
+    // exact vector. A grounding state must pin its scope explicitly.
+    let Some(tools) = state_def.get("tools").and_then(Value::as_array) else {
+        out.push(Diagnostic::Error(format!(
+            "GROUNDING_TOOLS_UNDECLARED: workflow '{id}' state '{state_name}' (role: grounding) declares no \
+             `tools:` — an absent key inherits the gateway-wide auto-drive tool set (every wired connection, \
+             including external-fetch MCPs). A grounding state must pin its scope explicitly. \
+             Fix: `tools: [\"file-ro:{{{{ $.run.repo_root }}}}\"]` (V38)."
+        )));
+        return;
+    };
+
+    // (b) Every tool must be a repo-local file reader rooted at $.run.repo_root.
+    for tool in tools {
+        let Some(t) = tool.as_str() else {
+            out.push(Diagnostic::Error(format!(
+                "GROUNDING_SCOPE_BREACH: workflow '{id}' state '{state_name}' (role: grounding) has a \
+                 non-string tool entry {tool}. A grounding state may only carry repo-local file tools like \
+                 `file-ro:{{{{ $.run.repo_root }}}}` (V38)."
+            )));
+            continue;
+        };
+        if !is_repo_local_grounding_tool(t) {
+            out.push(Diagnostic::Error(format!(
+                "GROUNDING_SCOPE_BREACH: workflow '{id}' state '{state_name}' (role: grounding) has tool `{t}` \
+                 in scope — a grounding state may only read the run's own repo. Any external-fetch tool (an MCP \
+                 connection like `opensrc`/`github-mcp`, a leased token, or an absolute root) lets a run ground \
+                 on a same-named public project instead of `$.run.repo_root` (the phantom-repo fabrication). \
+                 Fix: `tools: [\"file-ro:{{{{ $.run.repo_root }}}}\"]`, or remove `role: grounding` (V38)."
+            )));
+        }
+    }
+}
+
+/// A grounding tool must be a `file:`/`file-ro:` reader whose root is the
+/// run-ambient `{{ $.run.repo_root }}` template (a `/subpath` under it is fine;
+/// a `..` escape is not). A bare connection name, a leased token, or an absolute
+/// literal root can all reach outside the run's repo and are rejected.
+fn is_repo_local_grounding_tool(tool: &str) -> bool {
+    let Some(rest) = tool
+        .strip_prefix(FILE_RO_TOOL_PREFIX)
+        .or_else(|| tool.strip_prefix(FILE_TOOL_PREFIX))
+    else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(after_open) = rest.strip_prefix("{{") else {
+        return false;
+    };
+    let Some(close_idx) = after_open.find("}}") else {
+        return false;
+    };
+    if after_open[..close_idx].trim() != "$.run.repo_root" {
+        return false;
+    }
+    let tail = after_open[close_idx + 2..].trim_end();
+    tail.is_empty() || (tail.starts_with('/') && !tail.contains(".."))
 }
 
 /// Parse a guard expression of the exact shape `$.some.path == 'literal'`
@@ -5167,6 +5307,127 @@ mod tests {
             "{:?}",
             bare_optional_errors(&cfg)
         );
+    }
+
+    fn v38_errors(config: &Value) -> Vec<String> {
+        validate_workflows(config)
+            .into_iter()
+            .filter(|d| d.is_error())
+            .map(|d| d.message().to_string())
+            .filter(|m| {
+                m.contains("GROUNDING_SCOPE_BREACH")
+                    || m.contains("GROUNDING_TOOLS_UNDECLARED")
+                    || m.contains("GROUNDING_ROLE_MISUSE")
+                    || m.contains("STATE_ROLE_UNKNOWN")
+            })
+            .collect()
+    }
+
+    fn grounding_state_wf(role: Value, tools: Option<Value>) -> Value {
+        let mut state = json!({
+            "transitions": {
+                "submit_surfaces": {
+                    "target": "done", "actor": "agent",
+                    "executor": { "kind": "noop" },
+                    "output": { "surfaces": "$.arguments.surfaces" }
+                }
+            }
+        });
+        if !role.is_null() {
+            state.as_object_mut().unwrap().insert("role".into(), role);
+        }
+        if let Some(t) = tools {
+            state.as_object_mut().unwrap().insert("tools".into(), t);
+        }
+        json!({ "workflows": { "cap.review.x": {
+            "verb": "review",
+            "snippet": { "outputs": {} },
+            "initialState": "g",
+            "states": { "g": state, "done": { "terminal": true } }
+        }}})
+    }
+
+    #[test]
+    fn grounding_state_without_tools_is_rejected() {
+        // The exact incident vector: no `tools:` → inherits every connection.
+        let d = v38_errors(&grounding_state_wf(json!("grounding"), None));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("GROUNDING_TOOLS_UNDECLARED"), "{}", d[0]);
+    }
+
+    #[test]
+    fn grounding_state_with_external_tool_is_rejected() {
+        let d = v38_errors(&grounding_state_wf(
+            json!("grounding"),
+            Some(json!(["file-ro:{{ $.run.repo_root }}", "opensrc"])),
+        ));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(
+            d[0].contains("GROUNDING_SCOPE_BREACH") && d[0].contains("opensrc"),
+            "{}",
+            d[0]
+        );
+    }
+
+    #[test]
+    fn grounding_state_with_repo_local_tools_is_clean() {
+        for tool in [
+            "file-ro:{{ $.run.repo_root }}",
+            "file:{{ $.run.repo_root }}/src",
+            "file-ro:{{$.run.repo_root}}",
+        ] {
+            let d = v38_errors(&grounding_state_wf(json!("grounding"), Some(json!([tool]))));
+            assert!(d.is_empty(), "tool {tool} should be clean: {d:?}");
+        }
+    }
+
+    #[test]
+    fn grounding_state_with_absolute_or_escaping_root_is_rejected() {
+        for tool in [
+            "file-ro:/home/mc/wt-elsewhere",
+            "file:{{ $.run.repo_root }}/../etc",
+        ] {
+            let d = v38_errors(&grounding_state_wf(json!("grounding"), Some(json!([tool]))));
+            assert_eq!(d.len(), 1, "tool {tool} must be rejected: {d:?}");
+            assert!(d[0].contains("GROUNDING_SCOPE_BREACH"), "{}", d[0]);
+        }
+    }
+
+    #[test]
+    fn unknown_state_role_is_rejected() {
+        let d = v38_errors(&grounding_state_wf(
+            json!("grouding"),
+            Some(json!(["file-ro:{{ $.run.repo_root }}"])),
+        ));
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("STATE_ROLE_UNKNOWN"), "{}", d[0]);
+    }
+
+    #[test]
+    fn grounding_role_on_non_agent_state_is_flagged() {
+        let wf = json!({ "workflows": { "cap.review.x": {
+            "verb": "review",
+            "snippet": { "outputs": {} },
+            "initialState": "g",
+            "states": {
+                "g": { "role": "grounding", "tools": ["file-ro:{{ $.run.repo_root }}"],
+                       "transitions": { "go": { "target": "done", "actor": "deterministic",
+                                                "executor": { "kind": "noop" } } } },
+                "done": { "terminal": true }
+            }
+        }}});
+        let d = v38_errors(&wf);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].contains("GROUNDING_ROLE_MISUSE"), "{}", d[0]);
+    }
+
+    #[test]
+    fn grounding_tool_prefixes_match_file_tools_crate() {
+        // Cross-crate pin: praxec-core duplicates these two literals because it
+        // cannot depend on praxec-agents. If the canonical constants ever change,
+        // this test must be updated in lockstep.
+        assert_eq!(FILE_TOOL_PREFIX, "file:");
+        assert_eq!(FILE_RO_TOOL_PREFIX, "file-ro:");
     }
 
     #[test]
