@@ -1,0 +1,8 @@
+workflows:
+  flow.mock-hello:
+    title: Mock hello (praxec-meta fixture)
+    description: Minimal trivial workflow, just enough to make this mock pack a valid load.
+    initialState: ready
+    states:
+      ready:
+        terminal: true

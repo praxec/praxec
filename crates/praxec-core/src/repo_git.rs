@@ -82,21 +82,28 @@ pub fn clone_or_update(uri: &str, gitref: &str, dest: &Path) -> anyhow::Result<P
         })?;
         run_git(&["reset", "--hard", "FETCH_HEAD"], Some(dest))?;
     } else {
+        // Cold clone. `git clone --branch <ref>` (the previous implementation)
+        // only resolves a branch or tag name — it cannot check out a bare
+        // commit SHA, which is exactly what a pinned `praxec.lock` entry
+        // needs to seed a never-before-seen cache at. `git fetch <remote>
+        // <gitref>` has no such restriction: a branch, tag, OR a full SHA are
+        // all legal fetch refspecs. So build the clone by hand from the same
+        // primitives the warm-cache update path below already uses (`fetch` +
+        // `reset --hard FETCH_HEAD`), rather than `git clone`, so both cases
+        // go through one code path with one set of semantics.
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        run_git(
-            &[
-                "clone",
-                "--branch",
-                gitref,
-                "--single-branch",
-                &url,
-                &dest.display().to_string(),
-            ],
-            None,
-        )
-        .map_err(|e| anyhow::anyhow!("REPO_CLONE_FAILED: cloning '{uri}' ({gitref}): {e}"))?;
+        run_git(&["init", "--quiet", &dest.display().to_string()], None)
+            .map_err(|e| anyhow::anyhow!("REPO_CLONE_FAILED: initializing '{uri}': {e}"))?;
+        run_git(&["remote", "add", "origin", &url], Some(dest)).map_err(|e| {
+            anyhow::anyhow!("REPO_CLONE_FAILED: configuring remote for '{uri}': {e}")
+        })?;
+        run_git(&["fetch", "origin", gitref], Some(dest))
+            .map_err(|e| anyhow::anyhow!("REPO_CLONE_FAILED: cloning '{uri}' ({gitref}): {e}"))?;
+        run_git(&["reset", "--hard", "FETCH_HEAD"], Some(dest)).map_err(|e| {
+            anyhow::anyhow!("REPO_CLONE_FAILED: checking out '{uri}' ({gitref}): {e}")
+        })?;
     }
     Ok(dest.to_path_buf())
 }
@@ -166,6 +173,106 @@ mod tests {
         let a = cache_dir_name("git+https://github.com/acme/repo@main");
         assert!(!a.contains('/') && !a.contains(':') && !a.contains('@'));
         assert_eq!(a, cache_dir_name("git+https://github.com/acme/repo@main"));
+    }
+
+    #[test]
+    fn cold_clone_a_bare_sha_materializes_exact_commit() {
+        // The concrete gap from the pack-currency design spec (increment A):
+        // `git clone --branch <ref>` (the pre-fix first-clone path) cannot
+        // resolve a bare commit SHA — only a branch or tag name. A lockfile
+        // (increment B) needs to seed a cold cache at an exact SHA, so the
+        // cold-clone path must support that today. No network: `seed_origin`
+        // + a `file://` URI.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        seed_origin(&origin);
+        let origin_uri = format!("file://{}", origin.display());
+
+        // Pin to the first commit's exact SHA before origin advances any further.
+        let sha_out = Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let pinned_sha = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+        assert!(!pinned_sha.is_empty(), "expected a resolvable HEAD sha");
+
+        // Advance origin with a second commit AFTER capturing the pin, so a
+        // naive "clone the branch tip" would land on the wrong commit.
+        std::fs::write(origin.join("extra.txt"), "x").unwrap();
+        git(&["add", "."], &origin);
+        git(
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "more",
+            ],
+            &origin,
+        );
+
+        // Cold-clone: `dest` has never been cloned before, and `gitref` is a
+        // bare SHA, not a branch/tag.
+        let dest = tmp.path().join("cache").join(cache_dir_name(&origin_uri));
+        clone_or_update(&origin_uri, &pinned_sha, &dest)
+            .expect("cold-clone pinned to a bare commit SHA must succeed");
+
+        assert!(dest.join("praxec.repo.yaml").exists());
+        assert!(
+            !dest.join("extra.txt").exists(),
+            "cold clone pinned to a bare SHA must not include commits made after that SHA"
+        );
+
+        let head_out = Command::new("git")
+            .arg("-C")
+            .arg(&dest)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let materialized = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+        assert_eq!(
+            materialized, pinned_sha,
+            "materialized HEAD must equal the pinned SHA exactly"
+        );
+    }
+
+    #[test]
+    fn cold_clone_a_branch_ref_into_a_fresh_cache_still_works() {
+        // Regression guard for the fix above: the ordinary branch/tag
+        // cold-clone path (the common case) must be unaffected.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        seed_origin(&origin);
+        let origin_uri = format!("file://{}", origin.display());
+
+        let dest = tmp.path().join("cache").join(cache_dir_name(&origin_uri));
+        clone_or_update(&origin_uri, "main", &dest)
+            .expect("cold-clone pinned to a branch name must still succeed");
+        assert!(dest.join("praxec.repo.yaml").exists());
+
+        let head_out = Command::new("git")
+            .arg("-C")
+            .arg(&dest)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let branch_out = Command::new("git")
+            .arg("-C")
+            .arg(&origin)
+            .args(["rev-parse", "main"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head_out.stdout).trim(),
+            String::from_utf8_lossy(&branch_out.stdout).trim(),
+            "cold clone by branch name must land on that branch's tip"
+        );
     }
 
     #[test]

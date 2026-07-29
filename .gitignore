@@ -30,6 +30,10 @@ praxec-providers.env
 # structureos working dir
 .frontrails/
 
+# `repos: [{ uri: ... }]` remote-pack clone cache (SPEC §9) — machine-local,
+# re-fetched on every load; never part of the repo contract.
+.praxec/
+
 # Agent working artifacts (plans/specs scaffolding) — keep local, not in the public repo
 docs/superpowers/
 

@@ -1,0 +1,12 @@
+schema: praxec.repo/v1
+name: praxec-meta-mock
+namespace: meta
+version: 1.0.0
+description: |
+  Offline mock of the real github.com/praxec/praxec-meta pack, used to
+  hermetically validate examples/remote-packs/gateway.yaml (see
+  scripts/mock-remote-packs-git.sh + docs/remote-pack-sourcing.md). Minimal
+  but genuinely valid — a manifest plus one trivial terminal workflow — just
+  enough for `praxec check` to resolve the `uri:`/`ref: v1.0.0` pack. The
+  `v1.0.0` git tag the real example pins is created on the mock's bare repo
+  by the mocking script, not stored here.

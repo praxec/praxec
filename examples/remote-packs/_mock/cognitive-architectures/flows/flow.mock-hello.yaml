@@ -1,0 +1,8 @@
+workflows:
+  flow.mock-hello:
+    title: Mock hello (cognitive-architectures fixture)
+    description: Minimal trivial workflow, just enough to make this mock pack a valid load.
+    initialState: ready
+    states:
+      ready:
+        terminal: true
