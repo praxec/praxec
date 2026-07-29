@@ -1,7 +1,19 @@
 schema: praxec.coverage-report/v1
 coverage_scope: "crates/praxec-core/src/guards.rs"
 repo_root: "/home/mc/working/mcp-flowgate-bcov"
-generated_by: flow.behavioral-coverage
+generated_by: flow.behavioral-coverage (HAND-COMPLETED dogfood — see provenance)
+# PROVENANCE (honest accounting): the live orchestrated run stalled in the
+# `enumerating` step on commodity-model latency (600s budget; engine
+# stall-defense correctly began escalating) and was deliberately terminated.
+# The primitive inventory below was then HAND-BUILT by reading guards.rs
+# directly, and the 18 assertions hand-authored to match (2 genuinely ran
+# red first on a real harness gap, then green). The `scanning_tests`,
+# `enforcing_atomicity`, and `reporting` steps WERE proven by invoking the
+# real committed scripts against this repo state (not fabricated). This is a
+# HAND-COMPLETED proof of the flow's components, NOT an unattended live run
+# to `done`. Full write-up: docs/BEHAVIORAL-COVERAGE-DOGFOOD-PROVENANCE.md.
+provenance: hand-completed
+live_run_reached: enumerating (stalled on model latency, terminated)
 primitive_count: 10
 contract_count: 18
 covered_count: 18
