@@ -2358,14 +2358,50 @@ fn migrate(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// SPEC §5.4.2 / audit-resolution C.2 + pack-staleness-warning — print soft
+/// (WARN-only) diagnostics under one shared banner. Used by BOTH `check` and
+/// `doctor` so a diagnostic surfaced by the config-resolve step (including a
+/// git-currency pack-staleness warning) is never visible from one command
+/// but silently swallowed by the other.
+fn print_soft_diagnostics(soft_diagnostics: &[praxec_core::config::Diagnostic]) {
+    if soft_diagnostics.is_empty() {
+        return;
+    }
+    println!();
+    println!("soft warnings (resolve-time):");
+    for d in soft_diagnostics {
+        let loc = d
+            .location
+            .as_deref()
+            .map(|l| format!(" at {l}"))
+            .unwrap_or_default();
+        let suggestion = d
+            .suggestion
+            .as_deref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        println!("  warn[{}]{loc}: {}{suggestion}", d.code, d.message);
+    }
+}
+
 /// P15 — the operator's "is my machine set up for this config" command: run
 /// the credential/tooling preflight and print the report. Exits non-zero iff
 /// a required provider credential is missing (a missing `kind: mcp` binary is
 /// reported as a warning — it fails loud at invocation, not at boot).
+///
+/// pack-staleness-warning — `doctor` loads via the diagnostics-returning
+/// resilient loader (the same RepoLoadMode `load_config` uses under the
+/// hood) INSTEAD of the `load_config` wrapper, specifically so it can print
+/// the soft diagnostics (e.g. a drifted/stale `path:` pack) that
+/// `load_config` discards. `check` and `doctor` must never disagree about
+/// what a config's soft diagnostics say.
 fn doctor(config_path: PathBuf) -> anyhow::Result<()> {
-    let config = load_config(&config_path)?;
+    let (config, soft_diagnostics) =
+        praxec_core::config::load_resolved_with_repos_resilient(&config_path)
+            .with_context(|| format!("loading config {}", config_path.display()))?;
     let report = crate::preflight::preflight(&config);
     print!("{}", crate::preflight::format_report(&report));
+    print_soft_diagnostics(&soft_diagnostics);
 
     // Durability parity with `serve`: report the SAME env-aware condition serve
     // fails fast on, so `doctor` (the health command) can never greenlight a
@@ -2520,23 +2556,7 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
     // SPEC §5.4.2 / audit-resolution C.2 — print soft diagnostics under
     // their own banner so operators see them even when the rest of
     // validation succeeds.
-    if !soft_diagnostics.is_empty() {
-        println!();
-        println!("soft warnings (resolve-time):");
-        for d in &soft_diagnostics {
-            let loc = d
-                .location
-                .as_deref()
-                .map(|l| format!(" at {l}"))
-                .unwrap_or_default();
-            let suggestion = d
-                .suggestion
-                .as_deref()
-                .map(|s| format!(" ({s})"))
-                .unwrap_or_default();
-            println!("  warn[{}]{loc}: {}{suggestion}", d.code, d.message);
-        }
-    }
+    print_soft_diagnostics(&soft_diagnostics);
     if !diagnostics.is_empty() || !soft_diagnostics.is_empty() || !durability.is_empty() {
         println!();
         println!(

@@ -125,9 +125,10 @@ pub fn push(root: &Path) -> anyhow::Result<()> {
 pub struct GitCurrency {
     /// Current branch name; `None` on a detached `HEAD`.
     pub branch: Option<String>,
-    /// The convention default branch this checkout is compared against:
-    /// `"dev"` if a `dev` branch (local or `origin/dev`) is known to this
-    /// checkout, else `"main"`.
+    /// The default branch this checkout is compared against: this
+    /// checkout's own `refs/remotes/origin/HEAD` when known (so a
+    /// `master`/`trunk`/anything-else mainline is judged correctly), else a
+    /// `"dev"`-if-known-else-`"main"` convention guess.
     pub default_branch: String,
     /// `true` iff `branch` is exactly `Some(default_branch)`. Always `false`
     /// on a detached `HEAD`.
@@ -168,16 +169,23 @@ pub fn git_currency(path: &Path) -> Option<GitCurrency> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    // Default-branch convention: prefer `dev` (local branch OR known
-    // remote-tracking ref), fall back to `main`.
-    let has_dev = git_ok(
-        &["show-ref", "--verify", "--quiet", "refs/heads/dev"],
-        &canonical,
-    ) || git_ok(
-        &["show-ref", "--verify", "--quiet", "refs/remotes/origin/dev"],
-        &canonical,
-    );
-    let default_branch = if has_dev { "dev" } else { "main" }.to_string();
+    // Default-branch resolution: prefer whatever this checkout's OWN remote
+    // says its default branch is (`refs/remotes/origin/HEAD`, set by `git
+    // clone` / `git remote set-head origin -a`) — this is what makes a
+    // `master`/`trunk`/anything-else mainline resolve correctly instead of
+    // being misjudged against praxec's own `dev` convention. Only when that
+    // isn't known locally (no `origin`, or `origin/HEAD` was never set) do
+    // we fall back to the dev-then-main convention-guess heuristic.
+    let default_branch = origin_head_branch(&canonical).unwrap_or_else(|| {
+        let has_dev = git_ok(
+            &["show-ref", "--verify", "--quiet", "refs/heads/dev"],
+            &canonical,
+        ) || git_ok(
+            &["show-ref", "--verify", "--quiet", "refs/remotes/origin/dev"],
+            &canonical,
+        );
+        if has_dev { "dev" } else { "main" }.to_string()
+    });
     let on_default_branch = branch.as_deref() == Some(default_branch.as_str());
 
     let dirty = git_stdout(&["status", "--porcelain"], &canonical)
@@ -213,6 +221,20 @@ pub fn git_currency(path: &Path) -> Option<GitCurrency> {
         dirty,
         behind_upstream,
     })
+}
+
+/// This checkout's OWN notion of its default branch, per its remote:
+/// `refs/remotes/origin/HEAD` (set by `git clone`, or explicitly by `git
+/// remote set-head origin -a`) resolved and stripped of the `origin/`
+/// prefix — e.g. `"master"`, `"trunk"`, whatever the remote actually uses.
+/// `None` if that ref isn't set locally (no `origin` remote, or it was never
+/// established) — purely local, no fetch. Never panics.
+fn origin_head_branch(cwd: &Path) -> Option<String> {
+    let short = git_stdout(
+        &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
+        cwd,
+    )?;
+    short.trim().strip_prefix("origin/").map(str::to_string)
 }
 
 /// `true` iff `git <args>` (run in `cwd`) exits successfully. Never panics —
@@ -548,5 +570,67 @@ mod tests {
         assert!(c.on_default_branch);
         assert!(!c.dirty);
         assert_eq!(c.behind_upstream, Some(1));
+    }
+
+    /// A clean repo whose mainline is `master` (not `dev`) must NOT be
+    /// misjudged against praxec's own `dev`-then-`main` convention guess: a
+    /// normal (non `--single-branch`) `git clone` sets
+    /// `refs/remotes/origin/HEAD`, which `git_currency` must consult FIRST.
+    #[test]
+    fn clean_master_repo_with_origin_head_is_not_flagged_as_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        init_repo(&origin, "master");
+        let origin_uri = format!("file://{}", origin.display());
+
+        let work = tmp.path().join("work");
+        // Deliberately NOT `--single-branch`/`--branch`: a plain clone is
+        // exactly what sets `refs/remotes/origin/HEAD` to the remote's own
+        // default branch.
+        Command::new("git")
+            .args(["clone", &origin_uri, &work.display().to_string()])
+            .output()
+            .unwrap();
+
+        let c = git_currency(&work).expect("is a git repo root");
+        assert_eq!(c.branch.as_deref(), Some("master"));
+        assert_eq!(
+            c.default_branch, "master",
+            "origin/HEAD must be consulted before the dev/main convention guess"
+        );
+        assert!(
+            c.on_default_branch,
+            "a clean checkout on its own remote's default branch must never drift"
+        );
+    }
+
+    /// A brand-new repo with NO commits (unborn `HEAD`) must never panic —
+    /// every helper here is exercised (toplevel resolution, symbolic-ref,
+    /// show-ref, status, rev-list-gating) before any commit exists.
+    #[test]
+    fn unborn_head_does_not_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("pack");
+        std::fs::create_dir_all(&repo).unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg("dev")
+            .arg(&repo)
+            .output()
+            .unwrap();
+        // No `praxec.repo.yaml`, no `git add`, no commit — HEAD is unborn.
+
+        let result = std::panic::catch_unwind(|| git_currency(&repo));
+        assert!(result.is_ok(), "must never panic on an unborn HEAD");
+        let currency = result
+            .unwrap()
+            .expect("an unborn repo is still a repo root");
+        // `symbolic-ref` reads HEAD's symbolic target regardless of whether
+        // it resolves to a commit yet, so the branch NAME is still known.
+        assert_eq!(currency.branch.as_deref(), Some("dev"));
+        // No origin, so upstream is unknown, not a crash and not a
+        // fabricated zero.
+        assert_eq!(currency.behind_upstream, None);
     }
 }
