@@ -27,7 +27,29 @@ use serde_json::Value;
 /// `(missing: unset)` — last path segment + `: unset`. The response is
 /// always produced; this function never fails.
 pub fn render_template(template: &str, instance: &WorkflowInstance) -> String {
+    render_template_tracked(template, instance).0
+}
+
+/// `Ok(value)` when the path resolved; `Err(stub)` carries the `(last: unset)`
+/// string the infallible renderer emits. Single source of truth for both.
+fn resolve_or_stub(path: &str, instance: &WorkflowInstance) -> Result<String, String> {
+    let s = resolve_template_path(path, instance);
+    // A resolved value can legitimately look like anything EXCEPT the reserved
+    // stub shape `(<segment>: unset)`; that shape is only produced on the
+    // unresolved branches of resolve_template_path.
+    let last = path.rsplit('.').next().unwrap_or(path);
+    if s == format!("({last}: unset)") {
+        Err(s)
+    } else {
+        Ok(s)
+    }
+}
+
+/// Render, and collect the `$.`-paths that stubbed. Element 0 is byte-identical
+/// to `render_template`. See the entry gate (Plan A) for the consumer.
+pub fn render_template_tracked(template: &str, instance: &WorkflowInstance) -> (String, Vec<String>) {
     let mut output = String::with_capacity(template.len());
+    let mut unresolved: Vec<String> = Vec::new();
     let mut remaining = template;
 
     while let Some(start) = remaining.find("{{") {
@@ -38,7 +60,7 @@ pub fn render_template(template: &str, instance: &WorkflowInstance) -> String {
         let Some(end_rel) = after_open.find("}}") else {
             // No closing `}}` — emit the rest literally and stop.
             output.push_str(&remaining[start..]);
-            return output;
+            return (output, unresolved);
         };
 
         let inner = after_open[..end_rel].trim();
@@ -46,8 +68,16 @@ pub fn render_template(template: &str, instance: &WorkflowInstance) -> String {
             // Empty placeholder `{{}}` — not a valid token; emit verbatim.
             output.push_str("{{}}");
         } else {
-            let replacement = resolve_template_path(inner, instance);
-            output.push_str(&replacement);
+            match resolve_or_stub(inner, instance) {
+                Ok(v) => output.push_str(&v),
+                Err(stub) => {
+                    output.push_str(&stub);
+                    let p = inner.to_string();
+                    if !unresolved.contains(&p) {
+                        unresolved.push(p);
+                    }
+                }
+            }
         }
 
         // Advance past the closing `}}`.
@@ -56,7 +86,7 @@ pub fn render_template(template: &str, instance: &WorkflowInstance) -> String {
 
     // Append any tail after the last placeholder.
     output.push_str(remaining);
-    output
+    (output, unresolved)
 }
 
 /// Resolve a single trimmed path token (e.g. `$.context.someKey`) against
@@ -218,5 +248,24 @@ mod tests {
             "got: {rendered}"
         );
         assert!(rendered.starts_with(inst.run_env.repo_root.as_str()));
+    }
+
+    /// Plan A (entry gate) — the tracked renderer must produce the exact same
+    /// bytes as the infallible `render_template` while also reporting every
+    /// `$.`-path that stubbed, de-duplicated, in encounter order.
+    #[test]
+    fn tracked_render_reports_unresolved_paths_and_matches_render_template() {
+        let inst = crate::model::WorkflowInstance::for_test_with_context(
+            serde_json::json!({ "present": "ok" }),
+        );
+        let tmpl = "A={{ $.context.present }} B={{ $.context.missing }} C={{ $.context.also_missing }}";
+        let (rendered, unresolved) = render_template_tracked(tmpl, &inst);
+        // element 0 is byte-identical to the infallible renderer
+        assert_eq!(rendered, render_template(tmpl, &inst));
+        // both unresolved paths are reported, de-duplicated, in encounter order
+        assert_eq!(unresolved, vec!["$.context.missing".to_string(), "$.context.also_missing".to_string()]);
+        // a fully-resolved template reports nothing
+        let (_r, none) = render_template_tracked("A={{ $.context.present }}", &inst);
+        assert!(none.is_empty());
     }
 }
