@@ -3052,6 +3052,72 @@ fn load_resolved_with_repos_mode(
     Ok((resolved, repo_diagnostics))
 }
 
+/// pack-staleness-warning — turn one `path:` repo's
+/// [`crate::repo_git::GitCurrency`] into zero or more WARN diagnostics.
+/// Never Error-severity: a stale/drifted pack is informative, not a load
+/// failure (`check`/`doctor` must still exit success). Three independent
+/// classes, any subset of which may fire together: branch drift (not on the
+/// convention default branch, including detached HEAD), a dirty working
+/// tree, and being behind the locally-known `origin/<default>` by N>0
+/// commits. When the operator would benefit from knowing upstream currency
+/// couldn't even be determined (no locally-known remote-tracking ref), that
+/// note rides along on whichever of the other two warnings fires — it is
+/// never surfaced as its own warning, so a repo with no `origin` configured
+/// at all (a legitimate local-only checkout) stays silent when it's clean
+/// and on its default branch.
+fn git_currency_diagnostics(
+    entry_desc: &str,
+    currency: &crate::repo_git::GitCurrency,
+) -> Vec<Diagnostic> {
+    let upstream_note = if currency.behind_upstream.is_none() {
+        " (upstream unknown — run git fetch to check)"
+    } else {
+        ""
+    };
+    let mut out = Vec::new();
+    if !currency.on_default_branch {
+        let branch_desc = currency.branch.as_deref().unwrap_or("a detached HEAD");
+        out.push(Diagnostic {
+            severity: DiagnosticSeverity::Warn,
+            code: "PACK_BRANCH_DRIFT".into(),
+            message: format!(
+                "pack repo '{entry_desc}' is on {branch_desc}, not its default branch \
+                 '{}'{upstream_note}",
+                currency.default_branch
+            ),
+            location: None,
+            suggestion: Some(format!(
+                "git -C {entry_desc} checkout {}",
+                currency.default_branch
+            )),
+        });
+    }
+    if currency.dirty {
+        out.push(Diagnostic {
+            severity: DiagnosticSeverity::Warn,
+            code: "PACK_DIRTY_TREE".into(),
+            message: format!("pack repo '{entry_desc}' has uncommitted changes{upstream_note}"),
+            location: None,
+            suggestion: Some(format!("git -C {entry_desc} status")),
+        });
+    }
+    if let Some(n) = currency.behind_upstream {
+        if n > 0 {
+            out.push(Diagnostic {
+                severity: DiagnosticSeverity::Warn,
+                code: "PACK_BEHIND_UPSTREAM".into(),
+                message: format!(
+                    "pack repo '{entry_desc}' is {n} commit(s) behind origin/{}",
+                    currency.default_branch
+                ),
+                location: None,
+                suggestion: Some(format!("git -C {entry_desc} pull")),
+            });
+        }
+    }
+    out
+}
+
 /// Extract `repos:` + `overrides:` from `host`, load each repo, validate
 /// V20 / V21 / V22 / V23, deep-merge repo contents (then host on top so
 /// declared overrides win), and return the cleaned value (with `repos:`
@@ -3107,6 +3173,12 @@ fn merge_declared_repos(
     // diverted out of the live registry and stamped as self-documenting
     // diagnostic state (see `stamp_ungranted_connections`).
     let mut ungranted_connections: Vec<UngrantedConnection> = Vec::new();
+    // pack-staleness-warning — (entry description, git currency) for every
+    // LOCAL `path:` entry that IS the root of a git working tree. Turned
+    // into WARN diagnostics (never errors — staleness never blocks) after
+    // the loop, once every entry has been visited (the cross-pack
+    // composition-mismatch check needs to see them all together).
+    let mut git_currency_checks: Vec<(String, crate::repo_git::GitCurrency)> = Vec::new();
 
     for RepoDecl {
         source,
@@ -3127,6 +3199,13 @@ fn merge_declared_repos(
                 format!("worktrees_of:{} name:{name}", anchor.display())
             }
         };
+        // pack-staleness-warning — only a LOCAL `path:` entry is a candidate
+        // for a git-currency warning. A `uri:` (remote) entry already
+        // re-pulls its ref's tip on every load via `clone_or_update`, so a
+        // staleness warning there would be noise, not signal; a
+        // `worktrees_of:` entry `continue`s below before it ever reaches the
+        // git-currency check.
+        let is_local_path = matches!(source, RepoSource::Local(_));
         // WS-B B3 — identity-first, worktree-churn-proof resolution. A
         // `worktrees_of:` entry declares a durable IDENTITY (`name`) + a stable
         // `anchor` to enumerate worktrees of; the live writable root is the
@@ -3315,6 +3394,18 @@ fn merge_declared_repos(
                 }
             },
         };
+        // pack-staleness-warning — collect git currency for a successfully
+        // loaded LOCAL `path:` entry, regardless of whether it's a
+        // definition repo or a bare writable target (FB-2): staleness is a
+        // property of the checkout, not of what it contributes to the
+        // registry. `git_currency` itself never errors or touches the
+        // network — `None` (not a git repo, or not a repo root) is silently
+        // skipped, exactly like a legitimate plain-dir pack.
+        if is_local_path {
+            if let Some(currency) = crate::repo_git::git_currency(&repo_path) {
+                git_currency_checks.push((entry_desc.clone(), currency));
+            }
+        }
         let Some((manifest, mut repo_value)) = manifest_and_registry else {
             // FB-2 bare writable run target: `parse_repo_entry` already
             // guaranteed `writable` here.
@@ -3360,6 +3451,43 @@ fn merge_declared_repos(
         )?);
         repo_aggregate = deep_merge(repo_aggregate, repo_value);
         loaded_definition_repos += 1;
+    }
+
+    // pack-staleness-warning — non-blocking currency warnings for every
+    // git-backed `path:` repo, plus a cross-pack composition-mismatch
+    // warning when 2+ of them disagree on branch (the base/overlay drift
+    // class this was built to catch). Always WARN-severity: a stale pack is
+    // informative, never a load error.
+    for (entry_desc, currency) in &git_currency_checks {
+        diagnostics.extend(git_currency_diagnostics(entry_desc, currency));
+    }
+    if git_currency_checks.len() >= 2 {
+        let mut distinct_branches: Vec<&str> = git_currency_checks
+            .iter()
+            .map(|(_, c)| c.branch.as_deref().unwrap_or("detached HEAD"))
+            .collect();
+        distinct_branches.sort_unstable();
+        distinct_branches.dedup();
+        if distinct_branches.len() > 1 {
+            let detail = git_currency_checks
+                .iter()
+                .map(|(entry, c)| {
+                    format!("{entry}@{}", c.branch.as_deref().unwrap_or("detached HEAD"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            diagnostics.push(Diagnostic {
+                severity: DiagnosticSeverity::Warn,
+                code: "PACK_COMPOSITION_BRANCH_MISMATCH".into(),
+                message: format!("composed git-backed packs are on different branches: {detail}"),
+                location: None,
+                suggestion: Some(
+                    "check out the same branch (typically the default) in every composed \
+                     pack repo before relying on cross-pack behavior"
+                        .into(),
+                ),
+            });
+        }
     }
 
     // Finding #13 backstop — resilience isolates a bad entry; it must not
