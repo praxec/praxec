@@ -10,6 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
+
 /// The git-cloneable URL for a repo `uri`. `git+https://…` → `https://…`;
 /// `git+ssh://…` → `ssh://…`; a bare `file://…` or local path passes through
 /// (so local mirrors + tests work without a network).
@@ -242,6 +244,83 @@ pub fn git_currency(path: &Path) -> Option<GitCurrency> {
         dirty,
         behind_upstream,
     })
+}
+
+/// pack-provenance-recording — the durable "what exactly ran" record for one
+/// loaded pack: `{ namespace, source, sha, ref, dirty }`. RECORDS, never
+/// CONSTRAINS — this is emitted as a `pack.provenance` audit event (the
+/// governance trail) and surfaced live via `discovery::home()`'s
+/// `loaded_packs`. Both surfaces are built from [`pack_provenance`], which
+/// itself reuses [`git_currency`] — one git introspection, two outputs (the
+/// staleness WARN and this record).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackProvenance {
+    /// The pack's declared `praxec.repo.yaml` namespace.
+    pub namespace: String,
+    /// How the operator declared the entry — the literal `path:` or `uri:`
+    /// string (same convention the staleness warnings name a repo by).
+    pub source: String,
+    /// The exact `HEAD` commit driving this pack's currently-loaded content.
+    /// `None` when `repo_path` isn't a git working tree (a plain `path:`
+    /// pack) — never a load failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    /// The operator's declared `ref:` for a remote pack, or the branch name
+    /// for a local checkout. `None` when neither is known (non-git pack, or
+    /// a local detached HEAD).
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// Uncommitted local changes, per `git status --porcelain`. `None` for a
+    /// non-git pack (there is no working tree to be dirty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<bool>,
+}
+
+/// Compute one pack's provenance record. `repo_path` is the pack's resolved
+/// root — a local `path:` checkout, or a remote `uri:` pack's clone-cache
+/// dir (`clone_or_update` always leaves a normal, non-bare git working tree
+/// there, so [`git_currency`] applies to it exactly the same way).
+/// `declared_ref` is the operator's declared `ref:` for a remote pack — pass
+/// `Some(gitref)` there and `None` for a local `path:` pack. It takes
+/// PRIORITY over the checkout's own branch name when present: `clone_or_update`
+/// cold-clones via `git init` (no `-b`), so a remote pack's cache-dir branch
+/// name is an internal artifact of the local git's default-branch config, not
+/// a meaningful ref — the operator's declared ref is the one that actually
+/// answers "which version of this pack is loaded".
+///
+/// Offline (delegates to [`git_currency`] + a local `git rev-parse HEAD`) and
+/// infallible: a pack that isn't a git working tree yields a record with
+/// `sha`/`git_ref`/`dirty` all `None` rather than an error — provenance
+/// RECORDS, it never blocks a load.
+pub fn pack_provenance(
+    namespace: &str,
+    source: &str,
+    repo_path: &Path,
+    declared_ref: Option<&str>,
+) -> PackProvenance {
+    match git_currency(repo_path) {
+        Some(currency) => PackProvenance {
+            namespace: namespace.to_string(),
+            source: source.to_string(),
+            sha: resolved_sha(repo_path),
+            git_ref: declared_ref.map(str::to_string).or(currency.branch),
+            dirty: Some(currency.dirty),
+        },
+        None => PackProvenance {
+            namespace: namespace.to_string(),
+            source: source.to_string(),
+            sha: None,
+            git_ref: None,
+            dirty: None,
+        },
+    }
+}
+
+/// `git rev-parse HEAD` in `path` — the exact commit sha driving this pack's
+/// currently-loaded content. Offline (no fetch). `None` if `path` isn't a
+/// git repo, `HEAD` is unborn, or the command fails to run — never panics.
+pub fn resolved_sha(path: &Path) -> Option<String> {
+    git_stdout(&["rev-parse", "HEAD"], path).map(|s| s.trim().to_string())
 }
 
 /// This checkout's OWN notion of its default branch, per its remote:
@@ -753,5 +832,106 @@ mod tests {
         // No origin, so upstream is unknown, not a crash and not a
         // fabricated zero.
         assert_eq!(currency.behind_upstream, None);
+    }
+
+    // ---------- pack_provenance (pack-provenance-recording, P1/P2) ----------
+
+    #[test]
+    fn clean_git_pack_provenance_carries_namespace_sha_ref_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("pack");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo, "dev");
+        let expected_sha = git_stdout(&["rev-parse", "HEAD"], &repo)
+            .expect("HEAD resolves")
+            .trim()
+            .to_string();
+
+        let prov = pack_provenance("acme", "/some/path", &repo, None);
+        assert_eq!(prov.namespace, "acme");
+        assert_eq!(prov.source, "/some/path");
+        assert_eq!(prov.sha.as_deref(), Some(expected_sha.as_str()));
+        assert_eq!(prov.git_ref.as_deref(), Some("dev"));
+        assert_eq!(prov.dirty, Some(false));
+    }
+
+    #[test]
+    fn dirty_git_pack_provenance_reports_dirty_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("pack");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo, "dev");
+        std::fs::write(repo.join("NOTES.md"), "uncommitted\n").unwrap();
+
+        let prov = pack_provenance("acme", "/some/path", &repo, None);
+        assert_eq!(prov.dirty, Some(true));
+        assert!(prov.sha.is_some(), "dirty is independent of sha resolution");
+    }
+
+    #[test]
+    fn non_git_path_pack_provenance_has_no_sha_ref_or_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("plain-pack");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let prov = pack_provenance("plain", "/plain/path", &plain, None);
+        assert_eq!(prov.namespace, "plain");
+        assert_eq!(prov.source, "/plain/path");
+        assert_eq!(
+            prov.sha, None,
+            "no git — provenance records absence, never fails"
+        );
+        assert_eq!(prov.git_ref, None);
+        assert_eq!(prov.dirty, None);
+    }
+
+    #[test]
+    fn remote_pack_provenance_uses_the_declared_ref_not_the_cache_dirs_local_branch_name() {
+        // `clone_or_update` cold-clones via `git init` (no `-b`), so the cache
+        // dir's own branch name is whatever the local git's
+        // `init.defaultBranch` happens to be — an internal artifact, NOT the
+        // ref the operator actually pinned. Provenance must report the
+        // DECLARED ref, regardless of what that artifact branch is named.
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        init_repo(&origin, "main");
+        let origin_uri = format!("file://{}", origin.display());
+
+        let dest = tmp.path().join("cache").join(cache_dir_name(&origin_uri));
+        clone_or_update(&origin_uri, "main", &dest).unwrap();
+
+        let expected_sha = git_stdout(&["rev-parse", "HEAD"], &dest)
+            .expect("HEAD resolves")
+            .trim()
+            .to_string();
+
+        let prov = pack_provenance("remote-pack", &origin_uri, &dest, Some("main"));
+        assert_eq!(prov.sha.as_deref(), Some(expected_sha.as_str()));
+        assert_eq!(
+            prov.git_ref.as_deref(),
+            Some("main"),
+            "the declared ref wins over the cache dir's own (artifact) branch name"
+        );
+        assert_eq!(prov.dirty, Some(false));
+    }
+
+    #[test]
+    fn resolved_sha_matches_git_rev_parse_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("pack");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo, "dev");
+        let expected = git_stdout(&["rev-parse", "HEAD"], &repo)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(resolved_sha(&repo), Some(expected));
+    }
+
+    #[test]
+    fn resolved_sha_is_none_for_a_non_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(resolved_sha(tmp.path()), None);
     }
 }

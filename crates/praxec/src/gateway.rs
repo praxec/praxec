@@ -933,6 +933,10 @@ async fn build_oneshot_server(
         Arc::new(ProgressElicitor::new(progress_peer.clone()));
     let (initial_defs, initial_executors, initial_discovery, initial_registry, workflow_handle) =
         build_hot_components(config, &audit, &embedder, Some(upstream.clone())).await?;
+    // pack-provenance-recording (P1) — the durable "what exactly ran" record at
+    // boot, from the SAME `_packProvenance` stamp `discovery::home()` (P2)
+    // reads live. Best-effort; never gates startup.
+    record_pack_provenance(config, &audit).await;
 
     let swappable_defs = Arc::new(SwappableDefinitionStore::new(initial_defs));
     let swappable_executors = Arc::new(SwappableExecutorRegistry::new(initial_executors));
@@ -1530,6 +1534,45 @@ async fn serve_degraded(config_path: PathBuf, err: anyhow::Error) -> anyhow::Res
 /// long-lived runtime and audits `config.reloaded`. Returns the outcome as JSON
 /// so the in-band caller learns what happened (incl. the reloaded `repos:`).
 #[allow(clippy::too_many_arguments)]
+/// pack-provenance-recording (P1) — emit ONE `pack.provenance` audit event
+/// listing every namespace-bearing loaded pack's provenance (`namespace`,
+/// `source`, `sha`, `ref`, `dirty`), read straight off the
+/// `/praxec/_packProvenance` stamp `merge_declared_repos` (praxec-core
+/// `config.rs`) computed via `repo_git::pack_provenance` — the SAME
+/// introspection `discovery::home()`'s `loaded_packs` (P2) reads. Called at
+/// every point a resolved config is live WITH the audit sink already built:
+/// `build_oneshot_server` (startup) and `reload_gated` (SIGHUP / in-band
+/// reload / staleness recheck) — never from `praxec check`, which has no
+/// audit sink to record into.
+///
+/// Because the audit trail already timestamps every event, "load provenance
+/// at T" + "a run's audit events at T'>T" reconstructs exactly which pack
+/// version drove that run — the durable governance record (SPEC: pack
+/// provenance-recording, P1). Best-effort: a record failure must never block
+/// startup/reload (this is a governance nicety layered on top of a load that
+/// already succeeded, not a load precondition).
+///
+/// A config with no namespace-bearing packs (no `repos:`, or `repos:` that
+/// only ship bare writable targets) has nothing to record — no event, no
+/// noise.
+async fn record_pack_provenance(config: &Value, audit: &Arc<dyn praxec_core::audit::AuditSink>) {
+    let Some(packs) = config
+        .pointer("/praxec/_packProvenance")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    if packs.is_empty() {
+        return;
+    }
+    let _ = audit
+        .record(
+            praxec_core::audit::AuditEvent::new("pack.provenance")
+                .with_payload(json!({ "packs": packs })),
+        )
+        .await;
+}
+
 async fn reload_gated(
     swappable_defs: &Arc<praxec_core::hot_reload::SwappableDefinitionStore>,
     swappable_executors: &Arc<praxec_core::hot_reload::SwappableExecutorRegistry>,
@@ -1674,6 +1717,10 @@ async fn reload_gated(
                     })),
                 )
                 .await;
+            // pack-provenance-recording (P1) — the durable "what exactly ran"
+            // record, from the SAME `_packProvenance` stamp `discovery::home()`
+            // (P2) reads live. Best-effort; never gates the reload outcome.
+            record_pack_provenance(&new_config, audit).await;
             tracing::info!("config reloaded successfully");
             json!({
                 "status": "reloaded",
@@ -4479,6 +4526,162 @@ mod tests {
                 .contains(&"discovery.index_degraded".to_string()),
             "embeddings off → lexical is the configured answer, not a degrade"
         );
+    }
+
+    /// A minimal git-backed pack fixture: `git init -b <branch>` + a valid
+    /// `praxec.repo.yaml` under a unique `namespace`, committed. Mirrors
+    /// `praxec-core`'s `pack_staleness_warning.rs` / `pack_provenance.rs`
+    /// fixture shape (a fresh `tempfile::TempDir`, never the checked-in
+    /// `tests/fixtures/repos/*`, which live inside THIS workspace's own git
+    /// repo and would spuriously inherit its branch/dirty state).
+    fn init_git_pack_for_provenance(dir: &std::path::Path, branch: &str, namespace: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg(branch)
+            .arg(dir)
+            .output()
+            .unwrap();
+        std::fs::write(
+            dir.join("praxec.repo.yaml"),
+            format!(
+                "schema: praxec.repo/v1\nname: {namespace}-pack\nnamespace: {namespace}\nversion: 0.0.1\n"
+            ),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} in {} failed",
+                dir.display()
+            );
+        };
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "seed",
+        ]);
+    }
+
+    /// pack-provenance-recording (P1) — a reload with a git-backed pack emits
+    /// ONE `pack.provenance` audit event whose payload lists that pack's
+    /// namespace + resolved sha + ref + dirty. Proves the record is durable
+    /// (lands in the audit trail, not just the live config) AND non-blocking
+    /// (the reload still completes normally).
+    #[tokio::test]
+    async fn reload_with_a_git_backed_pack_emits_a_pack_provenance_audit_event() {
+        use praxec_core::hot_reload::{
+            SwappableDefinitionStore, SwappableDiscoveryIndex, SwappableExecutorRegistry,
+            SwappableRegistry,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("pack");
+        init_git_pack_for_provenance(&pack, "dev", "gw-prov");
+        let expected_sha = head_sha(&pack);
+
+        let cfg_path = dir.path().join("praxec.yaml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n",
+                pack.display()
+            ),
+        )
+        .unwrap();
+
+        let overlays = GatewayOverlays::default();
+        let config = crate::gateway_config::load_config(&cfg_path).unwrap();
+        let runtime = build_runtime_for_orchestrate(&config, &overlays)
+            .await
+            .expect("runtime");
+
+        let audit_sink = praxec_core::audit::MemoryAuditSink::new();
+        let audit: Arc<dyn praxec_core::audit::AuditSink> = Arc::new(audit_sink.clone());
+        let embedder: Arc<dyn praxec_core::embeddings::EmbeddingProvider> =
+            Arc::new(praxec_core::embeddings::NoopEmbedder);
+        let (defs, execs, discovery, registry, handle) =
+            build_hot_components(&config, &audit, &embedder, None)
+                .await
+                .expect("components build");
+        handle.set_runtime((*runtime).clone());
+        let swappable_defs = Arc::new(SwappableDefinitionStore::new(defs));
+        let swappable_execs = Arc::new(SwappableExecutorRegistry::new(execs));
+        let swappable_discovery = Arc::new(SwappableDiscoveryIndex::new(discovery));
+        let swappable_registry = Arc::new(SwappableRegistry::new(registry));
+
+        // Nothing recorded yet — `build_hot_components` alone never emits
+        // `pack.provenance` (only `build_oneshot_server`/`reload_gated` do,
+        // where the audit sink is live at the right point).
+        assert!(
+            !audit_sink
+                .event_types()
+                .contains(&"pack.provenance".to_string()),
+            "provenance is recorded at load/reload, not at bare component build"
+        );
+
+        let repair_gate: praxec_mcp_server::RepairGateSlot = Arc::new(std::sync::RwLock::new(None));
+        let upstream: Arc<dyn praxec_executors::UpstreamElicitor> = Arc::new(
+            super::ProgressElicitor::new(praxec_mcp_server::ProgressPeer::default()),
+        );
+        let outcome = reload_gated(
+            &swappable_defs,
+            &swappable_execs,
+            &swappable_discovery,
+            &swappable_registry,
+            &cfg_path,
+            &audit,
+            &runtime,
+            &overlays.registrars,
+            &repair_gate,
+            &upstream,
+        )
+        .await;
+        assert_eq!(outcome["status"], "reloaded", "reload completes: {outcome}");
+
+        let events = audit_sink.snapshot();
+        let provenance_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "pack.provenance")
+            .collect();
+        assert_eq!(
+            provenance_events.len(),
+            1,
+            "exactly one pack.provenance event per load: {events:?}"
+        );
+        let packs = provenance_events[0]
+            .payload
+            .get("packs")
+            .and_then(Value::as_array)
+            .expect("payload carries a packs array");
+        let record = packs
+            .iter()
+            .find(|p| p.get("namespace").and_then(Value::as_str) == Some("gw-prov"))
+            .unwrap_or_else(|| panic!("expected a provenance record for 'gw-prov': {packs:?}"));
+        assert_eq!(
+            record.get("sha").and_then(Value::as_str),
+            Some(expected_sha.as_str())
+        );
+        assert_eq!(record.get("ref").and_then(Value::as_str), Some("dev"));
+        assert_eq!(record.get("dirty").and_then(Value::as_bool), Some(false));
+
+        // Provenance recording never constrains: a clean reload on an
+        // unremarkable branch still completes with `status: reloaded`, no
+        // gating whatsoever tied to the presence of this event.
+        assert_eq!(outcome["status"], "reloaded");
     }
 
     /// Refusing to BOOT on a bad writable repo is correct fail-fast. Bricking a

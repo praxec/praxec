@@ -169,11 +169,21 @@ pub async fn build_discovery_index(
     // the vector it was indexed by, so it needs `&mut`.
     let mut tools: Vec<ToolDescriptor> =
         registry.map(Registry::tool_descriptors).unwrap_or_default();
+    // pack-provenance-recording (P2) — the SAME `/praxec/_packProvenance`
+    // config stamp the gateway's `pack.provenance` audit event (P1) reads,
+    // attached to whichever index construction path below actually returns,
+    // so `home()` answers "what workflow versions am I running" from one
+    // computed list shared with the durable record.
+    let loaded_packs: Vec<Value> = config
+        .pointer("/praxec/_packProvenance")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     if embedder.backend_name() == NOOP_BACKEND {
-        return Ok(Arc::new(InMemoryDiscoveryIndex::new(catalog(
-            &items, &tools,
-        ))));
+        return Ok(Arc::new(
+            InMemoryDiscoveryIndex::new(catalog(&items, &tools)).with_loaded_packs(loaded_packs),
+        ));
     }
 
     // One deadline across both awaits below, so the worst case is the budget —
@@ -186,7 +196,15 @@ pub async fn build_discovery_index(
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             let items = catalog(&items, &tools);
-            return Ok(degrade("health_check_failed", e.to_string(), items, embedder, audit).await);
+            return Ok(degrade(
+                "health_check_failed",
+                e.to_string(),
+                items,
+                embedder,
+                audit,
+                loaded_packs,
+            )
+            .await);
         }
         Err(_) => {
             let items = catalog(&items, &tools);
@@ -196,6 +214,7 @@ pub async fn build_discovery_index(
                 items,
                 embedder,
                 audit,
+                loaded_packs,
             )
             .await);
         }
@@ -215,7 +234,15 @@ pub async fn build_discovery_index(
         Ok(Ok(index)) => index,
         Ok(Err(e)) => {
             let items = catalog(&items, &tools);
-            return Ok(degrade("embed_failed", e.to_string(), items, embedder, audit).await);
+            return Ok(degrade(
+                "embed_failed",
+                e.to_string(),
+                items,
+                embedder,
+                audit,
+                loaded_packs,
+            )
+            .await);
         }
         Err(_) => {
             let items = catalog(&items, &tools);
@@ -225,6 +252,7 @@ pub async fn build_discovery_index(
                 items,
                 embedder,
                 audit,
+                loaded_packs,
             )
             .await);
         }
@@ -242,6 +270,7 @@ pub async fn build_discovery_index(
             items,
             embedder,
             audit,
+            loaded_packs,
         )
         .await);
     }
@@ -253,7 +282,7 @@ pub async fn build_discovery_index(
         embedded = semantic.embedded_count(),
         "semantic discovery index built"
     );
-    Ok(Arc::new(semantic))
+    Ok(Arc::new(semantic.with_loaded_packs(loaded_packs)))
 }
 
 /// The full lexical catalog — the config's items plus the registry's tools,
@@ -280,6 +309,7 @@ async fn degrade(
     items: Vec<DiscoveryItem>,
     embedder: &Arc<dyn EmbeddingProvider>,
     audit: &Arc<dyn AuditSink>,
+    loaded_packs: Vec<Value>,
 ) -> Arc<dyn DiscoveryIndex> {
     tracing::warn!(
         backend = embedder.backend_name(),
@@ -299,7 +329,7 @@ async fn degrade(
             })),
         )
         .await;
-    Arc::new(InMemoryDiscoveryIndex::new(items))
+    Arc::new(InMemoryDiscoveryIndex::new(items).with_loaded_packs(loaded_packs))
 }
 
 /// SPEC §22 — convert a `scripts:` entry into a DiscoveryItem. Mirror of
