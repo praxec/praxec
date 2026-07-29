@@ -1332,6 +1332,39 @@ mod tests {
         );
     }
 
+    /// A3 — an agent's `goal:` templated against `$.workflow.input.<key>`
+    /// renders that seeded input value into the USER prompt actually
+    /// dispatched to the model runner, at invocation time.
+    #[tokio::test]
+    async fn goal_renders_from_workflow_input_at_invocation() {
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        let mut req = request(
+            json!({
+                "affinity": "coding",
+                "goal": "{{ $.workflow.input.instructions }}"
+            }),
+            bare_def(),
+        );
+        req.workflow.input = json!({ "instructions": "refactor the parser module" });
+
+        exec.execute(req).await.expect("success");
+
+        let user = runner.sessions()[0].user_prompt.clone();
+        assert_eq!(
+            user, "refactor the parser module",
+            "the rendered goal (USER prompt) must contain the seeded \
+             $.workflow.input.instructions value at invocation"
+        );
+    }
+
     /// WS1-B — a hop whose PAIRED effort the model can't do must fail fast
     /// (permanent `REASONING_EFFORT_UNSUPPORTED`) BEFORE the model runs — a
     /// config error is not a transient, so it neither escalates nor silently
