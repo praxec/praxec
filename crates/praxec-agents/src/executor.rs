@@ -721,9 +721,10 @@ impl Executor for AgentExecutor {
         })?;
 
         // User prompt = the templated goal, rendered against the blackboard.
-        // Entry gate (Plan A, shadow mode) — the tracked render also reports
-        // any `$.`-paths that stubbed. In shadow mode dispatch still proceeds
-        // regardless; enforcement (blocking on unresolved paths) is Task 4.
+        // Entry gate (Plan A) — the tracked render also reports any `$.`-paths
+        // that stubbed. Shadow mode (`enforce_input_grounding == false`, the
+        // default) proceeds regardless, only emitting the anomaly below.
+        // Enforced mode (Task 4) refuses before any model dispatch.
         let (user_prompt, unresolved) =
             praxec_core::templating::render_template_tracked(&cfg.goal, &request.workflow);
         if !unresolved.is_empty() {
@@ -733,12 +734,22 @@ impl Executor for AgentExecutor {
                     .with_payload(json!({
                         "transition": request.transition,
                         "unresolved": unresolved,
-                        "enforced": false,
+                        "enforced": cfg.enforce_input_grounding,
                     }));
                 if let Some(c) = &request.correlation_id {
                     event = event.with_correlation(c.clone());
                 }
                 let _ = sink.record(event).await;
+            }
+            if cfg.enforce_input_grounding {
+                return Err(permanent(
+                    AgentErrorCode::InputUnresolved,
+                    format!(
+                        "goal for transition {:?} of workflow '{}' has unresolved input path(s) {:?} \
+                         (rendered as `(…: unset)` stubs) — refusing to dispatch on non-truth",
+                        request.transition, request.workflow.id, unresolved
+                    ),
+                ));
             }
         }
 
@@ -1185,6 +1196,36 @@ mod tests {
                 .contains("$.context.missing")
         );
         assert_eq!(anomalies[0].payload["enforced"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn entry_gate_enforced_refuses_before_dispatch() {
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:claude-sonnet-4-6".into())),
+        );
+        let err = exec
+            .execute(request(
+                json!({
+                    "affinity": "coding", "goal": "do {{ $.context.missing }}",
+                    "enforce_input_grounding": true
+                }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("enforced gate must refuse");
+        assert!(format!("{err:?}").contains("AGENT_INPUT_UNRESOLVED"));
+        assert!(format!("{err:?}").contains("$.context.missing"));
+        // the runner was NEVER called — refusal is pre-dispatch
+        assert!(
+            runner.sessions().is_empty(),
+            "enforced refusal must happen before the runner is invoked"
+        );
     }
 
     #[tokio::test]

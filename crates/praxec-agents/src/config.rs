@@ -125,6 +125,12 @@ pub struct AgentExecutorConfig {
     /// Default `false`: a non-coding leaf is unaffected.
     #[serde(default)]
     pub requires_file_write: bool,
+    /// Entry gate (Plan A). When true, a step whose rendered goal contains an
+    /// unresolved `(x: unset)` template stub is REFUSED before dispatch
+    /// (AGENT_INPUT_UNRESOLVED). Default false = shadow mode (emit anomaly,
+    /// proceed). Flip per-step, or gateway-wide via the auto-drive composer.
+    #[serde(default)]
+    pub enforce_input_grounding: bool,
 }
 
 /// An agent's `affinity:` value — a closed [`ModelRef`] OR an open `activity:`
