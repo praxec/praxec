@@ -83,11 +83,18 @@ fn principal(roles: &[&str], permissions: &[&str]) -> Principal {
 fn every_guard_kind_token_round_trips_through_from_token_and_as_str() {
     let round_tripped: Vec<&str> = GuardKind::ALL
         .iter()
-        .map(|k| GuardKind::from_token(k.as_str()).expect("blessed token parses").as_str())
+        .map(|k| {
+            GuardKind::from_token(k.as_str())
+                .expect("blessed token parses")
+                .as_str()
+        })
         .collect();
     assert_eq!(
         round_tripped,
-        GuardKind::ALL.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+        GuardKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>(),
         "every GuardKind::ALL token must round-trip through from_token -> as_str"
     );
 }
@@ -111,10 +118,18 @@ async fn permission_guard_passes_when_the_principal_holds_the_required_permissio
     let inst = instance(json!({}));
     let guard = json!({ "kind": "permission", "permission": "workflow:submit" });
     let pass = evaluator
-        .evaluate(&guard, &inst, &json!({}), &principal(&[], &["workflow:submit"]))
+        .evaluate(
+            &guard,
+            &inst,
+            &json!({}),
+            &principal(&[], &["workflow:submit"]),
+        )
         .await
         .expect("permission guard evaluates without error");
-    assert!(pass, "a principal holding the required permission must pass");
+    assert!(
+        pass,
+        "a principal holding the required permission must pass"
+    );
 }
 
 /// Contract: a `permission` guard fails when the principal does NOT carry
@@ -125,10 +140,18 @@ async fn permission_guard_fails_when_the_principal_lacks_the_required_permission
     let inst = instance(json!({}));
     let guard = json!({ "kind": "permission", "permission": "workflow:submit" });
     let pass = evaluator
-        .evaluate(&guard, &inst, &json!({}), &principal(&[], &["some:other:permission"]))
+        .evaluate(
+            &guard,
+            &inst,
+            &json!({}),
+            &principal(&[], &["some:other:permission"]),
+        )
         .await
         .expect("permission guard evaluates without error");
-    assert!(!pass, "a principal lacking the required permission must not pass");
+    assert!(
+        !pass,
+        "a principal lacking the required permission must not pass"
+    );
 }
 
 /// Contract: a `role` guard passes when the principal carries the exact
@@ -153,7 +176,12 @@ async fn role_guard_fails_when_the_principal_lacks_the_required_role() {
     let inst = instance(json!({}));
     let guard = json!({ "kind": "role", "role": "human" });
     let pass = evaluator
-        .evaluate(&guard, &inst, &json!({}), &principal(&["service-account"], &[]))
+        .evaluate(
+            &guard,
+            &inst,
+            &json!({}),
+            &principal(&["service-account"], &[]),
+        )
         .await
         .expect("role guard evaluates without error");
     assert!(!pass, "a principal lacking the required role must not pass");
@@ -180,7 +208,10 @@ async fn all_of_fails_when_any_single_inner_guard_fails() {
         .evaluate(&guard, &inst, &json!({}), &principal(&["human"], &[]))
         .await
         .expect("all_of evaluates without error");
-    assert!(!pass, "one failing inner guard must fail the whole all_of composite");
+    assert!(
+        !pass,
+        "one failing inner guard must fail the whole all_of composite"
+    );
 }
 
 /// Contract: `all_of` passes when every inner guard passes.
@@ -239,7 +270,10 @@ async fn any_of_passes_when_a_later_sibling_passes_despite_an_earlier_siblings_e
         .evaluate(&guard, &inst, &json!({}), &principal(&["human"], &[]))
         .await
         .expect("any_of suppresses the earlier sibling's error once a later one passes");
-    assert!(pass, "a passing later sibling must satisfy any_of despite an earlier sibling's error");
+    assert!(
+        pass,
+        "a passing later sibling must satisfy any_of despite an earlier sibling's error"
+    );
 }
 
 /// Contract: `any_of` surfaces the first sibling's error when NO sibling
@@ -272,10 +306,18 @@ async fn not_guard_inverts_its_inner_guards_result() {
     let inst = instance(json!({}));
     let guard = json!({ "kind": "not", "guard": { "kind": "role", "role": "human" } });
     let pass = evaluator
-        .evaluate(&guard, &inst, &json!({}), &principal(&["service-account"], &[]))
+        .evaluate(
+            &guard,
+            &inst,
+            &json!({}),
+            &principal(&["service-account"], &[]),
+        )
         .await
         .expect("not guard evaluates without error");
-    assert!(pass, "not(role==human) must pass for a principal without the human role");
+    assert!(
+        pass,
+        "not(role==human) must pass for a principal without the human role"
+    );
 }
 
 /// Contract: a `not` guard with no `guard:` body errors rather than
@@ -315,7 +357,10 @@ async fn guidance_acknowledged_guard_fails_closed_with_no_ack_store_wired() {
         .evaluate(&guard, &inst, &json!({}), &Principal::anonymous())
         .await
         .expect("guidance_acknowledged evaluates without error even with no store");
-    assert!(!pass, "guidance_acknowledged with no ack store wired must fail closed");
+    assert!(
+        !pass,
+        "guidance_acknowledged with no ack store wired must fail closed"
+    );
 }
 
 /// Contract: a `script_acknowledged` guard cannot pass when no
@@ -335,7 +380,10 @@ async fn script_acknowledged_guard_fails_closed_with_no_script_ack_store_wired()
         .evaluate(&guard, &inst, &json!({}), &Principal::anonymous())
         .await
         .expect("script_acknowledged evaluates without error even with no store");
-    assert!(!pass, "script_acknowledged with no script-ack store wired must fail closed");
+    assert!(
+        !pass,
+        "script_acknowledged with no script-ack store wired must fail closed"
+    );
 }
 
 // ============================================================================
@@ -371,7 +419,10 @@ fn join_expression_treats_a_bare_path_as_a_truthiness_check() {
     let output = json!({ "ok": true });
     let result = evaluate_join_expression("$.ok", &output)
         .expect("a bare path join expression evaluates without error");
-    assert!(result, "a bare path resolving to a truthy value must evaluate true");
+    assert!(
+        result,
+        "a bare path resolving to a truthy value must evaluate true"
+    );
 }
 
 /// Contract: a bare `$.path` resolving to a falsy value (empty string)
@@ -381,5 +432,8 @@ fn join_expression_bare_path_resolving_falsy_evaluates_false() {
     let output = json!({ "summary": "" });
     let result = evaluate_join_expression("$.summary", &output)
         .expect("a bare path join expression evaluates without error");
-    assert!(!result, "a bare path resolving to an empty string must evaluate false");
+    assert!(
+        !result,
+        "a bare path resolving to an empty string must evaluate false"
+    );
 }
