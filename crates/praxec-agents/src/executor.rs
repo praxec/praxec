@@ -728,14 +728,16 @@ impl Executor for AgentExecutor {
             praxec_core::templating::render_template_tracked(&cfg.goal, &request.workflow);
         if !unresolved.is_empty() {
             if let Some(sink) = &self.audit {
-                let event = AuditEvent::new("agent.input_unresolved")
-                    .with_correlation(request.correlation_id.clone().unwrap_or_default())
+                let mut event = AuditEvent::new("agent.input_unresolved")
+                    .with_workflow(request.workflow.id.clone())
                     .with_payload(json!({
-                        "workflow_id": request.workflow.id,
                         "transition": request.transition,
                         "unresolved": unresolved,
                         "enforced": false,
                     }));
+                if let Some(c) = &request.correlation_id {
+                    event = event.with_correlation(c.clone());
+                }
                 let _ = sink.record(event).await;
             }
         }
