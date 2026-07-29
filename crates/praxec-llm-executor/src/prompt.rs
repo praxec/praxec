@@ -81,7 +81,7 @@ pub fn render_template(template: &str, request: &ExecuteRequest) -> String {
 }
 
 /// Resolve one `{{ … }}` token against the request. Mirrors the
-/// stub-on-miss semantics of `core::templating::resolve_template_path`
+/// stub-on-miss semantics of `core::templating::resolve_template_path_checked`
 /// so audit replay output stays comparable across goal/guidance
 /// templates and LLM prompt templates.
 fn resolve_token(raw: &str, request: &ExecuteRequest) -> String {

@@ -30,19 +30,22 @@ pub fn render_template(template: &str, instance: &WorkflowInstance) -> String {
     render_template_tracked(template, instance).0
 }
 
-/// `Ok(value)` when the path resolved; `Err(stub)` carries the `(last: unset)`
-/// string the infallible renderer emits. Single source of truth for both.
-fn resolve_or_stub(path: &str, instance: &WorkflowInstance) -> Result<String, String> {
-    let s = resolve_template_path(path, instance);
-    // A resolved value can legitimately look like anything EXCEPT the reserved
-    // stub shape `(<segment>: unset)`; that shape is only produced on the
-    // unresolved branches of resolve_template_path.
-    let last = path.rsplit('.').next().unwrap_or(path);
-    if s == format!("({last}: unset)") {
-        Err(s)
-    } else {
-        Ok(s)
-    }
+/// Structural resolution outcome for a single `$.`-path token.
+///
+/// This is the single source of truth for "did this path resolve?" — each
+/// unresolved branch of `resolve_template_path_checked` hands back the exact
+/// stub string it produces alongside the `Unresolved` tag, so no caller ever
+/// needs to re-derive or string-match a stub shape to find out. (The former
+/// approach — re-deriving the expected stub as `path.rsplit('.').next()` and
+/// comparing it against the produced string — could disagree with what the
+/// resolver actually produced: the leased-pool branch stubs on the whole
+/// stripped suffix, e.g. `(foo.bar: unset)` for `$.run.leased.foo.bar`, not
+/// just the last segment. It could also misclassify a legitimately-resolved
+/// value that happens to look like a stub, e.g. a context value equal to the
+/// literal `(foo: unset)`.)
+enum Resolution {
+    Resolved(String),
+    Unresolved { stub: String, path: String },
 }
 
 /// Render, and collect the `$.`-paths that stubbed. Element 0 is byte-identical
@@ -71,13 +74,12 @@ pub fn render_template_tracked(
             // Empty placeholder `{{}}` — not a valid token; emit verbatim.
             output.push_str("{{}}");
         } else {
-            match resolve_or_stub(inner, instance) {
-                Ok(v) => output.push_str(&v),
-                Err(stub) => {
+            match resolve_template_path_checked(inner, instance) {
+                Resolution::Resolved(v) => output.push_str(&v),
+                Resolution::Unresolved { stub, path } => {
                     output.push_str(&stub);
-                    let p = inner.to_string();
-                    if !unresolved.contains(&p) {
-                        unresolved.push(p);
+                    if !unresolved.contains(&path) {
+                        unresolved.push(path);
                     }
                 }
             }
@@ -93,34 +95,41 @@ pub fn render_template_tracked(
 }
 
 /// Resolve a single trimmed path token (e.g. `$.context.someKey`) against
-/// the instance. Returns the string representation of the matched JSON value,
-/// or a `(lastSegment: unset)` stub when the path cannot be resolved.
-pub(crate) fn resolve_template_path(path: &str, instance: &WorkflowInstance) -> String {
+/// the instance, structurally. `Resolved` carries the string representation
+/// of the matched JSON value. `Unresolved` carries the exact stub string
+/// (`(lastSegment: unset)`, or the leased-pool variant below) that
+/// `render_template` embeds verbatim, plus the path itself — so
+/// `render_template_tracked` never has to re-derive either.
+fn resolve_template_path_checked(path: &str, instance: &WorkflowInstance) -> Resolution {
+    use Resolution::{Resolved, Unresolved};
+
     // Scalar instance metadata — no further traversal needed.
     if path == "$.workflow.id" {
-        return instance.id.clone();
+        return Resolved(instance.id.clone());
     }
     if path == "$.workflow.state" {
-        return instance.state.clone();
+        return Resolved(instance.state.clone());
     }
     if path == "$.workflow.version" {
-        return instance.definition_version.clone();
+        return Resolved(instance.definition_version.clone());
     }
     // Run-ambient root (v0.0.21) — always resolves, because `run_env` is
     // mandatory on every instance. This is what a coding leaf's
     // `file:{{ $.run.repo_root }}` connection renders against; it replaces the
     // former hand-threaded `$.workflow.input.repo_path` convention.
     if path == "$.run.repo_root" {
-        return instance.run_env.repo_root.as_str().to_string();
+        return Resolved(instance.run_env.repo_root.as_str().to_string());
     }
     // Run-scoped evidence dir — engine-created, so a probe/screenshot path
     // assembled from it always has an existing parent.
     if path == "$.run.artifacts_dir" {
-        return instance
-            .run_env
-            .artifacts_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "(artifacts_dir: unset)".to_string());
+        return match instance.run_env.artifacts_dir() {
+            Some(p) => Resolved(p.to_string_lossy().into_owned()),
+            None => Unresolved {
+                stub: "(artifacts_dir: unset)".to_string(),
+                path: path.to_string(),
+            },
+        };
     }
     // Run-scoped exclusive-pool lease: `$.run.leased.<pool>` → the connection
     // leased for that pool this run. This is what a browser-touching state's
@@ -128,10 +137,17 @@ pub(crate) fn resolve_template_path(path: &str, instance: &WorkflowInstance) -> 
     // did not declare the pool, or the lease was not acquired) stubs like any
     // other unresolved token, and A0's FILE_TOOL_ROOT_UNRESOLVED / the empty
     // toolbelt guard catches a leaf dispatched with an unresolved tool.
+    //
+    // Note the stub is built from the WHOLE stripped suffix (`pool`, which may
+    // itself be dotted, e.g. `foo.bar`), not just the last dot segment — this
+    // is exactly the shape a naive last-segment re-derivation would miss.
     if let Some(pool) = path.strip_prefix("$.run.leased.") {
         return match instance.run_env.leased_member(pool) {
-            Some(member) => member.to_string(),
-            None => format!("({pool}: unset)"),
+            Some(member) => Resolved(member.to_string()),
+            None => Unresolved {
+                stub: format!("({pool}: unset)"),
+                path: path.to_string(),
+            },
         };
     }
 
@@ -147,24 +163,33 @@ pub(crate) fn resolve_template_path(path: &str, instance: &WorkflowInstance) -> 
             Some(prefs) => (prefs, t),
             None => {
                 let last = path.rsplit('.').next().unwrap_or(path);
-                return format!("({last}: unset)");
+                return Unresolved {
+                    stub: format!("({last}: unset)"),
+                    path: path.to_string(),
+                };
             }
         }
     } else {
         // Unrecognised prefix → stub using last segment of the path.
         let last = path.rsplit('.').next().unwrap_or(path);
-        return format!("({last}: unset)");
+        return Unresolved {
+            stub: format!("({last}: unset)"),
+            path: path.to_string(),
+        };
     };
 
     let pointer = crate::guards::path_to_pointer(tail);
     match root.pointer(&pointer) {
-        Some(Value::String(s)) => s.clone(),
-        Some(Value::Null) => "(null)".to_string(),
-        Some(v) => v.to_string(),
+        Some(Value::String(s)) => Resolved(s.clone()),
+        Some(Value::Null) => Resolved("(null)".to_string()),
+        Some(v) => Resolved(v.to_string()),
         None => {
             // Last dot-separated segment as the stub label.
             let last = tail.rsplit('.').next().unwrap_or(tail);
-            format!("({last}: unset)")
+            Unresolved {
+                stub: format!("({last}: unset)"),
+                path: path.to_string(),
+            }
         }
     }
 }
@@ -277,5 +302,38 @@ mod tests {
         // a fully-resolved template reports nothing
         let (_r, none) = render_template_tracked("A={{ $.context.present }}", &inst);
         assert!(none.is_empty());
+    }
+
+    /// Finding 1 (false negative): a nested/dotted leased-pool path stubs using
+    /// the WHOLE stripped suffix (`foo.bar`), not just its last segment
+    /// (`bar`). A stub-detector that re-derives the expected label as
+    /// `path.rsplit('.').next()` would compute `(bar: unset)`, fail to match
+    /// the actual `(foo.bar: unset)` stub, and silently drop the path from
+    /// `unresolved` — this test fails against that old detection mechanism.
+    #[test]
+    fn tracked_render_reports_a_nested_leased_pool_as_unresolved() {
+        let inst = instance();
+        let tmpl = "{{ $.run.leased.foo.bar }}";
+        let (rendered, unresolved) = render_template_tracked(tmpl, &inst);
+        assert_eq!(rendered, "(foo.bar: unset)");
+        assert_eq!(rendered, render_template(tmpl, &inst));
+        assert_eq!(unresolved, vec!["$.run.leased.foo.bar".to_string()]);
+    }
+
+    /// Finding 2 (false positive): a context value that legitimately resolves
+    /// to the exact literal `(foo: unset)` must NOT be reported as unresolved
+    /// — the old detector classified "does this look like a stub?" by string
+    /// equality against a re-derived label, so a real value in that shape was
+    /// indistinguishable from an actual miss.
+    #[test]
+    fn tracked_render_does_not_misclassify_a_resolved_value_shaped_like_a_stub() {
+        let inst = crate::model::WorkflowInstance::for_test_with_context(
+            serde_json::json!({ "foo": "(foo: unset)" }),
+        );
+        let tmpl = "{{ $.context.foo }}";
+        let (rendered, unresolved) = render_template_tracked(tmpl, &inst);
+        assert_eq!(rendered, "(foo: unset)");
+        assert_eq!(rendered, render_template(tmpl, &inst));
+        assert!(unresolved.is_empty());
     }
 }
