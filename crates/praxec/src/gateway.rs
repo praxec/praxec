@@ -1573,6 +1573,10 @@ async fn record_pack_provenance(config: &Value, audit: &Arc<dyn praxec_core::aud
         .await;
 }
 
+// A reload orchestrator that coordinates the full hot-swappable component set
+// plus the audit sink (to emit pack.provenance on the success arm); its args
+// are cohesive collaborators, not a smell worth a struct-wrapping refactor.
+#[allow(clippy::too_many_arguments)]
 async fn reload_gated(
     swappable_defs: &Arc<praxec_core::hot_reload::SwappableDefinitionStore>,
     swappable_executors: &Arc<praxec_core::hot_reload::SwappableExecutorRegistry>,
