@@ -94,16 +94,30 @@ pub fn clone_or_update(uri: &str, gitref: &str, dest: &Path) -> anyhow::Result<P
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        run_git(&["init", "--quiet", &dest.display().to_string()], None)
-            .map_err(|e| anyhow::anyhow!("REPO_CLONE_FAILED: initializing '{uri}': {e}"))?;
-        run_git(&["remote", "add", "origin", &url], Some(dest)).map_err(|e| {
-            anyhow::anyhow!("REPO_CLONE_FAILED: configuring remote for '{uri}': {e}")
-        })?;
-        run_git(&["fetch", "origin", gitref], Some(dest))
-            .map_err(|e| anyhow::anyhow!("REPO_CLONE_FAILED: cloning '{uri}' ({gitref}): {e}"))?;
-        run_git(&["reset", "--hard", "FETCH_HEAD"], Some(dest)).map_err(|e| {
-            anyhow::anyhow!("REPO_CLONE_FAILED: checking out '{uri}' ({gitref}): {e}")
-        })?;
+        // `git init` creates `dest` BEFORE `fetch`/`reset` run, so a failure at
+        // any later step (e.g. an unreachable remote) would otherwise leave a
+        // partial cache behind. Do the cold clone all-or-nothing: on ANY error,
+        // remove the partial `dest` before propagating, so a failed clone leaves
+        // nothing (a retry does a clean cold clone; callers can rely on "no
+        // partial cache on failure"). The warm-update path above is untouched.
+        let cold_clone = (|| -> anyhow::Result<()> {
+            run_git(&["init", "--quiet", &dest.display().to_string()], None)
+                .map_err(|e| anyhow::anyhow!("REPO_CLONE_FAILED: initializing '{uri}': {e}"))?;
+            run_git(&["remote", "add", "origin", &url], Some(dest)).map_err(|e| {
+                anyhow::anyhow!("REPO_CLONE_FAILED: configuring remote for '{uri}': {e}")
+            })?;
+            run_git(&["fetch", "origin", gitref], Some(dest)).map_err(|e| {
+                anyhow::anyhow!("REPO_CLONE_FAILED: cloning '{uri}' ({gitref}): {e}")
+            })?;
+            run_git(&["reset", "--hard", "FETCH_HEAD"], Some(dest)).map_err(|e| {
+                anyhow::anyhow!("REPO_CLONE_FAILED: checking out '{uri}' ({gitref}): {e}")
+            })?;
+            Ok(())
+        })();
+        if let Err(e) = cold_clone {
+            let _ = std::fs::remove_dir_all(dest);
+            return Err(e);
+        }
     }
     Ok(dest.to_path_buf())
 }
