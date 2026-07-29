@@ -107,38 +107,48 @@ block: verify = "test exists and fails for the intended reason"; GREEN block: ve
 flips red→green, nothing regresses"; the inter-block handoff `a proven-failing test` makes
 red-before-green a contract). **This is a shape, not the atom.**
 
-## 5. L3 — the `kind: change` interpreter (a narrow, A/B-gated probe)
+## 5. L3 — a deterministic apply-strategy TOOL (a narrow, A/B-gated probe), NOT an engine `kind`
 
-A separate bet: *if the system does the writing, narrated-write becomes structurally impossible.*
-Plausible, but **unproven against the shipped `kind: agent` + forcing function**, and §6 concedes
-constrained may be *worse* for some changes. So it is built as a **probe**, not a co-equal
-deliverable. A `ChangeExecutor` (`kind: change`, peer to `kind: agent`) is a deterministic
-interpreter of `Vec<ImplementationStrategy>`, plugged into the existing `promotion.rs::run_trusted_
-agent` `edit: FnOnce(PathBuf)->Fut` seam. The model is invoked at exactly one site per generative
-slot, returns a typed value only (no fs tools, no path, no "done"), validated before the system
-applies it.
+A separate bet: *if a deterministic executor does the writing, narrated-write becomes structurally
+impossible* — the model emits a strategy VALUE and something else applies it. Per praxec's
+host-agnostic-primitives principle, that executor is **a separate MCP/CLI tool, not a hardcoded
+`kind: change` in the engine.** Keeping it out of the spine keeps the bet swappable and killable
+without engine churn.
 
-**Phase-1 probe scope (build only this of L3):**
-- `DeleteFile`, `MoveFile` — **zero model**, pure-upside deterministic conformance.
-- `CreateFile` — one CONTENT slot; path is a deterministic field checked against project convention.
-- `ModifyFile` — **lift `edit_file`'s existing `0/1/n` unique-match** to a *pre-generation*
-  precondition (fail-closed on `≠1`; feed the miss into the block re-plan); model returns the new
-  span text only.
+**The contract.** The `plan → execute` micro-workflow (§4, *authored in the pack*) produces a
+`Vec<ImplementationStrategy>` — some variants carry model-generated content, some are fully
+deterministic. The workflow's execute step calls the **apply-strategy tool** with that
+(partly-generated) strategy; the tool deterministically applies each op, runs each op's conformance
+check + effect-scope containment, and returns a typed verdict. The model **never touches the
+filesystem** — it emits a strategy value; the tool applies; conformance verifies. Narrated-write is
+impossible with no hardcoded engine executor.
 
-**Everything above is HARD-GATED on the Phase-1 A/B** (§6): `UpdateReferences` (index/LSP — the
-single largest, least-proven build), `StructuredEdit`, `Split`/`Merge`, gated `Codemod`/`Migration`,
-and the full recognizer type-system. Until the A/B shows constrained beats free-form on
-success-rate × cost, ripples use `kind: agent` + slice-compile.
+**Deterministic vs generative variants (the slot ladder, as data — a first-class property):**
+- `DeleteFile`, `MoveFile` — carry no content; the tool just executes them (**zero model**).
+- `CreateFile` — carries model-generated content the tool writes at a **convention-checked path**.
+- `ModifyFile` — carries a model-generated span; the tool lifts `edit_file`'s `0/1/n` unique-match as
+  a **pre-apply** check (fail-closed on `≠1`; the miss feeds the block re-plan).
 
-**Reuse / relabel:** reuse promotion/locks/chain-walk/cost-gate/effort (the `SlotGenerator` runs
-single-shot completions through them; escalation is per-slot with a **structured diagnostic** bound
-into the next fill and delta-gated, so the #65 disease can't recur per-slot). The forcing function
-is **not removed** — `kind: agent` keeps it as the escape hatch *and* the A/B baseline. "Moot"
-means "never fires for interpreter-driven ops," not "deleted." No cleanup is claimed.
+**Phase-1 probe scope:** the tool supports only `Delete`/`Move`/`Create`/`Modify`.
+`UpdateReferences` (index/LSP — the single largest, least-proven build), `StructuredEdit`,
+`Split`/`Merge`, gated `Codemod`/`Migration`, and the full recognizer type-system are **HARD-GATED
+on the A/B**; until it shows constrained beats free-form on success-rate × cost, ripples use
+`kind: agent` + slice-compile.
 
-**Prerequisite (grounded spine gap):** `promotion.rs` on `Conflict` leaves the live tree with
-`git apply --3way` markers and exits non-zero with no reset. **Fix this (apply-to-staging-ref or
-reset-on-conflict) BEFORE wiring `kind: change` on top** — the interpreter inherits the rollback gap.
+**Execution substrate.** The tool applies in the run's **worktree** (already the sandbox); the
+engine's existing commit-slice integrates the verified slice. This sidesteps the `promotion.rs`
+conflict-leaves-dirty-tree gap for the tool path (still worth fixing for the `kind: agent` path).
+Model generation still runs through the engine's chain-walk/cost-gate/effort (per-slot, with a
+**structured diagnostic** bound into the next fill and delta-gated, so the #65 disease can't recur
+per-slot). The forcing function is **not removed** — `kind: agent` keeps it as the free-form escape
+hatch *and* the A/B baseline.
+
+### 5.1 What lives where (the engine stays lean)
+| Layer | Home | Contents |
+|---|---|---|
+| Generic enforcement | **core engine (mcp-flowgate)** | the L1 gates (entry/continuation/exit) + admissibility/validators + existing worktree/commit machinery. Applies to ALL workflows; nothing change-specific enters the spine. |
+| Workflow shapes | **packs (cognitive-architectures)** | the `plan→execute→verify` micro-workflows, the strategy-consuming change flows, TDD/refactor/etc. molecules — authored, not hardcoded. |
+| Deterministic apply | **a separate MCP/CLI tool** | the `ImplementationStrategy` vocabulary + per-op conformance + effect-scope. Swappable, A/B-gated, killable. |
 
 ## 6. Constrained vs unconstrained — TRIZ, with a runtime fall-through
 
@@ -198,8 +208,10 @@ silent-scope-escape is machine-checkable post-hoc via `observed_files ⊆ ∪eff
   label**.
 - Prerequisite fix: `promotion.rs` Conflict-leaves-dirty-tree.
 
-**PROBE (Phase 1, behind the A/B):** `kind: change` with `Delete`/`Move`/`Create`/`Modify` only;
-dogfood `flow.refactor.god-file` against the free-form baseline; auto-fall-through on no-progress.
+**PROBE (Phase 1, behind the A/B — pack + tool, NOT engine):** a deterministic **apply-strategy
+MCP/CLI tool** (`Delete`/`Move`/`Create`/`Modify` only) + a **change micro-workflow in
+cognitive-architectures** that calls it; dogfood `flow.refactor.god-file` against the free-form
+`kind: agent` baseline; runtime auto-fall-through to `kind: agent` on no-progress.
 
 **DEMOTE / RELABEL:** "THE core building block" → "the mutate-verify shape (one of five)"; the
 handoff type-system → consumer-validation on the consumed slot (defer named-type/recognizer/hash
@@ -240,8 +252,8 @@ workflows), grounded in `promotion.rs`, `file_tools.rs`, `executor.rs`, `rig_run
 | Findings/decision artifact recognizer | Useful | Adapted | Ship w/ L1 |
 | Micro-waterfall as "THE core block" | **Unjustified (supremacy)** | Adapted | **Demote** → one of five shapes |
 | Handoff type-system (named-type/recognizer/hash) | Speculative | Speculative | **Defer** (collapse load-bearing half into entry gate) |
-| `kind: change` interpreter | **Useful, not Essential** | Adapted (seam Proven) | **Probe**, A/B-gated |
-| File ops Delete/Move/Create/Modify | Useful | Proven mechanism | Build (probe) |
+| Deterministic apply as an engine `kind: change` | **Rejected as an engine kind** | Adapted | **Move out of engine** → a separate MCP/CLI tool |
+| Apply-strategy tool (MCP/CLI) w/ Delete/Move/Create/Modify | Useful, not Essential | Proven mechanism | **Probe**, A/B-gated, pack+tool |
 | `UpdateReferences` (index/LSP) | **Speculative — largest build** | Speculative | **Defer hardest** |
 | StructuredEdit / Split / Merge / Codemod / Migration | Speculative | Adapted | Hard-gate on A/B |
 | ExternalEffect as an L3 op-family | **Mis-placed** | Speculative | **Relocate to L1 rule** |
