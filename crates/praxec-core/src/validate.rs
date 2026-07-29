@@ -2357,6 +2357,16 @@ fn check_skills_refs(
         }
         for entry in arr {
             let Some(subject) = entry.as_str() else {
+                // A `skills:` entry must be a JSON string subject. A
+                // non-string entry (number, bool, array, object) is a
+                // config bug — silently skipping it would hide a broken
+                // reference as if no skill were declared at this scope.
+                out.push(Diagnostic::Error(format!(
+                    "workflow '{id}': {scope} contains a non-string skills entry \
+                     '{entry}' — every `skills:` entry must be a string subject \
+                     naming a fragment declared in the top-level `skills:` \
+                     library (SPEC §11)"
+                )));
                 continue;
             };
             // Direct match first (bare subject, OR already-prefixed).

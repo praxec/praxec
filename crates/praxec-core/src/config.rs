@@ -3068,6 +3068,13 @@ fn merge_declared_repos(
         // No repos declared — strip an empty `overrides:` (it's meaningless
         // without any repo-provided ids to shadow). Host-level staged
         // connections (`px connections add` / `grant`) still get the grant gate.
+        //
+        // V22 — every `kind: workflow` definitionId reference must resolve
+        // even in a host-only config (no `repos:` block). A definitionId is
+        // a static registry lookup with no legitimate runtime-resolution
+        // path, so this must run unconditionally, not only on the
+        // repos-present branch below.
+        validate_workflow_refs_resolve(&host)?;
         let staged_ungranted = apply_staged_connection_grants(&mut host)?;
         stamp_ungranted_connections(&mut host, staged_ungranted);
         return Ok(host);
