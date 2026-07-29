@@ -91,8 +91,14 @@ visible in your config (and don't want to remember to `git pull`), use
 
 See [`examples/remote-packs/gateway.yaml`](../examples/remote-packs/gateway.yaml)
 for a runnable-shape config with both a moving branch ref and a tag pin.
-That file isn't swept by CI's example-validation test on purpose — it points
-at real network remotes, and that test suite must stay offline.
+That file's two `uri:`s point at real network remotes, but it IS fully
+validated by CI, like every other example — CI mocks the git *transport*
+only (local bare repos seeded from minimal pack fixtures under
+`examples/remote-packs/_mock/`, redirected in via git `url.insteadOf`; see
+`scripts/mock-remote-packs-git.sh` and
+`crates/praxec-core/tests/remote_example_validates.rs` for the hermetic
+Rust-test equivalent), so the example itself stays realistic and
+unmodified while still getting the full offline `praxec check` sweep.
 
 To see the whole path work end-to-end with **no network**, point `uri:` at
 a local repo over `file://` — this is exactly how `repo_git.rs`'s own tests

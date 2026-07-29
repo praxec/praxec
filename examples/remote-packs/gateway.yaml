@@ -14,11 +14,18 @@
 # whatever), it works here identically — praxec never stores or manages git
 # credentials. A private org pack repo just works with no praxec-side setup.
 #
-# This file isn't wired into the `every_top_level_yaml_in_examples resolves`
-# CI sweep (crates/praxec-core/tests/examples_validate.rs) on purpose: it
-# points at real network remotes, and that test must stay offline. See
-# docs/remote-pack-sourcing.md for an offline `file://` walkthrough you can
-# actually run with `praxec check`.
+# This file's two `uri:`s point at real network remotes, but it IS fully
+# validated by CI (the "schema check on examples" step in
+# .github/workflows/ci.yml) — just like every other example. Rather than
+# skip it, CI mocks the git *transport* only: it builds local bare repos
+# from minimal-but-valid pack fixtures (examples/remote-packs/_mock/) and
+# redirects git's resolution of these exact URLs to them
+# (scripts/mock-remote-packs-git.sh), so `praxec check` here runs fully
+# offline against this file, unmodified. The same resolution is proven
+# hermetically (no global git config) in
+# crates/praxec-core/tests/remote_example_validates.rs. See
+# docs/remote-pack-sourcing.md for a `file://` walkthrough you can run by
+# hand.
 
 version: "1.0.0"
 

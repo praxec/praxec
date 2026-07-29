@@ -104,14 +104,21 @@ jobs:
             - name: cargo build --release (for dogfood)
               run: cargo build --release -p praxec
 
+            - name: mock remote-packs git remotes (offline)
+              # examples/remote-packs/gateway.yaml sources two packs via a
+              # network `uri:` (real github.com URLs). Skipping validation of
+              # that file would leave its OTHER potential errors (bad workflow
+              # refs, schema drift, broken guards) unchecked — so instead we
+              # mock the git *transport* only: build local bare repos seeded
+              # with minimal-but-valid pack fixtures, then redirect git's
+              # resolution of the example's exact URLs to those bare repos via
+              # `url.insteadOf`. The example file itself is untouched and
+              # still gets the FULL `praxec check` sweep below, offline.
+              run: bash scripts/mock-remote-packs-git.sh
+
             - name: schema check on examples
               run: |
                   for f in examples/*.yaml examples/*/gateway.yaml; do
-                    # remote-packs example sources packs via a network `uri:` and
-                    # cannot be resolved offline in CI (by design) — skip it here.
-                    case "$f" in
-                      examples/remote-packs/*) echo "--- skipping $f (remote uri: needs network)"; continue;;
-                    esac
                     echo "--- checking $f"
                     ./target/release/praxec check --config "$f"
                   done

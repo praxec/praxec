@@ -1,0 +1,10 @@
+schema: praxec.repo/v1
+name: cognitive-architectures-mock
+namespace: cognitive
+version: 0.0.1
+description: |
+  Offline mock of the real github.com/praxec/cognitive-architectures pack,
+  used to hermetically validate examples/remote-packs/gateway.yaml (see
+  scripts/mock-remote-packs-git.sh + docs/remote-pack-sourcing.md). Minimal
+  but genuinely valid — a manifest plus one trivial terminal workflow — just
+  enough for `praxec check` to resolve the `uri:`/`ref: main` pack.
