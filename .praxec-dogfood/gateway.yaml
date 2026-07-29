@@ -1,0 +1,52 @@
+# .praxec-dogfood/gateway.yaml
+#
+# Dogfood harness for cognitive/flow.behavioral-coverage against THIS repo
+# (mcp-flowgate, on the dogfood/behavioral-coverage worktree/branch). Loads
+# the cognitive-architectures pack from the feat/behavioral-coverage-flow
+# worktree (the flow + its new caps/scripts are committed there but not yet
+# merged to dev); the writable repo is THIS worktree, so $.run.repo_root
+# resolves here and every authored test lands in THIS checkout.
+#
+# Drive headless:
+#   set -a; . ~/.config/praxec/providers.env; set +a
+#   praxec orchestrate --config .praxec-dogfood/gateway.yaml \
+#     --definition cognitive/flow.behavioral-coverage \
+#     --model openrouter:z-ai/glm-5.2 \
+#     --input '{"coverage_scope": "crates/praxec-core/src/guards.rs",
+#               "completeness_cap": 1,
+#               "report_path": ".praxec-dogfood/coverage-report.guards.yaml"}'
+
+version: "1.0.0"
+
+gateway:
+  principal: { subject: operator, roles: [human] }
+  models_yaml: /home/mc/.config/praxec/models.yaml
+
+praxec:
+  embeddings:
+    enabled: false
+  _writableRepos:
+    - root: "."
+      push: false
+  agents:
+    auto_drive: true
+    auto_drive_affinity: reasoning
+    auto_drive_max_seconds: 600
+    # Gateway-wide default: read reach over the target repo (enumeration /
+    # diagnosis / build-loop leaves all need it). The build-loop's own
+    # per-state tools (if any) would replace this per-state; it declares
+    # none, so it inherits this set.
+    auto_drive_tools:
+      - "file:{{ $.run.repo_root }}"
+
+audit:
+  sink: file
+  path: /home/mc/working/mcp-flowgate-bcov/.praxec-dogfood/audit-logs
+  rotation: daily
+
+store:
+  kind: sqlite
+  path: /home/mc/working/mcp-flowgate-bcov/.praxec-dogfood/praxec.db
+
+repos:
+  - path: /home/mc/working/cog-arch-bcov
