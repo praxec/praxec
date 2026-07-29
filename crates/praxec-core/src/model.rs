@@ -87,6 +87,30 @@ impl WorkflowInstance {
         }
         e
     }
+
+    /// Test-only constructor: a minimal instance with the given `context`
+    /// and everything else stubbed (empty `input`, placeholder id/state/
+    /// version, `RunEnv::for_test()`). Used by templating tests that only
+    /// care about `$.context.*` resolution.
+    #[cfg(test)]
+    pub fn for_test_with_context(context: serde_json::Value) -> Self {
+        WorkflowInstance {
+            id: "wf".into(),
+            definition_id: "d".into(),
+            definition_version: "1".into(),
+            definition: serde_json::json!({}),
+            state: "s".into(),
+            version: 1,
+            input: serde_json::json!({}),
+            context,
+            started_at: Utc::now(),
+            run_env: RunEnv::for_test(),
+            cancelled_at: None,
+            cancelled_reason: None,
+            depth: 0,
+            parent: None,
+        }
+    }
 }
 
 /// SPEC §26/§29 — read a gateway-maintained synthetic counter slot

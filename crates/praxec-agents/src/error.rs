@@ -115,6 +115,12 @@ pub enum AgentErrorCode {
     /// manual "swap the lead coder" — same class as `NoResult`/`NotConverging`),
     /// with a distinct wire code purely for honest observability + accounting.
     NoFileWrites,
+    /// Entry gate — a `required` input rendered to an unresolved `(x: unset)`
+    /// stub, so the agent would have been dispatched on non-truth (the
+    /// surface-name-as-path class). Classifies `ContentOther` (an author/data
+    /// error that must surface to a human, NOT a model-capability failure — do
+    /// not chain-escalate it to another model).
+    InputUnresolved,
 }
 
 impl AgentErrorCode {
@@ -145,6 +151,7 @@ impl AgentErrorCode {
             AgentErrorCode::NotConverging => "AGENT_NOT_CONVERGING",
             AgentErrorCode::NoFileWrites => "AGENT_NO_FILE_WRITES",
             AgentErrorCode::ChainExhausted => "AGENT_CHAIN_EXHAUSTED",
+            AgentErrorCode::InputUnresolved => "AGENT_INPUT_UNRESOLVED",
         }
     }
 }
@@ -230,6 +237,14 @@ mod tests {
         assert_eq!(
             AgentErrorCode::NoFileWrites.as_wire_code(),
             "AGENT_NO_FILE_WRITES"
+        );
+    }
+
+    #[test]
+    fn input_unresolved_wire_code_is_stable() {
+        assert_eq!(
+            AgentErrorCode::InputUnresolved.as_wire_code(),
+            "AGENT_INPUT_UNRESOLVED"
         );
     }
 

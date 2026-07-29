@@ -386,4 +386,20 @@ mod tests {
             );
         }
     }
+
+    /// P12 R2 — AGENT_INPUT_UNRESOLVED is a data/authoring error (an unresolved
+    /// binding at the entry gate, not a model-capability gap). Must surface to
+    /// the operator rather than escalate to another model — a different model
+    /// cannot fix an unresolved input binding.
+    #[test]
+    fn input_unresolved_surfaces_not_escalates() {
+        let err =
+            ExecutorError::Permanent("AGENT_INPUT_UNRESOLVED: goal has unresolved path".into());
+        let class = FailureClass::from_executor_error(&err);
+        assert_eq!(class, FailureClass::ContentOther);
+        assert!(
+            !class.is_infrastructure(),
+            "must not chain-escalate an unresolved input"
+        );
+    }
 }

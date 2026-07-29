@@ -721,7 +721,37 @@ impl Executor for AgentExecutor {
         })?;
 
         // User prompt = the templated goal, rendered against the blackboard.
-        let user_prompt = render_template(&cfg.goal, &request.workflow);
+        // Entry gate (Plan A) — the tracked render also reports any `$.`-paths
+        // that stubbed. Shadow mode (`enforce_input_grounding == false`, the
+        // default) proceeds regardless, only emitting the anomaly below.
+        // Enforced mode (Task 4) refuses before any model dispatch.
+        let (user_prompt, unresolved) =
+            praxec_core::templating::render_template_tracked(&cfg.goal, &request.workflow);
+        if !unresolved.is_empty() {
+            if let Some(sink) = &self.audit {
+                let mut event = AuditEvent::new("agent.input_unresolved")
+                    .with_workflow(request.workflow.id.clone())
+                    .with_payload(json!({
+                        "transition": request.transition,
+                        "unresolved": unresolved,
+                        "enforced": cfg.enforce_input_grounding,
+                    }));
+                if let Some(c) = &request.correlation_id {
+                    event = event.with_correlation(c.clone());
+                }
+                let _ = sink.record(event).await;
+            }
+            if cfg.enforce_input_grounding {
+                return Err(permanent(
+                    AgentErrorCode::InputUnresolved,
+                    format!(
+                        "goal for transition {:?} of workflow '{}' has unresolved input path(s) {:?} \
+                         (rendered as `(…: unset)` stubs) — refusing to dispatch on non-truth",
+                        request.transition, request.workflow.id, unresolved
+                    ),
+                ));
+            }
+        }
 
         // Resolve the full ordered model chain (cheapest-effective first). Each
         // hop carries its model-paired reasoning effort (WS1-B).
@@ -1130,6 +1160,72 @@ mod tests {
             .expect("success");
         assert_eq!(res.output, json!({ "verdict": "pass" }));
         assert_eq!(res.evidence.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn entry_gate_shadow_emits_anomaly_but_does_not_block() {
+        let audit = praxec_core::audit::MemoryAuditSink::new();
+        let exec = AgentExecutor::new(
+            Arc::new(MockSessionRunner::completed(AgentResult {
+                status: AgentStatus::Success,
+                output: json!({ "verdict": "pass" }),
+                internal_monologue: None,
+            })),
+            Arc::new(MockModelResolver("anthropic:claude-sonnet-4-6".into())),
+        )
+        .with_audit_sink(Arc::new(audit.clone()));
+        // goal references a context key that is NOT present → renders "(missing: unset)"
+        let res = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "do {{ $.context.missing }}" }),
+                bare_def(),
+            ))
+            .await;
+        // shadow mode: the run still succeeds (does NOT block)
+        assert!(res.is_ok(), "shadow mode must not block: {res:?}");
+        // but an anomaly was recorded, naming the unresolved path
+        let anomalies: Vec<_> = audit
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.event_type == "agent.input_unresolved")
+            .collect();
+        assert_eq!(anomalies.len(), 1);
+        assert!(
+            anomalies[0].payload["unresolved"]
+                .to_string()
+                .contains("$.context.missing")
+        );
+        assert_eq!(anomalies[0].payload["enforced"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn entry_gate_enforced_refuses_before_dispatch() {
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:claude-sonnet-4-6".into())),
+        );
+        let err = exec
+            .execute(request(
+                json!({
+                    "affinity": "coding", "goal": "do {{ $.context.missing }}",
+                    "enforce_input_grounding": true
+                }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("enforced gate must refuse");
+        assert!(format!("{err:?}").contains("AGENT_INPUT_UNRESOLVED"));
+        assert!(format!("{err:?}").contains("$.context.missing"));
+        // the runner was NEVER called — refusal is pre-dispatch
+        assert!(
+            runner.sessions().is_empty(),
+            "enforced refusal must happen before the runner is invoked"
+        );
     }
 
     #[tokio::test]
