@@ -47,7 +47,10 @@ fn resolve_or_stub(path: &str, instance: &WorkflowInstance) -> Result<String, St
 
 /// Render, and collect the `$.`-paths that stubbed. Element 0 is byte-identical
 /// to `render_template`. See the entry gate (Plan A) for the consumer.
-pub fn render_template_tracked(template: &str, instance: &WorkflowInstance) -> (String, Vec<String>) {
+pub fn render_template_tracked(
+    template: &str,
+    instance: &WorkflowInstance,
+) -> (String, Vec<String>) {
     let mut output = String::with_capacity(template.len());
     let mut unresolved: Vec<String> = Vec::new();
     let mut remaining = template;
@@ -258,12 +261,19 @@ mod tests {
         let inst = crate::model::WorkflowInstance::for_test_with_context(
             serde_json::json!({ "present": "ok" }),
         );
-        let tmpl = "A={{ $.context.present }} B={{ $.context.missing }} C={{ $.context.also_missing }}";
+        let tmpl =
+            "A={{ $.context.present }} B={{ $.context.missing }} C={{ $.context.also_missing }}";
         let (rendered, unresolved) = render_template_tracked(tmpl, &inst);
         // element 0 is byte-identical to the infallible renderer
         assert_eq!(rendered, render_template(tmpl, &inst));
         // both unresolved paths are reported, de-duplicated, in encounter order
-        assert_eq!(unresolved, vec!["$.context.missing".to_string(), "$.context.also_missing".to_string()]);
+        assert_eq!(
+            unresolved,
+            vec![
+                "$.context.missing".to_string(),
+                "$.context.also_missing".to_string()
+            ]
+        );
         // a fully-resolved template reports nothing
         let (_r, none) = render_template_tracked("A={{ $.context.present }}", &inst);
         assert!(none.is_empty());
