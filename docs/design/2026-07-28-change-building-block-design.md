@@ -1,293 +1,283 @@
-# Design: The Change Building Block — evidence-gated, deterministic-frame system mutation
+# Design: Evidence-Gated Workflow Boundaries (and a narrow file-mutation probe)
 
-Status: DRAFT for FMECA/poka-yoke/TRIZ vetting. Not approved for implementation.
-Date: 2026-07-28.
+Status: DRAFT, **post-FMECA-vetting revision**. Phase-1 (L1 gates) recommended for implementation;
+L3 interpreter recommended as an A/B-gated probe; everything above rung-0/3 is a data-gated roadmap.
+Date: 2026-07-28. Vetted by three independent FMECA/poka-yoke/TRIZ reviews (see Appendix A).
+
+> **What changed after vetting.** The first draft led with a "change building block" (a
+> plan→execute→verify micro-waterfall) as *the core*, plus a large `ImplementationStrategy`
+> interpreter. The vetting — grounded in the real code and the ~28 shipped orchestrator flows —
+> demoted both: the **atom is L1** (evidence-gated boundaries + typed handoffs), which is universal
+> and largely already shipped; the mutation waterfall is **one of five block-shapes**; the
+> `kind: change` interpreter is a **narrow, A/B-gated file optimization**, not essential (the three
+> incidents are all killed by L1 alone). This revision reflects that.
 
 ## 1. Context & problem
 
-A lead commodity coder (glm-5.2) reported success, burned ~$1.88/253s, and wrote **zero
-files**. We shipped a runtime forcing function (`requires_file_write`) that catches a coding
-agent signing off with no file-mutation evidence. It works. But subsequent dogfood surfaced the
-*same shape* wearing different clothes:
+glm-5.2 reported success, burned ~$1.88/253s, wrote zero files. We shipped a runtime forcing
+function (`requires_file_write`); it works. Dogfood then surfaced the same shape twice more: a
+surface **name** reached a coder where **paths** were expected (→ it could only STOP), and a verify
+step discarded the real build error so the retry loop fed the agent nothing to fix (→ 434s
+livelock). The disease is one thing: **an agent is handed something that isn't usable truth, drives
+its own execution, and the system burns silently.** We patched the instances (cognitive-
+architectures#65). This design targets the class.
 
-- a surface **name** (`"organization-payment"`) reached the coder where **file paths** were
-  expected (semantic-string confusion) → the coder could only STOP;
-- the verify step discarded the real build error, so the retry loop fed the agent "build: fail"
-  with nothing to fix → livelock to `AGENT_CHAIN_EXHAUSTED` (434s wasted).
+### Failure classes
+1. Narrated success *(shipped forcing function)*.
+2. Semantic-string confusion (a value with the wrong *meaning* in a slot).
+3. Context starvation → livelock.
+4. Silent fallback (empty/ungrounded value silently becomes a default).
+5. Feedback-loop starvation (retry with no new information).
 
-Across every incident the disease is one thing: **an agent is handed something that isn't
-usable truth, drives its own execution against it, and the system burns silently.** Patching
-instances (we shipped two pack fixes, cognitive-architectures#65) treats symptoms. This design
-targets the class.
+**All three incidents are killed by L1 (§2) alone — no interpreter required.** That is the central
+finding of the vetting and it shapes the whole design.
 
-### The recurring failure classes
-1. **Narrated success** — claims done without doing it. *(patched by the forcing function)*
-2. **Semantic-string confusion** — a value with the wrong *meaning* flows into a slot; the type
-   system (`string==string`) can't see it.
-3. **Context starvation** — agent/loop fed empty/useless context → livelock to budget exhaustion.
-4. **Silent fallback** — an empty/ungrounded value silently becomes a default that hides the
-   anomaly.
-5. **Feedback-loop starvation** — a retry re-dispatches the agent with no new information.
+## 2. The atom: L1 — evidence-gated boundaries + typed handoffs
 
-## 2. The paradigm
+The shipped forcing function gates the **exit** boundary (success needs evidence). L1 applies the
+same principle at **entry** and **continuation**, and promotes handoffs from stringly-typed
+blackboard slots to **validated typed artifacts**. This is the atom of *every* workflow, not just
+code:
 
-The shipped forcing function gates the **exit** boundary of an expensive step (success needs
-deterministic evidence). The reset: apply the same principle at the **entry** and
-**continuation** boundaries, turning the blackboard from a stringly-typed mutable dict into a
-**typed, provenance-aware dataflow** where every value an agent acts on is validated against
-ground truth before a token is spent.
+- **Entry gate** — no agent is dispatched on inputs that don't provably resolve to real referents.
+  Mechanism: make `render_template` **fallible** (today it silently emits `(x: unset)` stubs —
+  `templating.rs:90,101,117`) and add non-empty-consume, **only on `required` bindings** (`$optional`
+  exempt — V29/V38 precedent, non-retroactive). Kills classes 2 & 4 pre-dispatch, zero tokens.
+- **Continuation gate** — a retry is illegal unless its evidence slot changed since the last
+  iteration (hash the statically-derived read-slice via `reads.rs`, minus counters; infra-transient
+  retries exempt via `FailureClass::is_infrastructure`). Kills class 5 + livelock. Subsumes the
+  "anti-livelock guard" candidate.
+- **Exit gate** — success needs evidence *(shipped)*.
+- **Fallback-ledger invariant** — every fallback/degrade path emits a typed `Anomaly` event; silence
+  becomes a validation error; `cost report` gets an anomaly column. This is also the **shadow-mode
+  substrate**: the entry gate ships counting would-be-refusals *before* it enforces.
 
-Three boundary gates (mirror images of the exit gate we already ship):
-- **Entry** — no agent is dispatched on inputs that don't provably resolve to real referents
-  (empty / name-as-path / `(unset)` stub → refused, zero tokens).
-- **Continuation** — no loop iterates without new information (a retry is illegal unless its
-  evidence slot changed).
-- **Exit** — success needs evidence *(already shipped; becomes moot for the ops in §5, see §6).*
+L1 reuses the existing spine (`templating.rs`, `reads.rs`, evidence-guards-fail-closed, `$optional`,
+snapshot-versions). It is the real MVP.
 
-This is not greenfield: it realizes the already-staged "Gate1 evidence-binding" direction and
-reuses existing spine (`templating.rs`'s `(unset)` stub is the smoking gun; `reads.rs` derives
-read-sets; evidence guards fail-closed; `$optional`, snapshot-versions, the lexicon are
-precedent).
+## 3. The five block-shapes (L1 is the atom; mutation is one shape)
 
-## 3. The Change Building Block (the atom)
+Grounded in the real orchestrators, workflows compose from L1 into five shapes. Mutation is **one**:
 
-**A step that mutates the system is a micro-waterfall: `plan → execute → verify`, enforced as a
-contract.** This is not a new engine concept — a praxec workflow already *is* a plan/execute/
-verify state machine with guards, evidence, and HATEOAS. We turn that primitive inward and make
-it the mandatory, **fractal** unit of a mutation:
+| Shape | Real exemplars | Governance (all L1) | Mutating? |
+|---|---|---|---|
+| **gather-decide-route** | `flow.triage-issue` | closed-label-set + grounded + route resolves | No (may end in an effect) |
+| **gather-judge-aggregate** | `audit-docs`, `review.docs-fmeca` | typed findings + code-computed rollup (`drift_blocking==0`) | No |
+| **elicit-design-vet** | `loom` deriving, `derisk`, `sebok` | resolve-refs + **human + FMECA** | No |
+| **external-effect** | `check-in`, `intent.propose_and_park` | do-effect → read-back **or** park-unverified | External |
+| **mutate-verify** (was "the" block) | `implement.deliverable`, `refactor.god-file` | plan→execute→verify micro-waterfall | Filesystem |
 
-```
-mission  ▷ workflow of deliverables
- deliverable ▷ workflow of steps
-  step   ▷ micro-waterfall: plan → execute → verify   (enforced seams, typed handoffs)
-```
+Across ~28 flows the non-mutating + external + elicit shapes **outnumber** mutate-verify — so "THE
+core building block" was over-claimed. Each mutation flow is itself a *molecule of L1 handoffs*
+(e.g. `qa.promote-finding` = the TDD RED→GREEN molecule: write→prove-red→pin→fix→verify→flake-scan).
 
-- **Scope:** the building block is the **mutation** primitive. A step that only reads/reports/
-  decides does not go through it. A step where a model does judgment on a change does.
-- **Only agentic steps recurse.** A deterministic step (a script, a git op) is already atomic.
-- **Deterministic-by-default stages.** When the file-set is already known (CPM `owned_files`),
-  the plan stage is a *deterministic projection*, not a model call. A model plan stage fires only
-  when the step genuinely needs decomposition. This keeps the block a *structural* invariant
-  without being a *cost* invariant (avoids the historical "ceremony failure" where mandatory
-  sign-off steps failed the chain).
-- **Composition → methodologies.** TDD is a *molecule*: a RED block (verify = "test exists and
-  fails for the intended reason") then a GREEN block (verify = "that test flips red→green, nothing
-  regresses"). The inter-block handoff (`a proven-failing test`) makes red-before-green a
-  *contract on the seam*, not a convention a model can skip. Refactor-under-green, migration, and
-  feature-slice are other molecules of the same atom.
+### 3.1 Handoff artifacts have two recognizers, not one
+A handoff is a validated typed artifact, consumer-checked **at the consuming block's entry**
+(post-predecessor apply; ground-truth = current tree ∪ pending-creates-from-earlier-ops — so a
+forward-referenced file doesn't false-refuse). Two recognizer families:
+- **file-plan** (mutation): paths resolve (Modify/Delete/Move) **or** match project path convention
+  (Create — extension/source-root/naming, *not* just non-empty, or name-as-path survives on Create).
+- **findings/decision** (triage/audit/review): closed-label-set membership + citation-grounding +
+  code-computed aggregate.
 
-### 3.1 Scope & generality (UNDER-TESTED — a key vetting target)
+Net-new content (an elicitation spec) has **no ground-truth referent** — grounding validates only
+*cited-existing* entities; the operative gate is **human + FMECA** (`loom.deriving` parks;
+`plan_qa` runs `fmeca-converge`). The design does not claim to certify a spec.
 
-praxec orchestrates *diverse* workflows (triage, external-tool orchestration, review, elicitation,
-planning), not just code. The design must state honestly what is general vs mutation-specific vs
-file-specific — three layers of decreasing generality:
+### 3.2 External effects are an L1 step-level rule (not an L3 op)
+Legitimate external actions live at L1 as state-emitting `kind: script`/`tool_source` steps + a
+downstream gate — exactly what `flow.check-in` does (`run.git.push-pr` emits `{ok, pr_url, pr_number}`;
+the flow gates on `ok`; conflict uses a *local trial merge* because GitHub's async `mergeable` is
+non-deterministic). The **external-effect admissibility rule**:
+- **read-back postcondition** (a deterministic state predicate: PR #N exists; row present), AND
+- **check-before-effect precondition (dedup)** whenever the effect isn't natively idempotent (Slack
+  post, row insert) — *this precondition was missing in the draft and is required*;
+- **default arm = park-labeled-unverified** (the real packs park far more than they auto-verify:
+  `frontrails-campaign` defers PR-open to a human/CI; `intent.propose_and_park` parks every proposal).
 
-- **L1 — the paradigm (ALL workflows).** Evidence-gated boundaries (entry/continuation/exit) and
-  **typed, validated handoffs instead of blackboard dumps** apply to *every* step. A triage step's
-  classification is a handoff artifact that must be a member of a *closed label set* and grounded
-  in the issue; a routing target must resolve to a real workflow. This layer is general.
-- **L2 — the mutation building block (mutation steps only).** The `plan → execute → verify`
-  micro-waterfall governs steps that *change* a system. **Non-mutating steps do NOT go through it.**
-  Triage is `gather → classify → route`, not `plan → execute → verify`; its "verify" is that the
-  decision artifact is well-typed and grounded (a valid label, an existing route), not a build.
-  Triage may *terminate in* routing to a mutation block.
-- **L3 — the file interpreter (file/code changes only).** The `ImplementationStrategy` enum + the
-  `kind: change` interpreter (§5–6) are tuned for **filesystem** mutation and do not generalize
-  as-is.
+The **`RunCommand` rejection is an L3-op-vocabulary rejection, not a ban on external actions** —
+praxec posts to Slack / opens PRs today via L1 state-emitting steps. (One sentence the draft omitted.)
 
-**External effects (3rd-party MCP mutations) — the frontier.** A step that mutates an *external*
-system (post a Slack message, open a GitHub PR, write a DB row, drive a browser) IS a mutation, but
-not a file one. It is a distinct operation family (`ExternalEffect`) governed by the **same
-admissibility rule** (§5.3) — and that rule is exactly the `RunCommand` classifier generalized:
-- **Admissible** when the effect is **read-back verifiable + idempotent**: the interpreter makes the
-  structured call, then a deterministic state predicate confirms it (`message exists in channel`,
-  `PR #N exists with head=X`, `row present`). Effect-scope = the external resource; containment is
-  best-effort (often you cannot prove *nothing else* in the external system changed — state that
-  limit honestly).
-- **Inadmissible as a deterministic op** when the only witness is a fire-and-forget response or a
-  human/model judgment → it routes to verify + human park-approval, **labeled unverified**, never
-  masquerading as a checked op. (Same boundary the rule draws for `RunCommand` and migration
-  data-safety.)
+## 4. L2 — the mutate-verify shape (one of five)
 
-**Open question the FMECA must answer:** is "THE core building block" over-claimed? Should L2 be
-demoted to "ONE building-block shape (mutation) among several (gather-decide-route,
-external-effect)"? Is L3 an executor (`kind: change`) that is *useful* but not *essential*, when
-the free-form `kind: agent` already exists? Phase-1 architecture-validity decides this, tested
-against triage, external-MCP orchestration, and review flows — not just code.
+A filesystem-mutating step is the plan→execute→verify micro-waterfall. **Deterministic-by-default
+stages**: when the file-set is known (CPM `owned_files`), the plan stage is a deterministic
+projection, not a model call (prevents the historical ceremony-failure). TDD is a molecule (RED
+block: verify = "test exists and fails for the intended reason"; GREEN block: verify = "that test
+flips red→green, nothing regresses"; the inter-block handoff `a proven-failing test` makes
+red-before-green a contract). **This is a shape, not the atom.**
 
-## 4. The handoff contract (typed artifacts, validated against ground truth)
+## 5. L3 — the `kind: change` interpreter (a narrow, A/B-gated probe)
 
-The incident was a **handoff failure** — the plan *had* the right `owned_files`; the executor
-*could* write; the seam between them lost the truth (an ambient blackboard slot a verify-knob
-clobbered). A blackboard slot has no producer contract, no consumer validation, no immutability.
-The fix is to promote handoffs from *slots* to *typed artifacts with contracts*:
+A separate bet: *if the system does the writing, narrated-write becomes structurally impossible.*
+Plausible, but **unproven against the shipped `kind: agent` + forcing function**, and §6 concedes
+constrained may be *worse* for some changes. So it is built as a **probe**, not a co-equal
+deliverable. A `ChangeExecutor` (`kind: change`, peer to `kind: agent`) is a deterministic
+interpreter of `Vec<ImplementationStrategy>`, plugged into the existing `promotion.rs::run_trusted_
+agent` `edit: FnOnce(PathBuf)->Fut` seam. The model is invoked at exactly one site per generative
+slot, returns a typed value only (no fs tools, no path, no "done"), validated before the system
+applies it.
 
-A handoff artifact has: a **named type** (with a recognizer, not `string`); a **single
-authoritative producer** (write-once); **non-empty + grounded** (references resolve to real
-things); **consumer-validated on entry** (the next stage refuses an ungrounded/empty artifact
-*before* spending a token); **immutable + hashed** (so continuation can prove new information
-crossed).
+**Phase-1 probe scope (build only this of L3):**
+- `DeleteFile`, `MoveFile` — **zero model**, pure-upside deterministic conformance.
+- `CreateFile` — one CONTENT slot; path is a deterministic field checked against project convention.
+- `ModifyFile` — **lift `edit_file`'s existing `0/1/n` unique-match** to a *pre-generation*
+  precondition (fail-closed on `≠1`; feed the miss into the block re-plan); model returns the new
+  span text only.
 
-**Handoff validation is deterministic and runs against the codebase at the seam.** A plan naming
-files that don't exist, or a hallucinated surface-name where paths belong, is an *invalid
-handoff* — a typed refusal, zero cost. This is the entry-evidence gate applied to the plan
-artifact, and it structurally kills the incident: `"organization-payment"` expressed as an
-operation names paths that don't resolve → rejected before any executor runs.
+**Everything above is HARD-GATED on the Phase-1 A/B** (§6): `UpdateReferences` (index/LSP — the
+single largest, least-proven build), `StructuredEdit`, `Split`/`Merge`, gated `Codemod`/`Migration`,
+and the full recognizer type-system. Until the A/B shows constrained beats free-form on
+success-rate × cost, ripples use `kind: agent` + slice-compile.
 
-## 5. The Execution Strategy contract (`Vec<ImplementationStrategy>`)
+**Reuse / relabel:** reuse promotion/locks/chain-walk/cost-gate/effort (the `SlotGenerator` runs
+single-shot completions through them; escalation is per-slot with a **structured diagnostic** bound
+into the next fill and delta-gated, so the #65 disease can't recur per-slot). The forcing function
+is **not removed** — `kind: agent` keeps it as the escape hatch *and* the A/B baseline. "Moot"
+means "never fires for interpreter-driven ops," not "deleted." No cleanup is claimed.
 
-The plan→execute handoff is an **Execution Strategy**: a command-pattern enum that reifies
-INTENT (describe the change; do not execute it). Operations are the vehicle for §4's contract.
+**Prerequisite (grounded spine gap):** `promotion.rs` on `Conflict` leaves the live tree with
+`git apply --3way` markers and exits non-zero with no reset. **Fix this (apply-to-staging-ref or
+reset-on-conflict) BEFORE wiring `kind: change` on top** — the interpreter inherits the rollback gap.
 
-### 5.1 The slot ladder (the load-bearing idea)
-The generative slot handed to the model is not one thing — it's a ladder, and every op sits as
-low (as constrained) as the change permits. **Slot width is a function of how much deterministic
-machinery the frame owns** — investing in the frame deletes generative surface:
+## 6. Constrained vs unconstrained — TRIZ, with a runtime fall-through
 
-| Rung | Slot | Ops | Model returns | Placement risk |
-|---|---|---|---|---|
-| 0 | NULL | `DeleteFile`, `MoveFile`, `UpdateReferences` | nothing | none |
-| 1 | PARTITION | `SplitFile`, `MergeFile` | assignment of *existing* bytes | none (system moves) |
-| 2 | EDIT-OP | `ModifyFile` | anchored `{old→new}` | anchor-miss (fails closed) |
-| 3 | CONTENT | `CreateFile` | whole artifact | none (path is system-owned) |
+Physical contradiction: the model should be *free* (agentic loop it's trained on → effectiveness)
+AND *constrained* (deterministic frame → correctness). Resolved by separation:
+- **In TIME:** unconstrained plan, constrained execute (the micro-waterfall).
+- **On the slot ladder:** constrain placement/orchestration (the model's weakness); free generation
+  (its strength). IFR: the model does only the irreducibly-generative part; the system does the
+  chores. Constraint removes failure-prone responsibilities, not creative ones.
+- **By CONDITION — a runtime ladder, not a one-shot verdict:** keep both modes; on repeated block
+  no-progress (continuation gate: re-plan yields no new strategy shape), **auto-fall-through to
+  `kind: agent` free-form**. §6's "constrained may lose" becomes a runtime safety net, not only an
+  offline A/B.
 
-### 5.2 Operation families — axed on (effect-scope × conformance-predicate), NOT file-verbs
-The shipped `implement.edit.constrained` skill already grew to 8 ops that aren't file-family —
-evidence the file axis is wrong. Families:
-- **File**: `CreateFile{path, purpose, content:Generated}`, `ModifyFile{path, anchor,
-  replacement:Generated}` (anchor is interpreter-owned; unique-match checked *before* generation),
-  `DeleteFile{path}`, `MoveFile{from,to}` (byte-preserving), `SplitFile`, `MergeFile`
-  (byte-conserving; PARTITION slot).
-- **Reference** (the load-bearing addition): `UpdateReferences{rename|moves, scope}` — index/LSP-
-  backed, **discovers** the reference sites, rewrites deterministically, conformance = global
-  predicate (`refs(old)==0 ∧ count conserved`). This is how the "ripple" (fix all importers) stops
-  being model-diligence-and-hope and becomes a checkable receipt. Moves/renames/deletes' wiring
-  consequences are *separate* `UpdateReferences` ops, not baked into the move.
-- **Structured-data**: `DependencyChange`, `ConfigSet` (really one `StructuredEdit{format, keypath,
-  value}` family — parse-set-reparse; conformance = `==`).
-- **Gated Tool**: `Codemod`, `Migration` — admissible **only** if they carry a declared
-  state-predicate postcondition / schema-delta as a **non-optional field** (an un-checkable one is
-  *unconstructible* — V38/V39-style poka-yoke).
-- **Rejected**: `RunCommand` — its only witness is an exit code, no bounded effect-scope. Its
-  absence is a feature. "Run something" must be re-expressed as run-as-machinery + check-resulting-
-  state, or escalated to a human/verify boundary and *labeled unverified*.
+**The A/B is a STOP-GATE, not a footnote.** If free-form matches constrained on success-rate × cost,
+most of L3 is over-engineering: keep the cheap L1 gates + `kind: agent`, drop the rest.
 
-### 5.3 Admissibility rule (the classifier)
-An operation kind is admissible only if it declares (a) a **deterministic conformance check** — a
-predicate over introspectable **state**, never an exit code — and (b) a **two-sided effect-scope**
-(positive: what must change; containment: `changed_set ⊆ scope`, nothing outside changed). The
-rule *is* the classifier: it ejects `RunCommand`, gates `Codemod`/`Migration`, and honestly
-reports its frontier — migration **data**-safety and cross-op parity (ORM↔schema) are NOT
-single-op-checkable and route to verify + human park-approval.
+## 7. The irreducible residuals (no oracle — be honest)
 
-### 5.4 Two-tier verification (the honest split)
-"Deterministic conformance" for `ModifyFile` is tautological if it means intent — "the bytes I
-said would change, changed" proves the op executed itself, not that the bug is fixed. So:
-- **Structural op-conformance** — deterministic, per-op: the op applied as specified (patch applies
-  to a pinned base-hash; anchor unique; byte-conservation; `refs==0`; effect-scope respected).
-- **Intent verification** — behavioral, per-**slice**: compile + test + lint (with the real error
-  surfaced, per #65). Cannot run per-op.
-- **The real waterfall unit is the SLICE** (a coherent set of ops), not the individual op.
+Three risk classes cannot be driven below Medium/High because **there is no deterministic oracle for
+intent-correctness or data-safety**; TRIZ/poka-yoke cannot manufacture a missing oracle:
+- **conforming-but-wrong edit / vacuous-green** (structural conformance + "tests pass" while the
+  change is wrong, or the slice has no test exercising it);
+- **semantic rename** over/under-match (esp. dynamic languages without an LSP);
+- **migration data-safety** (a schema-delta postcondition ≠ row preservation).
 
-### 5.5 Interdependence
-A flat `Vec` of pre-filled content values fails when op B's content depends on op A's *executed*
-result. Resolution: content-dependent changes go in **sequenced blocks** (contract-block executes,
-then impl-block plans against the real signature — the TDD shape); **ripples** are discovered-
-effect ops (`UpdateReferences`), not pre-enumerated edits. Within a block the strategy is a bounded
-*ordered* program (importers before deletes) when scopes are dependent, an unordered set when
-disjoint. We do **not** build one mega-DAG with deferred closures.
+The only honest mitigation is the design's own posture, made mandatory:
+- **Label `behaviorally-unverified` and route to human — never let structural conformance
+  masquerade as correctness.** Labels must be *real gates*, not advisory strings.
+- **Diff-coverage instrumentation** (was the changed span exercised?) *triggers the label
+  automatically* — without it, conforming-but-wrong is byte-indistinguishable from correct in the
+  audit (the observability hole).
+- **`Migration`/`Codemod` route to human park-approval unconditionally** (postcondition gates
+  schema; human gates data) — cannot reach `Applied` without an approval-evidence artifact.
+- **A calibration harness** (a corpus of known-good/known-bad edits → false-pass confusion matrix)
+  must exist *before* the two-tier-verification claim is treated as proven.
 
-## 6. The `kind: change` interpreter (engine fit)
+## 8. Observability (detectable from the audit alone)
 
-A new `ChangeExecutor` (`kind: change`) registers as a peer to `kind: agent`. Its body is a
-**deterministic interpreter of `Vec<ImplementationStrategy>`**, plugged in as the `edit` closure
-of the existing trusted-promotion bridge (`promotion.rs::run_trusted_agent` already takes
-`edit: FnOnce(PathBuf)->Fut`). Execution:
+Uniform **gate telemetry** across all boundaries (entry/continuation/exit/structural/intent +
+fallback-ledger): every gate emits pass/fail/refusal with a reason. Then: premature-completion is
+structurally observable for `kind: change` (the system writes — a patch exists or doesn't);
+silent-scope-escape is machine-checkable post-hoc via `observed_files ⊆ ∪effect_scope` **iff
+`effect_scope` is in the audit**; policy-regression = fleet-level refusal/fallback rate; bad-edit
+(conforming-but-wrong) is *only* visible via diff-coverage (§7).
 
-```
-for strat in plan:
-  strat.check_preconditions(tree)      # deterministic gate against the REAL disposable copy
-  for slot in strat.pending_slots():
-      value = generator.fill(slot, tree, intent)   # THE ONE model call site; None for Delete/Move
-      strat.bind(slot, value)
-  strat.check_generation(tree)         # deterministic conformance of the filled value
-  strat.apply(tree)                    # the SYSTEM writes (fs::write / replacen / git mv)
-  assert tree.touched() ⊆ strat.effect_scope()
-# → capture_patch → promote (lock observed set, git apply --3way) → Applied|Conflict|Locked
-```
+## 9. Revised architecture & phasing (the vetted outcome)
 
-The model is invoked at **exactly one site**, returns a **typed value only** (`FileBody` /
-`SpanText` / `GlueEdits`) — no filesystem tools, no path, no "done" signal — validated before the
-system applies it. Escalation happens **per generative slot** (a non-conforming fill escalates
-down the model chain via the existing `Capability` path). Coupled slots (`Split`/`Merge`) type
-their generation as a single `Generated<GlueEdits>` (one grouped call); everything else is
-one-value-one-call. No "fill the whole plan" mega-call.
+**SHIP (Phase 1 — L1, cheap, universal, incident-justified, non-retroactive):**
+- Entry gate (fallible render + non-empty-consume, **required-only, shadow-mode first via the
+  fallback-ledger**, flag-rollback — widest blast radius, do not enforce day one).
+- Continuation delta gate (infra-transient exempt).
+- Fallback-ledger invariant + uniform gate telemetry.
+- Admissibility rule + `RunCommand`-rejection as an authoring validator (mirrors V38/V39); the
+  external-effect L1 rule (read-back + dedup precondition + park-default).
+- Per-slice intent-verify with **real-error surfacing (#65) + diff-coverage + behaviorally-unverified
+  label**.
+- Prerequisite fix: `promotion.rs` Conflict-leaves-dirty-tree.
 
-### Reuse / moot / replace
-- **REUSE (unchanged):** promotion/sandbox candidate-patch flow; `owned_files` locks (assert
-  `observed_files ⊆ effect_scope` as a pre-merge post-condition); path-escape safety
-  (`resolve_under_no_symlink_escape`); the chain-walk/breaker/cost-gate/effort stack (the
-  `SlotGenerator` runs single-shot completions through it).
-- **MOOT (dead weight for these ops):** the entire coding-evidence forcing function
-  (`CODING_WRITE_PROTOCOL`, `writes_seen`, `MAX_WRITE_NUDGES`, `NoFileWrites`), `sign_off_ceremony`,
-  `salvage_result`, `force_final`, `COMPLETION_PROTOCOL` — narrated-write is structurally
-  impossible when the system does the writing. (They remain for free-form `kind: agent`.)
-- **REPLACE (for these ops only):** `write_file`/`edit_file` as a *model-facing* surface — the
-  interpreter calls `fs` directly; `file_tools` survives for the free-form untrusted tier.
+**PROBE (Phase 1, behind the A/B):** `kind: change` with `Delete`/`Move`/`Create`/`Modify` only;
+dogfood `flow.refactor.god-file` against the free-form baseline; auto-fall-through on no-progress.
 
-## 7. Constrained vs unconstrained — the TRIZ resolution
+**DEMOTE / RELABEL:** "THE core building block" → "the mutate-verify shape (one of five)"; the
+handoff type-system → consumer-validation on the consumed slot (defer named-type/recognizer/hash
+machinery until a second consumer needs it); the slot ladder / op-families → design lenses.
 
-**Physical contradiction:** the model should be *free* (leverage the agentic loop it's trained on
-→ effectiveness) AND *constrained* (deterministic frame → correctness). Resolved by separation:
-- **In TIME:** unconstrained **plan** (full agentic exploration — read, search, reason, decide the
-  strategy); constrained **execute** (interpreter drives; model fills narrow slots). The micro-
-  waterfall *is* this separation.
-- **On the slot ladder:** constrain PLACEMENT/ORCHESTRATION (the model's weakness — scope, paths,
-  sequencing, remembering to write) and FREE GENERATION (its strength — write this file/span).
-  **Ideal Final Result:** the model does only the irreducibly-generative part it's best at; the
-  system does the chores it's worst at. The constraint removes failure-prone responsibilities, not
-  creative ones.
-- **By CONDITION:** keep BOTH modes (`kind: change` constrained; `kind: agent` free-form escape
-  hatch for the exploratory tail); route by change-type; let the flywheel learn.
+**HARD-GATE on the A/B (roadmap, not Phase 1):** `UpdateReferences`, `StructuredEdit`, `Split`/`Merge`,
+gated `Codemod`/`Migration`, the full recognizer type-system, `ExternalEffect` op-vocabulary.
 
-**We do not assume constrained wins everywhere.** Compiler-feedback iteration moves from turn-
-level to block-level (re-plan with the real error). For some changes that may be worse. This is
-**empirical**: A/B constrained vs the free-form baseline on real changes, measure success-rate ×
-cost, let data decide the routing boundary.
+**NON-GOALS (do not build):** fractal-recursion enforcement; full provenance value-envelopes;
+auto-mining guards; forward-only state ratchet; fleet-canary infra (just `check --against-corpus`);
+the untrusted-subprocess NoChanges hole (no cap uses it); parametric brands.
 
-## 8. Phased build
+## 10. Final outcome
+No High or Medium residual risk remains **that is mitigable** — the surviving Med/High
+(conforming-but-wrong, semantic rename, migration data-safety) are *oracle-absent* and are handled
+by the only honest means (label-and-route-to-human + diff-coverage + mandatory migration gate),
+with severity intrinsic and probability driven low by real (not advisory) gates. The design's
+complexity is brought in line with its evidence base: L1 ships (cheap, proven-adjacent), L3 is a
+narrow probe, and the speculative apparatus is gated on data.
 
-- **Phase 1 — kill the classes cheaply + prove the interpreter where it's pure upside.**
-  (a) Fallible render / non-empty consume for agent bindings (kill starvation/silent-fallback at
-  the root — one choke point); (b) the re-entry delta gate (kill feedback-starvation/livelock;
-  subsumes the anti-livelock candidate; reuses `reads.rs`); (c) the fallback-ledger invariant
-  (silence → validation error). Plus the `ChangeExecutor` + `Delete`/`Move`/`Create` (Delete/Move
-  = zero model; Create = one simplest slot). Dogfood on `flow.refactor.god-file` **against the
-  free-form baseline** to measure the effectiveness delta.
-- **Phase 2 — extend the interpreter where measured to help.** `ModifyFile` (lift `edit_file`'s
-  unique-match to a pre-generation precondition); `UpdateReferences` (index-backed); the
-  `StructuredEdit` family; two-tier verify hardening; the handoff-validation gate as a first-class
-  contract.
-- **Phase 3 — the frontier, only if data supports.** Gated `Codemod`/`Migration` (with mandatory
-  postconditions); `Split`/`Merge`; and the broader manifest/authority/brand typing if incidents
-  still slip the earlier gates.
+---
 
-## 9. Honest edges / non-goals
+## Appendix A — FMECA vetting record
 
-- **Migration data-safety and ORM↔schema parity are not single-op-checkable** → verify + human
-  park-approval. The contract *reports* this boundary; it does not pretend to certify it.
-- **Not built now:** the untrusted-subprocess NoChanges hole (no cap uses it); referent brands as
-  parametric types (closed enum or nothing); full provenance value-envelopes (audit already
-  captures); auto-mining guards from failures (human-initiated); forward-only state ratchet
-  (reachability lint instead); fleet-canary infra (`check --against-corpus` optional CI); dynamic
-  budget-reallocation markets.
-- **The two pack fixes (#65) stand** as the immediate instance patch; this design makes the class
-  structurally impossible.
+Three independent reviews (architecture-validity; failure-mode + calibration; generality across
+workflows), grounded in `promotion.rs`, `file_tools.rs`, `executor.rs`, `rig_runner.rs`,
+`templating.rs`, and the shipped orchestrator packs.
 
-## 10. Grounding (existing spine this builds on)
-`promotion.rs` (edit-closure seam, atomic 3-way promote, `observed_files` locks); `file_tools.rs`
-(`edit_file` unique-match conformance to lift; write host to replace as a model surface);
-`executor.rs` (chain-walk/breaker/cost-gate/effort to reuse in `SlotGenerator`); `ports.rs`
-(`Executor` one-method trait for `kind: change`); the shipped forcing function (now moot for these
-ops); V38/V39 (load-time forcing precedent); `$optional`, snapshot-versions, lexicon, `reads.rs`
-(precedent + machinery).
+### A.1 Phase-1 component classification (consolidated)
+| Component | Classification | Evidence | Disposition |
+|---|---|---|---|
+| Entry / Continuation / Exit gates | **Essential** | Adapted / Proven | Ship (Phase 1) |
+| Fallback-ledger + gate telemetry | Essential | Adapted | Ship (Phase 1) |
+| Admissibility rule + RunCommand rejection | Essential | Adapted (V38/V39) | Ship as validator |
+| External-effect L1 rule (+ dedup precondition) | Essential | Adapted | Ship (Phase 1) |
+| Per-slice intent-verify + diff-coverage + label | Essential | Proven (#65) + new | Ship (Phase 1) |
+| Deterministic-by-default stage rule | Essential (constraint) | Proven | Keep as rule |
+| Findings/decision artifact recognizer | Useful | Adapted | Ship w/ L1 |
+| Micro-waterfall as "THE core block" | **Unjustified (supremacy)** | Adapted | **Demote** → one of five shapes |
+| Handoff type-system (named-type/recognizer/hash) | Speculative | Speculative | **Defer** (collapse load-bearing half into entry gate) |
+| `kind: change` interpreter | **Useful, not Essential** | Adapted (seam Proven) | **Probe**, A/B-gated |
+| File ops Delete/Move/Create/Modify | Useful | Proven mechanism | Build (probe) |
+| `UpdateReferences` (index/LSP) | **Speculative — largest build** | Speculative | **Defer hardest** |
+| StructuredEdit / Split / Merge / Codemod / Migration | Speculative | Adapted | Hard-gate on A/B |
+| ExternalEffect as an L3 op-family | **Mis-placed** | Speculative | **Relocate to L1 rule** |
+| Slot ladder / fractal recursion | Speculative (lens) | Adapted / Speculative | Keep as lens / do not enforce |
+| Dual-mode + A/B | Essential (stance) | Adapted | Make A/B a **stop-gate** |
+
+### A.2 Top risks (residual after mitigation)
+| # | Failure mode | Sev | Prob | Mitigation (poka-yoke) + observability | R-Sev | R-Prob |
+|---|---|---|---|---|---|---|
+| 2/14 | conforming-but-wrong / vacuous-green | H | M | label behaviorally-unverified + diff-coverage triggers it; calibration harness | M | L |
+| 3 | semantic rename over/under-match | H | M | admissibility ejects grep-rename; compile+test; label for dynamic langs | M | L |
+| 10 | migration data-safety slips gate | H | L | unconditional human park-approval; approval-token invariant in audit | H | L |
+| 7 | name-as-path survives on `CreateFile` | M | M | Create-path convention recognizer (not just non-empty) | L | L |
+| 5b | `promote` Conflict leaves dirty tree | H | L | fix before wiring kind:change; post-promote tree-clean assertion | L | L |
+| 12 | fallible-render mass false-refusal | M | M | required-only + shadow-mode ledger warn→enforce + flag rollback | L | L |
+| 9 | mis-routing to constrained mode | M | M | runtime auto-fall-through to kind:agent on no-progress | L | L |
+| 4 | per-slot chain exhaustion | M | M | structured diagnostic bound into next fill + per-slot delta gate | L | L |
+| 6 | handoff false-refuses forward-ref | M | M | validate at block entry vs tree ∪ pending-creates | L | L |
+
+### A.3 Phase-3 systemic review
+- **Calibration:** structural conformance is trustworthy for *"the op executed as specified"* only;
+  over-reading it as correctness is the danger. Needs the calibration harness (A.2 #2/14) before the
+  two-tier claim is proven. Intent-verify is untrustworthy without diff-coverage.
+- **Observability:** premature-completion structurally observable for `kind: change` (win);
+  scope-escape observable iff `effect_scope` in audit; conforming-but-wrong is the hole (needs
+  diff-coverage); regressions need uniform gate telemetry.
+- **Over-engineering:** confirmed for L3-as-specified; simplest viable = L1 gates + Delete/Move/
+  Create/Modify; hard-gate the rest.
+- **Incremental delivery / rollback:** L1 entry-gate widest blast radius → shadow-mode + required-
+  only + flag. `kind: change` additive → clean, rollback = route to `kind: agent`. Fix #5b first.
+  Migration/Codemod deferred + human-gated (correct).
+
+## Appendix B — grounding
+`promotion.rs` (edit-closure seam :161-184; observed_files lock :244; Conflict path :73-76 — the
+rollback gap); `file_tools.rs` (`edit_file` `0/1/n` :239-248); `executor.rs` (chain-walk/breaker
+:772-1019); `rig_runner.rs` (forcing-function stack); `templating.rs` (`(unset)` stub :90,101,117);
+`ports.rs` (`Executor` one-method trait). Packs: `flow.triage-issue`, `flow.audit-docs`,
+`flow.check-in`, `flow.intent.propose_and_park`, `flow.loom`, `flow.implement.deliverable`,
+`flow.refactor.god-file`, `qa.promote-finding`.
