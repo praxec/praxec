@@ -107,6 +107,11 @@ jobs:
             - name: schema check on examples
               run: |
                   for f in examples/*.yaml examples/*/gateway.yaml; do
+                    # remote-packs example sources packs via a network `uri:` and
+                    # cannot be resolved offline in CI (by design) — skip it here.
+                    case "$f" in
+                      examples/remote-packs/*) echo "--- skipping $f (remote uri: needs network)"; continue;;
+                    esac
                     echo "--- checking $f"
                     ./target/release/praxec check --config "$f"
                   done
