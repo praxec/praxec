@@ -166,12 +166,6 @@ async fn unguarded_default_arm_is_taken_on_a_different_discriminant() {
 // ============================================================================
 
 #[test]
-#[ignore = "RED: V22 (validate_workflow_refs_resolve) only runs on the repos-present \
-            branch of merge_declared_repos (config.rs); a host-only config with no \
-            `repos:` block returns Ok(host) before V22 is ever reached, so an unknown \
-            `kind: workflow` definitionId passes `praxec check` clean and is only \
-            discovered at runtime dispatch. Fix: call validate_workflow_refs_resolve \
-            unconditionally (also on the repos.is_empty() early-return path)."]
 fn a_kind_workflow_transition_referencing_an_unknown_definition_id_fails_at_load() {
     let td = tempfile::TempDir::new().unwrap();
     let host = r#"
@@ -249,6 +243,44 @@ workflows:
             .any(|m| m.contains("$.workflow.input.missing")),
         "an unresolvable `$.`-path skills entry must fail loud at load, naming the \
          entry, rather than being silently treated as no skills declared; got: {messages:?}"
+    );
+}
+
+// ============================================================================
+// A5b — A `skills:` entry that is a NON-STRING JSON value (e.g. a bare
+// number, or a nested array/object) must be rejected LOUDLY at load, naming
+// the offending entry — never silently skipped as if no skill were declared
+// there. Both `check_skills_refs` (validate.rs) and the runtime
+// `push_scope_subjects` (runtime_links.rs) walk `skills:` arrays with an
+// `entry.as_str()` guard that silently `continue`s past any entry that
+// isn't a JSON string, so a non-string entry currently produces NO
+// diagnostic at all (as if the scope were empty).
+// ============================================================================
+
+#[test]
+fn non_string_skills_entry_is_rejected_loudly_at_load() {
+    let yaml = r#"
+version: "1.0.0"
+workflows:
+  flow.host:
+    initialState: s
+    states:
+      s:
+        skills: [42]
+        transitions:
+          go:
+            target: done
+            executor: { kind: noop }
+      done:
+        terminal: true
+"#;
+    let config = praxec_core::config::resolve_str(yaml).expect("yaml resolves");
+    let diags = praxec_core::validate::validate_workflows(&config);
+    let messages: Vec<String> = diags.iter().map(|d| d.to_string()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains("42")),
+        "a non-string `skills:` entry must be rejected loudly at load, naming the \
+         offending entry, rather than being silently skipped; got: {messages:?}"
     );
 }
 
