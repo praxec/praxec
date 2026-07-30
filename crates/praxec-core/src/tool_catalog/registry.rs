@@ -12,6 +12,7 @@
 //! [`crate::currency::CurrencyIo`], this keeps every adapter pure and
 //! unit-testable with a fake.
 
+use super::adapters::mcp_registry::DEFAULT_MCP_REGISTRY_URL;
 use super::candidate::ToolCandidate;
 use serde_json::Value;
 
@@ -27,8 +28,22 @@ pub enum RegistrySpec {
         name: String,
         org: String,
     },
-    // Phase-1 stubs return an empty adapter until their task lands:
-    // McpRegistry { name, url }, Rest { name, url }, …
+    /// A generic REST endpoint serving the normalized shape documented in
+    /// `adapters::rest`.
+    Rest {
+        name: String,
+        url: String,
+    },
+    /// The Official MCP Registry (or a compatible mirror) — see
+    /// `adapters::mcp_registry`. `url` defaults to
+    /// [`DEFAULT_MCP_REGISTRY_URL`] when the config entry omits it.
+    McpRegistry {
+        name: String,
+        url: String,
+    },
+    // Phase-3/Phase-1.5 follow-ups (Smithery/Glama/PulseMCP need their own
+    // native-schema adapter, or can front the generic `rest` adapter behind a
+    // normalizing endpoint — see the design doc's Phase 3 note).
     Unknown {
         name: String,
         kind: String,
@@ -70,6 +85,22 @@ pub fn registries_from(config: &Value) -> Vec<RegistrySpec> {
                         .unwrap_or_default()
                         .to_string();
                     RegistrySpec::GithubOrg { name, org }
+                }
+                "rest" => {
+                    let url = entry
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    RegistrySpec::Rest { name, url }
+                }
+                "mcp-registry" => {
+                    let url = entry
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| DEFAULT_MCP_REGISTRY_URL.to_string());
+                    RegistrySpec::McpRegistry { name, url }
                 }
                 _ => RegistrySpec::Unknown {
                     name,
@@ -132,5 +163,36 @@ mod tests {
     fn missing_registries_key_yields_empty() {
         let cfg = serde_json::json!({});
         assert!(registries_from(&cfg).is_empty());
+    }
+
+    #[test]
+    fn parses_rest_with_explicit_url() {
+        let cfg = serde_json::json!({ "registries": [
+            { "kind": "rest", "name": "acme-rest", "url": "https://tools.acme.dev/registry.json" }
+        ]});
+        let specs = registries_from(&cfg);
+        assert_eq!(specs.len(), 1);
+        assert!(matches!(&specs[0], RegistrySpec::Rest { name, url }
+            if name == "acme-rest" && url == "https://tools.acme.dev/registry.json"));
+    }
+
+    #[test]
+    fn parses_mcp_registry_with_explicit_url() {
+        let cfg = serde_json::json!({ "registries": [
+            { "kind": "mcp-registry", "name": "official", "url": "https://mirror.example.com/v0/servers" }
+        ]});
+        let specs = registries_from(&cfg);
+        assert!(matches!(&specs[0], RegistrySpec::McpRegistry { name, url }
+            if name == "official" && url == "https://mirror.example.com/v0/servers"));
+    }
+
+    #[test]
+    fn mcp_registry_defaults_url_when_omitted() {
+        let cfg = serde_json::json!({ "registries": [
+            { "kind": "mcp-registry", "name": "official" }
+        ]});
+        let specs = registries_from(&cfg);
+        assert!(matches!(&specs[0], RegistrySpec::McpRegistry { url, .. }
+            if url == DEFAULT_MCP_REGISTRY_URL));
     }
 }

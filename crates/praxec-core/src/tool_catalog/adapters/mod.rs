@@ -4,7 +4,11 @@
 //! module's docs) so it is unit-tested with a fake IO, no network.
 
 pub mod github_org;
+pub mod mcp_registry;
+pub mod rest;
 pub mod static_adapter;
 
 pub use github_org::GithubOrgAdapter;
+pub use mcp_registry::McpRegistryAdapter;
+pub use rest::RestAdapter;
 pub use static_adapter::StaticAdapter;
