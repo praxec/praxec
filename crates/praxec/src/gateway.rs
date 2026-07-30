@@ -2340,7 +2340,7 @@ fn run_sync(config_path: &PathBuf, dry_run: bool) -> anyhow::Result<()> {
             let dest = host_dir
                 .join(".praxec")
                 .join("repos")
-                .join(praxec_core::repo_git::cache_dir_name(uri));
+                .join(praxec_core::repo_git::cache_dir_name(uri, gitref));
             match sync_remote_repo(uri, gitref, &dest, dry_run) {
                 RemoteSyncOutcome::Cloned { sha } => {
                     println!("  {label} (remote) — cloned fresh at {}.", short_sha(&sha));
@@ -5076,7 +5076,7 @@ mod tests {
             .path()
             .join(".praxec")
             .join("repos")
-            .join(praxec_core::repo_git::cache_dir_name(&uri));
+            .join(praxec_core::repo_git::cache_dir_name(&uri, "main"));
 
         super::run_sync(&cfg_path, false).expect("first sync clones the remote repo");
         assert!(cache.join("pack.txt").exists());
