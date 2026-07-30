@@ -10,46 +10,140 @@
 #   granting → `praxec connections grant` (GRANT: the separate, explicit,
 #                                          auditable operator trust act)
 #
-# select → trust_gate → installing → collecting → staging → validating
-#        → granting → done | failed
+# select → trust_gate → installing → collecting → building → staging
+#        → validating → granting → done | failed
 #
-# ── Known scope limit (read before extending) ──────────────────────────
-# `staging`'s `connections add` call templates only the CONNECTION IDENTITY
-# (name / kind / command-or-url) from the candidate — never the elicited
-# secrets. This is a confirmed grammar limit, not an oversight:
+# ── The env-wiring gap (P2.3b) — CLOSED, here's exactly how ─────────────
+# `staging` used to template only the CONNECTION IDENTITY (name / kind /
+# command-or-url) from the candidate — never the elicited secrets/config —
+# because a `kind: cli` step's `args:` is a STATIC JSON array (see
+# `crates/praxec-executors/src/cli.rs` + `arg_render.rs`): each element
+# resolves to exactly ONE argv token via a whole-value path read or a
+# literal, with no loop/spread construct to expand one array-valued
+# context field (`candidate.requires.secrets`, arbitrary length) into N
+# repeated `--env NAME=VALUE` tokens. That grammar limit is real and
+# still true — it's just no longer the blocker, because the fix does not
+# route through repeated flags at all:
 #
-#   - `kind: cli` executor args are a STATIC JSON array (see
-#     `crates/praxec-executors/src/cli.rs` + `arg_render.rs`); each element
-#     resolves to exactly ONE argv token via a whole-value path read or a
-#     literal. There is no loop/spread construct that expands one
-#     array-valued context field (`candidate.requires.secrets`, arbitrary
-#     length) into N repeated `--env NAME=VALUE` tokens, and no
-#     string-templating inside a single token (`"--env=$.context.x"` is
-#     NOT interpolated — it is either a literal in full or a whole-path
-#     read in full).
-#   - Guard `expr` / output-mapping operators (`add|subtract|multiply|
-#     divide|set|concat|pick`) have no `length()`/count function either,
-#     so branching statically on "how many secrets does this candidate
-#     need" isn't expressible without a real code component.
+#   1. `building` (new) runs a `kind: script` step (`build.connection-body`,
+#      below) that reads `secretEnvNames`/`collectedConfig` — both
+#      ARBITRARY-length JSON, not CLI argv — and emits ONE JSON object:
+#      the full connection body, `env:`/`required_secrets:` included. This
+#      needed a real code component (jq) — `arg_render.rs`'s whole-path
+#      reads and the guard/output-mapping operators have no loop/length()
+#      construct either, so the arity problem genuinely can't be solved
+#      declaratively (confirmed while building this).
+#   2. That body lands in ONE context slot (`built_body`) as a JSON object
+#      — `render_arg`'s whole-value-path fallback (`other.to_string()`)
+#      compact-serializes an object-valued context field to a single argv
+#      token, so `staging` passes the WHOLE body as one templated
+#      `--block` token to `connections add --block` (P2.3b's new CLI
+#      flag — see `crates/praxec-executors/src/conn_write.rs`).
 #
-# `collecting` still ELICITS an arbitrary number of secrets/config values
-# from the operator (JSON has no such arity limit — only CLI argv does)
-# and records the env-var NAMES (never values) in `secrets_set` for the
-# audit trail. Wiring more than the connection identity into the staged
-# connection's `env:` block — for candidates that declare
-# `requires.secrets`/`requires.config` — needs either (a) a core
-# `add_connection`-with-JSON-requires primitive (the design doc's own
-# §8 "Option A"), or (b) an `argsFrom`/spread capability on the `cli`
-# executor. Neither exists today; this reference workflow does not fake
-# one. Candidates with empty `requires` (the common case — see
+# Collected values are wired as TWO different kinds, deliberately:
+#   - `collectedConfig` (non-secret) → literal `env:` entries. Safe to put
+#     in the config: the operator already typed these into the elicitation
+#     form and they carry no secret material.
+#   - `secretEnvNames[].envVar` (secret) → `required_secrets:` NAMES only,
+#     never values. This is NOT a templating shortcut — it's how connection
+#     secrets ACTUALLY resolve in this codebase: `std::process::Command`
+#     inherits the current process environment by default (see
+#     `crates/praxec-executors/src/cli.rs`/`mcp.rs`), so a spawned child
+#     already sees whatever the operator exported in their own shell before
+#     running `praxec`; `required_secrets:` is a pure DECLARATION that lets
+#     `praxec doctor`/preflight report a missing one (advisory — see
+#     `crates/praxec/src/preflight.rs`). Writing the secret's actual VALUE
+#     (or a `"$NAME"`-style placeholder string) into `env:` would be
+#     actively wrong: `cmd.env(k, v)` sets that key VERBATIM on the child,
+#     which would SHADOW the correctly-inherited real secret with a literal
+#     placeholder string instead of resolving it.
+#   - This is P2.1's `required_secrets` field; it was already read by
+#     `preflight.rs`/`doctor` but, until this change, absent from
+#     `schemas/gateway-config.schema.json`'s `mcpConnection` def
+#     (`additionalProperties: false` with no such property) — so granting
+#     a connection that declared it always failed `INVALID_STAGED_CONNECTION`
+#     schema validation. That schema gap is what this program closed; see
+#     the `required_secrets` entry added there.
+#
+# Candidates with empty `requires` (the common case — see
 # `crates/praxec-core/src/tool_catalog/candidate.rs`'s own doc comment)
-# provision fully automatically end to end.
+# provision exactly as before: `built_body` just has no `env:`/
+# `required_secrets:` keys.
 #
 # Transport coverage is deliberately the three the design doc names
 # (`stdio→mcp+command`, `remote→mcp+url`, `rest→rest`); anything else
-# (e.g. `docker`) fails fast at `installing`/`staging` with a typed
+# (e.g. `docker`) fails fast at `installing`/`building` with a typed
 # `*_RECIPE_UNAVAILABLE` reason rather than silently no-opping — extend
 # the guarded transitions below to add a transport.
+
+# Lexicon entry for the one script subject this workflow defines (SPEC §30.10.4).
+lexicon:
+  build.connection-body:
+    definition_short: >
+      Assemble a staged connection's full JSON body (kind, identity,
+      env:/required_secrets:) from a candidate + operator-collected values.
+
+scripts:
+  build.connection-body:
+    verb: build
+    lifecycle: stable
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      transport="$1"
+      npm_pkg="$2"
+      source_url="$3"
+      secret_env_names_json="$4"
+      collected_config_json="$5"
+
+      # `secretEnvNames` is `[{name, envVar}, ...]` (P2.3b's `collecting`
+      # output) — only the envVar NAMES are needed here, never a value.
+      required_secrets=$(echo "$secret_env_names_json" | jq -c '[ .[].envVar ]')
+
+      # `restConnection`'s schema has no `env:` (or `required_secrets:`)
+      # property — only `mcpConnection` gained `required_secrets:` (P2.3b).
+      # A rest-transport candidate that actually declared `requires` has
+      # nowhere safe to put the collected values today (its secret/config
+      # would need to land in `headers:`, a different, un-elicited-for-here
+      # mechanism) — fail fast rather than silently dropping them.
+      has_requires=$(jq -n --argjson secrets "$required_secrets" --argjson cfg "$collected_config_json" \
+        '($secrets|length) > 0 or ($cfg|length) > 0')
+
+      case "$transport" in
+        stdio)
+          jq -nc \
+            --arg pkg "$npm_pkg" \
+            --argjson secrets "$required_secrets" \
+            --argjson cfg "$collected_config_json" \
+            '{kind:"mcp", command:"npx", args:["-y",$pkg]}
+             + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
+             + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
+          ;;
+        remote)
+          jq -nc \
+            --arg url "$source_url" \
+            --argjson secrets "$required_secrets" \
+            --argjson cfg "$collected_config_json" \
+            '{kind:"mcp", url:$url}
+             + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
+             + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
+          ;;
+        rest)
+          if [ "$has_requires" = "true" ]; then
+            echo "BUILD_RECIPE_UNAVAILABLE: rest transport has no env:/required_secrets: analog — this candidate declared requires.secrets/requires.config, which this reference workflow cannot wire for a rest connection" >&2
+            exit 1
+          fi
+          jq -nc --arg url "$source_url" '{kind:"rest", baseUrl:$url}'
+          ;;
+        *)
+          # Dead code today — `building`'s guards route stdio/remote/rest
+          # before this script ever runs; kept as a defensive fail-fast in
+          # case a future guard change lets an unhandled transport through.
+          echo "BUILD_RECIPE_UNAVAILABLE: unsupported transport '$transport'" >&2
+          exit 1
+          ;;
+      esac
 
 workflows:
   flow.tools.provision:
@@ -135,6 +229,9 @@ workflows:
       secrets_set: []
       installExitCode: null
       installSuccess: null
+      built_body: null
+      buildExitCode: null
+      buildSuccess: null
       stageExitCode: null
       stageSuccess: null
       doctorExitCode: null
@@ -316,7 +413,7 @@ workflows:
           submit_collection:
             title: Submit the operator's secret-name / config mapping.
             actor: human
-            target: staging
+            target: building
             executor:
               kind: human
               queue: tool-provision-collect
@@ -347,108 +444,99 @@ workflows:
               collectedConfig: "$.arguments.config"
               secrets_set:     "$.arguments.secretEnvNames[*].envVar"
 
-      # ── staging ─────────────────────────────────────────────────────
-      staging:
+      # ── building ────────────────────────────────────────────────────
+      building:
         description: >
-          Stage the connection (inert, ungranted) via `praxec connections
-          add`. Identity fields only — see the header note. A non-zero
-          exit is data (`treatNonZeroAsFailure: false`); `branches` decides
-          the route so `STAGE_FAILED` lands correctly in `failed`.
+          P2.3b — build the FULL staged-connection body (identity +
+          `env:`/`required_secrets:`) in one `kind: script` step, from the
+          candidate's transport/source AND the operator's collected
+          secrets/config — see the header note for why this needed a real
+          code component and why secrets land as `required_secrets:` names
+          rather than `env:` values. A non-zero exit is data
+          (`treatNonZeroAsFailure: false`); `branches` decides the route so
+          `BUILD_FAILED` lands correctly in `failed`. The
+          transport/source-availability guards mirror `installing`'s —
+          checked BEFORE spawning anything, so an unsupported combination
+          never reaches the script at all.
         linkFilter: byGuards
         transitions:
-          stage_stdio_mcp:
-            title: "Stage: stdio mcp connection (npx-distributed server)."
+          build_stdio_mcp:
+            title: "Build: stdio mcp connection body (npx-distributed server)."
             target: failed
             guards:
               - { kind: expr, expr: "$.context.transport == 'stdio'" }
               - { kind: expr, expr: "$.context.npmPkg != null" }
             executor:
-              kind: cli
-              connection: praxec
+              kind: script
+              subject: build.connection-body
               args:
-                - "connections"
-                - "add"
-                - "--config"
-                - "$.context.config_path"
-                - "--name"
-                - "$.context.name"
-                - "--kind"
-                - "mcp"
-                - "--command"
-                - "npx"
-                - "--arg"
-                - "-y"
-                - "--arg"
+                - "stdio"
                 - "$.context.npmPkg"
+                - "$.context.sourceUrl"
+                - "$.context.secretEnvNames"
+                - "$.context.collectedConfig"
               treatNonZeroAsFailure: false
             branches:
-              - when: { kind: expr, expr: "$.context.stageSuccess == true" }
-                target: validating
+              - when: { kind: expr, expr: "$.context.buildSuccess == true" }
+                target: staging
             output:
-              stageExitCode: "$.output.exitCode"
-              stageSuccess:  "$.output.success"
-              reason: "STAGE_FAILED"
+              buildExitCode: "$.output.exitCode"
+              buildSuccess:  "$.output.success"
+              built_body:    "$.output.json"
+              reason: "BUILD_FAILED"
 
-          stage_remote_mcp:
-            title: "Stage: remote (streamable-http) mcp connection."
+          build_remote_mcp:
+            title: "Build: remote (streamable-http) mcp connection body."
             target: failed
             guards:
               - { kind: expr, expr: "$.context.transport == 'remote'" }
               - { kind: expr, expr: "$.context.sourceUrl != null" }
             executor:
-              kind: cli
-              connection: praxec
+              kind: script
+              subject: build.connection-body
               args:
-                - "connections"
-                - "add"
-                - "--config"
-                - "$.context.config_path"
-                - "--name"
-                - "$.context.name"
-                - "--kind"
-                - "mcp"
-                - "--url"
+                - "remote"
+                - "$.context.npmPkg"
                 - "$.context.sourceUrl"
+                - "$.context.secretEnvNames"
+                - "$.context.collectedConfig"
               treatNonZeroAsFailure: false
             branches:
-              - when: { kind: expr, expr: "$.context.stageSuccess == true" }
-                target: validating
+              - when: { kind: expr, expr: "$.context.buildSuccess == true" }
+                target: staging
             output:
-              stageExitCode: "$.output.exitCode"
-              stageSuccess:  "$.output.success"
-              reason: "STAGE_FAILED"
+              buildExitCode: "$.output.exitCode"
+              buildSuccess:  "$.output.success"
+              built_body:    "$.output.json"
+              reason: "BUILD_FAILED"
 
-          stage_rest:
-            title: "Stage: rest connection."
+          build_rest:
+            title: "Build: rest connection body."
             target: failed
             guards:
               - { kind: expr, expr: "$.context.transport == 'rest'" }
               - { kind: expr, expr: "$.context.sourceUrl != null" }
             executor:
-              kind: cli
-              connection: praxec
+              kind: script
+              subject: build.connection-body
               args:
-                - "connections"
-                - "add"
-                - "--config"
-                - "$.context.config_path"
-                - "--name"
-                - "$.context.name"
-                - "--kind"
                 - "rest"
-                - "--url"
+                - "$.context.npmPkg"
                 - "$.context.sourceUrl"
+                - "$.context.secretEnvNames"
+                - "$.context.collectedConfig"
               treatNonZeroAsFailure: false
             branches:
-              - when: { kind: expr, expr: "$.context.stageSuccess == true" }
-                target: validating
+              - when: { kind: expr, expr: "$.context.buildSuccess == true" }
+                target: staging
             output:
-              stageExitCode: "$.output.exitCode"
-              stageSuccess:  "$.output.success"
-              reason: "STAGE_FAILED"
+              buildExitCode: "$.output.exitCode"
+              buildSuccess:  "$.output.success"
+              built_body:    "$.output.json"
+              reason: "BUILD_FAILED"
 
-          stage_unsupported:
-            title: No staging recipe for this transport/source combination.
+          build_unsupported:
+            title: No build recipe for this transport/source combination.
             target: failed
             guards:
               - kind: all_of
@@ -472,7 +560,41 @@ workflows:
                         - { kind: expr, expr: "$.context.transport == 'rest'" }
                         - { kind: expr, expr: "$.context.sourceUrl != null" }
             output:
-              reason: "STAGE_RECIPE_UNAVAILABLE"
+              reason: "BUILD_RECIPE_UNAVAILABLE"
+
+      # ── staging ─────────────────────────────────────────────────────
+      staging:
+        description: >
+          Stage the connection (inert, ungranted) via `praxec connections
+          add --block`: `built_body` already carries the resolved `kind`
+          (mcp/rest) and every field, so ONE ungated transition covers all
+          transports — no more per-kind duplication. A non-zero exit is
+          data (`treatNonZeroAsFailure: false`); `branches` decides the
+          route so `STAGE_FAILED` lands correctly in `failed`.
+        transitions:
+          stage_connection:
+            title: "Stage: `connections add --block` with the built body."
+            target: failed
+            executor:
+              kind: cli
+              connection: praxec
+              args:
+                - "connections"
+                - "add"
+                - "--config"
+                - "$.context.config_path"
+                - "--name"
+                - "$.context.name"
+                - "--block"
+                - "$.context.built_body"
+              treatNonZeroAsFailure: false
+            branches:
+              - when: { kind: expr, expr: "$.context.stageSuccess == true" }
+                target: validating
+            output:
+              stageExitCode: "$.output.exitCode"
+              stageSuccess:  "$.output.success"
+              reason: "STAGE_FAILED"
 
       # ── validating ──────────────────────────────────────────────────
       validating:
@@ -562,6 +684,6 @@ workflows:
         description: >
           Provisioning did not complete. `context.reason` carries the typed
           cause (COMMUNITY_REQUIRES_PHASE3 | UNKNOWN_TRUST_TIER |
-          INSTALL_FAILED | INSTALL_RECIPE_UNAVAILABLE | STAGE_FAILED |
-          STAGE_RECIPE_UNAVAILABLE | VALIDATION_FAILED | GRANT_FAILED |
-          OPERATOR_DECLINED).
+          INSTALL_FAILED | INSTALL_RECIPE_UNAVAILABLE | BUILD_FAILED |
+          BUILD_RECIPE_UNAVAILABLE | STAGE_FAILED | VALIDATION_FAILED |
+          GRANT_FAILED | OPERATOR_DECLINED).
