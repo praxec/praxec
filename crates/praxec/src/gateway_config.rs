@@ -309,9 +309,10 @@ pub(crate) enum ConnectionsCommand {
         /// The connection name, referenced by `executor.connection:`. Must be
         /// unique in the config and must not contain '/'.
         name: String,
-        /// The connection kind.
+        /// The connection kind. Required unless `--block` is given (`--block`
+        /// carries its own `kind`).
         #[arg(long, value_enum)]
-        kind: CliConnectionKind,
+        kind: Option<CliConnectionKind>,
         /// Command to spawn — an mcp stdio server, or the cli command. (mcp/cli)
         #[arg(long)]
         command: Option<String>,
@@ -332,6 +333,22 @@ pub(crate) enum ConnectionsCommand {
         /// A request header `Name: value` (or `Name=value`); repeat for each. (rest)
         #[arg(long = "header")]
         headers: Vec<String>,
+        /// P2.3b — stage the WHOLE connection body as one JSON object token,
+        /// e.g. `--block '{"kind":"mcp","command":"figma-mcp","env":
+        /// {"FIGMA_TOKEN":"$FIGMA_TOKEN"}}'`. This is the only way to wire an
+        /// ARBITRARY-length `env:`/`headers:` map in one invocation — a
+        /// workflow's `kind: cli` step has a static `args:` array, so it
+        /// cannot expand a candidate's variable-length
+        /// `requires.secrets`/`requires.config` into repeated `--env
+        /// NAME=VALUE` flags. Build the body (with `env:` included) in a
+        /// prior workflow step instead and pass it here as one templated
+        /// token. Precedence: when `--block` is present it WINS — the
+        /// `--kind`/`--command`/`--arg`/`--url`/`--working-directory`/
+        /// `--env`/`--header` flags are ignored (not merged, not validated
+        /// against it). Either `--block` or `--kind` is required; giving
+        /// neither is a fail-fast error.
+        #[arg(long)]
+        block: Option<String>,
     },
     /// D4a — GRANT a previously-staged connection: the separate, explicit,
     /// auditable operator trust act. Adds the name to the top-level

@@ -195,6 +195,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 working_directory,
                 env,
                 headers,
+                block,
             } => connections_add(
                 &config,
                 &name,
@@ -205,6 +206,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 working_directory,
                 env,
                 headers,
+                block,
             ),
             ConnectionsCommand::Grant { config, name, yes } => {
                 connections_grant(&config, &name, yes).await
@@ -249,80 +251,103 @@ fn reject_inapplicable(kind: &str, offending: &[(&str, bool)]) -> anyhow::Result
     Ok(())
 }
 
-/// D4a — `connections add`: build a typed [`ConnectionSpec`] from the parsed
-/// flags (rejecting flags that don't apply to the kind), write it into the
-/// config as a GRANTED connection, and print what was written.
+/// D4a/P2.3b — `connections add`: either build a typed [`ConnectionSpec`]
+/// from the parsed flags (rejecting flags that don't apply to the kind), or —
+/// when `--block` is given — stage the caller-supplied whole-body JSON
+/// verbatim. Either way the result is written into the config as a STAGED
+/// (never granted) connection, and echoed back.
 #[allow(clippy::too_many_arguments)]
 fn connections_add(
     config: &std::path::Path,
     name: &str,
-    kind: CliConnectionKind,
+    kind: Option<CliConnectionKind>,
     command: Option<String>,
     args: Vec<String>,
     url: Option<String>,
     working_directory: Option<String>,
     env: Vec<String>,
     headers: Vec<String>,
+    block: Option<String>,
 ) -> anyhow::Result<()> {
-    use praxec_executors::conn_write::{ConnectionSpec, add_connection};
+    use praxec_executors::conn_write::{ConnectionSpec, add_connection, add_connection_raw};
 
-    let spec = match kind {
-        CliConnectionKind::Mcp => {
-            reject_inapplicable(
-                "mcp",
-                &[
-                    ("--working-directory", working_directory.is_some()),
-                    ("--header", !headers.is_empty()),
-                ],
-            )?;
-            ConnectionSpec::Mcp {
-                command,
-                args,
-                url,
-                env: parse_kv_flag(&env, '=', "--env")?,
+    // `--block` wins when present — see the flag's doc comment in
+    // gateway_config.rs for the precedence rationale (P2.3b: it is the only
+    // way to wire an arbitrary-length `env:` map in one CLI invocation).
+    let (written, kind_str) = if let Some(block_json) = block {
+        let written = add_connection_raw(config, name, &block_json)?;
+        let kind_str = written
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        (written, kind_str)
+    } else {
+        let kind = kind.ok_or_else(|| {
+            anyhow::anyhow!(
+                "connections add requires either --block <json> (the whole connection body) or \
+                 --kind <mcp|cli|rest> (with the matching flags)"
+            )
+        })?;
+        let spec = match kind {
+            CliConnectionKind::Mcp => {
+                reject_inapplicable(
+                    "mcp",
+                    &[
+                        ("--working-directory", working_directory.is_some()),
+                        ("--header", !headers.is_empty()),
+                    ],
+                )?;
+                ConnectionSpec::Mcp {
+                    command,
+                    args,
+                    url,
+                    env: parse_kv_flag(&env, '=', "--env")?,
+                }
             }
-        }
-        CliConnectionKind::Cli => {
-            reject_inapplicable(
-                "cli",
-                &[
-                    ("--arg", !args.is_empty()),
-                    ("--url", url.is_some()),
-                    ("--header", !headers.is_empty()),
-                ],
-            )?;
-            let command =
-                command.ok_or_else(|| anyhow::anyhow!("a `cli` connection requires --command"))?;
-            ConnectionSpec::Cli {
-                command,
-                working_directory,
-                env: parse_kv_flag(&env, '=', "--env")?,
+            CliConnectionKind::Cli => {
+                reject_inapplicable(
+                    "cli",
+                    &[
+                        ("--arg", !args.is_empty()),
+                        ("--url", url.is_some()),
+                        ("--header", !headers.is_empty()),
+                    ],
+                )?;
+                let command = command
+                    .ok_or_else(|| anyhow::anyhow!("a `cli` connection requires --command"))?;
+                ConnectionSpec::Cli {
+                    command,
+                    working_directory,
+                    env: parse_kv_flag(&env, '=', "--env")?,
+                }
             }
-        }
-        CliConnectionKind::Rest => {
-            reject_inapplicable(
-                "rest",
-                &[
-                    ("--command", command.is_some()),
-                    ("--arg", !args.is_empty()),
-                    ("--working-directory", working_directory.is_some()),
-                    ("--env", !env.is_empty()),
-                ],
-            )?;
-            let base_url = url.ok_or_else(|| {
-                anyhow::anyhow!("a `rest` connection requires --url (the base URL)")
-            })?;
-            ConnectionSpec::Rest {
-                base_url,
-                headers: parse_kv_flag(&headers, ':', "--header")?,
+            CliConnectionKind::Rest => {
+                reject_inapplicable(
+                    "rest",
+                    &[
+                        ("--command", command.is_some()),
+                        ("--arg", !args.is_empty()),
+                        ("--working-directory", working_directory.is_some()),
+                        ("--env", !env.is_empty()),
+                    ],
+                )?;
+                let base_url = url.ok_or_else(|| {
+                    anyhow::anyhow!("a `rest` connection requires --url (the base URL)")
+                })?;
+                ConnectionSpec::Rest {
+                    base_url,
+                    headers: parse_kv_flag(&headers, ':', "--header")?,
+                }
             }
-        }
+        };
+
+        let written = add_connection(config, name, &spec)?;
+        (written, spec.kind().as_str().to_string())
     };
 
-    let written = add_connection(config, name, &spec)?;
     println!(
-        "connections add: STAGED connection '{name}' (kind: {}) in {}",
-        spec.kind().as_str(),
+        "connections add: STAGED connection '{name}' (kind: {kind_str}) in {}",
         config.display()
     );
     println!("{}", serde_json::to_string_pretty(&written)?);

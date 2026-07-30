@@ -112,6 +112,8 @@ pub enum ConnWriteError {
     InvalidName(String),
     #[error("INVALID_CONNECTION_FIELDS: {0}")]
     InvalidFields(String),
+    #[error("INVALID_CONNECTION_BLOCK: {0}")]
+    InvalidBlock(String),
     #[error(
         "DUPLICATE_CONNECTION: a connection named '{0}' already exists (staged or live); refusing \
          to overwrite (remove the existing entry first to replace it)"
@@ -285,8 +287,63 @@ pub fn add_connection(
     name: &str,
     spec: &ConnectionSpec,
 ) -> Result<Value, ConnWriteError> {
-    validate_name(name)?;
     let entry = spec_to_entry(spec)?;
+    stage_entry(config_path, name, entry)
+}
+
+/// D4a/P2.3b — stage a new UNGRANTED connection whose body is supplied WHOLE,
+/// as a single JSON object string (the `connections add --block <json>`
+/// path). This exists because a `kind: cli` workflow step's `args:` is a
+/// static array — there is no construct that expands an arbitrary-length
+/// `env:` map (one entry per collected secret/config value) into repeated
+/// `--env NAME=VALUE` tokens. `--block` sidesteps that: the caller (typically
+/// a workflow's build-body step) assembles the FULL connection body,
+/// `env:` included, and passes it as ONE argv token.
+///
+/// Validates only the minimum needed to keep this a safe staging primitive —
+/// the body is a JSON object and its `kind` is one of the closed
+/// `mcp | cli | rest` set — then stages it through the exact same write path
+/// as [`add_connection`] ([`stage_entry`]): same duplicate-name check, same
+/// `stagedConnections:` block, same never-grants guarantee. Deeper
+/// kind-specific field validation (e.g. an `mcp` block needs a `command` or
+/// `url`) is NOT re-derived here — `praxec doctor` / the config-load gate
+/// catch a malformed staged body downstream, same as a hand-edited YAML
+/// entry would.
+///
+/// Fail-fast on: invalid JSON, a non-object body, a missing/unrecognized
+/// `kind`, or anything [`add_connection`] itself fails fast on (duplicate
+/// name, unwritable config).
+pub fn add_connection_raw(
+    config_path: &Path,
+    name: &str,
+    block_json: &str,
+) -> Result<Value, ConnWriteError> {
+    let entry: Value = serde_json::from_str(block_json)
+        .map_err(|e| ConnWriteError::InvalidBlock(format!("--block is not valid JSON: {e}")))?;
+    let obj = entry.as_object().ok_or_else(|| {
+        ConnWriteError::InvalidBlock(
+            "--block must be a JSON object (the connection body), e.g. \
+             '{\"kind\":\"cli\",\"command\":\"gh\"}'"
+                .into(),
+        )
+    })?;
+    let kind_str = obj.get("kind").and_then(Value::as_str).ok_or_else(|| {
+        ConnWriteError::InvalidBlock(
+            "--block must have a string `kind` field (mcp | cli | rest)".into(),
+        )
+    })?;
+    ConnectionKind::parse(kind_str)?;
+
+    stage_entry(config_path, name, entry)
+}
+
+/// The write tail shared by [`add_connection`] and [`add_connection_raw`]:
+/// validate the name, refuse a collision with a live OR already-staged
+/// connection, and write `entry` under `stagedConnections:<name>`. Neither
+/// caller-facing entry point grants — this only ever touches
+/// `stagedConnections:`.
+fn stage_entry(config_path: &Path, name: &str, entry: Value) -> Result<Value, ConnWriteError> {
+    validate_name(name)?;
 
     let mut doc = load_doc(config_path)?;
     let root = doc
@@ -438,5 +495,92 @@ mod tests {
             Err(ConnWriteError::InvalidName(_))
         ));
         assert!(validate_name("github_api").is_ok());
+    }
+
+    fn write_base_config(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("gateway.yaml");
+        std::fs::write(&path, "version: \"1.0.0\"\n").expect("write base config");
+        path
+    }
+
+    #[test]
+    fn add_connection_raw_stages_whole_body_env_included() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_base_config(dir.path());
+
+        let written = add_connection_raw(
+            &config,
+            "figma",
+            r#"{"kind":"mcp","command":"figma-mcp","env":{"FIGMA_TOKEN":"$FIGMA_TOKEN","OTHER":"$OTHER"}}"#,
+        )
+        .expect("stage via --block");
+        assert_eq!(written["kind"], "mcp");
+        assert_eq!(written["env"]["FIGMA_TOKEN"], "$FIGMA_TOKEN");
+        assert_eq!(written["env"]["OTHER"], "$OTHER");
+
+        // Round-trip through the on-disk file: the arbitrary-length env map
+        // survived under stagedConnections, never granted.
+        let raw = std::fs::read_to_string(&config).expect("read back config");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse written yaml");
+        assert_eq!(
+            doc["stagedConnections"]["figma"]["env"]["FIGMA_TOKEN"].as_str(),
+            Some("$FIGMA_TOKEN")
+        );
+        assert_eq!(
+            doc["stagedConnections"]["figma"]["env"]["OTHER"].as_str(),
+            Some("$OTHER")
+        );
+    }
+
+    #[test]
+    fn add_connection_raw_duplicate_name_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_base_config(dir.path());
+
+        add_connection_raw(&config, "dup", r#"{"kind":"cli","command":"gh"}"#)
+            .expect("first stage succeeds");
+        let err = add_connection_raw(&config, "dup", r#"{"kind":"cli","command":"gh"}"#)
+            .expect_err("second stage of the same name must fail");
+        assert!(matches!(err, ConnWriteError::DuplicateName(n) if n == "dup"));
+    }
+
+    #[test]
+    fn add_connection_raw_invalid_json_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_base_config(dir.path());
+
+        let err = add_connection_raw(&config, "bad", "{not json")
+            .expect_err("invalid JSON must be rejected");
+        assert!(matches!(err, ConnWriteError::InvalidBlock(_)));
+    }
+
+    #[test]
+    fn add_connection_raw_non_object_body_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_base_config(dir.path());
+
+        let err = add_connection_raw(&config, "bad", r#"["not", "an", "object"]"#)
+            .expect_err("a non-object body must be rejected");
+        assert!(matches!(err, ConnWriteError::InvalidBlock(_)));
+    }
+
+    #[test]
+    fn add_connection_raw_missing_kind_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_base_config(dir.path());
+
+        let err = add_connection_raw(&config, "bad", r#"{"command":"gh"}"#)
+            .expect_err("a body with no `kind` must be rejected");
+        assert!(matches!(err, ConnWriteError::InvalidBlock(_)));
+    }
+
+    #[test]
+    fn add_connection_raw_unknown_kind_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_base_config(dir.path());
+
+        let err = add_connection_raw(&config, "bad", r#"{"kind":"grpc","command":"gh"}"#)
+            .expect_err("an unrecognized `kind` must be rejected");
+        assert!(matches!(err, ConnWriteError::InvalidKind(k) if k == "grpc"));
     }
 }

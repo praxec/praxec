@@ -176,6 +176,122 @@ fn non_interactive_grant_is_refused_without_yes_and_succeeds_with_it() {
     );
 }
 
+/// P2.3b — `--block <json>` stages the WHOLE connection body (env: map
+/// included) in one token, so a workflow's `kind: cli` step (static `args:`
+/// array) can wire an arbitrary-length set of collected secrets/config into
+/// the staged connection's `env:` by building the body in a prior step.
+#[test]
+fn add_block_stages_whole_body_with_env() {
+    let (_d, path) = write_base();
+
+    let out = run(
+        &path,
+        &[
+            "add",
+            "figma",
+            "--block",
+            r#"{"kind":"mcp","command":"figma-mcp","env":{"FIGMA_TOKEN":"$FIGMA_TOKEN","OTHER_SECRET":"$OTHER_SECRET"}}"#,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "add --block failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let resolved = praxec_core::config::load_resolved_with_repos(&path)
+        .expect("resolves after add --block")
+        .0;
+    assert!(
+        resolved.pointer("/connections/figma").is_none(),
+        "a --block-staged connection must not be live before grant"
+    );
+    assert!(
+        resolved
+            .pointer("/praxec/_ungrantedConnections/figma")
+            .is_some(),
+        "staged connection must be stamped ungranted"
+    );
+    // `_ungrantedConnections` only stamps {repo, namespace, remedy} — the
+    // staged BODY (env: included) lives under `stagedConnections:` in the
+    // raw on-disk YAML (not the resolved/gated config), so read it back
+    // there to confirm the arbitrary-length env map from --block survived.
+    let raw = std::fs::read_to_string(&path).expect("read back config");
+    let doc: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse written yaml");
+    assert_eq!(
+        doc["stagedConnections"]["figma"]["env"]["FIGMA_TOKEN"].as_str(),
+        Some("$FIGMA_TOKEN"),
+        "the arbitrary-length env map from --block must survive to the staged body"
+    );
+    assert_eq!(
+        doc["stagedConnections"]["figma"]["env"]["OTHER_SECRET"].as_str(),
+        Some("$OTHER_SECRET")
+    );
+
+    // grant — --block-staged connections go live exactly like flag-staged ones.
+    let out = run(&path, &["grant", "figma", "--yes"]);
+    assert!(
+        out.status.success(),
+        "grant of a --block-staged connection failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let resolved = praxec_core::config::load_resolved_with_repos(&path)
+        .expect("resolves after grant")
+        .0;
+    assert_eq!(
+        resolved
+            .pointer("/connections/figma/env/FIGMA_TOKEN")
+            .and_then(serde_json::Value::as_str),
+        Some("$FIGMA_TOKEN")
+    );
+}
+
+#[test]
+fn add_block_duplicate_name_exits_non_zero() {
+    let (_d, path) = write_base();
+    assert!(
+        run(
+            &path,
+            &["add", "c", "--block", r#"{"kind":"cli","command":"gh"}"#]
+        )
+        .status
+        .success()
+    );
+    let out = run(
+        &path,
+        &["add", "c", "--block", r#"{"kind":"cli","command":"gh"}"#],
+    );
+    assert!(
+        !out.status.success(),
+        "a duplicate --block add must exit non-zero"
+    );
+}
+
+#[test]
+fn add_block_invalid_json_exits_non_zero() {
+    let (_d, path) = write_base();
+    let out = run(&path, &["add", "bad", "--block", "{not json"]);
+    assert!(
+        !out.status.success(),
+        "invalid --block JSON must exit non-zero"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("INVALID_CONNECTION_BLOCK"),
+        "stderr must carry the typed INVALID_CONNECTION_BLOCK code, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn add_without_block_or_kind_exits_non_zero() {
+    let (_d, path) = write_base();
+    let out = run(&path, &["add", "neither"]);
+    assert!(
+        !out.status.success(),
+        "add with neither --block nor --kind must exit non-zero"
+    );
+}
+
 #[test]
 fn inapplicable_flag_for_kind_exits_non_zero() {
     let (_d, path) = write_base();
