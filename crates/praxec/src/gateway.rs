@@ -2612,6 +2612,15 @@ fn doctor(config_path: PathBuf) -> anyhow::Result<()> {
     print!("{}", crate::preflight::format_report(&report));
     print_soft_diagnostics(&soft_diagnostics);
 
+    // Tool currency (v0.0.43): is each `kind: mcp` connection actually up to
+    // date with its source (local cargo repo / docker registry / remote)?
+    // Advisory only — like a missing tool, a stale one never blocks the report.
+    let currency = crate::currency::check_currency(
+        &crate::currency::conn_specs_from(&config),
+        &crate::currency::RealCurrencyIo,
+    );
+    print!("{}", crate::currency::format_currency(&currency));
+
     // Durability parity with `serve`: report the SAME env-aware condition serve
     // fails fast on, so `doctor` (the health command) can never greenlight a
     // config that `serve` would refuse to start on.
