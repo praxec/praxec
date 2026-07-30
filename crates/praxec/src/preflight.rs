@@ -14,6 +14,13 @@
 //! and only affects the steps that use it, whereas a missing model key means
 //! nothing agentic can run at all.
 //!
+//! Connection secrets generalize the same stance one layer down: a `kind: mcp`
+//! connection may declare `required_secrets: [ENV_VAR, ...]` — the env vars its
+//! own `env:` block references at runtime (never the secret values). Like
+//! tools, a missing one is REPORTED but never blocks — it only fails the steps
+//! that use that connection, not the whole drive (see
+//! [`check_connection_secrets_with`]).
+//!
 //! Lives in the `praxec` crate (not core) because it needs BOTH
 //! `praxec_core::provider_keys`/`providers` AND `crate::provision` — putting
 //! it in core would invert the dependency on `provision`.
@@ -45,12 +52,38 @@ impl CredCheck {
     }
 }
 
+/// One `kind: mcp` connection's `required_secrets` check: which of the env
+/// vars it declares it needs (referenced from its own `env:` block) fail to
+/// resolve. Mirrors [`CredCheck`] one layer down — a provider credential gates
+/// every model call, a connection secret gates only that connection's steps,
+/// which is why this is ADVISORY (see [`PreflightReport::connection_secrets`]).
+pub struct ConnSecretCheck {
+    pub connection: String,
+    /// The connection's declared `required_secrets` — every env var name it
+    /// says it needs at runtime.
+    pub required: Vec<String>,
+    /// The subset of `required` not resolvable in the environment.
+    pub missing: Vec<String>,
+}
+
+impl ConnSecretCheck {
+    pub fn ok(&self) -> bool {
+        self.missing.is_empty()
+    }
+}
+
 /// The typed preflight result. `ok` is false iff a REQUIRED credential is
 /// missing — missing tools are warnings (they fail loud at invocation and
 /// only affect the steps that use them), but a missing model key means
 /// nothing can run.
 pub struct PreflightReport {
     pub credentials: Vec<CredCheck>,
+    /// `kind: mcp` connections' `required_secrets` findings — ADVISORY (see
+    /// [`check_connection_secrets_with`]): a missing connection secret only
+    /// fails the steps that use that connection, never the whole drive, so it
+    /// never flips [`PreflightReport::ok`]. The provisioning flow's own
+    /// validate step is the hard gate for these.
+    pub connection_secrets: Vec<ConnSecretCheck>,
     pub tools: ProvisionReport,
     /// Where the provider-keys file resolves on this machine (for messaging;
     /// its contents are already loaded into env at startup).
@@ -153,6 +186,44 @@ pub fn check_credentials_with(
         .collect()
 }
 
+/// The pure connection-secrets check core: for each `connections:` entry that
+/// declares a non-empty `required_secrets` (the env-var names its own `env:`
+/// block references, never the secret values), which of those env vars does
+/// `has_env` fail to resolve? Connections with no `required_secrets` (or an
+/// empty list) are not checked — a `kind: mcp` connection with no declared
+/// secrets has nothing to verify here. Injectable lookup, exactly like
+/// [`check_credentials_with`], so the decision logic is unit-testable without
+/// touching the process env.
+pub fn check_connection_secrets_with(
+    config: &Value,
+    has_env: impl Fn(&str) -> bool,
+) -> Vec<ConnSecretCheck> {
+    let Some(connections) = config.pointer("/connections").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    connections
+        .iter()
+        .filter_map(|(name, conn)| {
+            let required: Vec<String> = conn
+                .get("required_secrets")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+            if required.is_empty() {
+                return None; // nothing declared — nothing to check
+            }
+            let missing = required.iter().filter(|v| !has_env(v)).cloned().collect();
+            Some(ConnSecretCheck {
+                connection: name.clone(),
+                required,
+                missing,
+            })
+        })
+        .collect()
+}
+
 /// Whether an auto-drive-enabled config has a model its agents can actually use.
 ///
 /// `praxec.agents.auto_drive: true` means every auto-drivable `actor: agent` leaf
@@ -212,7 +283,8 @@ pub fn check_auto_drive_model(config: &Value) -> Option<AutoDriveModelCheck> {
 
 /// Assemble the full report with an injectable env lookup (test seam).
 pub fn preflight_with(config: &Value, has_env: impl Fn(&str) -> bool) -> PreflightReport {
-    let credentials = check_credentials_with(&referenced_providers(config), has_env);
+    let credentials = check_credentials_with(&referenced_providers(config), &has_env);
+    let connection_secrets = check_connection_secrets_with(config, &has_env);
     let tools = provision::detect(&provision_config_from(config));
     let auto_drive_model = check_auto_drive_model(config);
     let mut reasoning = check_reasoning_config(config);
@@ -229,6 +301,7 @@ pub fn preflight_with(config: &Value, has_env: impl Fn(&str) -> bool) -> Preflig
             .is_none_or(AutoDriveModelCheck::ok);
     PreflightReport {
         credentials,
+        connection_secrets,
         tools,
         keys_file: praxec_core::provider_keys::resolve_path().ok(),
         auto_drive_model,
@@ -697,6 +770,26 @@ pub fn format_report(report: &PreflightReport) -> String {
             "  keys file: {} (env vars win over the file)\n",
             path.display()
         ));
+    }
+    if !report.connection_secrets.is_empty() {
+        out.push_str(
+            "connection secrets (env vars each kind: mcp connection declares it needs):\n",
+        );
+        for c in &report.connection_secrets {
+            if c.ok() {
+                out.push_str(&format!(
+                    "  ok       {}: {}\n",
+                    c.connection,
+                    c.required.join(", ")
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  MISSING  {}: {}\n",
+                    c.connection,
+                    c.missing.join(", ")
+                ));
+            }
+        }
     }
     out.push_str("tools (kind: mcp connection binaries on PATH):\n");
     if report.tools.present.is_empty() && report.tools.missing.is_empty() {
@@ -1219,6 +1312,70 @@ mod tests {
             guard_provider_credentials_with(&cfg, &["openrouter:m"], |v| v == "OPENROUTER_API_KEY")
                 .is_ok()
         );
+    }
+
+    // ── connection secrets ───────────────────────────────────────────────────
+
+    /// A config whose only model reference is fine, and one `kind: mcp`
+    /// connection declaring `required_secrets`.
+    fn config_with_connection_secrets(required: &[&str]) -> Value {
+        json!({
+            "workflows": {
+                "wf": { "states": { "s": { "transitions": {
+                    "go": { "target": "done", "executor": {
+                        "kind": "llm", "model": "ollama:llama3", "prompt": "p"
+                    } }
+                } } } }
+            },
+            "connections": {
+                "figma": { "kind": "mcp", "command": "figma-mcp", "required_secrets": required }
+            }
+        })
+    }
+
+    #[test]
+    fn missing_connection_secret_is_reported_but_stays_ok() {
+        let cfg = config_with_connection_secrets(&["FIGMA_TOKEN"]);
+        let report = preflight_with(&cfg, |_| false);
+        assert!(
+            report.ok,
+            "a missing connection secret must be advisory, not a hard failure"
+        );
+        assert_eq!(report.connection_secrets.len(), 1);
+        let check = &report.connection_secrets[0];
+        assert_eq!(check.connection, "figma");
+        assert_eq!(check.missing, vec!["FIGMA_TOKEN"]);
+        let rendered = format_report(&report);
+        assert!(rendered.contains("MISSING  figma"), "{rendered}");
+        assert!(rendered.contains("FIGMA_TOKEN"), "{rendered}");
+    }
+
+    #[test]
+    fn all_connection_secrets_present_is_ok() {
+        let cfg = config_with_connection_secrets(&["FIGMA_TOKEN", "SOME_PAT"]);
+        let report = preflight_with(&cfg, |_| true);
+        assert!(report.ok);
+        assert_eq!(report.connection_secrets.len(), 1);
+        assert!(report.connection_secrets[0].ok());
+        let rendered = format_report(&report);
+        assert!(rendered.contains("ok       figma"), "{rendered}");
+    }
+
+    #[test]
+    fn connection_with_no_required_secrets_is_not_listed() {
+        let cfg = config_with_connection_secrets(&[]);
+        let report = preflight_with(&cfg, |_| false);
+        assert!(report.ok);
+        assert!(
+            report.connection_secrets.is_empty(),
+            "a connection declaring no required_secrets must not appear"
+        );
+
+        let cfg_absent = json!({
+            "connections": { "figma": { "kind": "mcp", "command": "figma-mcp" } }
+        });
+        let report_absent = preflight_with(&cfg_absent, |_| false);
+        assert!(report_absent.connection_secrets.is_empty());
     }
 
     // ── AUTO_DRIVE_NO_MODEL poka-yoke (the dogfood finding) ──────────────────
