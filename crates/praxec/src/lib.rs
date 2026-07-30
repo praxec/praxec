@@ -13,6 +13,7 @@
 /// separately gated on `llm-executor`.
 pub mod affinity_resolver;
 
+pub mod currency;
 pub mod gateway;
 pub mod gateway_config;
 pub mod preflight;
