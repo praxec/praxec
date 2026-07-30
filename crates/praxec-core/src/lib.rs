@@ -34,6 +34,7 @@ pub mod cap_verb;
 pub mod capability;
 pub mod catalog;
 pub mod config;
+pub mod config_mutation;
 pub mod contract_hash;
 pub mod cost_report;
 pub mod deescalation;
