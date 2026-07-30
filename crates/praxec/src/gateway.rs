@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 pub(crate) use crate::gateway_config::{
     ApprovalsCommand, AuditCommand, Cli, CliConnectionKind, Command, ConnectionsCommand,
-    CostCommand, InspectCommand, IntentCommand, OneshotServer, SchemaCommand, ack_guards_used,
-    apply_overlays, build_audit_sink, build_workflow_store, cli_principal, headless_policy_from,
-    is_ephemeral_path, load_config, parse_since, resolve_embedder,
+    CostCommand, InitEditorArg, InspectCommand, IntentCommand, OneshotServer, SchemaCommand,
+    ack_guards_used, apply_overlays, build_audit_sink, build_workflow_store, cli_principal,
+    headless_policy_from, is_ephemeral_path, load_config, parse_since, resolve_embedder,
 };
 pub use crate::gateway_config::{
     GatewayOverlays, OverlayCtx, build_evidence_store, build_guidance_ack_store,
@@ -213,6 +213,14 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             }
             ConnectionsCommand::Revoke { config, name } => connections_revoke(&config, &name).await,
         },
+        Command::Init {
+            editor,
+            provider,
+            dir,
+            global,
+            force,
+            yes,
+        } => init(editor, provider, dir, global, force, yes),
     }
 }
 
@@ -2885,6 +2893,179 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
 
     if errors > 0 {
         anyhow::bail!("config validation failed with {errors} error(s)");
+    }
+
+    Ok(())
+}
+
+/// `praxec init` — cross-platform single-command onboarding: scaffold a
+/// working `gateway.yaml` + starter `models.yaml`, capture a provider API key
+/// (reusing the `provider_keys` file backend — see [`praxec_core::provider_keys`]),
+/// wire an editor's MCP config to this binary, then run the SAME
+/// preflight/`doctor` this module's [`doctor`] runs, reported (never a hard
+/// failure — scaffolding is init's job; `check`/`doctor`/`serve` remain the
+/// separate gates that enforce). Idempotent + safe throughout: an existing
+/// `gateway.yaml`/`models.yaml` is only ever overwritten with `--force`; an
+/// existing editor MCP config is only ever MERGED (add/replace the `praxec`
+/// server key, never touching another server or top-level key).
+#[allow(clippy::too_many_arguments)]
+fn init(
+    editor: Option<InitEditorArg>,
+    provider: String,
+    dir: Option<PathBuf>,
+    global: bool,
+    force: bool,
+    yes: bool,
+) -> anyhow::Result<()> {
+    use crate::init::{
+        EditorTarget, EditorWriteOutcome, InitIo, RealInitIo, ScaffoldOutcome,
+        gateway_yaml_content, models_yaml_content, resolve_target_dir, scaffold_file,
+        write_editor_mcp_config,
+    };
+
+    anyhow::ensure!(
+        provider == "openrouter",
+        "praxec init currently only wires the `openrouter` provider (got `{provider}`); omit \
+         --provider (or pass --provider openrouter) — add other providers by hand afterward via \
+         the providers.env file"
+    );
+
+    let io = RealInitIo;
+
+    let dir = resolve_target_dir(dir)?;
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating target directory {}", dir.display()))?;
+    // Best-effort absolute+resolved (symlinks etc.); an unresolved dir is not
+    // fatal here — the un-canonicalized form is still a valid absolute path
+    // for everything that follows.
+    let dir = dir.canonicalize().unwrap_or(dir);
+
+    println!("praxec init — target directory: {}", dir.display());
+
+    let gateway_yaml_path = dir.join("gateway.yaml");
+    match scaffold_file(&gateway_yaml_path, &gateway_yaml_content(&dir), force)? {
+        ScaffoldOutcome::Wrote => println!("  wrote   {}", gateway_yaml_path.display()),
+        ScaffoldOutcome::Skipped => println!(
+            "  skipped {} (already exists; pass --force to overwrite)",
+            gateway_yaml_path.display()
+        ),
+    }
+
+    let models_yaml_path = dir.join("models.yaml");
+    match scaffold_file(&models_yaml_path, models_yaml_content(), force)? {
+        ScaffoldOutcome::Wrote => println!("  wrote   {}", models_yaml_path.display()),
+        ScaffoldOutcome::Skipped => println!(
+            "  skipped {} (already exists; pass --force to overwrite)",
+            models_yaml_path.display()
+        ),
+    }
+
+    // ── API key ──────────────────────────────────────────────────────────────
+    let providers_env_path = dir.join("providers.env");
+    let mut key_note: Option<String> = None;
+    let key = if yes {
+        match io.read_env("OPENROUTER_API_KEY") {
+            Some(k) if !k.trim().is_empty() => Some(k.trim().to_string()),
+            _ => {
+                key_note = Some(format!(
+                    "no OPENROUTER_API_KEY in the environment (--yes skipped the prompt) — set \
+                     it with `export OPENROUTER_API_KEY=...` and re-run, or edit {} directly",
+                    providers_env_path.display()
+                ));
+                None
+            }
+        }
+    } else {
+        io.prompt_api_key(
+            "Paste your OpenRouter API key (or set OPENROUTER_API_KEY, blank to skip):",
+        )
+        .or_else(|| io.read_env("OPENROUTER_API_KEY"))
+    };
+    match &key {
+        Some(k) => {
+            praxec_core::provider_keys::set_var(&providers_env_path, "OPENROUTER_API_KEY", k)
+                .with_context(|| format!("writing {}", providers_env_path.display()))?;
+            // NEVER print/log `k` itself.
+            println!(
+                "  wrote   {} (OPENROUTER_API_KEY)",
+                providers_env_path.display()
+            );
+        }
+        None => {
+            if key_note.is_none() {
+                key_note = Some(format!(
+                    "no API key set (skipped) — set it later: `export OPENROUTER_API_KEY=...` \
+                     and re-run `praxec init`, or edit {} directly",
+                    providers_env_path.display()
+                ));
+            }
+            println!("  skipped API key");
+        }
+    }
+
+    // ── editor MCP wiring ──────────────────────────────────────────────────
+    let targets: Vec<EditorTarget> = match editor {
+        Some(InitEditorArg::None) => Vec::new(),
+        Some(InitEditorArg::Cursor) => vec![EditorTarget::Cursor],
+        Some(InitEditorArg::Claude) => vec![EditorTarget::Claude],
+        Some(InitEditorArg::Both) => vec![EditorTarget::Cursor, EditorTarget::Claude],
+        None => {
+            let mut detected = Vec::new();
+            if io.detect_cursor() {
+                detected.push(EditorTarget::Cursor);
+            }
+            if io.detect_claude() {
+                detected.push(EditorTarget::Claude);
+            }
+            if !yes {
+                detected.retain(|t| {
+                    io.confirm(&format!("Detected {} — wire its MCP config?", t.label()))
+                });
+            }
+            detected
+        }
+    };
+
+    if targets.is_empty() {
+        println!("  editor wiring: none");
+    } else {
+        let exe = std::env::current_exe()
+            .context("resolving the running praxec binary path for editor MCP wiring")?;
+        let cwd = std::env::current_dir().context("resolving the current directory")?;
+        for target in targets {
+            let path = target.config_path(&cwd, global)?;
+            match write_editor_mcp_config(&path, &exe, &gateway_yaml_path)? {
+                EditorWriteOutcome::Created => {
+                    println!("  wrote   {} ({})", path.display(), target.label())
+                }
+                EditorWriteOutcome::Merged => {
+                    println!("  merged  {} ({})", path.display(), target.label())
+                }
+            }
+        }
+    }
+
+    // ── doctor epilogue — reported only; init's job is to scaffold, not gate ─
+    println!();
+    println!("running doctor on the scaffolded config...");
+    match praxec_core::config::load_resolved_with_repos_resilient(&gateway_yaml_path) {
+        Ok((config, soft_diagnostics)) => {
+            let report = crate::preflight::preflight(&config);
+            print!("{}", crate::preflight::format_report(&report));
+            print_soft_diagnostics(&soft_diagnostics);
+        }
+        Err(e) => println!("  doctor could not load the scaffolded config: {e:#}"),
+    }
+
+    println!();
+    println!("you're ready:");
+    println!("  - restart your editor (or reload its MCP servers) to pick up praxec");
+    println!(
+        "  - try:      praxec query --config {} '{{}}'",
+        gateway_yaml_path.display()
+    );
+    if let Some(note) = key_note {
+        println!("  - {note}");
     }
 
     Ok(())

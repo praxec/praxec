@@ -48,6 +48,11 @@ tracing-subscriber = { workspace = true }
 which = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+# `praxec init` — resolve the cross-platform config dir (%APPDATA%\praxec /
+# ~/.config/praxec / ~/Library/Application Support/praxec) and home dir (for
+# Cursor's global MCP config). Same version praxec-core already pins for
+# provider_keys::resolve_path.
+dirs = "5"
 
 # SPEC §33 D4 — optional in-runtime LLM executor; default-on so
 # `cargo install praxec` ships with `kind: llm` available.

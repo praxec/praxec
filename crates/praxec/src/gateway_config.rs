@@ -269,6 +269,58 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ConnectionsCommand,
     },
+    /// Cross-platform single-command onboarding: scaffold a working
+    /// `gateway.yaml` + starter `models.yaml`, capture a provider API key
+    /// (reusing the `providers.env` backend), wire an editor's MCP config
+    /// (Cursor / Claude Code) to this binary, then run `doctor` on the result.
+    /// Idempotent and safe: never overwrites an existing scaffolded file or
+    /// clobbers an existing editor MCP config without `--force`.
+    Init {
+        /// Which editor(s) to wire MCP config for. Omit to auto-detect
+        /// installed editors and confirm before writing (skipped entirely
+        /// with `--yes`, which applies to every detected editor).
+        #[arg(long, value_enum)]
+        editor: Option<InitEditorArg>,
+        /// Model provider for the starter `models.yaml` chain. Only
+        /// `openrouter` is supported today.
+        #[arg(long, default_value = "openrouter")]
+        provider: String,
+        /// Target directory for the scaffolded files. Default:
+        /// `dirs::config_dir()/praxec` (`%APPDATA%\praxec` on Windows,
+        /// `~/.config/praxec` on Linux, `~/Library/Application Support/praxec`
+        /// on macOS).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Write Cursor's MCP config to its GLOBAL location instead of the
+        /// project-local `.cursor/mcp.json`. No effect on Claude Code (always
+        /// project-local `.mcp.json`).
+        #[arg(long)]
+        global: bool,
+        /// Overwrite an existing `gateway.yaml` / `models.yaml` in the target
+        /// directory. Editor MCP config is always MERGED regardless of this
+        /// flag (only the `praxec` server entry is ever replaced).
+        #[arg(long)]
+        force: bool,
+        /// Non-interactive: skip the API-key prompt (read `OPENROUTER_API_KEY`
+        /// from the environment instead, noting if unset) and skip the
+        /// editor-wiring confirmation (auto-detected editors are wired
+        /// without asking).
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// `praxec init --editor` selector. `None` (the CLI's `none`) skips editor MCP
+/// wiring entirely; the flag itself being unset (`Option<InitEditorArg>` at the
+/// `Command::Init` call site is `None` in the Rust sense) triggers auto-detect
+/// + confirm instead — a distinct case from the explicit `none` value.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[value(rename_all = "lowercase")]
+pub(crate) enum InitEditorArg {
+    Cursor,
+    Claude,
+    Both,
+    None,
 }
 
 #[derive(Subcommand, Debug)]
