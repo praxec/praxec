@@ -33,7 +33,10 @@ pub fn tool_definitions() -> Vec<Tool> {
                 "SPEC §32 read tool. Dispatches by present-field shape: \
                  {} → home; query → search; subject → describe; \
                  workflowId → get; workflowId+transition → explain; \
-                 observe:true → bounded audit-event replay (since/limit). \
+                 observe:true → bounded audit-event replay (since/limit); \
+                 discover → ranked MCP tool candidates from configured \
+                 registries:; evaluate:{verbs} → tool candidates ranked by \
+                 cap-verb overlap. \
                  Add kind='skill'|'script'|'lexicon' to scope search results.",
             ),
             schema_for_args::<QueryArgs>(&[]),
@@ -54,7 +57,8 @@ pub(crate) fn instructions() -> &'static str {
     r#"This is the praxec gateway. SPEC §32 two-tool surface.
 
 The tool surface is exactly two tools, stable across configs:
-  praxec.query   — read: home, search, describe, get, explain, observe
+  praxec.query   — read: home, search, describe, get, explain, observe,
+                   discover, evaluate
   praxec.command — write: start, submit, define
 
 Dispatch by present-field shape:
@@ -67,6 +71,11 @@ Dispatch by present-field shape:
                                              (since=<RFC3339>, limit=<n>; poll
                                              next_since to tail; requires
                                              audit.sink: file)
+  praxec.query { discover: "<text>" }      → MCP tool candidates from the
+                                             configured registries:, ranked by
+                                             name/description/tags match
+  praxec.query { evaluate: { verbs: [] } } → MCP tool candidates ranked by
+                                             overlap with the given cap-verbs
 
   praxec.command { definitionId }                                    → start
   praxec.command { workflowId, expectedVersion, transition }         → submit

@@ -195,6 +195,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 working_directory,
                 env,
                 headers,
+                block,
             } => connections_add(
                 &config,
                 &name,
@@ -205,10 +206,12 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 working_directory,
                 env,
                 headers,
+                block,
             ),
             ConnectionsCommand::Grant { config, name, yes } => {
                 connections_grant(&config, &name, yes).await
             }
+            ConnectionsCommand::Revoke { config, name } => connections_revoke(&config, &name).await,
         },
     }
 }
@@ -249,80 +252,103 @@ fn reject_inapplicable(kind: &str, offending: &[(&str, bool)]) -> anyhow::Result
     Ok(())
 }
 
-/// D4a — `connections add`: build a typed [`ConnectionSpec`] from the parsed
-/// flags (rejecting flags that don't apply to the kind), write it into the
-/// config as a GRANTED connection, and print what was written.
+/// D4a/P2.3b — `connections add`: either build a typed [`ConnectionSpec`]
+/// from the parsed flags (rejecting flags that don't apply to the kind), or —
+/// when `--block` is given — stage the caller-supplied whole-body JSON
+/// verbatim. Either way the result is written into the config as a STAGED
+/// (never granted) connection, and echoed back.
 #[allow(clippy::too_many_arguments)]
 fn connections_add(
     config: &std::path::Path,
     name: &str,
-    kind: CliConnectionKind,
+    kind: Option<CliConnectionKind>,
     command: Option<String>,
     args: Vec<String>,
     url: Option<String>,
     working_directory: Option<String>,
     env: Vec<String>,
     headers: Vec<String>,
+    block: Option<String>,
 ) -> anyhow::Result<()> {
-    use praxec_executors::conn_write::{ConnectionSpec, add_connection};
+    use praxec_executors::conn_write::{ConnectionSpec, add_connection, add_connection_raw};
 
-    let spec = match kind {
-        CliConnectionKind::Mcp => {
-            reject_inapplicable(
-                "mcp",
-                &[
-                    ("--working-directory", working_directory.is_some()),
-                    ("--header", !headers.is_empty()),
-                ],
-            )?;
-            ConnectionSpec::Mcp {
-                command,
-                args,
-                url,
-                env: parse_kv_flag(&env, '=', "--env")?,
+    // `--block` wins when present — see the flag's doc comment in
+    // gateway_config.rs for the precedence rationale (P2.3b: it is the only
+    // way to wire an arbitrary-length `env:` map in one CLI invocation).
+    let (written, kind_str) = if let Some(block_json) = block {
+        let written = add_connection_raw(config, name, &block_json)?;
+        let kind_str = written
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        (written, kind_str)
+    } else {
+        let kind = kind.ok_or_else(|| {
+            anyhow::anyhow!(
+                "connections add requires either --block <json> (the whole connection body) or \
+                 --kind <mcp|cli|rest> (with the matching flags)"
+            )
+        })?;
+        let spec = match kind {
+            CliConnectionKind::Mcp => {
+                reject_inapplicable(
+                    "mcp",
+                    &[
+                        ("--working-directory", working_directory.is_some()),
+                        ("--header", !headers.is_empty()),
+                    ],
+                )?;
+                ConnectionSpec::Mcp {
+                    command,
+                    args,
+                    url,
+                    env: parse_kv_flag(&env, '=', "--env")?,
+                }
             }
-        }
-        CliConnectionKind::Cli => {
-            reject_inapplicable(
-                "cli",
-                &[
-                    ("--arg", !args.is_empty()),
-                    ("--url", url.is_some()),
-                    ("--header", !headers.is_empty()),
-                ],
-            )?;
-            let command =
-                command.ok_or_else(|| anyhow::anyhow!("a `cli` connection requires --command"))?;
-            ConnectionSpec::Cli {
-                command,
-                working_directory,
-                env: parse_kv_flag(&env, '=', "--env")?,
+            CliConnectionKind::Cli => {
+                reject_inapplicable(
+                    "cli",
+                    &[
+                        ("--arg", !args.is_empty()),
+                        ("--url", url.is_some()),
+                        ("--header", !headers.is_empty()),
+                    ],
+                )?;
+                let command = command
+                    .ok_or_else(|| anyhow::anyhow!("a `cli` connection requires --command"))?;
+                ConnectionSpec::Cli {
+                    command,
+                    working_directory,
+                    env: parse_kv_flag(&env, '=', "--env")?,
+                }
             }
-        }
-        CliConnectionKind::Rest => {
-            reject_inapplicable(
-                "rest",
-                &[
-                    ("--command", command.is_some()),
-                    ("--arg", !args.is_empty()),
-                    ("--working-directory", working_directory.is_some()),
-                    ("--env", !env.is_empty()),
-                ],
-            )?;
-            let base_url = url.ok_or_else(|| {
-                anyhow::anyhow!("a `rest` connection requires --url (the base URL)")
-            })?;
-            ConnectionSpec::Rest {
-                base_url,
-                headers: parse_kv_flag(&headers, ':', "--header")?,
+            CliConnectionKind::Rest => {
+                reject_inapplicable(
+                    "rest",
+                    &[
+                        ("--command", command.is_some()),
+                        ("--arg", !args.is_empty()),
+                        ("--working-directory", working_directory.is_some()),
+                        ("--env", !env.is_empty()),
+                    ],
+                )?;
+                let base_url = url.ok_or_else(|| {
+                    anyhow::anyhow!("a `rest` connection requires --url (the base URL)")
+                })?;
+                ConnectionSpec::Rest {
+                    base_url,
+                    headers: parse_kv_flag(&headers, ':', "--header")?,
+                }
             }
-        }
+        };
+
+        let written = add_connection(config, name, &spec)?;
+        (written, spec.kind().as_str().to_string())
     };
 
-    let written = add_connection(config, name, &spec)?;
     println!(
-        "connections add: STAGED connection '{name}' (kind: {}) in {}",
-        spec.kind().as_str(),
+        "connections add: STAGED connection '{name}' (kind: {kind_str}) in {}",
         config.display()
     );
     println!("{}", serde_json::to_string_pretty(&written)?);
@@ -407,6 +433,55 @@ async fn connections_grant(config: &std::path::Path, name: &str, yes: bool) -> a
     println!(
         "It is now live: the config-load gate promotes it into the `/connections` registry. \
          Recorded a `connections.granted` audit event."
+    );
+    Ok(())
+}
+
+/// D4a/P2.4 — `connections revoke`: the explicit, auditable MIRROR of
+/// `connections grant`, run in reverse. Removes `name` from the config's
+/// top-level `grant_connections:` list (via the write primitive) and records
+/// a `connections.revoked` audit event — demoting the connection back to
+/// inert/staged. The staged body itself is left in place; this only
+/// un-grants (a separate `remove` that deletes the staged body entirely is
+/// out of scope here).
+///
+/// Unlike `connections grant`, there is no F13 operator-origin (TTY/`--yes`)
+/// gate: that gate exists because granting MINTS trust, and a non-human
+/// invocation must not be able to do that silently. Revoking only ever
+/// REMOVES trust — the safe direction — so the gate does not apply.
+async fn connections_revoke(config: &std::path::Path, name: &str) -> anyhow::Result<()> {
+    use praxec_executors::conn_write::revoke_connection;
+
+    // Edit the raw config file first (fail-fast if not currently granted).
+    let body = revoke_connection(config, name)?;
+    let kind = body
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Emit a governance audit event, same pattern as `connections_grant`: read
+    // the sink from the (now updated) resolved config so a durable
+    // `audit.sink: file` retains the revoke in the queryable trail.
+    let resolved = load_config(&config.to_path_buf())?;
+    let sink = build_audit_sink(&resolved)?;
+    let event = praxec_core::audit::AuditEvent::new("connections.revoked")
+        .with_actor("operator")
+        .with_payload(serde_json::json!({
+            "connection": name,
+            "kind": kind,
+            "config": config.display().to_string(),
+        }));
+    sink.record(event).await?;
+
+    println!(
+        "connections revoke: REVOKED connection '{name}' (kind: {kind}) in {}",
+        config.display()
+    );
+    println!(
+        "It is no longer live: the config-load gate no longer promotes it into the \
+         `/connections` registry — it is back to inert/staged. Recorded a \
+         `connections.revoked` audit event."
     );
     Ok(())
 }
@@ -1130,6 +1205,11 @@ async fn build_oneshot_server(
     let mut server = PraxecServer::new(runtime.clone())
         .with_discovery(swappable_discovery.clone() as Arc<dyn DiscoveryIndex>)
         .with_registry(swappable_registry.clone())
+        // MCP tool discovery, Phase 1 — parse the config `registries:` block
+        // once here; `discover`/`evaluate` assemble the catalog fresh per
+        // call against the real `CatalogIo` (RealCatalogIo, the server's
+        // default). Empty when no `registries:` is declared.
+        .with_tool_registries(praxec_core::tool_catalog::registries_from(config))
         .with_lexicon(lexicon_base)
         .with_ack_store(guidance_ack.clone())
         .with_script_ack_store(script_ack.clone())
@@ -1850,6 +1930,24 @@ async fn build_hot_components(
             executors,
             "inventory",
             Arc::new(praxec_executors::InventoryExecutor::new(discovery.clone())),
+        ));
+    // P3.3a — overlay `tool-suggest` with the config's `registries:`, parsed
+    // once here (same source `praxec.query { evaluate }` reads via
+    // `PraxecServer::with_tool_registries`), deterministically surfacing
+    // INSTALLABLE tool candidates for a set of cap-verbs. Same overlay idiom
+    // as `inventory`/`registry`/`llm`/`agent`; stacked on top since it also
+    // needs a handle (here, config-derived, not the live discovery index).
+    let tool_registries = Arc::new(praxec_core::tool_catalog::registries_from(
+        &effective_config,
+    ));
+    let executors: Arc<dyn praxec_core::ports::ExecutorRegistry> =
+        Arc::new(praxec_core::overlay::SingleKindOverlay::new(
+            executors,
+            "tool-suggest",
+            Arc::new(praxec_executors::ToolSuggestExecutor::new(
+                tool_registries,
+                Arc::new(praxec_core::tool_catalog::RealCatalogIo),
+            )),
         ));
     Ok((definitions, executors, discovery, registry, workflow_handle))
 }

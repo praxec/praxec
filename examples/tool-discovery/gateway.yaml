@@ -1,0 +1,100 @@
+# MCP tool discovery (Phase 1 + Phase 3 registry adapters) —
+# docs/design/plans/2026-07-30-mcp-tool-discovery-phase1.md
+#
+# A minimal config demonstrating the `registries:` block: `github-org` and
+# `static` (Phase 1), plus the Phase-3 `rest` and `mcp-registry` adapters
+# below (commented out — they'd hit real network on `query`, which this
+# example doesn't exercise). Phase 1/3 are read-only: nothing here installs
+# or provisions anything.
+#
+# Also demonstrates the `tool-suggest` executor (P3.3a) — the engine piece of
+# "suggest tools during authoring": a deterministic `cap.search.tool-suggest`
+# capability that, given `verbs` at start, assembles this SAME `registries:`
+# catalog and ranks it by cap-verb overlap. No model, no step budget.
+#
+# Try it:
+#   praxec check --config examples/tool-discovery/gateway.yaml
+#   praxec query --config examples/tool-discovery/gateway.yaml '{"discover":"browser"}'
+#   praxec query --config examples/tool-discovery/gateway.yaml '{"evaluate":{"verbs":["diagnose"]}}'
+#   praxec command --config examples/tool-discovery/gateway.yaml \
+#     '{"definitionId":"cap.search.tool-suggest","input":{"verbs":["diagnose"]}}'
+#
+# The `github-org` entry is best-effort: if the network is unreachable or the
+# org can't be resolved, `assemble` downgrades it to a warning (surfaced in
+# the response's `warnings` array) rather than failing the query — the
+# `static` candidate below still lands either way. Same fail-safe behavior
+# applies to `rest` and `mcp-registry`.
+version: "1.0.0"
+
+# This example only exercises `praxec.query { discover }` / `{ evaluate }` —
+# it never starts a workflow, so ephemeral (in-memory/stderr) storage is fine
+# for `praxec check` / `praxec query`. `serve` would still refuse to run it
+# durably without this override.
+gateway:
+  allow_ephemeral: true
+
+registries:
+  - kind: github-org
+    name: praxec-org
+    org: praxec
+
+  - kind: static
+    name: local
+    candidates:
+      - name: browser-mcp
+        description: Playwright-backed browser automation MCP server.
+        transport: stdio
+        source:
+          npm:
+            pkg: "@playwright/mcp"
+        verbs: [diagnose]
+        tags: [browser, e2e]
+        trust_tier: verified
+        provenance: local
+
+  # Phase 3 — generic `rest` adapter: any endpoint serving a JSON array in
+  # the normalized shape documented in
+  # crates/praxec-core/src/tool_catalog/adapters/rest.rs. Uncomment + point
+  # `url` at a real endpoint to use it.
+  # - kind: rest
+  #   name: acme-rest
+  #   url: https://tools.acme.dev/registry.json
+
+  # Phase 3 — Official MCP Registry adapter. `url` is optional; it defaults
+  # to the registry's `v0` servers endpoint (see `DEFAULT_MCP_REGISTRY_URL`
+  # in crates/praxec-core/src/tool_catalog/adapters/mcp_registry.rs).
+  # - kind: mcp-registry
+  #   name: official
+
+workflows:
+  cap.search.tool-suggest:
+    verb: search
+    lifecycle: experimental
+    description: >
+      Surface INSTALLABLE tool candidates from the gateway's configured
+      `registries:` matching the given cap-verbs. Deterministic: assembles the
+      SAME catalog `praxec.query { evaluate }` reads — no model, no step
+      budget, no hallucinated tools. The engine piece of "suggest tools during
+      authoring" (P3.3a).
+    snippet:
+      inputs:
+        verbs: { type: array }
+      outputs:
+        suggestions: { type: array }
+        warnings: { type: array }
+    initialState: ready
+    states:
+      ready:
+        goal: Rank the configured registries' catalog against the requested verbs.
+        transitions:
+          suggest:
+            target: done
+            # Deterministic: fires on `start` via the runtime's deterministic
+            # chain, so the caller's `verbs` (start-time `input`, since chain
+            # arguments are always empty) resolve straight to a suggestion.
+            actor: deterministic
+            executor: { kind: tool-suggest }
+            output:
+              suggestions: "$.output.suggestions"
+              warnings: "$.output.warnings"
+      done: { terminal: true }

@@ -1,0 +1,877 @@
+# flow.tools.provision — Phase 2 of the MCP tool lifecycle
+# (docs/design/2026-07-30-mcp-tool-lifecycle-phase2.md §3).
+#
+# Provisions a discovered `ToolCandidate` (Phase 1 `tool_catalog`) into a
+# live praxec connection by COMPOSING praxec's own connection-governance
+# CLI — it never writes `connections:` / `stagedConnections:` YAML itself:
+#
+#   staging  → `praxec connections add`   (STAGE: writes an inert, ungranted
+#                                          connection body)
+#   granting → `praxec connections grant` (GRANT: the separate, explicit,
+#                                          auditable operator trust act)
+#
+# select → trust_gate ─┬─(verified/org)→ installing ──────────────┐
+#                       └─(community)──→ community_gate            ├→ collecting
+#                                          ├─approve→ community_installing
+#                                          └─decline→ failed         (rejoins the same
+#                                                                     path as installing)
+#        → collecting → building → staging → validating → granting → done | failed
+#
+# ── Phase 3 (P3.2) — the community lane, sandboxed + double-approved ────
+# `trust_gate` no longer refuses `community` candidates. It routes them
+# through ONE extra operator gate (`community_gate` — "yes, I understand
+# this is unverified/third-party and I accept the risk of running its
+# install code") before `community_installing` runs the SAME per-transport
+# install recipe as `installing`, except the code-executing branch (stdio's
+# `npm install -g`) is recast from a raw `kind: cli` + `connection: npm`
+# invocation into a hash-pinned `kind: script` (`install.community-npm`,
+# below) carrying a `confinement: "confined"` profile — the ONLY executor
+# kind in this codebase actually wired to `SandboxProvider` (ADR-0006; see
+# `crates/praxec-core/src/sandbox.rs` + `crates/praxec-executors/src/
+# script.rs`). `kind: cli` never reads `confinement` at all (grep-verified:
+# only `script.rs` calls `ConfinementProfile::from_executor_config`), so a
+# `kind: cli` step is UNSANDBOXABLE as-is — that's the real grammar
+# constraint this design respects rather than fakes.
+#
+# This ALSO happens to be exactly the codebase's existing trust philosophy
+# for untrusted-provenance content (see `crates/praxec-executors/src/
+# untrusted_execution.rs`'s header: "untrusted content may run ONLY
+# hash-pinned `kind: script` ... never a fresh raw command") — that module
+# itself is a DIFFERENT mechanism (a publish-time provenance gate over
+# whole authored workflow DEFINITIONS, invoked by the `registry` executor
+# and `structural_analysis`'s advisory vet; it has no per-step "run
+# sandboxed" marker and is never consulted mid-execution of an already
+# defined flow like this one), but the same "script, not raw command" stance
+# is exactly right here too.
+#
+# `community_installing` rejoins `collecting` on success — from there a
+# community-tier candidate follows the IDENTICAL collect → building →
+# staging → validating → granting path any verified/org tool does, so
+# `granting`'s `connections grant` remains the ONE final activation gate for
+# EVERY tier. Net: community gets TWO operator approvals (`community_gate`
+# then `granting`); verified/org get the one (`granting`) they always had.
+#
+# Known residual (documented, not silently worked around): `confinement:
+# "confined"` is deny-all egress (ADR-0006 default). `npm install -g` needs
+# network to reach the registry, and NEITHER wired sandbox backend supports
+# a working egress ALLOWLIST today (`BwrapProvider`/`OciProvider` both
+# `bail!` with `*_EGRESS_UNSUPPORTED` on one) — so a REAL drive of the
+# stdio/npm community branch currently fails fast at `INSTALL_FAILED`
+# end-to-end until a backend gains selective egress. That failure is typed
+# and routed through this workflow's existing `branches`/`failed` handling
+# exactly like any other install failure — never a silent unconfined
+# fallback. Also note: a real drive additionally needs `praxec.execution.
+# sandbox: bwrap` (or `oci` + an image) configured in the gateway config, or
+# `community_installing`'s script step fails fast with
+# `CONFINEMENT_UNAVAILABLE` (a declared `confinement` profile with no
+# provider configured refuses to run unconfined — see `script.rs`) rather
+# than silently running unsandboxed.
+#
+# ── The env-wiring gap (P2.3b) — CLOSED, here's exactly how ─────────────
+# `staging` used to template only the CONNECTION IDENTITY (name / kind /
+# command-or-url) from the candidate — never the elicited secrets/config —
+# because a `kind: cli` step's `args:` is a STATIC JSON array (see
+# `crates/praxec-executors/src/cli.rs` + `arg_render.rs`): each element
+# resolves to exactly ONE argv token via a whole-value path read or a
+# literal, with no loop/spread construct to expand one array-valued
+# context field (`candidate.requires.secrets`, arbitrary length) into N
+# repeated `--env NAME=VALUE` tokens. That grammar limit is real and
+# still true — it's just no longer the blocker, because the fix does not
+# route through repeated flags at all:
+#
+#   1. `building` (new) runs a `kind: script` step (`build.connection-body`,
+#      below) that reads `secretEnvNames`/`collectedConfig` — both
+#      ARBITRARY-length JSON, not CLI argv — and emits ONE JSON object:
+#      the full connection body, `env:`/`required_secrets:` included. This
+#      needed a real code component (jq) — `arg_render.rs`'s whole-path
+#      reads and the guard/output-mapping operators have no loop/length()
+#      construct either, so the arity problem genuinely can't be solved
+#      declaratively (confirmed while building this).
+#   2. That body lands in ONE context slot (`built_body`) as a JSON object
+#      — `render_arg`'s whole-value-path fallback (`other.to_string()`)
+#      compact-serializes an object-valued context field to a single argv
+#      token, so `staging` passes the WHOLE body as one templated
+#      `--block` token to `connections add --block` (P2.3b's new CLI
+#      flag — see `crates/praxec-executors/src/conn_write.rs`).
+#
+# Collected values are wired as TWO different kinds, deliberately:
+#   - `collectedConfig` (non-secret) → literal `env:` entries. Safe to put
+#     in the config: the operator already typed these into the elicitation
+#     form and they carry no secret material.
+#   - `secretEnvNames[].envVar` (secret) → `required_secrets:` NAMES only,
+#     never values. This is NOT a templating shortcut — it's how connection
+#     secrets ACTUALLY resolve in this codebase: `std::process::Command`
+#     inherits the current process environment by default (see
+#     `crates/praxec-executors/src/cli.rs`/`mcp.rs`), so a spawned child
+#     already sees whatever the operator exported in their own shell before
+#     running `praxec`; `required_secrets:` is a pure DECLARATION that lets
+#     `praxec doctor`/preflight report a missing one (advisory — see
+#     `crates/praxec/src/preflight.rs`). Writing the secret's actual VALUE
+#     (or a `"$NAME"`-style placeholder string) into `env:` would be
+#     actively wrong: `cmd.env(k, v)` sets that key VERBATIM on the child,
+#     which would SHADOW the correctly-inherited real secret with a literal
+#     placeholder string instead of resolving it.
+#   - This is P2.1's `required_secrets` field; it was already read by
+#     `preflight.rs`/`doctor` but, until this change, absent from
+#     `schemas/gateway-config.schema.json`'s `mcpConnection` def
+#     (`additionalProperties: false` with no such property) — so granting
+#     a connection that declared it always failed `INVALID_STAGED_CONNECTION`
+#     schema validation. That schema gap is what this program closed; see
+#     the `required_secrets` entry added there.
+#
+# Candidates with empty `requires` (the common case — see
+# `crates/praxec-core/src/tool_catalog/candidate.rs`'s own doc comment)
+# provision exactly as before: `built_body` just has no `env:`/
+# `required_secrets:` keys.
+#
+# Transport coverage is deliberately the three the design doc names
+# (`stdio→mcp+command`, `remote→mcp+url`, `rest→rest`); anything else
+# (e.g. `docker`) fails fast at `installing`/`building` with a typed
+# `*_RECIPE_UNAVAILABLE` reason rather than silently no-opping — extend
+# the guarded transitions below to add a transport.
+
+# Lexicon entry for the one script subject this workflow defines (SPEC §30.10.4).
+lexicon:
+  build.connection-body:
+    definition_short: >
+      Assemble a staged connection's full JSON body (kind, identity,
+      env:/required_secrets:) from a candidate + operator-collected values.
+  install.community-npm:
+    definition_short: >
+      Install a COMMUNITY-tier (unverified/third-party) npx-distributed
+      stdio server package. Hash-pinned `kind: script` (not a raw `kind:
+      cli` invocation) so it can carry a `confinement:` profile and run
+      under the ADR-0006 sandbox — see the workflow header's Phase 3 note.
+
+scripts:
+  build.connection-body:
+    verb: build
+    lifecycle: stable
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      transport="$1"
+      npm_pkg="$2"
+      source_url="$3"
+      secret_env_names_json="$4"
+      collected_config_json="$5"
+
+      # `secretEnvNames` is `[{name, envVar}, ...]` (P2.3b's `collecting`
+      # output) — only the envVar NAMES are needed here, never a value.
+      required_secrets=$(echo "$secret_env_names_json" | jq -c '[ .[].envVar ]')
+
+      # `restConnection`'s schema has no `env:` (or `required_secrets:`)
+      # property — only `mcpConnection` gained `required_secrets:` (P2.3b).
+      # A rest-transport candidate that actually declared `requires` has
+      # nowhere safe to put the collected values today (its secret/config
+      # would need to land in `headers:`, a different, un-elicited-for-here
+      # mechanism) — fail fast rather than silently dropping them.
+      has_requires=$(jq -n --argjson secrets "$required_secrets" --argjson cfg "$collected_config_json" \
+        '($secrets|length) > 0 or ($cfg|length) > 0')
+
+      case "$transport" in
+        stdio)
+          jq -nc \
+            --arg pkg "$npm_pkg" \
+            --argjson secrets "$required_secrets" \
+            --argjson cfg "$collected_config_json" \
+            '{kind:"mcp", command:"npx", args:["-y",$pkg]}
+             + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
+             + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
+          ;;
+        remote)
+          jq -nc \
+            --arg url "$source_url" \
+            --argjson secrets "$required_secrets" \
+            --argjson cfg "$collected_config_json" \
+            '{kind:"mcp", url:$url}
+             + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
+             + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
+          ;;
+        rest)
+          if [ "$has_requires" = "true" ]; then
+            echo "BUILD_RECIPE_UNAVAILABLE: rest transport has no env:/required_secrets: analog — this candidate declared requires.secrets/requires.config, which this reference workflow cannot wire for a rest connection" >&2
+            exit 1
+          fi
+          jq -nc --arg url "$source_url" '{kind:"rest", baseUrl:$url}'
+          ;;
+        *)
+          # Dead code today — `building`'s guards route stdio/remote/rest
+          # before this script ever runs; kept as a defensive fail-fast in
+          # case a future guard change lets an unhandled transport through.
+          echo "BUILD_RECIPE_UNAVAILABLE: unsupported transport '$transport'" >&2
+          exit 1
+          ;;
+      esac
+
+  install.community-npm:
+    verb: install
+    lifecycle: stable
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      npm_pkg="$1"
+      npm install -g "$npm_pkg"
+
+workflows:
+  flow.tools.provision:
+    description: >
+      Provision a discovered MCP tool candidate into a live connection via
+      the existing `connections add` (stage) → `connections grant`
+      (operator trust act) CLI. Verified/org candidates install directly;
+      `community` (unverified/third-party) candidates are no longer
+      refused — they take an extra operator-approved, sandboxed detour
+      (`community_gate` → `community_installing`, Phase 3 / P3.2) before
+      rejoining the same collect → validate → grant path every tier shares.
+    tags: [tool-lifecycle, governed, phase2, phase3-community-lane]
+
+    inputSchema:
+      type: object
+      required: [candidate, config_path]
+      additionalProperties: false
+      properties:
+        candidate:
+          type: object
+          description: A `ToolCandidate` (Phase 1 `tool_catalog`) — by value.
+          required: [name, transport, source, trust_tier]
+          additionalProperties: false
+          properties:
+            name: { type: string }
+            description: { type: string, default: "" }
+            transport:
+              type: string
+              enum: [stdio, docker, remote, rest]
+            source:
+              type: object
+              description: >
+                The `ToolSource` tagged union, e.g. `{ npm: { pkg: "..." } }`
+                or `{ url: { url: "..." } }`. Kept loose here (Phase 1's
+                type is the source of truth); the states below read only
+                the shapes they support.
+            verbs: { type: array, items: { type: string }, default: [] }
+            tags: { type: array, items: { type: string }, default: [] }
+            trust_tier:
+              type: string
+              enum: [community, org, verified]
+            requires:
+              type: object
+              default: { secrets: [], config: [] }
+              additionalProperties: false
+              properties:
+                secrets:
+                  type: array
+                  default: []
+                  items:
+                    type: object
+                    required: [name, description]
+                    properties:
+                      name: { type: string }
+                      description: { type: string }
+                config:
+                  type: array
+                  default: []
+                  items:
+                    type: object
+                    required: [name, description]
+                    properties:
+                      name: { type: string }
+                      description: { type: string }
+            provenance: { type: string, default: "" }
+        config_path:
+          type: string
+          description: The gateway YAML config to stage/grant the connection into.
+
+    initialState: select
+
+    # Every field any state's output touches is seeded here — no state's
+    # first read of a slot is ever an unset-context-slot guard error.
+    initialContext:
+      candidate: null
+      name: null
+      transport: null
+      trust_tier: null
+      secrets_required: []
+      config_required: []
+      config_path: null
+      npmPkg: null
+      sourceUrl: null
+      secretEnvNames: []
+      collectedConfig: {}
+      secrets_set: []
+      community_approved: null
+      installExitCode: null
+      installSuccess: null
+      built_body: null
+      buildExitCode: null
+      buildSuccess: null
+      stageExitCode: null
+      stageSuccess: null
+      doctorExitCode: null
+      doctorSuccess: null
+      doctorStdout: null
+      grantExitCode: null
+      grantSuccess: null
+      connection_name: null
+      wired: false
+      reason: null
+
+    states:
+
+      # ── select ──────────────────────────────────────────────────────
+      select:
+        description: >
+          Resolve/normalize the input candidate into the flat fields the
+          later states read. Pure data projection (`kind: noop` executor)
+          — every read here is null-safe (output-mapping path reads
+          coalesce to `null` when the candidate's `source` variant doesn't
+          have that shape), so branching on the result is never a guard
+          crash.
+        onEnter:
+          executor: { kind: noop }
+          output:
+            candidate:        "$.workflow.input.candidate"
+            name:             "$.workflow.input.candidate.name"
+            transport:        "$.workflow.input.candidate.transport"
+            trust_tier:       "$.workflow.input.candidate.trust_tier"
+            secrets_required: "$.workflow.input.candidate.requires.secrets"
+            config_required:  "$.workflow.input.candidate.requires.config"
+            config_path:      "$.workflow.input.config_path"
+            # Source-variant projections — null unless that variant is
+            # actually present (see the header note on why this is safe).
+            npmPkg:    "$.workflow.input.candidate.source.npm.pkg"
+            sourceUrl: "$.workflow.input.candidate.source.url.url"
+        transitions:
+          resolved:
+            title: Candidate resolved — evaluate trust tier.
+            target: trust_gate
+
+      # ── trust_gate ──────────────────────────────────────────────────
+      trust_gate:
+        description: >
+          Split gate on `trust_tier`. Exhaustive over the closed
+          `TrustTier` set (community/org/verified) rather than one
+          unguarded catch-all transition, so `linkFilter: byGuards` never
+          shows two simultaneously-legal outcomes. `community` no longer
+          fails closed here (Phase 3 / P3.2) — it routes to `community_gate`,
+          an extra operator approval that precedes a SANDBOXED install
+          (see the workflow header note), then rejoins the normal path.
+        linkFilter: byGuards
+        transitions:
+          # `proceed_verified`/`proceed_org` are split into two flat-guard
+          # transitions (rather than one `any_of`) so each is independently
+          # coverable by `praxec fuzz`'s satisfier, which only derives a
+          # satisfying value for a top-level `expr` guard, not a composite
+          # `any_of`/`all_of`/`not` — same reason as `expense-approval`'s
+          # permission-guarded edges show as uncoverable there.
+          proceed_verified:
+            title: Verified tier — proceed to install.
+            target: installing
+            guards:
+              - { kind: expr, expr: "$.context.trust_tier == 'verified'" }
+
+          proceed_org:
+            title: Org tier — proceed to install.
+            target: installing
+            guards:
+              - { kind: expr, expr: "$.context.trust_tier == 'org'" }
+
+          proceed_community:
+            title: Community tier — extra approval, then a SANDBOXED install.
+            target: community_gate
+            guards:
+              - { kind: expr, expr: "$.context.trust_tier == 'community'" }
+
+          reject_unknown_tier:
+            title: Unrecognized/unset trust tier — fail closed.
+            target: failed
+            guards:
+              - kind: all_of
+                guards:
+                  - { kind: expr, expr: "$.context.trust_tier != 'verified'" }
+                  - { kind: expr, expr: "$.context.trust_tier != 'org'" }
+                  - { kind: expr, expr: "$.context.trust_tier != 'community'" }
+            output:
+              reason: "UNKNOWN_TRUST_TIER"
+
+      # ── community_gate ──────────────────────────────────────────────
+      community_gate:
+        description: >
+          Phase 3 (P3.2) — the extra approval untrusted/unverified code
+          requires. `trust_gate` routes here ONLY for `trust_tier ==
+          'community'`; before any of the candidate's install code runs,
+          the operator must see plainly that this is an unverified,
+          third-party tool and explicitly accept running its install
+          SANDBOXED. This is distinct from `granting` (below), which still
+          gates ACTIVATION for every tier — approving here only permits
+          `community_installing` to run; the tool is not wired until
+          `granting` ALSO approves it. Community tools thus clear TWO
+          operator gates; verified/org clear the one (`granting`).
+        linkFilter: byGuards
+        transitions:
+          approve_community_install:
+            title: Approve — install this UNVERIFIED tool, sandboxed.
+            actor: human
+            target: community_installing
+            guards:
+              - { kind: permission, permission: workflow.approve }
+            output:
+              community_approved: true
+
+          decline_community_install:
+            title: Decline — do not install. Nothing runs.
+            actor: human
+            target: failed
+            guards:
+              - { kind: permission, permission: workflow.approve }
+            output:
+              community_approved: false
+              reason: "COMMUNITY_DECLINED"
+
+      # ── community_installing ─────────────────────────────────────────
+      community_installing:
+        description: >
+          Phase 3 (P3.2) — the SAME per-transport install recipe as
+          `installing`, reached only after `community_gate` approval, with
+          the one branch that actually executes third-party code (stdio's
+          `npm install -g`) recast as a hash-pinned `kind: script`
+          (`install.community-npm`) carrying `confinement: "confined"` —
+          the real ADR-0006 sandbox marker (`kind: cli`, what `installing`
+          uses, has no confinement support at all — see the workflow
+          header note for why this had to change kind, not just add a
+          field). A non-zero exit is DATA (`treatNonZeroAsFailure: false`);
+          `branches` routes it to `failed` (`INSTALL_FAILED`) exactly like
+          `installing` does. On success, REJOINS the normal path at
+          `collecting` — from here a community tool is indistinguishable
+          from a verified/org one; `granting` still gates its activation.
+        linkFilter: byGuards
+        transitions:
+          install_community_npm:
+            title: "Install (sandboxed): npx-distributed stdio server."
+            target: failed # fallback if the branch below doesn't match
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'stdio'" }
+              - { kind: expr, expr: "$.context.npmPkg != null" }
+            executor:
+              kind: script
+              subject: install.community-npm
+              confinement: "confined"
+              args: ["$.context.npmPkg"]
+              treatNonZeroAsFailure: false
+            reliability:
+              timeoutMs: 120000
+            branches:
+              - when: { kind: expr, expr: "$.context.installSuccess == true" }
+                target: collecting
+            output:
+              installExitCode: "$.output.exitCode"
+              installSuccess:  "$.output.success"
+              reason: "INSTALL_FAILED"
+
+          community_install_not_needed_remote:
+            title: "Install: remote transport needs nothing installed."
+            target: collecting
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'remote'" }
+            executor: { kind: noop }
+            output:
+              installSuccess: true
+
+          community_install_not_needed_rest:
+            title: "Install: rest transport needs nothing installed."
+            target: collecting
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'rest'" }
+            executor: { kind: noop }
+            output:
+              installSuccess: true
+
+          community_install_unsupported:
+            title: No install recipe for this transport/source combination.
+            target: failed
+            guards:
+              - kind: all_of
+                guards:
+                  - kind: not
+                    guard:
+                      kind: all_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'stdio'" }
+                        - { kind: expr, expr: "$.context.npmPkg != null" }
+                  - kind: not
+                    guard:
+                      kind: any_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'remote'" }
+                        - { kind: expr, expr: "$.context.transport == 'rest'" }
+            output:
+              reason: "INSTALL_RECIPE_UNAVAILABLE"
+
+      # ── installing ──────────────────────────────────────────────────
+      installing:
+        description: >
+          Run the candidate's install recipe, derived from
+          transport/source. Bounded by `reliability.timeoutMs`; a non-zero
+          exit is DATA here (`treatNonZeroAsFailure: false`) so the
+          `branches` guard — not an executor error — decides the route,
+          letting a real `INSTALL_FAILED` reason land in `failed`.
+        linkFilter: byGuards
+        transitions:
+          install_npm:
+            title: "Install: npx-distributed stdio server (npm install -g)."
+            target: failed # fallback if the branch below doesn't match
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'stdio'" }
+              - { kind: expr, expr: "$.context.npmPkg != null" }
+            executor:
+              kind: cli
+              connection: npm
+              args: ["install", "-g", "$.context.npmPkg"]
+              treatNonZeroAsFailure: false
+            reliability:
+              timeoutMs: 120000
+            branches:
+              - when: { kind: expr, expr: "$.context.installSuccess == true" }
+                target: collecting
+            output:
+              installExitCode: "$.output.exitCode"
+              installSuccess:  "$.output.success"
+              reason: "INSTALL_FAILED"
+
+          install_not_needed_remote:
+            title: "Install: remote transport needs nothing installed."
+            target: collecting
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'remote'" }
+            executor: { kind: noop }
+            output:
+              installSuccess: true
+
+          install_not_needed_rest:
+            title: "Install: rest transport needs nothing installed."
+            target: collecting
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'rest'" }
+            executor: { kind: noop }
+            output:
+              installSuccess: true
+
+          install_unsupported:
+            title: No install recipe for this transport/source combination.
+            target: failed
+            guards:
+              - kind: all_of
+                guards:
+                  - kind: not
+                    guard:
+                      kind: all_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'stdio'" }
+                        - { kind: expr, expr: "$.context.npmPkg != null" }
+                  - kind: not
+                    guard:
+                      kind: any_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'remote'" }
+                        - { kind: expr, expr: "$.context.transport == 'rest'" }
+            output:
+              reason: "INSTALL_RECIPE_UNAVAILABLE"
+
+      # ── collecting ──────────────────────────────────────────────────
+      collecting:
+        description: >
+          Elicit `candidate.requires.secrets` + `requires.config` from the
+          operator. Secrets are recorded as env-var NAMES the operator has
+          already set in `providers.env` — never values — so no secret
+          material ever reaches this workflow's context or audit trail.
+          Arbitrary-length lists are fine here: this is JSON data capture,
+          not CLI argv (see the header note on why `staging` can't turn
+          this into repeated `--env` flags today).
+        transitions:
+          # NOTE: `praxec check` warns ELICITATION_INCOMPATIBLE_GATE here
+          # (V36) — `secretEnvNames`/`config` are non-primitive, so a
+          # chat-style push-elicitation UI could never fill this form. That
+          # is the intended shape: this is a PULL-ONLY gate (V36 explicitly
+          # allows it — "pull-only object gates are legitimate"), resolved
+          # by the operator submitting the full JSON directly (`command
+          # submit` / `approvals resolve`), not by a primitives-only push
+          # form. `choices:` doesn't fit — there is no finite pick-list;
+          # the operator is naming arbitrary env-var mappings.
+          submit_collection:
+            title: Submit the operator's secret-name / config mapping.
+            actor: human
+            target: building
+            executor:
+              kind: human
+              queue: tool-provision-collect
+            inputSchema:
+              type: object
+              required: [secretEnvNames, config]
+              additionalProperties: false
+              properties:
+                secretEnvNames:
+                  type: array
+                  default: []
+                  description: >
+                    One entry per `candidate.requires.secrets` item: which
+                    env-var NAME (already set in `providers.env`) backs it.
+                  items:
+                    type: object
+                    required: [name, envVar]
+                    additionalProperties: false
+                    properties:
+                      name:   { type: string, description: "requires.secrets[].name this answers." }
+                      envVar: { type: string, description: "The env-var NAME in providers.env (never its value)." }
+                config:
+                  type: object
+                  default: {}
+                  description: Values for `candidate.requires.config` fields.
+            output:
+              secretEnvNames:  "$.arguments.secretEnvNames"
+              collectedConfig: "$.arguments.config"
+              secrets_set:     "$.arguments.secretEnvNames[*].envVar"
+
+      # ── building ────────────────────────────────────────────────────
+      building:
+        description: >
+          P2.3b — build the FULL staged-connection body (identity +
+          `env:`/`required_secrets:`) in one `kind: script` step, from the
+          candidate's transport/source AND the operator's collected
+          secrets/config — see the header note for why this needed a real
+          code component and why secrets land as `required_secrets:` names
+          rather than `env:` values. A non-zero exit is data
+          (`treatNonZeroAsFailure: false`); `branches` decides the route so
+          `BUILD_FAILED` lands correctly in `failed`. The
+          transport/source-availability guards mirror `installing`'s —
+          checked BEFORE spawning anything, so an unsupported combination
+          never reaches the script at all.
+        linkFilter: byGuards
+        transitions:
+          build_stdio_mcp:
+            title: "Build: stdio mcp connection body (npx-distributed server)."
+            target: failed
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'stdio'" }
+              - { kind: expr, expr: "$.context.npmPkg != null" }
+            executor:
+              kind: script
+              subject: build.connection-body
+              args:
+                - "stdio"
+                - "$.context.npmPkg"
+                - "$.context.sourceUrl"
+                - "$.context.secretEnvNames"
+                - "$.context.collectedConfig"
+              treatNonZeroAsFailure: false
+            branches:
+              - when: { kind: expr, expr: "$.context.buildSuccess == true" }
+                target: staging
+            output:
+              buildExitCode: "$.output.exitCode"
+              buildSuccess:  "$.output.success"
+              built_body:    "$.output.json"
+              reason: "BUILD_FAILED"
+
+          build_remote_mcp:
+            title: "Build: remote (streamable-http) mcp connection body."
+            target: failed
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'remote'" }
+              - { kind: expr, expr: "$.context.sourceUrl != null" }
+            executor:
+              kind: script
+              subject: build.connection-body
+              args:
+                - "remote"
+                - "$.context.npmPkg"
+                - "$.context.sourceUrl"
+                - "$.context.secretEnvNames"
+                - "$.context.collectedConfig"
+              treatNonZeroAsFailure: false
+            branches:
+              - when: { kind: expr, expr: "$.context.buildSuccess == true" }
+                target: staging
+            output:
+              buildExitCode: "$.output.exitCode"
+              buildSuccess:  "$.output.success"
+              built_body:    "$.output.json"
+              reason: "BUILD_FAILED"
+
+          build_rest:
+            title: "Build: rest connection body."
+            target: failed
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'rest'" }
+              - { kind: expr, expr: "$.context.sourceUrl != null" }
+            executor:
+              kind: script
+              subject: build.connection-body
+              args:
+                - "rest"
+                - "$.context.npmPkg"
+                - "$.context.sourceUrl"
+                - "$.context.secretEnvNames"
+                - "$.context.collectedConfig"
+              treatNonZeroAsFailure: false
+            branches:
+              - when: { kind: expr, expr: "$.context.buildSuccess == true" }
+                target: staging
+            output:
+              buildExitCode: "$.output.exitCode"
+              buildSuccess:  "$.output.success"
+              built_body:    "$.output.json"
+              reason: "BUILD_FAILED"
+
+          build_unsupported:
+            title: No build recipe for this transport/source combination.
+            target: failed
+            guards:
+              - kind: all_of
+                guards:
+                  - kind: not
+                    guard:
+                      kind: all_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'stdio'" }
+                        - { kind: expr, expr: "$.context.npmPkg != null" }
+                  - kind: not
+                    guard:
+                      kind: all_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'remote'" }
+                        - { kind: expr, expr: "$.context.sourceUrl != null" }
+                  - kind: not
+                    guard:
+                      kind: all_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'rest'" }
+                        - { kind: expr, expr: "$.context.sourceUrl != null" }
+            output:
+              reason: "BUILD_RECIPE_UNAVAILABLE"
+
+      # ── staging ─────────────────────────────────────────────────────
+      staging:
+        description: >
+          Stage the connection (inert, ungranted) via `praxec connections
+          add --block`: `built_body` already carries the resolved `kind`
+          (mcp/rest) and every field, so ONE ungated transition covers all
+          transports — no more per-kind duplication. A non-zero exit is
+          data (`treatNonZeroAsFailure: false`); `branches` decides the
+          route so `STAGE_FAILED` lands correctly in `failed`.
+        transitions:
+          stage_connection:
+            title: "Stage: `connections add --block` with the built body."
+            target: failed
+            executor:
+              kind: cli
+              connection: praxec
+              args:
+                - "connections"
+                - "add"
+                - "--config"
+                - "$.context.config_path"
+                - "--name"
+                - "$.context.name"
+                - "--block"
+                - "$.context.built_body"
+              treatNonZeroAsFailure: false
+            branches:
+              - when: { kind: expr, expr: "$.context.stageSuccess == true" }
+                target: validating
+            output:
+              stageExitCode: "$.output.exitCode"
+              stageSuccess:  "$.output.success"
+              reason: "STAGE_FAILED"
+
+      # ── validating ──────────────────────────────────────────────────
+      validating:
+        description: >
+          Doctor-check the staged connection (P2.1's `required_secrets`
+          check) BEFORE anything is granted — the poka-yoke: a tool never
+          reaches the live registry until its secrets resolve.
+        transitions:
+          validate:
+            title: Run `praxec doctor` against the staged connection.
+            target: failed
+            executor:
+              kind: cli
+              connection: praxec
+              args: ["doctor", "--config", "$.context.config_path"]
+              treatNonZeroAsFailure: false
+            reliability:
+              timeoutMs: 30000
+            branches:
+              - when: { kind: expr, expr: "$.context.doctorSuccess == true" }
+                target: granting
+            output:
+              doctorExitCode: "$.output.exitCode"
+              doctorSuccess:  "$.output.success"
+              doctorStdout:   "$.output.stdout"
+              reason: "VALIDATION_FAILED"
+
+      # ── granting ────────────────────────────────────────────────────
+      granting:
+        description: >
+          THE operator trust act: `praxec connections grant`. This is a
+          human gate — in a headless drive it parks for the operator
+          exactly like any other `actor: human` transition; approving it
+          here IS the proven-human origin, so the composed CLI call passes
+          `--yes` (a non-interactive grant is otherwise refused fail-closed
+          with `GRANT_REQUIRES_OPERATOR` — see `gateway.rs`). Declining
+          never invokes the CLI at all — nothing is granted.
+        linkFilter: byGuards
+        transitions:
+          approve_grant:
+            title: Approve — grant the staged connection.
+            actor: human
+            target: failed
+            guards:
+              - { kind: permission, permission: workflow.approve }
+            executor:
+              kind: cli
+              connection: praxec
+              args:
+                - "connections"
+                - "grant"
+                - "--config"
+                - "$.context.config_path"
+                - "$.context.name"
+                - "--yes"
+              treatNonZeroAsFailure: false
+            branches:
+              - when: { kind: expr, expr: "$.context.grantSuccess == true" }
+                target: done
+            output:
+              grantExitCode: "$.output.exitCode"
+              grantSuccess:  "$.output.success"
+              reason: "GRANT_FAILED"
+
+          decline_grant:
+            title: Decline — do not grant. Nothing is wired.
+            actor: human
+            target: failed
+            guards:
+              - { kind: permission, permission: workflow.approve }
+            output:
+              reason: "OPERATOR_DECLINED"
+
+      # ── terminal states ─────────────────────────────────────────────
+      done:
+        terminal: true
+        description: Granted and live. `connection_name` names the connection.
+        onEnter:
+          executor: { kind: noop }
+          output:
+            wired: true
+            connection_name: "$.context.name"
+            reason: null
+
+      failed:
+        terminal: true
+        description: >
+          Provisioning did not complete. `context.reason` carries the typed
+          cause (UNKNOWN_TRUST_TIER | COMMUNITY_DECLINED | INSTALL_FAILED |
+          INSTALL_RECIPE_UNAVAILABLE | BUILD_FAILED |
+          BUILD_RECIPE_UNAVAILABLE | STAGE_FAILED | VALIDATION_FAILED |
+          GRANT_FAILED | OPERATOR_DECLINED).
