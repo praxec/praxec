@@ -95,6 +95,14 @@ provisioning collect and validate them (§3.4).
   a workflow's declared steps/capabilities and their unmet needs, rank
   candidates whose `capabilities` fill the gaps. Grounded, not generative.
 
+  **Vocabulary (decided): reuse the existing verb + capability model.** A tool
+  sits one level below a capability — a `cap` *uses* a tool as substrate — so a
+  `ToolCandidate` is described by the cap-**verbs**/domains it can serve. That is
+  the join: a workflow needs a cap of verb X; a candidate offers to serve verb X.
+  One taxonomy across workflows, caps, and tools; the candidate's `tags` add the
+  finer axis (browser vs screenshot vs PDF, all `diagnose`/`research`). No new
+  vocabulary to invent.
+
 **Authoring integration (a first-class use, not a side feature).** praxec-meta's
 `flow.author-flow` / `flow.author-capability` gain a `suggest-tools` step: once
 the capability graph is drafted, it calls `evaluate` on that graph and offers
@@ -133,6 +141,18 @@ doctor's v0.0.43 currency check is the maintenance verb. A tool provisioned
 through §3.4 records enough (`source`/`provenance`) to be currency-checked
 automatically, closing the loop.
 
+**Freshness on a TTL (decided, ~24h).** The lifecycle workflow carries a refresh
+step that fires when data is older than a day, split by read vs execute:
+
+- **Catalog / registry metadata** is a pure read → auto-refresh freely on the
+  TTL (fresh discovery without hammering registries on every call).
+- **Installed tools** are execution + mutation (a rebuild/repull *runs new
+  code*) → the step always *surfaces* staleness (this is the v0.0.43 currency
+  check running on the TTL), but applies an update only inside the trust gate:
+  auto-update is opt-in for already-approved trusted/verified tools, and
+  surface-for-approval for community — never a silent reinstall of third-party
+  code on a timer. Same don't-silently-mutate line as provisioning.
+
 ## 4. Trust & secrets
 
 - **Trust tiers → execution posture.** Verified/org tools run in the trusted
@@ -143,8 +163,11 @@ automatically, closing the loop.
 - **Secrets.** Generalize the existing provider-key mechanism (`providers.env`,
   `guard_provider_credentials`, `px set-provider-keys`) to *connection secrets*.
   Values are env-referenced from the connection's `env:`; no secret material
-  lives in a config or a candidate. Decision to resolve (§6): extend
-  `providers.env` vs a dedicated connection-secrets store.
+  lives in a config or a candidate. **Decided:** extend `providers.env` — it is
+  already an env-var file loaded at startup, so it simply holds arbitrary
+  connection secrets (a Figma token, a PAT) alongside provider keys, referenced
+  from a connection's `env:` and validated by the same doctor credential-check.
+  No new store.
 
 ## 5. What it reuses (the real spine — nothing is greenfield)
 
@@ -175,16 +198,20 @@ automatically, closing the loop.
   third-party; Smithery/Glama/PulseMCP adapters; the `suggest-tools` authoring
   integration.
 
-## 7. Open questions (to resolve in the spec review)
+## 7. Decisions (from spec review) + remaining open questions
 
-- **Catalog cache/refresh** cadence — registries as remote data: staleness and
-  refresh, modeled on pack currency.
-- **Secrets store** — extend `providers.env` vs a dedicated connection-secrets
-  store; how to reference per-connection secrets.
-- **Capability vocabulary** — the shared taxonomy candidates declare and
-  workflows express needs against (this is what makes `evaluate` deterministic
-  rather than fuzzy). Likely the highest-leverage open question.
+**Decided:**
+
+- **Capability vocabulary** — reuse the existing verb + capability model; a tool
+  is described by the cap-verbs it serves, with `tags` for the finer axis
+  (§3.3). No new taxonomy.
+- **Secrets store** — extend `providers.env` (§4).
+- **Catalog freshness** — a ~24h-TTL refresh step: auto for metadata reads,
+  trust-gated for tool updates (§3.5).
+
+**Still open:**
+
 - **Uninstall semantics** — shared binaries / docker images / npx (nothing to
-  uninstall) differ.
+  uninstall) differ; deprovision needs a per-transport story.
 - **Ranking** — how `discover`/`evaluate` rank across composed registries and
-  trust tiers.
+  trust tiers (verified-first? capability-match score? provenance weight?).
