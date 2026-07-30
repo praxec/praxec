@@ -99,6 +99,22 @@ pub enum ChainOutcome {
         partial: ChainResult,
         reason: String,
     },
+    /// Chain stopped because the run exceeded its cumulative MISSION-DEADLINE
+    /// wall-clock budget (active-drive time, persisted across drives AND
+    /// restarts, excluding any time spent parked) without reaching a terminal
+    /// state. Distinct from `Quarantined`: this is the OUTER wall-clock
+    /// backstop (catches a run blocked on a single long operation, or one
+    /// whose total active-drive time runs away) rather than a hop-COUNT
+    /// liveness backstop. The caller QUARANTINES the run (cancels it) exactly
+    /// like `Quarantined`, so it cannot re-drive and burn the model
+    /// indefinitely. `elapsed_ms`/`deadline_ms` are the raw numbers behind
+    /// `reason`'s human-readable message.
+    DeadlineExceeded {
+        partial: ChainResult,
+        reason: String,
+        elapsed_ms: u64,
+        deadline_ms: u64,
+    },
     /// Chain stopped because the controlling MCP client ABORTED the in-flight
     /// call (its rmcp `CancellationToken` fired on cancel/disconnect). Distinct
     /// from `Quarantined`: a transport abort is NOT a decision to abandon the
@@ -190,6 +206,16 @@ pub struct WorkflowRuntime {
     /// LLM-driven workflows make progress, short enough to surface a
     /// stuck loop quickly). Override via [`Self::with_max_chained_llm_turns`].
     pub(crate) max_chained_llm_turns: u32,
+    /// Mission wall-clock deadline default (seconds) — the outer backstop so
+    /// NO run can hang indefinitely regardless of cause. Cumulative ACTIVE
+    /// DRIVE time only (excludes any time parked on a human/lock/sub-workflow
+    /// wait); see `runtime_chain::CHAIN_WALL_MS_TOTAL_KEY`. A definition's
+    /// `missionDeadlineSecs` overrides this per-workflow; `0` (either level)
+    /// disables the backstop. Default
+    /// `runtime_chain::DEFAULT_MISSION_DEADLINE_SECS` (30 min — generous,
+    /// tuned not to cut off a legitimately long agentic run). Override via
+    /// [`Self::with_mission_deadline_secs`].
+    pub(crate) mission_deadline_secs: u64,
     /// (1b) Auto-drive skill-surfacing `actor: agent` states. When enabled and a
     /// model binding is available, the deterministic chain — instead of stopping
     /// at a lone `actor: agent` transition — invokes the gateway's `kind: agent`
@@ -294,6 +320,7 @@ impl WorkflowRuntime {
             draining: Arc::new(AtomicBool::new(false)),
             pending_subjects: None,
             max_chained_llm_turns: DEFAULT_MAX_CHAINED_LLM_TURNS,
+            mission_deadline_secs: crate::runtime::runtime_chain::DEFAULT_MISSION_DEADLINE_SECS,
             auto_drive_agents: false,
             auto_drive_affinity: "reasoning".to_string(),
             auto_drive_tools: Vec::new(),
@@ -763,6 +790,18 @@ impl WorkflowRuntime {
         self
     }
 
+    /// Override the runtime-level mission wall-clock deadline default
+    /// (seconds). A definition's `missionDeadlineSecs` still wins per-workflow
+    /// when declared; this only changes the fallback used when a definition
+    /// doesn't declare one. `0` disables the backstop runtime-wide (still
+    /// overridable back on per-definition). See
+    /// `runtime_chain::DEFAULT_MISSION_DEADLINE_SECS` for the shipped default
+    /// and rationale.
+    pub fn with_mission_deadline_secs(mut self, secs: u64) -> Self {
+        self.mission_deadline_secs = secs;
+        self
+    }
+
     /// SPEC §30.10.4 — wire the live pending-subjects set. The MCP layer
     /// calls this with the subjects detected at config-load time; resolution
     /// handlers then remove entries from the shared Arc as subjects are defined.
@@ -952,6 +991,37 @@ impl WorkflowRuntime {
                 .await?;
                 reaped += 1;
                 continue;
+            }
+            // Mission-deadline backstop — the same boot-time reasoning as the
+            // livelock check above, for the OTHER liveness budget: an instance
+            // that already burned its full cumulative ACTIVE-DRIVE wall-clock
+            // budget (see `runtime_chain::CHAIN_WALL_MS_TOTAL_KEY`) without
+            // terminating is over deadline even though it never re-entered
+            // `run_deterministic_chain`'s in-drive check after the crash/
+            // restart that orphaned it. Checked BEFORE the waiting-skip below
+            // for the same reason: a livelocking/deadline-blown auto-driven
+            // agent loop persists an `_agent_await` marker and would otherwise
+            // be skipped and auto-resumed straight back into the burn.
+            let mission_deadline_secs = crate::runtime::runtime_chain::mission_deadline_secs_for(
+                def,
+                self.mission_deadline_secs,
+            );
+            if mission_deadline_secs > 0 {
+                let wall_ms_total = inst
+                    .context
+                    .get(crate::runtime::runtime_chain::CHAIN_WALL_MS_TOTAL_KEY)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if wall_ms_total >= mission_deadline_secs.saturating_mul(1000) {
+                    self.cancel(
+                        &inst.id,
+                        "mission_deadline_exceeded: exceeded cumulative active-drive \
+                         wall-clock budget without terminating (reaped at startup)",
+                    )
+                    .await?;
+                    reaped += 1;
+                    continue;
+                }
             }
             // Legitimately WAITING → never reap (mirrors the `get` derivation).
             let state_def = def.pointer(&format!("/states/{}", pointer_escape(&inst.state)));
@@ -1332,7 +1402,7 @@ impl WorkflowRuntime {
             .and_then(Value::as_u64)
             .unwrap_or(crate::runtime::runtime_chain::DEFAULT_LIVELOCK_HOP_BUDGET);
         let chain_outcome = self
-            .run_deterministic_chain(
+            .drive_chain_with_deadline(
                 &definition,
                 instance,
                 &request.principal,
@@ -1531,6 +1601,41 @@ impl WorkflowRuntime {
                         Some(json!({
                             "code": "LIVELOCK_QUARANTINE",
                             "message": reason,
+                            "cancelled_reason": cancelled.cancelled_reason,
+                        })),
+                        &request.principal,
+                    )
+                    .await;
+                if !partial.steps.is_empty() {
+                    response["chain"] = serde_json::to_value(&partial.steps)?;
+                }
+                Ok(response)
+            }
+            ChainOutcome::DeadlineExceeded {
+                partial,
+                reason,
+                elapsed_ms,
+                deadline_ms,
+            } => {
+                // Wall-clock backstop during `start` — the mission exceeded its
+                // cumulative active-drive deadline without terminating (either a
+                // single hop blocked mid-call, or many hops summed past budget).
+                // Cancel it (idempotent; wakes any suspended parent) so it cannot
+                // re-drive and burn the model, then surface the cancellation with
+                // the deadline reason (mirrors how `get` reports a cancelled run,
+                // and the livelock-quarantine arm above).
+                self.cancel(&partial.instance.id, &reason).await?;
+                let cancelled = self.store.load(&partial.instance.id).await?;
+                let mut response = self
+                    .response(
+                        &definition,
+                        &cancelled,
+                        StatusHint::Cancelled,
+                        Some(json!({
+                            "code": "MISSION_DEADLINE_EXCEEDED",
+                            "message": reason,
+                            "elapsedMs": elapsed_ms,
+                            "deadlineMs": deadline_ms,
                             "cancelled_reason": cancelled.cancelled_reason,
                         })),
                         &request.principal,

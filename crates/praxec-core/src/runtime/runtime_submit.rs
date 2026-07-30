@@ -1825,7 +1825,7 @@ impl WorkflowRuntime {
             .and_then(Value::as_u64)
             .unwrap_or(crate::runtime::runtime_chain::DEFAULT_LIVELOCK_HOP_BUDGET);
         let chain_outcome = self
-            .run_deterministic_chain(
+            .drive_chain_with_deadline(
                 &definition,
                 next,
                 &request.principal,
@@ -2038,6 +2038,41 @@ impl WorkflowRuntime {
                         Some(json!({
                             "code": "LIVELOCK_QUARANTINE",
                             "message": reason,
+                            "cancelled_reason": cancelled.cancelled_reason,
+                        })),
+                        &request.principal,
+                    )
+                    .await;
+                if !partial.steps.is_empty() {
+                    response["chain"] = serde_json::to_value(&partial.steps)?;
+                }
+                Ok(DispatchOutcome::terminal(response))
+            }
+            ChainOutcome::DeadlineExceeded {
+                partial,
+                reason,
+                elapsed_ms,
+                deadline_ms,
+            } => {
+                // Wall-clock backstop — the mission exceeded its cumulative
+                // active-drive deadline without terminating (either a single hop
+                // blocked mid-call, or many hops summed past budget). Cancel it
+                // (idempotent; wakes any suspended parent) so it cannot re-drive
+                // and burn the model, then respond terminal with the deadline
+                // reason (surfaced as a cancellation, mirroring `get` and the
+                // livelock-quarantine arm above).
+                self.cancel(&partial.instance.id, &reason).await?;
+                let cancelled = self.store.load(&partial.instance.id).await?;
+                let mut response = self
+                    .response(
+                        &definition,
+                        &cancelled,
+                        StatusHint::Cancelled,
+                        Some(json!({
+                            "code": "MISSION_DEADLINE_EXCEEDED",
+                            "message": reason,
+                            "elapsedMs": elapsed_ms,
+                            "deadlineMs": deadline_ms,
                             "cancelled_reason": cancelled.cancelled_reason,
                         })),
                         &request.principal,
