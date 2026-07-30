@@ -8,6 +8,36 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.42] — 2026-07-30 — hang backstops: mission deadline + process-group kill
+
+Two engine-level poka-yokes that make an agentic run structurally unable to hang
+indefinitely, plus a docs-tree cleanup. All additive and non-breaking.
+
+### Added
+
+- **Mission wall-clock deadline backstop.** Every mission now carries a hard
+  active-drive time budget (`DEFAULT_MISSION_DEADLINE_SECS = 1800`; per-definition
+  `missionDeadlineSecs` override; `0` disables). It budgets only *active-drive*
+  time — parked HITL, lock waits, and sub-workflow waits do **not** count —
+  enforced by both an in-loop cumulative check and an outer timeout wrapping the
+  deterministic chain, so even a mid-hop blocked call is bounded. On breach: a
+  durable `cancel()` plus a typed `MISSION_DEADLINE_EXCEEDED` failure (mirrors the
+  livelock/quarantine terminals). The strongest hang poka-yoke — it applies to
+  every run regardless of pack. (#158)
+
+### Fixed
+
+- **Process-group kill on MCP child drop.** A spawned stdio MCP server is now its
+  own process-group leader, and its entire group is SIGKILLed on drop. Previously
+  `kill_on_drop` reaped only the leader PID, so a connect/idle-timeout mid-startup
+  (leader blocked in a foreground `npx` / `playwright install`) orphaned the
+  grandchild process tree. A general fix for every stdio MCP connection. (#157)
+
+### Changed
+
+- **Docs tree cleanup.** Removed a stray working report from the repo root and
+  restored the session's design artifacts under `docs/design/`. (#160)
+
 ## [0.0.41] — 2026-07-29 — pack currency (remote sourcing, staleness, provenance) + L1 entry gate
 
 Adds a workflow-pack **currency** story — consume packs from a git remote, know
