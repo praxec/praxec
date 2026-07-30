@@ -369,6 +369,20 @@ pub(crate) enum ConnectionsCommand {
         #[arg(long = "yes", visible_alias = "force", default_value_t = false)]
         yes: bool,
     },
+    /// D4a/P2.4 — REVOKE a previously-granted connection: the explicit,
+    /// auditable MIRROR of `grant`. Removes the name from the top-level
+    /// `grant_connections:` list so the config-load gate no longer promotes it
+    /// into the live `/connections` registry on the next load — demoting it
+    /// back to inert/staged — and records a `connections.revoked` audit event.
+    /// This ONLY un-grants: the staged connection body itself is left in
+    /// place (not deleted). Fail-fast if the name is not currently granted.
+    Revoke {
+        /// Path to the gateway YAML config to edit in place.
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The granted connection to revoke.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

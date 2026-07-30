@@ -211,6 +211,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             ConnectionsCommand::Grant { config, name, yes } => {
                 connections_grant(&config, &name, yes).await
             }
+            ConnectionsCommand::Revoke { config, name } => connections_revoke(&config, &name).await,
         },
     }
 }
@@ -432,6 +433,55 @@ async fn connections_grant(config: &std::path::Path, name: &str, yes: bool) -> a
     println!(
         "It is now live: the config-load gate promotes it into the `/connections` registry. \
          Recorded a `connections.granted` audit event."
+    );
+    Ok(())
+}
+
+/// D4a/P2.4 — `connections revoke`: the explicit, auditable MIRROR of
+/// `connections grant`, run in reverse. Removes `name` from the config's
+/// top-level `grant_connections:` list (via the write primitive) and records
+/// a `connections.revoked` audit event — demoting the connection back to
+/// inert/staged. The staged body itself is left in place; this only
+/// un-grants (a separate `remove` that deletes the staged body entirely is
+/// out of scope here).
+///
+/// Unlike `connections grant`, there is no F13 operator-origin (TTY/`--yes`)
+/// gate: that gate exists because granting MINTS trust, and a non-human
+/// invocation must not be able to do that silently. Revoking only ever
+/// REMOVES trust — the safe direction — so the gate does not apply.
+async fn connections_revoke(config: &std::path::Path, name: &str) -> anyhow::Result<()> {
+    use praxec_executors::conn_write::revoke_connection;
+
+    // Edit the raw config file first (fail-fast if not currently granted).
+    let body = revoke_connection(config, name)?;
+    let kind = body
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Emit a governance audit event, same pattern as `connections_grant`: read
+    // the sink from the (now updated) resolved config so a durable
+    // `audit.sink: file` retains the revoke in the queryable trail.
+    let resolved = load_config(&config.to_path_buf())?;
+    let sink = build_audit_sink(&resolved)?;
+    let event = praxec_core::audit::AuditEvent::new("connections.revoked")
+        .with_actor("operator")
+        .with_payload(serde_json::json!({
+            "connection": name,
+            "kind": kind,
+            "config": config.display().to_string(),
+        }));
+    sink.record(event).await?;
+
+    println!(
+        "connections revoke: REVOKED connection '{name}' (kind: {kind}) in {}",
+        config.display()
+    );
+    println!(
+        "It is no longer live: the config-load gate no longer promotes it into the \
+         `/connections` registry — it is back to inert/staged. Recorded a \
+         `connections.revoked` audit event."
     );
     Ok(())
 }

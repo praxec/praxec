@@ -339,6 +339,116 @@ fn add_without_block_or_kind_exits_non_zero() {
     );
 }
 
+/// P2.4 — `connections revoke` is the explicit, auditable MIRROR of `grant`:
+/// it removes the name from `grant_connections:`, demoting the connection
+/// back to inert/staged (never live), while the staged body itself survives.
+#[test]
+fn revoke_demotes_granted_connection_back_to_staged() {
+    let (_d, path) = write_base();
+
+    assert!(
+        run(
+            &path,
+            &["add", "github", "--kind", "mcp", "--command", "npx"]
+        )
+        .status
+        .success(),
+        "stage the connection"
+    );
+    assert!(
+        run(&path, &["grant", "github", "--yes"]).status.success(),
+        "grant the connection"
+    );
+    let resolved = praxec_core::config::load_resolved_with_repos(&path)
+        .expect("resolves after grant")
+        .0;
+    assert_eq!(
+        resolved
+            .pointer("/connections/github/kind")
+            .and_then(serde_json::Value::as_str),
+        Some("mcp"),
+        "sanity: granted connection is live before revoke"
+    );
+
+    let out = run(&path, &["revoke", "github"]);
+    assert!(
+        out.status.success(),
+        "revoke failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let resolved = praxec_core::config::load_resolved_with_repos(&path)
+        .expect("resolves after revoke")
+        .0;
+    assert!(
+        resolved.pointer("/connections/github").is_none(),
+        "a revoked connection must no longer be live"
+    );
+    assert!(
+        resolved
+            .pointer("/praxec/_ungrantedConnections/github")
+            .is_some(),
+        "a revoked connection must fall back to staged/ungranted"
+    );
+}
+
+/// Revoking a connection that was never granted (only staged, or not present
+/// at all) is a fail-fast, not a silent no-op.
+#[test]
+fn revoke_of_ungranted_exits_non_zero() {
+    let (_d, path) = write_base();
+
+    // Never mentioned at all.
+    let out = run(&path, &["revoke", "ghost"]);
+    assert!(
+        !out.status.success(),
+        "revoking an unmentioned connection must exit non-zero"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("CONNECTION_NOT_GRANTED"),
+        "stderr must carry the typed CONNECTION_NOT_GRANTED code, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Staged but never granted.
+    assert!(
+        run(&path, &["add", "c", "--kind", "cli", "--command", "gh"])
+            .status
+            .success()
+    );
+    let out = run(&path, &["revoke", "c"]);
+    assert!(
+        !out.status.success(),
+        "revoking a merely-staged (never-granted) connection must exit non-zero"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("CONNECTION_NOT_GRANTED"),
+        "stderr must carry the typed CONNECTION_NOT_GRANTED code, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Revoking twice fails the second time — revoke is not idempotent, it fails
+/// fast rather than silently accepting a no-op re-revoke.
+#[test]
+fn double_revoke_exits_non_zero_second_time() {
+    let (_d, path) = write_base();
+    assert!(
+        run(&path, &["add", "c", "--kind", "cli", "--command", "gh"])
+            .status
+            .success()
+    );
+    assert!(run(&path, &["grant", "c", "--yes"]).status.success());
+    assert!(run(&path, &["revoke", "c"]).status.success());
+
+    let out = run(&path, &["revoke", "c"]);
+    assert!(
+        !out.status.success(),
+        "a second revoke of the same connection must exit non-zero"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("CONNECTION_NOT_GRANTED"));
+}
+
 #[test]
 fn inapplicable_flag_for_kind_exits_non_zero() {
     let (_d, path) = write_base();

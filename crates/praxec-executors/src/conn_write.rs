@@ -126,6 +126,11 @@ pub enum ConnWriteError {
     NotStaged(String),
     #[error("CONNECTION_ALREADY_GRANTED: connection '{0}' is already granted")]
     AlreadyGranted(String),
+    #[error(
+        "CONNECTION_NOT_GRANTED: connection '{0}' is not currently granted — nothing to revoke \
+         (check `grant_connections:` in the config)"
+    )]
+    NotGranted(String),
     #[error("CONNECTION_CONFIG_PARSE: {0}")]
     Parse(String),
     #[error("CONNECTION_CONFIG_IO: {0}")]
@@ -431,6 +436,67 @@ pub fn grant_connection(config_path: &Path, name: &str) -> Result<Value, ConnWri
     Ok(body_json)
 }
 
+/// P2.4 — REVOKE a previously-granted connection: the explicit, auditable
+/// MIRROR of [`grant_connection`], run in reverse. Removes `name` from the
+/// top-level `grant_connections:` list so the config-load gate no longer
+/// promotes it into the live `/connections` registry on the next load —
+/// demoting it back to inert/staged. This ONLY un-grants: the staged body
+/// under `stagedConnections:` is left untouched (a separate `remove` that
+/// deletes the staged body entirely is out of scope — see the module doc).
+/// Returns the (still-staged) connection body, if one is found, for the
+/// caller to echo + audit.
+///
+/// Unlike `grant_connection`, there is no F13 operator-origin gate here (that
+/// gate lives in the CLI layer for `grant` only): revoking only ever demotes
+/// a connection back to inert, which is the safe direction, not the one the
+/// origin gate protects against.
+///
+/// Fail-fast on: a `name` not currently present in `grant_connections:`
+/// ([`ConnWriteError::NotGranted`]), or an unreadable / unwritable / non-
+/// mapping config.
+pub fn revoke_connection(config_path: &Path, name: &str) -> Result<Value, ConnWriteError> {
+    let mut doc = load_doc(config_path)?;
+    let root = doc
+        .as_mapping_mut()
+        .expect("load_doc guarantees a top-level mapping");
+
+    let grant_key = serde_yaml::Value::String(GRANT_CONNECTIONS_KEY.to_string());
+    let grants = root
+        .get_mut(&grant_key)
+        .and_then(|v| match v {
+            serde_yaml::Value::Sequence(s) => Some(s),
+            _ => None,
+        })
+        .ok_or_else(|| ConnWriteError::NotGranted(name.to_string()))?;
+
+    let idx = grants
+        .iter()
+        .position(|v| v.as_str() == Some(name))
+        .ok_or_else(|| ConnWriteError::NotGranted(name.to_string()))?;
+    grants.remove(idx);
+
+    // Best-effort echo of the (still-staged) body — a granted name should
+    // always have a matching staged entry, but a missing one doesn't block
+    // the revoke itself (the un-grant is what matters; the echo is a
+    // convenience for the caller).
+    let body_yaml = root
+        .get(serde_yaml::Value::String(
+            STAGED_CONNECTIONS_KEY.to_string(),
+        ))
+        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(|m| m.get(serde_yaml::Value::String(name.to_string())))
+        .cloned();
+
+    write_doc(config_path, &doc)?;
+
+    let body_json = match body_yaml {
+        Some(y) => serde_json::to_value(&y)
+            .map_err(|e| ConnWriteError::Parse(format!("reading staged connection body: {e}")))?,
+        None => Value::Null,
+    };
+    Ok(body_json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +648,95 @@ mod tests {
         let err = add_connection_raw(&config, "bad", r#"{"kind":"grpc","command":"gh"}"#)
             .expect_err("an unrecognized `kind` must be rejected");
         assert!(matches!(err, ConnWriteError::InvalidKind(k) if k == "grpc"));
+    }
+
+    #[test]
+    fn revoke_removes_name_from_grant_connections() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_base_config(dir.path());
+
+        add_connection(
+            &config,
+            "gh",
+            &ConnectionSpec::Cli {
+                command: "gh".into(),
+                working_directory: None,
+                env: vec![],
+            },
+        )
+        .expect("stage");
+        grant_connection(&config, "gh").expect("grant");
+
+        let raw = std::fs::read_to_string(&config).expect("read back config");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse");
+        assert_eq!(
+            doc["grant_connections"]
+                .as_sequence()
+                .expect("sequence")
+                .len(),
+            1,
+            "sanity: granted before revoke"
+        );
+
+        let body = revoke_connection(&config, "gh").expect("revoke");
+        assert_eq!(body["kind"], "cli", "revoke echoes the still-staged body");
+
+        let raw = std::fs::read_to_string(&config).expect("read back config");
+        let doc: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse");
+        assert!(
+            doc["grant_connections"]
+                .as_sequence()
+                .map(|s| s.is_empty())
+                .unwrap_or(true),
+            "revoke must remove the name from grant_connections"
+        );
+        // The staged body itself must survive — revoke only un-grants.
+        assert_eq!(doc["stagedConnections"]["gh"]["kind"].as_str(), Some("cli"));
+    }
+
+    #[test]
+    fn revoke_of_ungranted_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_base_config(dir.path());
+
+        // Never granted at all (no `grant_connections:` key yet).
+        let err = revoke_connection(&config, "ghost").expect_err("must fail");
+        assert!(matches!(err, ConnWriteError::NotGranted(n) if n == "ghost"));
+
+        // Staged but not granted.
+        add_connection(
+            &config,
+            "staged_only",
+            &ConnectionSpec::Cli {
+                command: "gh".into(),
+                working_directory: None,
+                env: vec![],
+            },
+        )
+        .expect("stage");
+        let err = revoke_connection(&config, "staged_only").expect_err("must fail");
+        assert!(matches!(err, ConnWriteError::NotGranted(n) if n == "staged_only"));
+    }
+
+    #[test]
+    fn revoke_twice_errors_the_second_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = write_base_config(dir.path());
+
+        add_connection(
+            &config,
+            "gh",
+            &ConnectionSpec::Cli {
+                command: "gh".into(),
+                working_directory: None,
+                env: vec![],
+            },
+        )
+        .expect("stage");
+        grant_connection(&config, "gh").expect("grant");
+        revoke_connection(&config, "gh").expect("first revoke succeeds");
+
+        let err = revoke_connection(&config, "gh").expect_err("second revoke must fail");
+        assert!(matches!(err, ConnWriteError::NotGranted(n) if n == "gh"));
     }
 }
