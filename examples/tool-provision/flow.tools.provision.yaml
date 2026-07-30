@@ -10,8 +10,62 @@
 #   granting → `praxec connections grant` (GRANT: the separate, explicit,
 #                                          auditable operator trust act)
 #
-# select → trust_gate → installing → collecting → building → staging
-#        → validating → granting → done | failed
+# select → trust_gate ─┬─(verified/org)→ installing ──────────────┐
+#                       └─(community)──→ community_gate            ├→ collecting
+#                                          ├─approve→ community_installing
+#                                          └─decline→ failed         (rejoins the same
+#                                                                     path as installing)
+#        → collecting → building → staging → validating → granting → done | failed
+#
+# ── Phase 3 (P3.2) — the community lane, sandboxed + double-approved ────
+# `trust_gate` no longer refuses `community` candidates. It routes them
+# through ONE extra operator gate (`community_gate` — "yes, I understand
+# this is unverified/third-party and I accept the risk of running its
+# install code") before `community_installing` runs the SAME per-transport
+# install recipe as `installing`, except the code-executing branch (stdio's
+# `npm install -g`) is recast from a raw `kind: cli` + `connection: npm`
+# invocation into a hash-pinned `kind: script` (`install.community-npm`,
+# below) carrying a `confinement: "confined"` profile — the ONLY executor
+# kind in this codebase actually wired to `SandboxProvider` (ADR-0006; see
+# `crates/praxec-core/src/sandbox.rs` + `crates/praxec-executors/src/
+# script.rs`). `kind: cli` never reads `confinement` at all (grep-verified:
+# only `script.rs` calls `ConfinementProfile::from_executor_config`), so a
+# `kind: cli` step is UNSANDBOXABLE as-is — that's the real grammar
+# constraint this design respects rather than fakes.
+#
+# This ALSO happens to be exactly the codebase's existing trust philosophy
+# for untrusted-provenance content (see `crates/praxec-executors/src/
+# untrusted_execution.rs`'s header: "untrusted content may run ONLY
+# hash-pinned `kind: script` ... never a fresh raw command") — that module
+# itself is a DIFFERENT mechanism (a publish-time provenance gate over
+# whole authored workflow DEFINITIONS, invoked by the `registry` executor
+# and `structural_analysis`'s advisory vet; it has no per-step "run
+# sandboxed" marker and is never consulted mid-execution of an already
+# defined flow like this one), but the same "script, not raw command" stance
+# is exactly right here too.
+#
+# `community_installing` rejoins `collecting` on success — from there a
+# community-tier candidate follows the IDENTICAL collect → building →
+# staging → validating → granting path any verified/org tool does, so
+# `granting`'s `connections grant` remains the ONE final activation gate for
+# EVERY tier. Net: community gets TWO operator approvals (`community_gate`
+# then `granting`); verified/org get the one (`granting`) they always had.
+#
+# Known residual (documented, not silently worked around): `confinement:
+# "confined"` is deny-all egress (ADR-0006 default). `npm install -g` needs
+# network to reach the registry, and NEITHER wired sandbox backend supports
+# a working egress ALLOWLIST today (`BwrapProvider`/`OciProvider` both
+# `bail!` with `*_EGRESS_UNSUPPORTED` on one) — so a REAL drive of the
+# stdio/npm community branch currently fails fast at `INSTALL_FAILED`
+# end-to-end until a backend gains selective egress. That failure is typed
+# and routed through this workflow's existing `branches`/`failed` handling
+# exactly like any other install failure — never a silent unconfined
+# fallback. Also note: a real drive additionally needs `praxec.execution.
+# sandbox: bwrap` (or `oci` + an image) configured in the gateway config, or
+# `community_installing`'s script step fails fast with
+# `CONFINEMENT_UNAVAILABLE` (a declared `confinement` profile with no
+# provider configured refuses to run unconfined — see `script.rs`) rather
+# than silently running unsandboxed.
 #
 # ── The env-wiring gap (P2.3b) — CLOSED, here's exactly how ─────────────
 # `staging` used to template only the CONNECTION IDENTITY (name / kind /
@@ -82,6 +136,12 @@ lexicon:
     definition_short: >
       Assemble a staged connection's full JSON body (kind, identity,
       env:/required_secrets:) from a candidate + operator-collected values.
+  install.community-npm:
+    definition_short: >
+      Install a COMMUNITY-tier (unverified/third-party) npx-distributed
+      stdio server package. Hash-pinned `kind: script` (not a raw `kind:
+      cli` invocation) so it can carry a `confinement:` profile and run
+      under the ADR-0006 sandbox — see the workflow header's Phase 3 note.
 
 scripts:
   build.connection-body:
@@ -145,14 +205,27 @@ scripts:
           ;;
       esac
 
+  install.community-npm:
+    verb: install
+    lifecycle: stable
+    body: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      npm_pkg="$1"
+      npm install -g "$npm_pkg"
+
 workflows:
   flow.tools.provision:
     description: >
       Provision a discovered MCP tool candidate into a live connection via
       the existing `connections add` (stage) → `connections grant`
-      (operator trust act) CLI — the trusted lane only (verified/org);
-      community candidates are refused (Phase 3 territory).
-    tags: [tool-lifecycle, governed, phase2]
+      (operator trust act) CLI. Verified/org candidates install directly;
+      `community` (unverified/third-party) candidates are no longer
+      refused — they take an extra operator-approved, sandboxed detour
+      (`community_gate` → `community_installing`, Phase 3 / P3.2) before
+      rejoining the same collect → validate → grant path every tier shares.
+    tags: [tool-lifecycle, governed, phase2, phase3-community-lane]
 
     inputSchema:
       type: object
@@ -227,6 +300,7 @@ workflows:
       secretEnvNames: []
       collectedConfig: {}
       secrets_set: []
+      community_approved: null
       installExitCode: null
       installSuccess: null
       built_body: null
@@ -279,7 +353,10 @@ workflows:
           Split gate on `trust_tier`. Exhaustive over the closed
           `TrustTier` set (community/org/verified) rather than one
           unguarded catch-all transition, so `linkFilter: byGuards` never
-          shows two simultaneously-legal outcomes.
+          shows two simultaneously-legal outcomes. `community` no longer
+          fails closed here (Phase 3 / P3.2) — it routes to `community_gate`,
+          an extra operator approval that precedes a SANDBOXED install
+          (see the workflow header note), then rejoins the normal path.
         linkFilter: byGuards
         transitions:
           # `proceed_verified`/`proceed_org` are split into two flat-guard
@@ -300,13 +377,11 @@ workflows:
             guards:
               - { kind: expr, expr: "$.context.trust_tier == 'org'" }
 
-          reject_community:
-            title: Community tier needs Phase 3 (sandboxed) provisioning.
-            target: failed
+          proceed_community:
+            title: Community tier — extra approval, then a SANDBOXED install.
+            target: community_gate
             guards:
               - { kind: expr, expr: "$.context.trust_tier == 'community'" }
-            output:
-              reason: "COMMUNITY_REQUIRES_PHASE3"
 
           reject_unknown_tier:
             title: Unrecognized/unset trust tier — fail closed.
@@ -319,6 +394,119 @@ workflows:
                   - { kind: expr, expr: "$.context.trust_tier != 'community'" }
             output:
               reason: "UNKNOWN_TRUST_TIER"
+
+      # ── community_gate ──────────────────────────────────────────────
+      community_gate:
+        description: >
+          Phase 3 (P3.2) — the extra approval untrusted/unverified code
+          requires. `trust_gate` routes here ONLY for `trust_tier ==
+          'community'`; before any of the candidate's install code runs,
+          the operator must see plainly that this is an unverified,
+          third-party tool and explicitly accept running its install
+          SANDBOXED. This is distinct from `granting` (below), which still
+          gates ACTIVATION for every tier — approving here only permits
+          `community_installing` to run; the tool is not wired until
+          `granting` ALSO approves it. Community tools thus clear TWO
+          operator gates; verified/org clear the one (`granting`).
+        linkFilter: byGuards
+        transitions:
+          approve_community_install:
+            title: Approve — install this UNVERIFIED tool, sandboxed.
+            actor: human
+            target: community_installing
+            guards:
+              - { kind: permission, permission: workflow.approve }
+            output:
+              community_approved: true
+
+          decline_community_install:
+            title: Decline — do not install. Nothing runs.
+            actor: human
+            target: failed
+            guards:
+              - { kind: permission, permission: workflow.approve }
+            output:
+              community_approved: false
+              reason: "COMMUNITY_DECLINED"
+
+      # ── community_installing ─────────────────────────────────────────
+      community_installing:
+        description: >
+          Phase 3 (P3.2) — the SAME per-transport install recipe as
+          `installing`, reached only after `community_gate` approval, with
+          the one branch that actually executes third-party code (stdio's
+          `npm install -g`) recast as a hash-pinned `kind: script`
+          (`install.community-npm`) carrying `confinement: "confined"` —
+          the real ADR-0006 sandbox marker (`kind: cli`, what `installing`
+          uses, has no confinement support at all — see the workflow
+          header note for why this had to change kind, not just add a
+          field). A non-zero exit is DATA (`treatNonZeroAsFailure: false`);
+          `branches` routes it to `failed` (`INSTALL_FAILED`) exactly like
+          `installing` does. On success, REJOINS the normal path at
+          `collecting` — from here a community tool is indistinguishable
+          from a verified/org one; `granting` still gates its activation.
+        linkFilter: byGuards
+        transitions:
+          install_community_npm:
+            title: "Install (sandboxed): npx-distributed stdio server."
+            target: failed # fallback if the branch below doesn't match
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'stdio'" }
+              - { kind: expr, expr: "$.context.npmPkg != null" }
+            executor:
+              kind: script
+              subject: install.community-npm
+              confinement: "confined"
+              args: ["$.context.npmPkg"]
+              treatNonZeroAsFailure: false
+            reliability:
+              timeoutMs: 120000
+            branches:
+              - when: { kind: expr, expr: "$.context.installSuccess == true" }
+                target: collecting
+            output:
+              installExitCode: "$.output.exitCode"
+              installSuccess:  "$.output.success"
+              reason: "INSTALL_FAILED"
+
+          community_install_not_needed_remote:
+            title: "Install: remote transport needs nothing installed."
+            target: collecting
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'remote'" }
+            executor: { kind: noop }
+            output:
+              installSuccess: true
+
+          community_install_not_needed_rest:
+            title: "Install: rest transport needs nothing installed."
+            target: collecting
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'rest'" }
+            executor: { kind: noop }
+            output:
+              installSuccess: true
+
+          community_install_unsupported:
+            title: No install recipe for this transport/source combination.
+            target: failed
+            guards:
+              - kind: all_of
+                guards:
+                  - kind: not
+                    guard:
+                      kind: all_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'stdio'" }
+                        - { kind: expr, expr: "$.context.npmPkg != null" }
+                  - kind: not
+                    guard:
+                      kind: any_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'remote'" }
+                        - { kind: expr, expr: "$.context.transport == 'rest'" }
+            output:
+              reason: "INSTALL_RECIPE_UNAVAILABLE"
 
       # ── installing ──────────────────────────────────────────────────
       installing:
@@ -683,7 +871,7 @@ workflows:
         terminal: true
         description: >
           Provisioning did not complete. `context.reason` carries the typed
-          cause (COMMUNITY_REQUIRES_PHASE3 | UNKNOWN_TRUST_TIER |
-          INSTALL_FAILED | INSTALL_RECIPE_UNAVAILABLE | BUILD_FAILED |
+          cause (UNKNOWN_TRUST_TIER | COMMUNITY_DECLINED | INSTALL_FAILED |
+          INSTALL_RECIPE_UNAVAILABLE | BUILD_FAILED |
           BUILD_RECIPE_UNAVAILABLE | STAGE_FAILED | VALIDATION_FAILED |
           GRANT_FAILED | OPERATOR_DECLINED).
