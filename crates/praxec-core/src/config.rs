@@ -3352,7 +3352,7 @@ fn merge_declared_repos(
                     let dest = host_dir
                         .join(".praxec")
                         .join("repos")
-                        .join(crate::repo_git::cache_dir_name(&uri));
+                        .join(crate::repo_git::cache_dir_name(&uri, &gitref));
                     crate::repo_git::clone_or_update(&uri, &gitref, &dest)
                         .with_context(|| format!("importing repo {uri}"))?
                 }

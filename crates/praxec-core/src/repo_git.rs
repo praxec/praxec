@@ -21,21 +21,28 @@ pub fn clone_url(uri: &str) -> String {
         .unwrap_or_else(|| uri.to_string())
 }
 
-/// A stable, filesystem-safe directory name derived from a repo URI — the
-/// cache slot a remote repo clones into. Non-alphanumerics collapse to `-`.
-pub fn cache_dir_name(uri: &str) -> String {
-    let mut out = String::with_capacity(uri.len());
-    let mut last_dash = false;
-    for c in uri.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c);
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
+/// A stable, filesystem-safe directory name for a remote repo's clone cache,
+/// keyed on BOTH the URI and the ref. Keying on the URI alone means two
+/// `repos:` entries with the same `uri:` but different `ref:` collapse to one
+/// cache dir and thrash each other (each load `reset --hard`s the other's ref
+/// away); including the ref gives each its own slot. Non-alphanumerics collapse
+/// to `-`; the two slugs are joined by `--`.
+pub fn cache_dir_name(uri: &str, gitref: &str) -> String {
+    fn slug(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut last_dash = false;
+        for c in s.chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c);
+                last_dash = false;
+            } else if !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
         }
+        out.trim_matches('-').to_string()
     }
-    out.trim_matches('-').to_string()
+    format!("{}--{}", slug(uri), slug(gitref))
 }
 
 fn run_git(args: &[&str], cwd: Option<&Path>) -> anyhow::Result<()> {
@@ -416,9 +423,19 @@ mod tests {
 
     #[test]
     fn cache_dir_name_is_filesystem_safe_and_stable() {
-        let a = cache_dir_name("git+https://github.com/acme/repo@main");
+        let a = cache_dir_name("git+https://github.com/acme/repo", "main");
         assert!(!a.contains('/') && !a.contains(':') && !a.contains('@'));
-        assert_eq!(a, cache_dir_name("git+https://github.com/acme/repo@main"));
+        assert_eq!(
+            a,
+            cache_dir_name("git+https://github.com/acme/repo", "main")
+        );
+        // Thrash-prevention: same uri, DIFFERENT ref → DISTINCT cache dirs, so
+        // two `repos:` entries on the same repo at different refs don't collide.
+        assert_ne!(
+            cache_dir_name("git+https://github.com/acme/repo", "main"),
+            cache_dir_name("git+https://github.com/acme/repo", "v1.0.0"),
+            "same uri + different ref must not share a cache dir",
+        );
     }
 
     #[test]
@@ -464,7 +481,10 @@ mod tests {
 
         // Cold-clone: `dest` has never been cloned before, and `gitref` is a
         // bare SHA, not a branch/tag.
-        let dest = tmp.path().join("cache").join(cache_dir_name(&origin_uri));
+        let dest = tmp
+            .path()
+            .join("cache")
+            .join(cache_dir_name(&origin_uri, "main"));
         clone_or_update(&origin_uri, &pinned_sha, &dest)
             .expect("cold-clone pinned to a bare commit SHA must succeed");
 
@@ -497,7 +517,10 @@ mod tests {
         seed_origin(&origin);
         let origin_uri = format!("file://{}", origin.display());
 
-        let dest = tmp.path().join("cache").join(cache_dir_name(&origin_uri));
+        let dest = tmp
+            .path()
+            .join("cache")
+            .join(cache_dir_name(&origin_uri, "main"));
         clone_or_update(&origin_uri, "main", &dest)
             .expect("cold-clone pinned to a branch name must still succeed");
         assert!(dest.join("praxec.repo.yaml").exists());
@@ -529,7 +552,10 @@ mod tests {
         seed_origin(&origin);
         let origin_uri = format!("file://{}", origin.display());
 
-        let dest = tmp.path().join("cache").join(cache_dir_name(&origin_uri));
+        let dest = tmp
+            .path()
+            .join("cache")
+            .join(cache_dir_name(&origin_uri, "main"));
         // First call clones.
         clone_or_update(&origin_uri, "main", &dest).unwrap();
         assert!(dest.join("praxec.repo.yaml").exists());
@@ -898,7 +924,10 @@ mod tests {
         init_repo(&origin, "main");
         let origin_uri = format!("file://{}", origin.display());
 
-        let dest = tmp.path().join("cache").join(cache_dir_name(&origin_uri));
+        let dest = tmp
+            .path()
+            .join("cache")
+            .join(cache_dir_name(&origin_uri, "main"));
         clone_or_update(&origin_uri, "main", &dest).unwrap();
 
         let expected_sha = git_stdout(&["rev-parse", "HEAD"], &dest)
