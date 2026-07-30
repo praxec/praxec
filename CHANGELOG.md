@@ -8,6 +8,50 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.44] — 2026-07-30 — MCP tool discovery & lifecycle (discover → evaluate → provision → deprovision)
+
+A complete surface for discovering, recommending, and governing MCP tools — built
+on praxec's existing connection governance, the two-tool query surface, and the
+sandbox trust model. All additive.
+
+### Added
+
+- **Tool discovery (`praxec.query` verbs).** A data-driven `tool_catalog` with a
+  declarative `registries:` block — typed adapters (`github-org`, `static`,
+  `rest`, `mcp-registry`) each normalizing to one `ToolCandidate`
+  (transport/source/verbs/tags/`trust_tier`/`requires{secrets,config}`). Two new
+  query verbs: `discover: "<text>"` (ranked candidates) and
+  `evaluate: { verbs: [...] }` (deterministic cap-verb match). Fail-safe assembly
+  (a registry error is a warning, never an abort), dedup keeping the highest
+  trust tier, a 24h-TTL cache type.
+- **Governed provisioning — `flow.tools.provision`.** Composes praxec's existing
+  acts rather than a parallel writer: `connections add` (stage → inert
+  `stagedConnections:`) → `connections grant` (the explicit, auditable operator
+  trust act, `GRANT_REQUIRES_OPERATOR`). Flow: select → trust-gate → install →
+  collect secrets/config (elicited to `providers.env`, names only) → stage →
+  validate (doctor on the inert connection) → grant. Validate-before-grant is the
+  poka-yoke.
+  - **Community lane:** community-tier candidates route through an extra operator
+    approval (`community_gate`) and a hash-pinned `kind: script` install carrying
+    `confinement: "confined"` (the wired sandbox marker), then rejoin — two
+    approvals for community, one (grant) for verified/org.
+  - **`flow.tools.deprovision`** — the reverse, via `connections revoke`.
+- **Connection CLI + secrets.** `connections add --block <json>` (stage a whole
+  connection body — the arbitrary-`env` wiring path); `connections revoke` (the
+  mirror of grant, `connections.revoked` audit). `doctor` now validates a
+  connection's declared `required_secrets` (env-referenced from `providers.env`,
+  never values in config).
+- **Authoring engine — `tool-suggest` executor.** A deterministic executor that
+  surfaces *installable* candidates from the configured registries by cap-verb
+  overlap (mirrors `inventory`) — the engine piece of "suggest tools during
+  authoring."
+
+### Design
+
+- `docs/design/2026-07-30-mcp-tool-lifecycle.md` + `-phase2.md` + the Phase-1
+  plan — the full spec: registries-as-data, `ToolCandidate`, trust tiers,
+  discover/evaluate/provision, secrets via `providers.env`.
+
 ## [0.0.43] — 2026-07-30 — doctor tool-currency (is each MCP tool up to date?)
 
 `praxec doctor` gains a transport-aware currency check for `kind: mcp`
