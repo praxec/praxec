@@ -31,6 +31,9 @@ praxec-embeddings = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 rmcp = { workspace = true }
+# doctor tool-currency: the remote-MCP `initialize` probe builds a
+# StreamableHttpClientTransport::<reqwest::Client> (same as praxec-executors).
+reqwest = { workspace = true }
 # ADR-0007 — the production ToolHost converts rmcp tools → rig ToolDefinitions.
 rig = { package = "rig-core", version = "0.40" }
 serde = { workspace = true }
