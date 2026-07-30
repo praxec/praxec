@@ -479,6 +479,10 @@ impl AgentExecutor {
             expected_output_keys: cfg.expected_output_keys.clone(),
             expected_output_types: cfg.expected_output_types.clone(),
             await_enabled: cfg.await_enabled,
+            // Coding-evidence forcing function: a coding leaf's `final_answer`
+            // must be backed by real `write_file`/`edit_file` calls (see the
+            // runner's write tally). Non-coding leaves leave this false.
+            requires_file_write: cfg.requires_file_write,
             // The identity the runtime stamps on `agent.invoked` — carried so
             // the runner's in-run `agent.heartbeat` events join the same
             // workflow + correlation in the audit stream.
@@ -560,6 +564,21 @@ impl AgentExecutor {
             // distinct from a genuinely empty NoResult, and carries the partial
             // work rather than discarding it. Both classify as Capability
             // (escalate to a stronger model), so the walk is unchanged.
+            // Coding-evidence forcing function: a success with zero file writes,
+            // after the runner's bounded in-context correction. Escalatable
+            // (Capability) like NoResult/NotConverging so the chain-walk hands the
+            // work to the next model — the automated "swap the lead coder". The
+            // burned tokens rode in on the report (this is an OUTCOME, not a
+            // runner Err), so the wasted spend is attributed to this model.
+            AgentRunOutcome::NoFileWrites => Err(permanent(
+                AgentErrorCode::NoFileWrites,
+                format!(
+                    "agent reported success on a coding deliverable but made no successful \
+                     write_file/edit_file call across the run, even after in-context correction \
+                     — escalating to the next model. Partial work: {}",
+                    partial_tail(&report.transcript)
+                ),
+            )),
             AgentRunOutcome::NoResult => {
                 if report.transcript.trim().is_empty() {
                     Err(permanent(
@@ -702,7 +721,37 @@ impl Executor for AgentExecutor {
         })?;
 
         // User prompt = the templated goal, rendered against the blackboard.
-        let user_prompt = render_template(&cfg.goal, &request.workflow);
+        // Entry gate (Plan A) — the tracked render also reports any `$.`-paths
+        // that stubbed. Shadow mode (`enforce_input_grounding == false`, the
+        // default) proceeds regardless, only emitting the anomaly below.
+        // Enforced mode (Task 4) refuses before any model dispatch.
+        let (user_prompt, unresolved) =
+            praxec_core::templating::render_template_tracked(&cfg.goal, &request.workflow);
+        if !unresolved.is_empty() {
+            if let Some(sink) = &self.audit {
+                let mut event = AuditEvent::new("agent.input_unresolved")
+                    .with_workflow(request.workflow.id.clone())
+                    .with_payload(json!({
+                        "transition": request.transition,
+                        "unresolved": unresolved,
+                        "enforced": cfg.enforce_input_grounding,
+                    }));
+                if let Some(c) = &request.correlation_id {
+                    event = event.with_correlation(c.clone());
+                }
+                let _ = sink.record(event).await;
+            }
+            if cfg.enforce_input_grounding {
+                return Err(permanent(
+                    AgentErrorCode::InputUnresolved,
+                    format!(
+                        "goal for transition {:?} of workflow '{}' has unresolved input path(s) {:?} \
+                         (rendered as `(…: unset)` stubs) — refusing to dispatch on non-truth",
+                        request.transition, request.workflow.id, unresolved
+                    ),
+                ));
+            }
+        }
 
         // Resolve the full ordered model chain (cheapest-effective first). Each
         // hop carries its model-paired reasoning effort (WS1-B).
@@ -1114,6 +1163,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entry_gate_shadow_emits_anomaly_but_does_not_block() {
+        let audit = praxec_core::audit::MemoryAuditSink::new();
+        let exec = AgentExecutor::new(
+            Arc::new(MockSessionRunner::completed(AgentResult {
+                status: AgentStatus::Success,
+                output: json!({ "verdict": "pass" }),
+                internal_monologue: None,
+            })),
+            Arc::new(MockModelResolver("anthropic:claude-sonnet-4-6".into())),
+        )
+        .with_audit_sink(Arc::new(audit.clone()));
+        // goal references a context key that is NOT present → renders "(missing: unset)"
+        let res = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "do {{ $.context.missing }}" }),
+                bare_def(),
+            ))
+            .await;
+        // shadow mode: the run still succeeds (does NOT block)
+        assert!(res.is_ok(), "shadow mode must not block: {res:?}");
+        // but an anomaly was recorded, naming the unresolved path
+        let anomalies: Vec<_> = audit
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.event_type == "agent.input_unresolved")
+            .collect();
+        assert_eq!(anomalies.len(), 1);
+        assert!(
+            anomalies[0].payload["unresolved"]
+                .to_string()
+                .contains("$.context.missing")
+        );
+        assert_eq!(anomalies[0].payload["enforced"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn entry_gate_enforced_refuses_before_dispatch() {
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:claude-sonnet-4-6".into())),
+        );
+        let err = exec
+            .execute(request(
+                json!({
+                    "affinity": "coding", "goal": "do {{ $.context.missing }}",
+                    "enforce_input_grounding": true
+                }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("enforced gate must refuse");
+        assert!(format!("{err:?}").contains("AGENT_INPUT_UNRESOLVED"));
+        assert!(format!("{err:?}").contains("$.context.missing"));
+        // the runner was NEVER called — refusal is pre-dispatch
+        assert!(
+            runner.sessions().is_empty(),
+            "enforced refusal must happen before the runner is invoked"
+        );
+    }
+
+    #[tokio::test]
     async fn tools_are_templated_against_the_blackboard() {
         // A coding step declares `file:{{repo_path}}` so the agent gets file
         // tools rooted at the workflow's repo — the root must be rendered, not
@@ -1214,6 +1329,39 @@ mod tests {
         assert_eq!(
             user, "fix ticket T-7",
             "goal must be rendered against context"
+        );
+    }
+
+    /// A3 — an agent's `goal:` templated against `$.workflow.input.<key>`
+    /// renders that seeded input value into the USER prompt actually
+    /// dispatched to the model runner, at invocation time.
+    #[tokio::test]
+    async fn goal_renders_from_workflow_input_at_invocation() {
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        let mut req = request(
+            json!({
+                "affinity": "coding",
+                "goal": "{{ $.workflow.input.instructions }}"
+            }),
+            bare_def(),
+        );
+        req.workflow.input = json!({ "instructions": "refactor the parser module" });
+
+        exec.execute(req).await.expect("success");
+
+        let user = runner.sessions()[0].user_prompt.clone();
+        assert_eq!(
+            user, "refactor the parser module",
+            "the rendered goal (USER prompt) must contain the seeded \
+             $.workflow.input.instructions value at invocation"
         );
     }
 
@@ -1418,6 +1566,69 @@ mod tests {
             !msg.contains("AGENT_NO_RESULT"),
             "a run that did work must not be mislabeled NoResult: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn no_file_writes_outcome_maps_to_escalatable_error_with_partial_work() {
+        // Coding-evidence forcing function: the runner reports the NoFileWrites
+        // OUTCOME; the executor maps it to the escalatable AGENT_NO_FILE_WRITES
+        // and carries the partial work (never a bare NoResult).
+        let exec = exec_with(MockSessionRunner::no_file_writes());
+        let err = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "g" }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("a zero-write coding success → escalatable error");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("AGENT_NO_FILE_WRITES"), "got {msg}");
+        assert!(
+            msg.contains("Partial work"),
+            "partial work must be surfaced: {msg}"
+        );
+    }
+
+    /// Honest accounting: because NoFileWrites is an OUTCOME (not a runner Err),
+    /// the burned tokens survive onto the `agent.model_attempt` event — so the
+    /// wasted spend is attributed to the model that narrated instead of writing,
+    /// exactly the "glm burned $1.88 for nothing" case the flywheel must see.
+    #[tokio::test]
+    async fn a_no_file_writes_attempt_records_its_burned_tokens() {
+        let audit = praxec_core::audit::MemoryAuditSink::new();
+        let exec = AgentExecutor::new(
+            Arc::new(MockSessionRunner::no_file_writes()),
+            Arc::new(MockModelResolver("anthropic:claude-sonnet-4-6".into())),
+        )
+        .with_audit_sink(Arc::new(audit.clone()));
+        let _ = exec
+            .execute(request(
+                json!({ "affinity": "coding", "goal": "g" }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("zero-write coding success escalates");
+
+        let attempts: Vec<_> = audit
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.event_type == AGENT_MODEL_ATTEMPT_EVENT)
+            .collect();
+        assert_eq!(attempts.len(), 1, "one failed attempt recorded");
+        assert_eq!(attempts[0].payload["outcome"], json!("Capability"));
+        assert!(
+            attempts[0].payload["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("AGENT_NO_FILE_WRITES")),
+            "carries its typed error: {:#}",
+            attempts[0].payload
+        );
+        assert_eq!(
+            attempts[0].payload["prompt_tokens"],
+            json!(800),
+            "the burned tokens must survive the outcome→error map (honest accounting)"
+        );
+        assert_eq!(attempts[0].payload["completion_tokens"], json!(200));
     }
 
     #[tokio::test]

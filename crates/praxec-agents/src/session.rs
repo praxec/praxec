@@ -38,6 +38,14 @@ pub enum AgentRunOutcome {
     Completed(AgentResult),
     /// The run ended without a conforming `final_answer` call (FM1).
     NoResult,
+    /// Coding-evidence forcing function: the run reported success on a coding
+    /// deliverable (`requires_file_write`) but made zero successful
+    /// `write_file`/`edit_file` calls, even after the bounded in-context
+    /// correction. A first-class OUTCOME (not an `Err` out of the runner) so the
+    /// report still carries the burned token usage — the executor maps it to the
+    /// escalatable `AGENT_NO_FILE_WRITES`, and the wasted spend is attributed to
+    /// the model that narrated instead of writing (honest accounting).
+    NoFileWrites,
     /// Wall-clock timeout (FM4).
     TimedOut,
     /// P12 R1.4 — the agent hit its suspend signal (`await_human`): the
@@ -156,6 +164,17 @@ pub struct AgentSession {
     /// hallucinated call routes to the normal unknown-tool error result.
     #[serde(default)]
     pub await_enabled: bool,
+    /// Coding-evidence forcing function: when `true`, this session is a coding
+    /// deliverable whose success REQUIRES real file mutations. The runner tallies
+    /// successful `write_file`/`edit_file` calls; a `final_answer` (or salvaged /
+    /// sign-off-rescued answer) with zero writes is not accepted — the SAME model
+    /// is first re-prompted in-context (bounded), then the run fails
+    /// `AGENT_NO_FILE_WRITES` so the chain-walk escalates to the next model. This
+    /// closes the "narrated success on an empty worktree" hole for commodity lead
+    /// coders. **Default `false`** (serde-defaulted for frames parked before the
+    /// field existed): a non-coding session is unaffected.
+    #[serde(default)]
+    pub requires_file_write: bool,
     /// Correlating identity for the in-run `agent.heartbeat` audit events.
     /// Defaulted (all-`None`) for callers that run sessions outside a governed
     /// step (e.g. the orchestrator's decision calls) and for parked frames
@@ -268,6 +287,19 @@ pub mod testing {
         }
         pub fn timed_out() -> Self {
             Self::with_outcome(AgentRunOutcome::TimedOut)
+        }
+        /// Coding-evidence forcing function: reported success with zero file
+        /// writes → AGENT_NO_FILE_WRITES. Carries non-zero token usage so a test
+        /// can assert the burned spend survives the outcome→error map (honest
+        /// accounting), unlike a runner `Err` which would drop it.
+        pub fn no_file_writes() -> Self {
+            let mut m = Self::with_outcome_transcript(
+                AgentRunOutcome::NoFileWrites,
+                "{\"kind\":\"text\",\"message\":\"reported success, wrote nothing\"}".into(),
+            );
+            m.report.prompt_tokens = 800;
+            m.report.completion_tokens = 200;
+            m
         }
         pub fn suspended(correlation_id: &str, prompt: &str) -> Self {
             Self::with_outcome(AgentRunOutcome::Suspended(AgentSuspension {

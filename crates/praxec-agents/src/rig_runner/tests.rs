@@ -135,6 +135,7 @@ fn session(tools: Vec<String>) -> AgentSession {
         expected_output_keys: Vec::new(),
         expected_output_types: Default::default(),
         await_enabled: false,
+        requires_file_write: false,
         identity: Default::default(),
     }
 }
@@ -557,6 +558,229 @@ async fn tool_loop_executes_tool_then_completes_on_next_turn() {
         report.transcript.contains("[tool lookup]"),
         "tool result in transcript"
     );
+}
+
+// ── Coding-evidence forcing function (requires_file_write) ───────────────────
+
+fn coding_session(tools: Vec<String>) -> AgentSession {
+    AgentSession {
+        requires_file_write: true,
+        ..session(tools)
+    }
+}
+
+fn write_call(id: &str) -> StreamEvent {
+    StreamEvent::ToolCall(ToolCallRequest {
+        id: id.into(),
+        name: "write_file".into(),
+        arguments: r#"{"path":"src/x.rs","content":"// x\n"}"#.into(),
+    })
+}
+
+fn coding_answer() -> StreamEvent {
+    final_answer(r#"{"status":"success","output":{"ok":true}}"#)
+}
+
+/// A tool host exposing `write_file`/`read_file`. `write_ok` decides whether a
+/// write returns Ok (a real mutation → counts as evidence) or Err (refused → no
+/// evidence). Records the tool names it was asked to call.
+struct WriteHost {
+    write_ok: bool,
+    calls: Mutex<Vec<String>>,
+}
+#[async_trait]
+impl ToolHost for WriteHost {
+    async fn tools(
+        &self,
+        connections: &[String],
+    ) -> Result<Vec<(ToolDefinition, String)>, ExecutorError> {
+        let conn = connections
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "conn".into());
+        Ok(vec![
+            (
+                ToolDefinition {
+                    name: "write_file".into(),
+                    description: "write".into(),
+                    parameters: json!({ "type": "object" }),
+                },
+                conn.clone(),
+            ),
+            (
+                ToolDefinition {
+                    name: "read_file".into(),
+                    description: "read".into(),
+                    parameters: json!({ "type": "object" }),
+                },
+                conn,
+            ),
+        ])
+    }
+    async fn call(&self, _conn: &str, name: &str, _args: &str) -> Result<String, String> {
+        self.calls.lock().unwrap().push(name.into());
+        match name {
+            "write_file" if self.write_ok => Ok("wrote src/x.rs".into()),
+            "write_file" => Err("FILE_TOOL_WRITE_FAILED: refused".into()),
+            _ => Ok("file contents".into()),
+        }
+    }
+}
+
+/// PREVENT layer: the coding write-protocol clause rides the system message ONLY
+/// for a coding session, and never displaces the base completion protocol.
+#[test]
+fn coding_write_protocol_rides_the_system_message_only_when_required() {
+    let off = compose_system_message(&None, false);
+    assert!(
+        !off.contains("This is a CODING task"),
+        "a non-coding session must not carry the write clause: {off}"
+    );
+    let on = compose_system_message(&None, true);
+    assert!(
+        on.contains("This is a CODING task") && on.contains("write_file"),
+        "a coding session must carry the write clause: {on}"
+    );
+    assert!(
+        on.contains("final_answer"),
+        "and must still carry the base completion protocol"
+    );
+}
+
+/// DETECT + CORRECT: a coding agent that reports success with zero writes is
+/// re-prompted IN-CONTEXT, and once it actually writes, the run completes.
+#[tokio::test]
+async fn coding_zero_write_success_is_corrected_then_completes_after_a_real_write() {
+    // Turn 0: final_answer, no writes → rejected + re-prompted (nudge #1).
+    // Turn 1: the model actually writes. Turn 2: final_answer → accepted.
+    let factory = ScriptedFactory::new(vec![
+        vec![Ok(coding_answer()), Ok(done())],
+        vec![Ok(write_call("w1")), Ok(done())],
+        vec![Ok(coding_answer()), Ok(done())],
+    ]);
+    let host = Arc::new(WriteHost {
+        write_ok: true,
+        calls: Mutex::new(vec![]),
+    });
+    let runner = RigSessionRunner::new(Arc::new(factory)).with_tool_host(host.clone());
+    let report = runner
+        .run(coding_session(vec!["conn".into()]))
+        .await
+        .unwrap();
+    match report.outcome {
+        AgentRunOutcome::Completed(r) => assert_eq!(r.output["ok"], true),
+        other => panic!("expected Completed after in-context correction, got {other:?}"),
+    }
+    assert!(
+        report.transcript.contains("write-evidence feedback"),
+        "the zero-write success must have been nudged: {}",
+        report.transcript
+    );
+    assert_eq!(
+        host.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| *c == "write_file")
+            .count(),
+        1,
+        "exactly one real write happened"
+    );
+}
+
+/// ESCALATE: a coding agent that never writes, even after the bounded in-context
+/// corrections, fails `AGENT_NO_FILE_WRITES` (Capability → chain-walk escalates).
+#[tokio::test]
+async fn coding_persistent_zero_write_fails_no_file_writes_after_the_correction_budget() {
+    let factory = ScriptedFactory::new(vec![
+        vec![Ok(coding_answer()), Ok(done())], // nudge #1
+        vec![Ok(coding_answer()), Ok(done())], // nudge #2
+        vec![Ok(coding_answer()), Ok(done())], // budget spent → escalate
+    ]);
+    let host = Arc::new(WriteHost {
+        write_ok: true,
+        calls: Mutex::new(vec![]),
+    });
+    let runner = RigSessionRunner::new(Arc::new(factory)).with_tool_host(host.clone());
+    // A first-class OUTCOME (not a runner Err) so the report keeps the burned
+    // tokens; the executor maps it to the escalatable AGENT_NO_FILE_WRITES.
+    let report = runner
+        .run(coding_session(vec!["conn".into()]))
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, AgentRunOutcome::NoFileWrites);
+    assert!(
+        host.calls.lock().unwrap().is_empty(),
+        "no write was ever made"
+    );
+}
+
+/// A write that ERRORS (refused/escaped/no-match) is not file-mutation evidence:
+/// the gate still fires. Guards against counting the mere call instead of the
+/// mutation.
+#[tokio::test]
+async fn a_write_that_errors_is_not_counted_as_evidence() {
+    let factory = ScriptedFactory::new(vec![
+        vec![Ok(write_call("w1")), Ok(done())], // errored write → no evidence
+        vec![Ok(coding_answer()), Ok(done())],  // nudge #1
+        vec![Ok(coding_answer()), Ok(done())],  // nudge #2
+        vec![Ok(coding_answer()), Ok(done())],  // → escalate
+    ]);
+    let host = Arc::new(WriteHost {
+        write_ok: false,
+        calls: Mutex::new(vec![]),
+    });
+    let runner = RigSessionRunner::new(Arc::new(factory)).with_tool_host(host.clone());
+    let report = runner
+        .run(coding_session(vec!["conn".into()]))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.outcome,
+        AgentRunOutcome::NoFileWrites,
+        "an errored write is not evidence — the gate must still fire"
+    );
+    assert!(
+        host.calls.lock().unwrap().iter().any(|c| c == "write_file"),
+        "the write was attempted (just refused)"
+    );
+}
+
+/// A coding agent that writes first and finalizes second is accepted with NO
+/// correction — the forcing function is invisible on the happy path.
+#[tokio::test]
+async fn coding_write_then_final_answer_is_accepted_without_a_nudge() {
+    let factory = ScriptedFactory::new(vec![
+        vec![Ok(write_call("w1")), Ok(done())],
+        vec![Ok(coding_answer()), Ok(done())],
+    ]);
+    let host = Arc::new(WriteHost {
+        write_ok: true,
+        calls: Mutex::new(vec![]),
+    });
+    let runner = RigSessionRunner::new(Arc::new(factory)).with_tool_host(host.clone());
+    let report = runner
+        .run(coding_session(vec!["conn".into()]))
+        .await
+        .unwrap();
+    assert!(matches!(report.outcome, AgentRunOutcome::Completed(_)));
+    assert!(
+        !report.transcript.contains("write-evidence feedback"),
+        "the happy path must not nudge: {}",
+        report.transcript
+    );
+}
+
+/// A NON-coding session (the default) is unaffected: a zero-write success is
+/// accepted exactly as before.
+#[tokio::test]
+async fn non_coding_zero_write_success_is_accepted_unchanged() {
+    let factory = ScriptedFactory::new(vec![vec![Ok(coding_answer()), Ok(done())]]);
+    let report = RigSessionRunner::new(Arc::new(factory))
+        .run(session(vec![])) // requires_file_write = false
+        .await
+        .unwrap();
+    assert!(matches!(report.outcome, AgentRunOutcome::Completed(_)));
 }
 
 /// A ToolHost whose every `lookup` returns a fixed sizeable payload — so the
@@ -1052,6 +1276,7 @@ async fn tool_setup_timeout_honors_session_value() {
         expected_output_keys: Vec::new(),
         expected_output_types: Default::default(),
         await_enabled: false,
+        requires_file_write: false,
         identity: Default::default(),
     };
     let runner = RigSessionRunner::new(Arc::new(ScriptedFactory::new(vec![])))

@@ -1,0 +1,77 @@
+schema: praxec.coverage-report/v1
+coverage_scope: "crates/praxec-core/src/guards.rs"
+repo_root: "/home/mc/working/mcp-flowgate-bcov"
+generated_by: flow.behavioral-coverage (HAND-COMPLETED dogfood — see provenance)
+# PROVENANCE (honest accounting): the live orchestrated run stalled in the
+# `enumerating` step on commodity-model latency (600s budget; engine
+# stall-defense correctly began escalating) and was deliberately terminated.
+# The primitive inventory below was then HAND-BUILT by reading guards.rs
+# directly, and the 18 assertions hand-authored to match (2 genuinely ran
+# red first on a real harness gap, then green). The `scanning_tests`,
+# `enforcing_atomicity`, and `reporting` steps WERE proven by invoking the
+# real committed scripts against this repo state (not fabricated). This is a
+# HAND-COMPLETED proof of the flow's components, NOT an unattended live run
+# to `done`. Full write-up: docs/BEHAVIORAL-COVERAGE-DOGFOOD-PROVENANCE.md.
+provenance: hand-completed
+live_run_reached: enumerating (stalled on model latency, terminated)
+primitive_count: 10
+contract_count: 18
+covered_count: 18
+uncovered_count: 0
+atomic_passed: true
+dod_met: true
+inventory:
+[
+  {"primitive": "GuardKind::from_token / as_str", "kind": "enum round-trip", "location": "crates/praxec-core/src/guards.rs:59-90",
+   "contracts": [
+     {"contract": "every blessed guard-kind token round-trips through from_token -> as_str", "rationale": "wire-format stability (SPEC §9 closed set)"},
+     {"contract": "a token outside the closed set is rejected (None)", "rationale": "closed-set poka-yoke"}
+   ]},
+  {"primitive": "DefaultGuardEvaluator::evaluate (permission)", "kind": "guard kind", "location": "crates/praxec-core/src/guards.rs:196-202",
+   "contracts": [
+     {"contract": "passes when the principal holds the required permission", "rationale": "positive case, untested"},
+     {"contract": "fails when the principal lacks the required permission", "rationale": "negative case, untested"}
+   ]},
+  {"primitive": "DefaultGuardEvaluator::evaluate (role)", "kind": "guard kind", "location": "crates/praxec-core/src/guards.rs:204-210",
+   "contracts": [
+     {"contract": "passes when the principal holds the required role", "rationale": "positive case, untested"},
+     {"contract": "fails when the principal lacks the required role", "rationale": "negative case, untested"}
+   ]},
+  {"primitive": "DefaultGuardEvaluator::evaluate (all_of)", "kind": "guard composition", "location": "crates/praxec-core/src/guards.rs:220-233",
+   "contracts": [
+     {"contract": "fails when any single inner guard fails", "rationale": "short-circuit AND semantics, untested"},
+     {"contract": "passes when every inner guard passes", "rationale": "positive composition case, untested"}
+   ]},
+  {"primitive": "DefaultGuardEvaluator::evaluate (any_of)", "kind": "guard composition", "location": "crates/praxec-core/src/guards.rs:235-268",
+   "contracts": [
+     {"contract": "an empty guards list is vacuously false", "rationale": "explicit vacuous-false design decision, untested"},
+     {"contract": "passes when a later sibling passes despite an earlier sibling's error", "rationale": "error-suppression-on-sibling-pass, untested"},
+     {"contract": "surfaces the first sibling's error when no sibling passes", "rationale": "error is not silently swallowed, untested"}
+   ]},
+  {"primitive": "DefaultGuardEvaluator::evaluate (not)", "kind": "guard composition", "location": "crates/praxec-core/src/guards.rs:270-276",
+   "contracts": [
+     {"contract": "inverts its inner guard's result", "rationale": "untested"},
+     {"contract": "a guard with no `guard:` body errors", "rationale": "malformed-config defense-in-depth, untested"}
+   ]},
+  {"primitive": "DefaultGuardEvaluator::evaluate (guidance_acknowledged)", "kind": "guard kind", "location": "crates/praxec-core/src/guards.rs:278-316",
+   "contracts": [
+     {"contract": "fails closed when no acknowledgment store is wired", "rationale": "governance gate must not fail open, untested for this guard kind (only evidence's fail-closed case was covered)"}
+   ]},
+  {"primitive": "DefaultGuardEvaluator::evaluate (script_acknowledged)", "kind": "guard kind", "location": "crates/praxec-core/src/guards.rs:318-351",
+   "contracts": [
+     {"contract": "fails closed when no script-acknowledgment store is wired", "rationale": "governance gate must not fail open, untested for this guard kind"}
+   ]},
+  {"primitive": "DefaultGuardEvaluator::evaluate (unknown kind)", "kind": "runtime backstop", "location": "crates/praxec-core/src/guards.rs:168-190",
+   "contracts": [
+     {"contract": "an unrecognized guard kind errors INVALID_GUARD_KIND at evaluation time", "rationale": "defense-in-depth mirror of the load-time validator, untested at the runtime layer"}
+   ]},
+  {"primitive": "evaluate_join_expression", "kind": "parallel-join expression (SPEC §24.2)", "location": "crates/praxec-core/src/guards.rs:727-749",
+   "contracts": [
+     {"contract": "a bare $.path (no operator) is a truthiness check against output", "rationale": "convenience syntax, untested"},
+     {"contract": "a bare $.path resolving to a falsy value evaluates false", "rationale": "untested"}
+   ]}
+]
+residual_gaps:
+[]
+atomic_violations:
+[]

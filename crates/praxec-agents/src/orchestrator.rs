@@ -243,6 +243,8 @@ impl TransitionChooser for AgentChooser {
             expected_output_types: Default::default(),
             // A decision call is one synchronous turn — never suspendable.
             await_enabled: false,
+            // A decision call writes no files — the coding-evidence gate is off.
+            requires_file_write: false,
             // Decision calls run outside a governed step — no audit identity.
             identity: Default::default(),
         };

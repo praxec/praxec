@@ -116,11 +116,15 @@ impl FailureClass {
             ExecutorError::Permanent(msg)
                 if msg.starts_with("AGENT_NO_RESULT")
                     || msg.starts_with("AGENT_RESULT_FAILED")
-                    || msg.starts_with("AGENT_NOT_CONVERGING") =>
+                    || msg.starts_with("AGENT_NOT_CONVERGING")
+                    || msg.starts_with("AGENT_NO_FILE_WRITES") =>
             {
-                // NOT_CONVERGING (did work, never finalized) escalates like
-                // NoResult — a stronger model may finalize. The distinct wire
-                // code is for honest observability, not a behavior change.
+                // NOT_CONVERGING (did work, never finalized) and NO_FILE_WRITES
+                // (a coding agent that reported success but never wrote a file,
+                // after in-context correction was already spent) both escalate
+                // like NoResult — a stronger model may actually write. The
+                // distinct wire codes are for honest observability, not a
+                // behavior change.
                 FailureClass::Capability
             }
             // A spent time budget is a distinct outcome from a dead-air stall
@@ -209,6 +213,19 @@ mod tests {
     #[test]
     fn from_executor_error_agent_result_failed_is_capability() {
         let err = ExecutorError::Permanent("AGENT_RESULT_FAILED: conformance check failed".into());
+        assert_eq!(
+            FailureClass::from_executor_error(&err),
+            FailureClass::Capability
+        );
+    }
+
+    /// The coding-evidence forcing function: a success with zero file writes,
+    /// after in-context correction was spent, escalates to the next model.
+    #[test]
+    fn from_executor_error_agent_no_file_writes_is_capability() {
+        let err = ExecutorError::Permanent(
+            "AGENT_NO_FILE_WRITES: reported success but wrote no file".into(),
+        );
         assert_eq!(
             FailureClass::from_executor_error(&err),
             FailureClass::Capability
@@ -368,5 +385,21 @@ mod tests {
                 "LlmErrorCode::{code:?} should map to ContentOther"
             );
         }
+    }
+
+    /// P12 R2 — AGENT_INPUT_UNRESOLVED is a data/authoring error (an unresolved
+    /// binding at the entry gate, not a model-capability gap). Must surface to
+    /// the operator rather than escalate to another model — a different model
+    /// cannot fix an unresolved input binding.
+    #[test]
+    fn input_unresolved_surfaces_not_escalates() {
+        let err =
+            ExecutorError::Permanent("AGENT_INPUT_UNRESOLVED: goal has unresolved path".into());
+        let class = FailureClass::from_executor_error(&err);
+        assert_eq!(class, FailureClass::ContentOther);
+        assert!(
+            !class.is_infrastructure(),
+            "must not chain-escalate an unresolved input"
+        );
     }
 }

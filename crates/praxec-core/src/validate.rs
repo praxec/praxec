@@ -133,6 +133,7 @@ pub fn validate_workflows(config: &Value) -> Vec<Diagnostic> {
     validate_no_reference_cycles(workflows, &mut diagnostics);
     validate_exclusive_leases(config, workflows, &mut diagnostics);
     validate_reasoning_efforts(workflows, &mut diagnostics);
+    validate_requires_file_write(workflows, &mut diagnostics);
     validate_grounding_scopes(workflows, &mut diagnostics);
 
     diagnostics
@@ -301,6 +302,71 @@ fn validate_reasoning_efforts(
                      `reasoning_effort: {declared}` — it must be one of {:?}. Omit the key to \
                      inherit the run's effort override, or the configured default (V32).",
                     crate::tuning::known_effort_levels()
+                )));
+            }
+        }
+    }
+}
+
+/// V40 — the coding-evidence marker `requires_file_write` must be a boolean AND
+/// declared only on a state that can actually honor it (one with an
+/// agent-drivable transition). It takes effect solely when the runner builds an
+/// `AgentSession` for an agent-actor leaf; on a purely deterministic/human state
+/// it is a dead knob that would silently never fire — exactly the class of
+/// unenforceable-config the project rejects loudly (mirrors `deny_unknown_fields`
+/// on the executor config, and V32 for `reasoning_effort`).
+///
+/// This is a COHERENCE gate, not a mandate: coding-ness is not statically
+/// determinable for auto-driven caps (the gateway-wide tool set grants the file
+/// host to every leaf, and the dominant coding path injects the marker per state
+/// at compose time), so the runtime forcing function is the guarantee — this
+/// only ensures a declared marker is well-formed and live, moving the composer's
+/// mid-run `AUTO_DRIVE_STATE_REQUIRES_FILE_WRITE_INVALID` before the human gate.
+fn validate_requires_file_write(
+    workflows: &serde_json::Map<String, Value>,
+    out: &mut Vec<Diagnostic>,
+) {
+    for (id, def) in workflows {
+        let Some(states) = def.get("states").and_then(Value::as_object) else {
+            continue;
+        };
+        for (state_name, state_def) in states {
+            // Absent → nothing to check (the regression fence for every shipped
+            // state, none of which declares the key).
+            let Some(declared) = state_def.get("requires_file_write") else {
+                continue;
+            };
+            let Some(flag) = declared.as_bool() else {
+                out.push(Diagnostic::Error(format!(
+                    "REQUIRES_FILE_WRITE_NOT_BOOL: workflow '{id}' state '{state_name}' declares \
+                     `requires_file_write: {declared}` — it must be a boolean. Omit the key to \
+                     leave it off (a non-coding leaf) (V40)."
+                )));
+                continue;
+            };
+            // `false` is a legitimate explicit opt-out — nothing to enforce.
+            if !flag {
+                continue;
+            }
+            // `true` on a state with no agent-drivable transition can never fire:
+            // the marker only gates an `AgentSession`, which is built for an
+            // agent-actor / `kind: agent` transition. Anything else is a dead knob.
+            let has_agent_move = state_def
+                .get("transitions")
+                .and_then(Value::as_object)
+                .is_some_and(|txns| {
+                    txns.values().any(|t| {
+                        t.get("actor").and_then(Value::as_str) == Some("agent")
+                            || t.pointer("/executor/kind").and_then(Value::as_str) == Some("agent")
+                    })
+                });
+            if !has_agent_move {
+                out.push(Diagnostic::Error(format!(
+                    "REQUIRES_FILE_WRITE_DEAD: workflow '{id}' state '{state_name}' declares \
+                     `requires_file_write: true` but has no agent-drivable transition (none with \
+                     `actor: agent` or `executor.kind: agent`), so the coding-evidence gate could \
+                     never fire. Put the marker on the agent leaf that does the editing, or remove \
+                     it (V40)."
                 )));
             }
         }
@@ -2291,6 +2357,16 @@ fn check_skills_refs(
         }
         for entry in arr {
             let Some(subject) = entry.as_str() else {
+                // A `skills:` entry must be a JSON string subject. A
+                // non-string entry (number, bool, array, object) is a
+                // config bug — silently skipping it would hide a broken
+                // reference as if no skill were declared at this scope.
+                out.push(Diagnostic::Error(format!(
+                    "workflow '{id}': {scope} contains a non-string skills entry \
+                     '{entry}' — every `skills:` entry must be a string subject \
+                     naming a fragment declared in the top-level `skills:` \
+                     library (SPEC §11)"
+                )));
                 continue;
             };
             // Direct match first (bare subject, OR already-prefixed).
@@ -6706,6 +6782,88 @@ mod tests {
     fn a_non_string_state_reasoning_effort_is_rejected_at_load() {
         let config = flow_with_state_effort(json!(3));
         assert!(!errors_with(&config, "UNKNOWN_REASONING_EFFORT").is_empty());
+    }
+
+    // --- V40 — requires_file_write coherence ---------------------------------
+
+    fn flow_with_state_rfw(state: Value) -> Value {
+        json!({
+            "workflows": { "cap.implement.thing": {
+                "verb": "implement",
+                "initialState": "editing",
+                "states": { "editing": state, "done": { "terminal": true } }
+            }}
+        })
+    }
+
+    /// A boolean marker on an agent-drivable state is the sanctioned shape.
+    #[test]
+    fn requires_file_write_true_on_an_agent_state_passes_v40() {
+        let config = flow_with_state_rfw(json!({
+            "requires_file_write": true,
+            "transitions": { "submit": {
+                "target": "done", "actor": "agent", "executor": { "kind": "noop" }
+            }}
+        }));
+        assert!(
+            errors_with(&config, "REQUIRES_FILE_WRITE").is_empty(),
+            "true on an agent leaf must pass: {:?}",
+            errors_with(&config, "REQUIRES_FILE_WRITE")
+        );
+    }
+
+    /// A state without the marker is untouched — the regression fence for every
+    /// shipped state (including the emit-yaml `verb: implement` caps that never
+    /// write files).
+    #[test]
+    fn a_state_without_the_marker_is_untouched_by_v40() {
+        let config = flow_with_state_rfw(json!({
+            "transitions": { "submit": {
+                "target": "done", "actor": "agent", "executor": { "kind": "noop" }
+            }}
+        }));
+        assert!(errors_with(&config, "REQUIRES_FILE_WRITE").is_empty());
+    }
+
+    /// A non-boolean marker fails at load (the composer's mid-run check, moved
+    /// before the human gate).
+    #[test]
+    fn a_non_bool_requires_file_write_is_rejected_at_load() {
+        let config = flow_with_state_rfw(json!({
+            "requires_file_write": "yes",
+            "transitions": { "submit": {
+                "target": "done", "actor": "agent", "executor": { "kind": "noop" }
+            }}
+        }));
+        let errs = errors_with(&config, "REQUIRES_FILE_WRITE_NOT_BOOL");
+        assert_eq!(errs.len(), 1, "expected one V40 type error: {errs:?}");
+        assert!(errs[0].contains("editing"), "names the state: {errs:?}");
+    }
+
+    /// `true` on a state that can never build an AgentSession (no agent-drivable
+    /// transition) is a dead knob → rejected.
+    #[test]
+    fn requires_file_write_on_a_non_agent_state_is_a_dead_knob() {
+        let config = flow_with_state_rfw(json!({
+            "requires_file_write": true,
+            "transitions": { "run": {
+                "target": "done", "actor": "deterministic", "executor": { "kind": "noop" }
+            }}
+        }));
+        let errs = errors_with(&config, "REQUIRES_FILE_WRITE_DEAD");
+        assert_eq!(errs.len(), 1, "expected one V40 dead-knob error: {errs:?}");
+    }
+
+    /// An explicit `false` is a legitimate opt-out anywhere — never an error.
+    #[test]
+    fn requires_file_write_false_is_always_allowed() {
+        let config = flow_with_state_rfw(json!({
+            "requires_file_write": false,
+            "transitions": { "run": {
+                "target": "done", "actor": "deterministic", "executor": { "kind": "noop" }
+            }}
+        }));
+        assert!(errors_with(&config, "REQUIRES_FILE_WRITE").is_empty());
     }
 
     // --- V31 — exclusive-resource must be leased -----------------------------

@@ -501,6 +501,122 @@ async fn non_string_state_reasoning_effort_is_rejected() {
     );
 }
 
+// ── requires_file_write (coding-evidence forcing function) ───────────────────
+
+fn agent_state_with_requires_file_write(marker: serde_json::Value) -> serde_json::Value {
+    let mut state = json!({
+        "goal": "Apply the edits.",
+        "transitions": {
+            "submit": {
+                "target": "done",
+                "actor": "agent",
+                "executor": { "kind": "noop" },
+                "output": { "verdict": "$.arguments.verdict" }
+            }
+        }
+    });
+    state["requires_file_write"] = marker;
+    json!({
+        "version": "1.0.0",
+        "workflows": {
+            "pipeline": {
+                "verb": "implement",
+                "initialState": "s",
+                "states": { "s": state, "done": { "terminal": true } }
+            }
+        }
+    })
+}
+
+/// A coding state's `requires_file_write: true` must reach the synthesized agent
+/// config, so the runner turns on the write-evidence gate for that leaf.
+#[tokio::test]
+async fn state_requires_file_write_flows_into_the_agent_config() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        agent_state_with_requires_file_write(json!(true)),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec!["github_mcp".into()], 180);
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .expect("a coding leaf composes fine");
+    assert_eq!(
+        exec.config_for_kind("agent").expect("invoked")["requires_file_write"],
+        true,
+        "the marker must reach the kind:agent config"
+    );
+}
+
+/// Absent marker → the key stays out of the config (byte-clean for the
+/// overwhelmingly-common non-coding leaf).
+#[tokio::test]
+async fn absent_requires_file_write_leaves_the_key_off_the_agent_config() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        linear_chain_stops_at_agent(),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec![], 180);
+    runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        exec.config_for_kind("agent")
+            .expect("invoked")
+            .get("requires_file_write")
+            .is_none(),
+        "no marker → the key must be absent"
+    );
+}
+
+/// A non-bool marker fails the run loudly (mirrors the reasoning_effort guard).
+#[tokio::test]
+async fn non_bool_requires_file_write_is_rejected() {
+    let exec = std::sync::Arc::new(CapturingExecutor::new(json!({ "verdict": "pass" })));
+    let (runtime, _audit) = build_runtime_with_executor(
+        agent_state_with_requires_file_write(json!("yes")),
+        exec.clone() as std::sync::Arc<dyn praxec_core::ports::Executor>,
+    );
+    let runtime = runtime.with_auto_drive_agents(true, "reasoning", vec!["github_mcp".into()], 180);
+    let err = runtime
+        .start(StartWorkflow {
+            definition_id: "pipeline".into(),
+            input: json!({}),
+            principal: Principal::anonymous(),
+            run_env: praxec_core::RunEnv::for_test(),
+            depth: 0,
+            parent: None,
+        })
+        .await
+        .expect_err("a non-bool `requires_file_write:` must fail the run");
+    assert!(
+        err.to_string()
+            .contains("AUTO_DRIVE_STATE_REQUIRES_FILE_WRITE_INVALID"),
+        "error must name the typed code, got: {err}"
+    );
+    assert!(
+        exec.config_for_kind("agent").is_none(),
+        "the agent must NOT be dispatched with an invalid marker"
+    );
+}
+
 /// `medium` is accepted DELIBERATELY: it is a real key of the shipped tuning
 /// maps and means "provider default — do not cap this step", which is a
 /// meaningful declaration even though `reasoning_params` emits nothing for it.

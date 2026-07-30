@@ -1,0 +1,5 @@
+praxec.db
+praxec.db-shm
+praxec.db-wal
+audit-logs/
+orchestrate.log

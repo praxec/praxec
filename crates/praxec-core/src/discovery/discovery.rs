@@ -560,19 +560,51 @@ fn default_home() -> Value {
     })
 }
 
+/// pack-provenance-recording (P2) — `discovery::home()`'s live "what am I
+/// running" complement to the durable `pack.provenance` audit event (P1):
+/// insert a `loaded_packs` array (each `{ namespace, source, sha?, ref?,
+/// dirty? }`, straight off the `/praxec/_packProvenance` config stamp — see
+/// `crate::repo_git::pack_provenance` / `config::stamp_pack_provenance`) into
+/// `default_home()`'s result. A no-op (base `home()` shape unchanged) when
+/// `packs` is empty, so a host-only config with no `repos:` reads exactly as
+/// it did before this field existed.
+fn home_with_loaded_packs(packs: &[Value]) -> Value {
+    let mut home = default_home();
+    if !packs.is_empty() {
+        if let Some(obj) = home.as_object_mut() {
+            obj.insert("loaded_packs".into(), Value::Array(packs.to_vec()));
+        }
+    }
+    home
+}
+
 /// In-memory lexical discovery index. Construct via
 /// `InMemoryDiscoveryIndex::from_config(config)` to populate from the parsed
 /// gateway YAML, or via `new(items)` if you're building documents yourself.
 #[derive(Default, Clone)]
 pub struct InMemoryDiscoveryIndex {
     docs: Arc<Vec<DiscoveryItem>>,
+    /// pack-provenance-recording (P2) — see [`home_with_loaded_packs`]. Empty
+    /// (the default) for an index built with no git-backed, namespace-bearing
+    /// packs loaded.
+    loaded_packs: Arc<Vec<Value>>,
 }
 
 impl InMemoryDiscoveryIndex {
     pub fn new(items: Vec<DiscoveryItem>) -> Self {
         Self {
             docs: Arc::new(items),
+            loaded_packs: Arc::new(Vec::new()),
         }
+    }
+
+    /// Attach the loaded packs' provenance (P2) so `home()` surfaces them.
+    /// Reuses the SAME `/praxec/_packProvenance` config stamp the gateway's
+    /// `pack.provenance` audit event (P1) reads — one computed list, two
+    /// consumers.
+    pub fn with_loaded_packs(mut self, packs: Vec<Value>) -> Self {
+        self.loaded_packs = Arc::new(packs);
+        self
     }
 
     /// Build an index from a parsed gateway config. Fails (CMP-031) if
@@ -661,6 +693,10 @@ impl DiscoveryIndex for InMemoryDiscoveryIndex {
             .cloned()
             .collect())
     }
+
+    async fn home(&self) -> anyhow::Result<Value> {
+        Ok(home_with_loaded_packs(&self.loaded_packs))
+    }
 }
 
 // ---------- semantic (opt-in add-on) ----------------------------------------
@@ -735,6 +771,10 @@ pub struct SemanticDiscoveryIndex {
     /// time (they fall back to the lexical score).
     embeddings: Arc<Vec<Option<Vec<f32>>>>,
     embedder: Arc<dyn crate::embeddings::EmbeddingProvider>,
+    /// pack-provenance-recording (P2) — see [`home_with_loaded_packs`]. Empty
+    /// (the default via [`Self::build`]) until attached with
+    /// [`Self::with_loaded_packs`].
+    loaded_packs: Arc<Vec<Value>>,
 }
 
 impl SemanticDiscoveryIndex {
@@ -772,7 +812,17 @@ impl SemanticDiscoveryIndex {
             items: Arc::new(items),
             embeddings: Arc::new(embeddings),
             embedder,
+            loaded_packs: Arc::new(Vec::new()),
         })
+    }
+
+    /// Attach the loaded packs' provenance (P2) so `home()` surfaces them.
+    /// Reuses the SAME `/praxec/_packProvenance` config stamp the gateway's
+    /// `pack.provenance` audit event (P1) reads — one computed list, two
+    /// consumers.
+    pub fn with_loaded_packs(mut self, packs: Vec<Value>) -> Self {
+        self.loaded_packs = Arc::new(packs);
+        self
     }
 
     /// Build over the config's items **and** a tool catalog (surface b), then
@@ -932,6 +982,10 @@ impl DiscoveryIndex for SemanticDiscoveryIndex {
             .filter(|d| Self::kind_ok(d, kind))
             .cloned()
             .collect())
+    }
+
+    async fn home(&self) -> anyhow::Result<Value> {
+        Ok(home_with_loaded_packs(&self.loaded_packs))
     }
 }
 

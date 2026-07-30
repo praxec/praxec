@@ -1,0 +1,66 @@
+# Remote pack sourcing: load workflow/capability packs straight from a git
+# remote (`uri:` + `ref:`) instead of a manually-managed `path:` clone.
+#
+# This is the RECOMMENDED way to consume a shared pack — see
+# docs/remote-pack-sourcing.md for the full picture (cache location, auth,
+# how this differs from `path:`).
+#
+# `repos:` entries are one of:
+#   - path: <local dir>          — you clone/pull it yourself; hot-reloads on edit
+#   - uri: <git url>, ref: <ref> — praxec clones/updates it FOR you (this file)
+#
+# Auth for `uri:` is 100% the operator's own git: if `git clone <uri>` works
+# in your shell today (SSH key loaded, HTTPS credential helper, `gh auth`,
+# whatever), it works here identically — praxec never stores or manages git
+# credentials. A private org pack repo just works with no praxec-side setup.
+#
+# This file's two `uri:`s point at real network remotes, but it IS fully
+# validated by CI (the "schema check on examples" step in
+# .github/workflows/ci.yml) — just like every other example. Rather than
+# skip it, CI mocks the git *transport* only: it builds local bare repos
+# from minimal-but-valid pack fixtures (examples/remote-packs/_mock/) and
+# redirects git's resolution of these exact URLs to them
+# (scripts/mock-remote-packs-git.sh), so `praxec check` here runs fully
+# offline against this file, unmodified. The same resolution is proven
+# hermetically (no global git config) in
+# crates/praxec-core/tests/remote_example_validates.rs. See
+# docs/remote-pack-sourcing.md for a `file://` walkthrough you can run by
+# hand.
+
+version: "1.0.0"
+
+gateway:
+  allow_ephemeral: true
+  principal:
+    subject: operator
+    roles: [human]
+
+# v0.0.21 — every run needs a writable repo_root; this example operates on
+# its own directory and writes nothing to it.
+praxec:
+  _writableRepos:
+    - root: "."
+      push: false
+
+repos:
+  # A moving ref: always resolves to whatever `main` currently points to.
+  # Good for "track this pack's latest" (e.g. local dev, a fast-iterating
+  # internal pack). Re-fetched (and reset to the tip) on every config load.
+  - uri: "git+https://github.com/praxec/cognitive-architectures"
+    ref: main
+
+  # A tag ref: a soft pin that only moves when you edit this file. For a
+  # true, reproducible pin to one exact commit (independent of the tag or
+  # branch ever moving), see the lockfile increment in
+  # docs/remote-pack-sourcing.md — a bare commit SHA also works as `ref:`
+  # today (this is the increment-A fix: cold-cloning a never-before-seen
+  # `uri:` now accepts a branch, a tag, OR a bare SHA).
+  - uri: "git+https://github.com/praxec/praxec-meta"
+    ref: v1.0.0
+
+discovery:
+  index: memory
+  include: [workflows]
+
+audit:
+  sink: stderr

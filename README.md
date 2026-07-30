@@ -234,7 +234,11 @@ with a top-level `repos:` block, namespace-prefixed and collision-checked at loa
 Two sibling libraries show the shape:
 [cognitive-architectures](https://github.com/praxec/cognitive-architectures)
 and [praxec-meta](https://github.com/praxec/praxec-meta).
-→ [Capabilities & orchestrators](https://praxec.dev/guides/capabilities-and-orchestrators/)
+Load one with `repos: [{ path: ... }]` (you manage the clone) or the
+recommended `repos: [{ uri: "git+https://...", ref: main }]` (praxec clones/
+updates it for you — private org repos work with zero praxec-side auth setup,
+piggybacking entirely on your own git) → [docs/remote-pack-sourcing.md](docs/remote-pack-sourcing.md)
+· [Capabilities & orchestrators](https://praxec.dev/guides/capabilities-and-orchestrators/)
 · [Multi-repo loading](https://praxec.dev/guides/multi-repo-loading/)
 
 ## Companion MCP tools

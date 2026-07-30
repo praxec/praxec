@@ -120,17 +120,24 @@ pub(crate) enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Bring every git-backed pack dependency up to latest `main`. Remote
-    /// (`uri:`) repos are refreshed on every load already; this syncs the
-    /// operator's LOCAL (`path:`) repo checkouts — the stale-pack failure mode
-    /// (a checkout left on the wrong branch). Fail-safe: fetches, then
-    /// fast-forwards to `origin/main` ONLY when the working tree is clean and on
-    /// `main`; a dirty tree, a non-`main` branch, or a non-fast-forward is
-    /// reported and left untouched (never destroys local work).
+    /// Pull the latest validated workflows: bring every git-backed pack
+    /// dependency up to its tracked `ref`'s newest tip and report what
+    /// changed. Remote (`uri:`) repos are fetched and reset to their ref's
+    /// latest commit (currency, not pinning — latest is the goal, gated by
+    /// upstream CI); local (`path:`) checkouts are fast-forwarded to
+    /// `origin/main` — the stale-pack failure mode (a checkout left on the
+    /// wrong branch). Fail-safe throughout: fetches, then applies ONLY when
+    /// it's safe (clean tree, fast-forwardable, reachable remote); anything
+    /// else (dirty tree, non-`main` branch, diverged history, unreachable
+    /// remote) is reported and left untouched — never destroys local work.
     Sync {
         /// Path to the gateway YAML config (its `repos:` declare the deps).
         #[arg(short, long)]
         config: PathBuf,
+        /// Report what WOULD update (old SHA → new SHA / fast-forward count)
+        /// without moving any repo's cache or working tree.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Inspect a running workflow.
     Inspect {

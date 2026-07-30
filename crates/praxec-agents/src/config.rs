@@ -115,6 +115,22 @@ pub struct AgentExecutorConfig {
     /// runner (fail-fast `AGENT_AWAIT_UNSUPPORTED` otherwise).
     #[serde(default)]
     pub await_enabled: bool,
+    /// Coding-evidence forcing function: `true` marks this a coding deliverable
+    /// whose success REQUIRES real file mutations. The runner then refuses to
+    /// accept a `final_answer` produced with zero successful `write_file`/
+    /// `edit_file` calls — it re-prompts the same model in-context (bounded) and,
+    /// if still empty, fails `AGENT_NO_FILE_WRITES` so the chain-walk escalates.
+    /// Set per-state by the auto-drive composer (from `/states/<s>/
+    /// requires_file_write`) or directly on an authored `kind: agent` step.
+    /// Default `false`: a non-coding leaf is unaffected.
+    #[serde(default)]
+    pub requires_file_write: bool,
+    /// Entry gate (Plan A). When true, a step whose rendered goal contains an
+    /// unresolved `(x: unset)` template stub is REFUSED before dispatch
+    /// (AGENT_INPUT_UNRESOLVED). Default false = shadow mode (emit anomaly,
+    /// proceed). Flip per-step, or gateway-wide via the auto-drive composer.
+    #[serde(default)]
+    pub enforce_input_grounding: bool,
 }
 
 /// An agent's `affinity:` value — a closed [`ModelRef`] OR an open `activity:`

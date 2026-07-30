@@ -105,6 +105,22 @@ pub enum AgentErrorCode {
     /// model), same as `NoResult` — the split is for honest observability +
     /// partial-work preservation, not a walk-behavior change.
     NotConverging,
+    /// The agent was on a coding deliverable (`requires_file_write`) and reported
+    /// success (or was salvaged/sign-off-rescued) having produced ZERO successful
+    /// `write_file`/`edit_file` calls across the whole run — a narrated/false
+    /// success on an empty worktree. The runner first re-prompts the SAME model
+    /// in-context (bounded), and only emits this once that correction is spent, so
+    /// it always means "this model cannot be made to actually write." Classifies
+    /// as `Capability` (escalate to the next model — the automated version of a
+    /// manual "swap the lead coder" — same class as `NoResult`/`NotConverging`),
+    /// with a distinct wire code purely for honest observability + accounting.
+    NoFileWrites,
+    /// Entry gate — a `required` input rendered to an unresolved `(x: unset)`
+    /// stub, so the agent would have been dispatched on non-truth (the
+    /// surface-name-as-path class). Classifies `ContentOther` (an author/data
+    /// error that must surface to a human, NOT a model-capability failure — do
+    /// not chain-escalate it to another model).
+    InputUnresolved,
 }
 
 impl AgentErrorCode {
@@ -133,7 +149,9 @@ impl AgentErrorCode {
             AgentErrorCode::StepBudgetExhausted => "AGENT_STEP_BUDGET_EXHAUSTED",
             AgentErrorCode::BudgetExceeded => "AGENT_BUDGET_EXCEEDED",
             AgentErrorCode::NotConverging => "AGENT_NOT_CONVERGING",
+            AgentErrorCode::NoFileWrites => "AGENT_NO_FILE_WRITES",
             AgentErrorCode::ChainExhausted => "AGENT_CHAIN_EXHAUSTED",
+            AgentErrorCode::InputUnresolved => "AGENT_INPUT_UNRESOLVED",
         }
     }
 }
@@ -208,6 +226,25 @@ mod tests {
         assert_eq!(
             AgentErrorCode::NotConverging.as_wire_code(),
             "AGENT_NOT_CONVERGING"
+        );
+    }
+
+    #[test]
+    fn no_file_writes_wire_code_is_stable() {
+        // The coding-evidence forcing function: reported success with zero real
+        // file writes. classify.rs maps this prefix to Capability (escalate) like
+        // NoResult/NotConverging — distinct code for observability + accounting.
+        assert_eq!(
+            AgentErrorCode::NoFileWrites.as_wire_code(),
+            "AGENT_NO_FILE_WRITES"
+        );
+    }
+
+    #[test]
+    fn input_unresolved_wire_code_is_stable() {
+        assert_eq!(
+            AgentErrorCode::InputUnresolved.as_wire_code(),
+            "AGENT_INPUT_UNRESOLVED"
         );
     }
 

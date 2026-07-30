@@ -3052,6 +3052,72 @@ fn load_resolved_with_repos_mode(
     Ok((resolved, repo_diagnostics))
 }
 
+/// pack-staleness-warning — turn one `path:` repo's
+/// [`crate::repo_git::GitCurrency`] into zero or more WARN diagnostics.
+/// Never Error-severity: a stale/drifted pack is informative, not a load
+/// failure (`check`/`doctor` must still exit success). Three independent
+/// classes, any subset of which may fire together: branch drift (not on the
+/// convention default branch, including detached HEAD), a dirty working
+/// tree, and being behind the locally-known `origin/<default>` by N>0
+/// commits. When the operator would benefit from knowing upstream currency
+/// couldn't even be determined (no locally-known remote-tracking ref), that
+/// note rides along on whichever of the other two warnings fires — it is
+/// never surfaced as its own warning, so a repo with no `origin` configured
+/// at all (a legitimate local-only checkout) stays silent when it's clean
+/// and on its default branch.
+fn git_currency_diagnostics(
+    entry_desc: &str,
+    currency: &crate::repo_git::GitCurrency,
+) -> Vec<Diagnostic> {
+    let upstream_note = if currency.behind_upstream.is_none() {
+        " (upstream unknown — run git fetch to check)"
+    } else {
+        ""
+    };
+    let mut out = Vec::new();
+    if !currency.on_default_branch {
+        let branch_desc = currency.branch.as_deref().unwrap_or("a detached HEAD");
+        out.push(Diagnostic {
+            severity: DiagnosticSeverity::Warn,
+            code: "PACK_BRANCH_DRIFT".into(),
+            message: format!(
+                "pack repo '{entry_desc}' is on {branch_desc}, not its default branch \
+                 '{}'{upstream_note}",
+                currency.default_branch
+            ),
+            location: None,
+            suggestion: Some(format!(
+                "git -C {entry_desc} checkout {}",
+                currency.default_branch
+            )),
+        });
+    }
+    if currency.dirty {
+        out.push(Diagnostic {
+            severity: DiagnosticSeverity::Warn,
+            code: "PACK_DIRTY_TREE".into(),
+            message: format!("pack repo '{entry_desc}' has uncommitted changes{upstream_note}"),
+            location: None,
+            suggestion: Some(format!("git -C {entry_desc} status")),
+        });
+    }
+    if let Some(n) = currency.behind_upstream {
+        if n > 0 {
+            out.push(Diagnostic {
+                severity: DiagnosticSeverity::Warn,
+                code: "PACK_BEHIND_UPSTREAM".into(),
+                message: format!(
+                    "pack repo '{entry_desc}' is {n} commit(s) behind origin/{}",
+                    currency.default_branch
+                ),
+                location: None,
+                suggestion: Some(format!("git -C {entry_desc} pull")),
+            });
+        }
+    }
+    out
+}
+
 /// Extract `repos:` + `overrides:` from `host`, load each repo, validate
 /// V20 / V21 / V22 / V23, deep-merge repo contents (then host on top so
 /// declared overrides win), and return the cleaned value (with `repos:`
@@ -3068,6 +3134,13 @@ fn merge_declared_repos(
         // No repos declared — strip an empty `overrides:` (it's meaningless
         // without any repo-provided ids to shadow). Host-level staged
         // connections (`px connections add` / `grant`) still get the grant gate.
+        //
+        // V22 — every `kind: workflow` definitionId reference must resolve
+        // even in a host-only config (no `repos:` block). A definitionId is
+        // a static registry lookup with no legitimate runtime-resolution
+        // path, so this must run unconditionally, not only on the
+        // repos-present branch below.
+        validate_workflow_refs_resolve(&host)?;
         let staged_ungranted = apply_staged_connection_grants(&mut host)?;
         stamp_ungranted_connections(&mut host, staged_ungranted);
         return Ok(host);
@@ -3100,6 +3173,22 @@ fn merge_declared_repos(
     // diverted out of the live registry and stamped as self-documenting
     // diagnostic state (see `stamp_ungranted_connections`).
     let mut ungranted_connections: Vec<UngrantedConnection> = Vec::new();
+    // pack-staleness-warning — (entry description, git currency) for every
+    // LOCAL `path:` entry that IS the root of a git working tree. Turned
+    // into WARN diagnostics (never errors — staleness never blocks) after
+    // the loop, once every entry has been visited (the cross-pack
+    // composition-mismatch check needs to see them all together).
+    let mut git_currency_checks: Vec<(String, crate::repo_git::GitCurrency)> = Vec::new();
+    // pack-provenance-recording (P1/P2) — one [`crate::repo_git::PackProvenance`]
+    // per successfully-loaded, NAMESPACE-bearing pack (local `path:` or remote
+    // `uri:` — a bare FB-2 writable target has no namespace and is out of
+    // scope: provenance answers "which workflow-definition version drove this
+    // run", not "what's writable"). Stamped into the merged config under
+    // `/praxec/_packProvenance` after the loop so the gateway (P1's
+    // `pack.provenance` audit event) and `discovery::home()` (P2's
+    // `loaded_packs`) both read the SAME computed list — one introspection,
+    // two consumers.
+    let mut pack_provenance_records: Vec<crate::repo_git::PackProvenance> = Vec::new();
 
     for RepoDecl {
         source,
@@ -3112,7 +3201,7 @@ fn merge_declared_repos(
     } in repos
     {
         // How the operator wrote the entry — used to name it in skip
-        // warnings (finding #13).
+        // warnings (finding #13) and as this pack's provenance `source`.
         let entry_desc = match &source {
             RepoSource::Local(p) => p.display().to_string(),
             RepoSource::Remote { uri, .. } => uri.clone(),
@@ -3120,6 +3209,21 @@ fn merge_declared_repos(
                 format!("worktrees_of:{} name:{name}", anchor.display())
             }
         };
+        // pack-provenance-recording — a remote `uri:` entry's declared `ref:`,
+        // captured before `source` is consumed below. Takes priority over the
+        // clone-cache dir's own branch name (an internal `git init`-default
+        // artifact, not a meaningful ref) — see `repo_git::pack_provenance`.
+        let declared_ref: Option<String> = match &source {
+            RepoSource::Remote { gitref, .. } => Some(gitref.clone()),
+            _ => None,
+        };
+        // pack-staleness-warning — only a LOCAL `path:` entry is a candidate
+        // for a git-currency warning. A `uri:` (remote) entry already
+        // re-pulls its ref's tip on every load via `clone_or_update`, so a
+        // staleness warning there would be noise, not signal; a
+        // `worktrees_of:` entry `continue`s below before it ever reaches the
+        // git-currency check.
+        let is_local_path = matches!(source, RepoSource::Local(_));
         // WS-B B3 — identity-first, worktree-churn-proof resolution. A
         // `worktrees_of:` entry declares a durable IDENTITY (`name`) + a stable
         // `anchor` to enumerate worktrees of; the live writable root is the
@@ -3248,7 +3352,7 @@ fn merge_declared_repos(
                     let dest = host_dir
                         .join(".praxec")
                         .join("repos")
-                        .join(crate::repo_git::cache_dir_name(&uri));
+                        .join(crate::repo_git::cache_dir_name(&uri, &gitref));
                     crate::repo_git::clone_or_update(&uri, &gitref, &dest)
                         .with_context(|| format!("importing repo {uri}"))?
                 }
@@ -3308,6 +3412,18 @@ fn merge_declared_repos(
                 }
             },
         };
+        // pack-staleness-warning — collect git currency for a successfully
+        // loaded LOCAL `path:` entry, regardless of whether it's a
+        // definition repo or a bare writable target (FB-2): staleness is a
+        // property of the checkout, not of what it contributes to the
+        // registry. `git_currency` itself never errors or touches the
+        // network — `None` (not a git repo, or not a repo root) is silently
+        // skipped, exactly like a legitimate plain-dir pack.
+        if is_local_path {
+            if let Some(currency) = crate::repo_git::git_currency(&repo_path) {
+                git_currency_checks.push((entry_desc.clone(), currency));
+            }
+        }
         let Some((manifest, mut repo_value)) = manifest_and_registry else {
             // FB-2 bare writable run target: `parse_repo_entry` already
             // guaranteed `writable` here.
@@ -3334,6 +3450,17 @@ fn merge_declared_repos(
             );
         }
         repo_priorities.push((manifest.namespace.clone(), priority));
+        // pack-provenance-recording — this pack has a namespace, so it's in
+        // scope for the durable "what version drove this run" record. Works
+        // for BOTH a local `path:` checkout and a remote `uri:` pack's
+        // clone-cache dir (`repo_path` in both cases — `clone_or_update`
+        // always leaves a normal, non-bare git working tree there).
+        pack_provenance_records.push(crate::repo_git::pack_provenance(
+            &manifest.namespace,
+            &entry_desc,
+            &repo_path,
+            declared_ref.as_deref(),
+        ));
         // Collect ids BEFORE the grant gate strips ungranted connections, so
         // a host definition colliding with an ungranted pack connection still
         // trips V23 (the operator must acknowledge the shadowing either way).
@@ -3353,6 +3480,43 @@ fn merge_declared_repos(
         )?);
         repo_aggregate = deep_merge(repo_aggregate, repo_value);
         loaded_definition_repos += 1;
+    }
+
+    // pack-staleness-warning — non-blocking currency warnings for every
+    // git-backed `path:` repo, plus a cross-pack composition-mismatch
+    // warning when 2+ of them disagree on branch (the base/overlay drift
+    // class this was built to catch). Always WARN-severity: a stale pack is
+    // informative, never a load error.
+    for (entry_desc, currency) in &git_currency_checks {
+        diagnostics.extend(git_currency_diagnostics(entry_desc, currency));
+    }
+    if git_currency_checks.len() >= 2 {
+        let mut distinct_branches: Vec<&str> = git_currency_checks
+            .iter()
+            .map(|(_, c)| c.branch.as_deref().unwrap_or("detached HEAD"))
+            .collect();
+        distinct_branches.sort_unstable();
+        distinct_branches.dedup();
+        if distinct_branches.len() > 1 {
+            let detail = git_currency_checks
+                .iter()
+                .map(|(entry, c)| {
+                    format!("{entry}@{}", c.branch.as_deref().unwrap_or("detached HEAD"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            diagnostics.push(Diagnostic {
+                severity: DiagnosticSeverity::Warn,
+                code: "PACK_COMPOSITION_BRANCH_MISMATCH".into(),
+                message: format!("composed git-backed packs are on different branches: {detail}"),
+                location: None,
+                suggestion: Some(
+                    "check out the same branch (typically the default) in every composed \
+                     pack repo before relying on cross-pack behavior"
+                        .into(),
+                ),
+            });
+        }
     }
 
     // Finding #13 backstop — resilience isolates a bad entry; it must not
@@ -3438,6 +3602,12 @@ fn merge_declared_repos(
 
     // Spec A §5 — carry namespace priorities forward for `hop_slot:` resolution.
     stamp_repo_priority(&mut merged, repo_priorities);
+
+    // pack-provenance-recording (P1/P2) — carry each loaded pack's provenance
+    // forward so the gateway can emit the durable `pack.provenance` audit
+    // event AND `discovery::home()` can surface it live as `loaded_packs`,
+    // both reading this SAME stamp.
+    stamp_pack_provenance(&mut merged, pack_provenance_records);
 
     // SPEC §9.5 — surface ungranted pack connections as live, self-documenting
     // DEGRADED state (the #23 pattern): each entry carries the exact YAML
@@ -3722,6 +3892,34 @@ fn stamp_repo_priority(config: &mut Value, priorities: Vec<(String, i64)>) {
             map.insert(ns, Value::from(prio));
         }
         fg.insert("_repoPriority".into(), Value::Object(map));
+    }
+}
+
+/// pack-provenance-recording (P1/P2) — record each namespace-bearing loaded
+/// pack's provenance under `/praxec/_packProvenance` (internal resolved-config
+/// metadata, not an operator-authored key — mirrors
+/// [`stamp_writable_repos`]/`_writableRepos`) as `{ namespace, source, sha?,
+/// ref?, dirty? }` objects. The gateway reads this to emit the durable
+/// `pack.provenance` audit event at load/reload; `discovery::home()` reads
+/// the SAME stamp to answer "what workflow versions am I running right now"
+/// live. RECORDS, never constrains: a dirty/drifted/non-git pack is still
+/// stamped exactly as-is, never an error. No-op when empty.
+fn stamp_pack_provenance(config: &mut Value, provenance: Vec<crate::repo_git::PackProvenance>) {
+    if provenance.is_empty() {
+        return;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let praxec = obj
+        .entry("praxec")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(fg) = praxec.as_object_mut() {
+        let entries: Vec<Value> = provenance
+            .into_iter()
+            .map(|p| serde_json::to_value(p).expect("PackProvenance serializes"))
+            .collect();
+        fg.insert("_packProvenance".into(), Value::Array(entries));
     }
 }
 

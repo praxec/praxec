@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) use crate::gateway_config::{
@@ -125,7 +125,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             older_than_days,
             force,
         } => run_cleanup(&config, older_than_days, force),
-        Command::Sync { config } => run_sync(&config),
+        Command::Sync { config, dry_run } => run_sync(&config, dry_run),
         Command::Inspect { command } => match command {
             InspectCommand::Workflow { config, id } => inspect_workflow(&config, &id).await,
         },
@@ -933,6 +933,10 @@ async fn build_oneshot_server(
         Arc::new(ProgressElicitor::new(progress_peer.clone()));
     let (initial_defs, initial_executors, initial_discovery, initial_registry, workflow_handle) =
         build_hot_components(config, &audit, &embedder, Some(upstream.clone())).await?;
+    // pack-provenance-recording (P1) — the durable "what exactly ran" record at
+    // boot, from the SAME `_packProvenance` stamp `discovery::home()` (P2)
+    // reads live. Best-effort; never gates startup.
+    record_pack_provenance(config, &audit).await;
 
     let swappable_defs = Arc::new(SwappableDefinitionStore::new(initial_defs));
     let swappable_executors = Arc::new(SwappableExecutorRegistry::new(initial_executors));
@@ -1530,6 +1534,49 @@ async fn serve_degraded(config_path: PathBuf, err: anyhow::Error) -> anyhow::Res
 /// long-lived runtime and audits `config.reloaded`. Returns the outcome as JSON
 /// so the in-band caller learns what happened (incl. the reloaded `repos:`).
 #[allow(clippy::too_many_arguments)]
+/// pack-provenance-recording (P1) — emit ONE `pack.provenance` audit event
+/// listing every namespace-bearing loaded pack's provenance (`namespace`,
+/// `source`, `sha`, `ref`, `dirty`), read straight off the
+/// `/praxec/_packProvenance` stamp `merge_declared_repos` (praxec-core
+/// `config.rs`) computed via `repo_git::pack_provenance` — the SAME
+/// introspection `discovery::home()`'s `loaded_packs` (P2) reads. Called at
+/// every point a resolved config is live WITH the audit sink already built:
+/// `build_oneshot_server` (startup) and `reload_gated` (SIGHUP / in-band
+/// reload / staleness recheck) — never from `praxec check`, which has no
+/// audit sink to record into.
+///
+/// Because the audit trail already timestamps every event, "load provenance
+/// at T" + "a run's audit events at T'>T" reconstructs exactly which pack
+/// version drove that run — the durable governance record (SPEC: pack
+/// provenance-recording, P1). Best-effort: a record failure must never block
+/// startup/reload (this is a governance nicety layered on top of a load that
+/// already succeeded, not a load precondition).
+///
+/// A config with no namespace-bearing packs (no `repos:`, or `repos:` that
+/// only ship bare writable targets) has nothing to record — no event, no
+/// noise.
+async fn record_pack_provenance(config: &Value, audit: &Arc<dyn praxec_core::audit::AuditSink>) {
+    let Some(packs) = config
+        .pointer("/praxec/_packProvenance")
+        .and_then(Value::as_array)
+    else {
+        return;
+    };
+    if packs.is_empty() {
+        return;
+    }
+    let _ = audit
+        .record(
+            praxec_core::audit::AuditEvent::new("pack.provenance")
+                .with_payload(json!({ "packs": packs })),
+        )
+        .await;
+}
+
+// A reload orchestrator that coordinates the full hot-swappable component set
+// plus the audit sink (to emit pack.provenance on the success arm); its args
+// are cohesive collaborators, not a smell worth a struct-wrapping refactor.
+#[allow(clippy::too_many_arguments)]
 async fn reload_gated(
     swappable_defs: &Arc<praxec_core::hot_reload::SwappableDefinitionStore>,
     swappable_executors: &Arc<praxec_core::hot_reload::SwappableExecutorRegistry>,
@@ -1674,6 +1721,10 @@ async fn reload_gated(
                     })),
                 )
                 .await;
+            // pack-provenance-recording (P1) — the durable "what exactly ran"
+            // record, from the SAME `_packProvenance` stamp `discovery::home()`
+            // (P2) reads live. Best-effort; never gates the reload outcome.
+            record_pack_provenance(&new_config, audit).await;
             tracing::info!("config reloaded successfully");
             json!({
                 "status": "reloaded",
@@ -2159,10 +2210,110 @@ fn run_cleanup(config_path: &PathBuf, older_than_days: u64, force: bool) -> anyh
     Ok(())
 }
 
-/// `praxec sync` — fast-forward local git-backed pack repos to `origin/main`.
-/// Fail-safe: only pulls a clean checkout that is on `main` and behind by a
-/// fast-forwardable amount; anything else is reported and left untouched.
-fn run_sync(config_path: &PathBuf) -> anyhow::Result<()> {
+/// The outcome of pulling one remote (`uri:`) pack repo to its `ref`'s latest
+/// tip — the unit the "pull the latest validated workflows" report is built
+/// from. Kept as data (not a println!) so it is directly assertable in tests
+/// without a stdout-capture harness.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteSyncOutcome {
+    /// No local cache existed yet; it was cloned fresh at `sha`.
+    Cloned { sha: String },
+    /// `--dry-run`, no local cache yet: this is what a real sync would clone.
+    WouldClone { sha: String },
+    /// The cache is already at its ref's latest tip.
+    UpToDate { sha: String },
+    /// The cache was fetched + reset from `old` to `new`.
+    Updated { old: String, new: String },
+    /// `--dry-run`: `old` → `new` is available but NOT applied.
+    WouldUpdate { old: String, new: String },
+    /// The repo could not be reached (network down, bad uri/ref, etc.) —
+    /// reported, not fatal to the rest of the sync run.
+    FetchFailed(String),
+}
+
+/// Pull one remote (`uri:`) pack repo's `gitref` to its latest tip into
+/// `dest`, or (when `dry_run`) determine what that pull WOULD do without
+/// moving `dest`. Reuses [`praxec_core::repo_git`]'s clone/fetch primitives —
+/// no git plumbing is reimplemented here.
+fn sync_remote_repo(uri: &str, gitref: &str, dest: &Path, dry_run: bool) -> RemoteSyncOutcome {
+    if !dest.join(".git").is_dir() {
+        // Nothing cached yet.
+        if dry_run {
+            let clone_url = praxec_core::repo_git::clone_url(uri);
+            match git_out(&["ls-remote", &clone_url, gitref], Path::new(".")) {
+                Some(out) => match out.split_whitespace().next() {
+                    Some(sha) if !sha.is_empty() => RemoteSyncOutcome::WouldClone {
+                        sha: sha.to_string(),
+                    },
+                    _ => {
+                        RemoteSyncOutcome::FetchFailed(format!("ref '{gitref}' not found at {uri}"))
+                    }
+                },
+                None => RemoteSyncOutcome::FetchFailed(format!("could not reach {uri}")),
+            }
+        } else {
+            match praxec_core::repo_git::clone_or_update(uri, gitref, dest) {
+                Ok(_) => RemoteSyncOutcome::Cloned {
+                    sha: git_out(&["rev-parse", "HEAD"], dest)
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default(),
+                },
+                Err(e) => RemoteSyncOutcome::FetchFailed(e.to_string()),
+            }
+        }
+    } else {
+        // Already cached — capture the OLD tip before touching anything.
+        let old = git_out(&["rev-parse", "HEAD"], dest)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if dry_run {
+            // Fetch only (no reset) so comparison never mutates the cache.
+            if !git_ok(&["fetch", "--quiet", "origin", gitref], dest) {
+                return RemoteSyncOutcome::FetchFailed(format!(
+                    "`git fetch` failed for {uri} (offline?)"
+                ));
+            }
+            let new = git_out(&["rev-parse", "FETCH_HEAD"], dest)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if new.is_empty() || new == old {
+                RemoteSyncOutcome::UpToDate { sha: old }
+            } else {
+                RemoteSyncOutcome::WouldUpdate { old, new }
+            }
+        } else {
+            match praxec_core::repo_git::clone_or_update(uri, gitref, dest) {
+                Ok(_) => {
+                    let new = git_out(&["rev-parse", "HEAD"], dest)
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    if new == old {
+                        RemoteSyncOutcome::UpToDate { sha: old }
+                    } else {
+                        RemoteSyncOutcome::Updated { old, new }
+                    }
+                }
+                Err(e) => RemoteSyncOutcome::FetchFailed(e.to_string()),
+            }
+        }
+    }
+}
+
+/// Shorten a SHA for display (falls back to the whole string if shorter).
+fn short_sha(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
+}
+
+/// `praxec sync` — bring every declared git-backed pack repo up to its
+/// tracked `ref`'s latest tip and report what changed. Remote (`uri:`) repos
+/// are fetched and reset to their ref's newest commit (currency, not
+/// pinning — see the product intent: latest is more capable, upstream-CI
+/// gated); local (`path:`) checkouts are fast-forwarded to `origin/main`
+/// when clean. `--dry-run` reports what WOULD update without moving
+/// anything. Fail-safe throughout: anything that can't be safely applied
+/// (dirty tree, diverged branch, unreachable remote) is reported and left
+/// untouched rather than erroring the whole run.
+fn run_sync(config_path: &PathBuf, dry_run: bool) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(config_path)
         .with_context(|| format!("reading config {}", config_path.display()))?;
     let cfg: Value = serde_yaml::from_str(&raw)
@@ -2176,11 +2327,57 @@ fn run_sync(config_path: &PathBuf) -> anyhow::Result<()> {
         println!("sync: no `repos:` declared — nothing to sync.");
         return Ok(());
     }
+    let host_dir = config_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
 
-    let (mut updated, mut attention) = (0u32, 0u32);
+    let (mut updated, mut attention, mut pending) = (0u32, 0u32, 0u32);
     for entry in &repos {
         if let Some(uri) = entry.get("uri").and_then(Value::as_str) {
-            println!("  {uri} (remote) — refreshed to its ref on every load; nothing to do.");
+            let gitref = entry.get("ref").and_then(Value::as_str).unwrap_or("main");
+            let label = entry.get("name").and_then(Value::as_str).unwrap_or(uri);
+            let dest = host_dir
+                .join(".praxec")
+                .join("repos")
+                .join(praxec_core::repo_git::cache_dir_name(uri, gitref));
+            match sync_remote_repo(uri, gitref, &dest, dry_run) {
+                RemoteSyncOutcome::Cloned { sha } => {
+                    println!("  {label} (remote) — cloned fresh at {}.", short_sha(&sha));
+                    updated += 1;
+                }
+                RemoteSyncOutcome::WouldClone { sha } => {
+                    println!(
+                        "  {label} (remote) — DRY-RUN: would clone fresh at {} (not applied).",
+                        short_sha(&sha)
+                    );
+                    pending += 1;
+                }
+                RemoteSyncOutcome::UpToDate { sha } => {
+                    println!("  {label} (remote) — up to date at {}.", short_sha(&sha));
+                }
+                RemoteSyncOutcome::Updated { old, new } => {
+                    println!(
+                        "  {label} (remote) — updated {} \u{2192} {}.",
+                        short_sha(&old),
+                        short_sha(&new)
+                    );
+                    updated += 1;
+                }
+                RemoteSyncOutcome::WouldUpdate { old, new } => {
+                    println!(
+                        "  {label} (remote) — DRY-RUN: {} \u{2192} {} available (not applied; \
+                         re-run without --dry-run to pull it).",
+                        short_sha(&old),
+                        short_sha(&new)
+                    );
+                    pending += 1;
+                }
+                RemoteSyncOutcome::FetchFailed(msg) => {
+                    println!("  {label} (remote) — could not update: {msg}; left as-is.");
+                    attention += 1;
+                }
+            }
             continue;
         }
         let Some(path) = entry.get("path").and_then(Value::as_str) else {
@@ -2218,6 +2415,11 @@ fn run_sync(config_path: &PathBuf) -> anyhow::Result<()> {
                 "  {path} — {behind} commit(s) behind origin/main but the working tree is DIRTY; not pulled (commit or stash first)."
             );
             attention += 1;
+        } else if dry_run {
+            println!(
+                "  {path} — DRY-RUN: {behind} commit(s) behind origin/main; would fast-forward (not applied)."
+            );
+            pending += 1;
         } else if git_ok(&["merge", "--ff-only", "origin/main"], &dir) {
             println!("  {path} — fast-forwarded {behind} commit(s) to origin/main.");
             updated += 1;
@@ -2228,7 +2430,14 @@ fn run_sync(config_path: &PathBuf) -> anyhow::Result<()> {
             attention += 1;
         }
     }
-    println!("\nsync: {updated} repo(s) updated, {attention} needing attention.");
+    if dry_run {
+        println!(
+            "\nsync (dry-run): {pending} repo(s) would update, {attention} needing attention. \
+             Re-run without --dry-run to apply."
+        );
+    } else {
+        println!("\nsync: {updated} repo(s) updated, {attention} needing attention.");
+    }
     Ok(())
 }
 
@@ -2358,14 +2567,50 @@ fn migrate(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// SPEC §5.4.2 / audit-resolution C.2 + pack-staleness-warning — print soft
+/// (WARN-only) diagnostics under one shared banner. Used by BOTH `check` and
+/// `doctor` so a diagnostic surfaced by the config-resolve step (including a
+/// git-currency pack-staleness warning) is never visible from one command
+/// but silently swallowed by the other.
+fn print_soft_diagnostics(soft_diagnostics: &[praxec_core::config::Diagnostic]) {
+    if soft_diagnostics.is_empty() {
+        return;
+    }
+    println!();
+    println!("soft warnings (resolve-time):");
+    for d in soft_diagnostics {
+        let loc = d
+            .location
+            .as_deref()
+            .map(|l| format!(" at {l}"))
+            .unwrap_or_default();
+        let suggestion = d
+            .suggestion
+            .as_deref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        println!("  warn[{}]{loc}: {}{suggestion}", d.code, d.message);
+    }
+}
+
 /// P15 — the operator's "is my machine set up for this config" command: run
 /// the credential/tooling preflight and print the report. Exits non-zero iff
 /// a required provider credential is missing (a missing `kind: mcp` binary is
 /// reported as a warning — it fails loud at invocation, not at boot).
+///
+/// pack-staleness-warning — `doctor` loads via the diagnostics-returning
+/// resilient loader (the same RepoLoadMode `load_config` uses under the
+/// hood) INSTEAD of the `load_config` wrapper, specifically so it can print
+/// the soft diagnostics (e.g. a drifted/stale `path:` pack) that
+/// `load_config` discards. `check` and `doctor` must never disagree about
+/// what a config's soft diagnostics say.
 fn doctor(config_path: PathBuf) -> anyhow::Result<()> {
-    let config = load_config(&config_path)?;
+    let (config, soft_diagnostics) =
+        praxec_core::config::load_resolved_with_repos_resilient(&config_path)
+            .with_context(|| format!("loading config {}", config_path.display()))?;
     let report = crate::preflight::preflight(&config);
     print!("{}", crate::preflight::format_report(&report));
+    print_soft_diagnostics(&soft_diagnostics);
 
     // Durability parity with `serve`: report the SAME env-aware condition serve
     // fails fast on, so `doctor` (the health command) can never greenlight a
@@ -2520,23 +2765,7 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
     // SPEC §5.4.2 / audit-resolution C.2 — print soft diagnostics under
     // their own banner so operators see them even when the rest of
     // validation succeeds.
-    if !soft_diagnostics.is_empty() {
-        println!();
-        println!("soft warnings (resolve-time):");
-        for d in &soft_diagnostics {
-            let loc = d
-                .location
-                .as_deref()
-                .map(|l| format!(" at {l}"))
-                .unwrap_or_default();
-            let suggestion = d
-                .suggestion
-                .as_deref()
-                .map(|s| format!(" ({s})"))
-                .unwrap_or_default();
-            println!("  warn[{}]{loc}: {}{suggestion}", d.code, d.message);
-        }
-    }
+    print_soft_diagnostics(&soft_diagnostics);
     if !diagnostics.is_empty() || !soft_diagnostics.is_empty() || !durability.is_empty() {
         println!();
         println!(
@@ -4303,6 +4532,162 @@ mod tests {
         );
     }
 
+    /// A minimal git-backed pack fixture: `git init -b <branch>` + a valid
+    /// `praxec.repo.yaml` under a unique `namespace`, committed. Mirrors
+    /// `praxec-core`'s `pack_staleness_warning.rs` / `pack_provenance.rs`
+    /// fixture shape (a fresh `tempfile::TempDir`, never the checked-in
+    /// `tests/fixtures/repos/*`, which live inside THIS workspace's own git
+    /// repo and would spuriously inherit its branch/dirty state).
+    fn init_git_pack_for_provenance(dir: &std::path::Path, branch: &str, namespace: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::process::Command::new("git")
+            .arg("init")
+            .arg("-b")
+            .arg(branch)
+            .arg(dir)
+            .output()
+            .unwrap();
+        std::fs::write(
+            dir.join("praxec.repo.yaml"),
+            format!(
+                "schema: praxec.repo/v1\nname: {namespace}-pack\nnamespace: {namespace}\nversion: 0.0.1\n"
+            ),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} in {} failed",
+                dir.display()
+            );
+        };
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "seed",
+        ]);
+    }
+
+    /// pack-provenance-recording (P1) — a reload with a git-backed pack emits
+    /// ONE `pack.provenance` audit event whose payload lists that pack's
+    /// namespace + resolved sha + ref + dirty. Proves the record is durable
+    /// (lands in the audit trail, not just the live config) AND non-blocking
+    /// (the reload still completes normally).
+    #[tokio::test]
+    async fn reload_with_a_git_backed_pack_emits_a_pack_provenance_audit_event() {
+        use praxec_core::hot_reload::{
+            SwappableDefinitionStore, SwappableDiscoveryIndex, SwappableExecutorRegistry,
+            SwappableRegistry,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("pack");
+        init_git_pack_for_provenance(&pack, "dev", "gw-prov");
+        let expected_sha = head_sha(&pack);
+
+        let cfg_path = dir.path().join("praxec.yaml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n",
+                pack.display()
+            ),
+        )
+        .unwrap();
+
+        let overlays = GatewayOverlays::default();
+        let config = crate::gateway_config::load_config(&cfg_path).unwrap();
+        let runtime = build_runtime_for_orchestrate(&config, &overlays)
+            .await
+            .expect("runtime");
+
+        let audit_sink = praxec_core::audit::MemoryAuditSink::new();
+        let audit: Arc<dyn praxec_core::audit::AuditSink> = Arc::new(audit_sink.clone());
+        let embedder: Arc<dyn praxec_core::embeddings::EmbeddingProvider> =
+            Arc::new(praxec_core::embeddings::NoopEmbedder);
+        let (defs, execs, discovery, registry, handle) =
+            build_hot_components(&config, &audit, &embedder, None)
+                .await
+                .expect("components build");
+        handle.set_runtime((*runtime).clone());
+        let swappable_defs = Arc::new(SwappableDefinitionStore::new(defs));
+        let swappable_execs = Arc::new(SwappableExecutorRegistry::new(execs));
+        let swappable_discovery = Arc::new(SwappableDiscoveryIndex::new(discovery));
+        let swappable_registry = Arc::new(SwappableRegistry::new(registry));
+
+        // Nothing recorded yet — `build_hot_components` alone never emits
+        // `pack.provenance` (only `build_oneshot_server`/`reload_gated` do,
+        // where the audit sink is live at the right point).
+        assert!(
+            !audit_sink
+                .event_types()
+                .contains(&"pack.provenance".to_string()),
+            "provenance is recorded at load/reload, not at bare component build"
+        );
+
+        let repair_gate: praxec_mcp_server::RepairGateSlot = Arc::new(std::sync::RwLock::new(None));
+        let upstream: Arc<dyn praxec_executors::UpstreamElicitor> = Arc::new(
+            super::ProgressElicitor::new(praxec_mcp_server::ProgressPeer::default()),
+        );
+        let outcome = reload_gated(
+            &swappable_defs,
+            &swappable_execs,
+            &swappable_discovery,
+            &swappable_registry,
+            &cfg_path,
+            &audit,
+            &runtime,
+            &overlays.registrars,
+            &repair_gate,
+            &upstream,
+        )
+        .await;
+        assert_eq!(outcome["status"], "reloaded", "reload completes: {outcome}");
+
+        let events = audit_sink.snapshot();
+        let provenance_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "pack.provenance")
+            .collect();
+        assert_eq!(
+            provenance_events.len(),
+            1,
+            "exactly one pack.provenance event per load: {events:?}"
+        );
+        let packs = provenance_events[0]
+            .payload
+            .get("packs")
+            .and_then(Value::as_array)
+            .expect("payload carries a packs array");
+        let record = packs
+            .iter()
+            .find(|p| p.get("namespace").and_then(Value::as_str) == Some("gw-prov"))
+            .unwrap_or_else(|| panic!("expected a provenance record for 'gw-prov': {packs:?}"));
+        assert_eq!(
+            record.get("sha").and_then(Value::as_str),
+            Some(expected_sha.as_str())
+        );
+        assert_eq!(record.get("ref").and_then(Value::as_str), Some("dev"));
+        assert_eq!(record.get("dirty").and_then(Value::as_bool), Some(false));
+
+        // Provenance recording never constrains: a clean reload on an
+        // unremarkable branch still completes with `status: reloaded`, no
+        // gating whatsoever tied to the presence of this event.
+        assert_eq!(outcome["status"], "reloaded");
+    }
+
     /// Refusing to BOOT on a bad writable repo is correct fail-fast. Bricking a
     /// RUNNING gateway on one would be a different failure class — an operator's
     /// config edit silently costing every governed capability. This proves the
@@ -4451,21 +4836,266 @@ mod tests {
         // No repos → clean no-op.
         let empty = dir.path().join("empty.yaml");
         std::fs::write(&empty, "version: \"1.0.0\"\nworkflows: {}\n").unwrap();
-        super::run_sync(&empty).expect("no-repos sync is a clean no-op");
+        super::run_sync(&empty, false).expect("no-repos sync is a clean no-op");
 
-        // A local path that is NOT a git checkout → skipped (never errors).
+        // A local path that is NOT a git checkout, and a remote `uri:` that
+        // cannot be reached (a nonexistent local `file://` target — no
+        // network involved, just an unreachable remote) → both skipped, never
+        // erroring the whole sync run.
         let plain = dir.path().join("plain-pack");
         std::fs::create_dir_all(&plain).unwrap();
         let cfg = dir.path().join("with-repos.yaml");
         std::fs::write(
             &cfg,
             format!(
-                "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n  - uri: \"git+https://example.com/x@main\"\nworkflows: {{}}\n",
-                plain.display()
+                "version: \"1.0.0\"\nrepos:\n  - path: \"{}\"\n  - uri: \"file://{}/no-such-remote\"\nworkflows: {{}}\n",
+                plain.display(),
+                dir.path().display(),
             ),
         )
         .unwrap();
-        super::run_sync(&cfg).expect("non-git local path + remote uri are handled, not errored");
+        super::run_sync(&cfg, false)
+            .expect("non-git local path + unreachable remote uri are handled, not errored");
+    }
+
+    /// A non-bare local "remote": one commit, clonable over `file://` — same
+    /// fixture shape as `repo_git`'s own tests (no network).
+    fn seed_pack_update_origin(dir: &std::path::Path) {
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} in {} failed",
+                dir.display()
+            );
+        };
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .arg(dir)
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("pack.txt"), "v1\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "seed",
+        ]);
+    }
+
+    /// Advance the origin by one commit (simulates upstream progress).
+    fn advance_pack_update_origin(dir: &std::path::Path) {
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} in {} failed",
+                dir.display()
+            );
+        };
+        std::fs::write(dir.join("extra.txt"), "v2\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "advance",
+        ]);
+    }
+
+    fn head_sha(dir: &std::path::Path) -> String {
+        super::git_out(&["rev-parse", "HEAD"], dir)
+            .expect("HEAD resolves")
+            .trim()
+            .to_string()
+    }
+
+    /// The pull-latest unit: a not-yet-cached remote repo is cloned fresh and
+    /// its tip SHA reported.
+    #[test]
+    fn sync_remote_repo_clones_fresh_and_reports_its_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        seed_pack_update_origin(&origin);
+        let uri = format!("file://{}", origin.display());
+        let dest = tmp.path().join("cache");
+
+        let outcome = super::sync_remote_repo(&uri, "main", &dest, false);
+        let want = head_sha(&origin);
+        assert_eq!(outcome, super::RemoteSyncOutcome::Cloned { sha: want });
+        assert!(dest.join("pack.txt").exists());
+    }
+
+    /// The core "pull latest" behavior: an already-cached remote repo whose
+    /// origin has advanced is fetched + reset to the new tip, and the old→new
+    /// SHA pair is reported.
+    #[test]
+    fn sync_remote_repo_pulls_latest_and_reports_old_to_new_sha() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        seed_pack_update_origin(&origin);
+        let uri = format!("file://{}", origin.display());
+        let dest = tmp.path().join("cache");
+
+        // First sync clones.
+        super::sync_remote_repo(&uri, "main", &dest, false);
+        let old = head_sha(&dest);
+
+        // Origin advances.
+        advance_pack_update_origin(&origin);
+        let new_expected = head_sha(&origin);
+        assert_ne!(old, new_expected, "the fixture must actually advance");
+
+        let outcome = super::sync_remote_repo(&uri, "main", &dest, false);
+        assert_eq!(
+            outcome,
+            super::RemoteSyncOutcome::Updated {
+                old: old.clone(),
+                new: new_expected.clone(),
+            }
+        );
+        assert_eq!(head_sha(&dest), new_expected, "cache reset to the new tip");
+        assert!(
+            dest.join("extra.txt").exists(),
+            "the new commit's content is present"
+        );
+    }
+
+    /// `--dry-run`: reports the pending update but does NOT move the cache.
+    #[test]
+    fn sync_remote_repo_dry_run_reports_pending_change_without_moving_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        seed_pack_update_origin(&origin);
+        let uri = format!("file://{}", origin.display());
+        let dest = tmp.path().join("cache");
+
+        super::sync_remote_repo(&uri, "main", &dest, false);
+        let old = head_sha(&dest);
+
+        advance_pack_update_origin(&origin);
+        let new_expected = head_sha(&origin);
+
+        let outcome = super::sync_remote_repo(&uri, "main", &dest, true);
+        assert_eq!(
+            outcome,
+            super::RemoteSyncOutcome::WouldUpdate {
+                old: old.clone(),
+                new: new_expected,
+            }
+        );
+        assert_eq!(head_sha(&dest), old, "dry-run must not move the cache");
+        assert!(
+            !dest.join("extra.txt").exists(),
+            "dry-run must not pull the new commit's content"
+        );
+    }
+
+    /// An already-current cached repo reports "up to date" (both for a real
+    /// sync and a dry-run — neither moves anything, since there's nothing new).
+    #[test]
+    fn sync_remote_repo_already_current_reports_up_to_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        seed_pack_update_origin(&origin);
+        let uri = format!("file://{}", origin.display());
+        let dest = tmp.path().join("cache");
+
+        super::sync_remote_repo(&uri, "main", &dest, false);
+        let sha = head_sha(&dest);
+
+        assert_eq!(
+            super::sync_remote_repo(&uri, "main", &dest, false),
+            super::RemoteSyncOutcome::UpToDate { sha: sha.clone() }
+        );
+        assert_eq!(
+            super::sync_remote_repo(&uri, "main", &dest, true),
+            super::RemoteSyncOutcome::UpToDate { sha }
+        );
+    }
+
+    /// A remote repo that cannot be reached (bad path, no network involved) is
+    /// reported as needing attention rather than failing the whole sync run.
+    #[test]
+    fn sync_remote_repo_unreachable_reports_attention_not_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let uri = format!("file://{}/does-not-exist", tmp.path().display());
+        let dest = tmp.path().join("cache");
+
+        match super::sync_remote_repo(&uri, "main", &dest, false) {
+            super::RemoteSyncOutcome::FetchFailed(_) => {}
+            other => panic!("expected FetchFailed, got {other:?}"),
+        }
+        assert!(!dest.exists(), "a failed clone leaves no partial cache");
+    }
+
+    /// End-to-end: `praxec sync` (not just the unit) actually pulls a declared
+    /// remote `uri:` repo to its ref's latest tip, and `--dry-run` leaves the
+    /// cache untouched — proves the CLI wiring, not just the helper.
+    #[test]
+    fn sync_end_to_end_pulls_latest_for_a_declared_remote_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        seed_pack_update_origin(&origin);
+        let uri = format!("file://{}", origin.display());
+
+        let cfg_path = dir.path().join("with-remote.yaml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "version: \"1.0.0\"\nrepos:\n  - uri: \"{uri}\"\n    ref: main\nworkflows: {{}}\n"
+            ),
+        )
+        .unwrap();
+
+        let cache = dir
+            .path()
+            .join(".praxec")
+            .join("repos")
+            .join(praxec_core::repo_git::cache_dir_name(&uri, "main"));
+
+        super::run_sync(&cfg_path, false).expect("first sync clones the remote repo");
+        assert!(cache.join("pack.txt").exists());
+
+        advance_pack_update_origin(&origin);
+
+        // --dry-run must not touch the cache.
+        super::run_sync(&cfg_path, true).expect("dry-run sync reports without mutating");
+        assert!(
+            !cache.join("extra.txt").exists(),
+            "dry-run must not pull the new commit"
+        );
+
+        // A real sync pulls it.
+        super::run_sync(&cfg_path, false).expect("second sync pulls the new commit");
+        assert!(
+            cache.join("extra.txt").exists(),
+            "a real sync applies the pending update"
+        );
     }
 
     /// #8 — `cleanup` prunes only OLD, dateable audit files, dry-runs by

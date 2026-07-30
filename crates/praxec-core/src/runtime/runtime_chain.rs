@@ -852,6 +852,33 @@ impl WorkflowRuntime {
                 };
                 let effort =
                     state_effort.or_else(|| auto_effort(&instance.context, &instance.input));
+                // Coding-evidence forcing function: a state declares
+                // `requires_file_write: true` when its success is a real edit, so
+                // the runner refuses a `final_answer` produced with zero
+                // `write_file`/`edit_file` calls (re-prompt in-context, then
+                // escalate). This is an EXPLICIT per-state marker, never inferred
+                // from tool reach: the gateway-wide `auto_drive_tools` grants the
+                // file host to EVERY auto-driven leaf, so "has a file tool" is true
+                // for non-coding leaves too — inference would false-fail them.
+                // Absent → false (unchanged behavior). A non-bool is a hard error,
+                // not a silent default (mirrors the `tools:`/`reasoning_effort:`
+                // per-state validators above).
+                let requires_file_write: bool = match definition.pointer(&format!(
+                    "/states/{}/requires_file_write",
+                    pointer_escape(&instance.state)
+                )) {
+                    None => false,
+                    Some(Value::Bool(b)) => *b,
+                    Some(other) => {
+                        return Err(anyhow!(
+                            "AUTO_DRIVE_STATE_REQUIRES_FILE_WRITE_INVALID: state '{}' of '{}' \
+                             declares `requires_file_write: {other}` — it must be a boolean. Omit \
+                             the key to leave it off (a non-coding leaf).",
+                            instance.state,
+                            instance.definition_id
+                        ));
+                    }
+                };
                 let mut agent_config = json!({
                     "kind": "agent",
                     "affinity": auto_affinity_tier,
@@ -865,6 +892,12 @@ impl WorkflowRuntime {
                 });
                 if let Some(e) = &effort {
                     agent_config["reasoning_effort"] = json!(e);
+                }
+                // Only set when true so the kind:agent config (deny_unknown_fields,
+                // requires_file_write: bool #[serde(default)]) stays byte-clean for
+                // the overwhelmingly-common non-coding leaf.
+                if requires_file_write {
+                    agent_config["requires_file_write"] = json!(true);
                 }
                 // (finding #12) The configured allowance must bound the WHOLE
                 // chain-walk, not just each attempt: without this the executor
