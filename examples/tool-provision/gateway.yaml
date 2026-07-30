@@ -6,7 +6,10 @@
 # connection below, and to `npm` for the npx-distributed-server install
 # recipe. Both must be on PATH for a real (non-`check`/`fuzz`) drive;
 # `praxec check` and `praxec fuzz` validate the workflow shape statically /
-# with mock executors and never actually spawn either.
+# with mock executors and never actually spawn either. `jq` must also be on
+# PATH — `building`'s script (declared in `flow.tools.provision.yaml`'s own
+# `scripts:` block, colocated with the workflow that owns it) uses it to
+# assemble the staged connection body.
 
 version: "1.0.0"
 

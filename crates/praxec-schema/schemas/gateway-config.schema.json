@@ -210,6 +210,14 @@
           },
           "default": {}
         },
+        "required_secrets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "P2.1/P2.3b — env-var NAMES this connection's child process needs at runtime (never the values — those flow in via the operator's own process environment, which the spawned child inherits). Advisory: `praxec doctor`/preflight reports a missing one but never blocks (see `praxec::preflight::check_connection_secrets_with`)."
+        },
         "idleTimeoutMs": {
           "type": "integer",
           "minimum": 1,

@@ -176,6 +176,53 @@ fn non_interactive_grant_is_refused_without_yes_and_succeeds_with_it() {
     );
 }
 
+/// P2.1/P2.3b — a connection body declaring `required_secrets` must actually
+/// be GRANTABLE. P2.1 (#169) added the `praxec doctor` check that reads a
+/// connection's `required_secrets`, but the gateway config schema's
+/// `mcpConnection` `$defs` never gained the matching property —
+/// `additionalProperties: false` meant `connections grant` rejected any
+/// staged body that declared it with `INVALID_STAGED_CONNECTION`, silently
+/// making the P2.1 feature ungrantable. Fixed alongside P2.3b (which needs
+/// `required_secrets` to ride in a `--block`-staged body); this pins the
+/// schema fix so it can't regress.
+#[test]
+fn add_block_with_required_secrets_stages_and_grants() {
+    let (_d, path) = write_base();
+
+    assert!(
+        run(
+            &path,
+            &[
+                "add",
+                "figma",
+                "--block",
+                r#"{"kind":"mcp","command":"figma-mcp","required_secrets":["FIGMA_TOKEN"]}"#,
+            ],
+        )
+        .status
+        .success(),
+        "stage a connection declaring required_secrets"
+    );
+
+    let out = run(&path, &["grant", "figma", "--yes"]);
+    assert!(
+        out.status.success(),
+        "granting a required_secrets-declaring connection must succeed \
+         (schema must allow the field): {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let resolved = praxec_core::config::load_resolved_with_repos(&path)
+        .expect("resolves after grant")
+        .0;
+    assert_eq!(
+        resolved
+            .pointer("/connections/figma/required_secrets/0")
+            .and_then(serde_json::Value::as_str),
+        Some("FIGMA_TOKEN"),
+        "the granted live connection must carry required_secrets through"
+    );
+}
+
 /// P2.3b — `--block <json>` stages the WHOLE connection body (env: map
 /// included) in one token, so a workflow's `kind: cli` step (static `args:`
 /// array) can wire an arbitrary-length set of collected secrets/config into
