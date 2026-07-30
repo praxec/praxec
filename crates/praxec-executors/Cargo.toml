@@ -34,6 +34,13 @@ tempfile = "3"
 # SPEC §24 — ParallelExecutor's defensive snapshot-hash assert (F1).
 sha2 = { workspace = true }
 
+# A spawned stdio MCP child is made its own process-group leader so that
+# dropping it can SIGKILL the WHOLE group (leader + grandchildren like
+# npx→node→chromium), not just the leader PID `kill_on_drop` reaches. That
+# group-kill is the only libc call and is unix-only (see mcp.rs `GroupChild`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 chrono = { workspace = true }
 tokio = { workspace = true }

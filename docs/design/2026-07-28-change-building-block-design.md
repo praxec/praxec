@@ -71,6 +71,24 @@ Across ~28 flows the non-mutating + external + elicit shapes **outnumber** mutat
 core building block" was over-claimed. Each mutation flow is itself a *molecule of L1 handoffs*
 (e.g. `qa.promote-finding` = the TDD RED→GREEN molecule: write→prove-red→pin→fix→verify→flake-scan).
 
+### 3.0 The handoff is ACCEPTANCE CRITERIA (definition-of-done), not a command list
+The primary, general handoff between steps is a set of **acceptance criteria** — a checkable
+definition-of-done that the upstream step produces and the downstream step must satisfy. This is
+praxec's existing `outcomes` mechanism (ADR-0008: a `statement` + a deterministic `check`
+expression + live `met` flags), extended so one step *emits the outcomes the next must meet*. It is
+declarative (WHAT is done, not HOW), it generalizes to all five shapes (every step has a
+"what-defines-done"), and it **unifies the handoff with verification** — the next step's verify *is*
+the evaluation of these criteria. TDD is the canonical case: the RED→GREEN handoff is a
+proven-failing test, i.e. a checkable acceptance criterion. A criterion must be *checkable* to gate
+(a deterministic `check` predicate over introspectable state, or a behavioral compile/test); a
+criterion whose only witness is a human/model judgment degrades to `behaviorally-unverified →
+human` (§7) — the same admissibility discipline, no escape hatch.
+
+The command-pattern `Vec<ImplementationStrategy>` (§5) is **not** the fundamental handoff — it is an
+optional *execution* specialization for file mutation (the deterministic frame that makes
+narrated-write impossible). Criteria say "done = X"; the strategy says "execute deterministically to
+get there." Criteria are L1 (general); the strategy is L3 (the file-mutation probe).
+
 ### 3.1 Handoff artifacts have two recognizers, not one
 A handoff is a validated typed artifact, consumer-checked **at the consuming block's entry**
 (post-predecessor apply; ground-truth = current tree ∪ pending-creates-from-earlier-ops — so a

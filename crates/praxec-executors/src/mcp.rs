@@ -236,18 +236,50 @@ pub trait McpToolCaller: Send + Sync {
     ) -> Result<Vec<rmcp::model::Tool>, ExecutorError>;
 }
 
+/// A spawned stdio MCP child, made its own process-group leader (via
+/// `Command::process_group(0)`), whose `Drop` SIGKILLs the ENTIRE group — the
+/// leader AND every descendant (e.g. `browser-mcp.sh` → `npx` → `node` →
+/// chromium, or a cold `npx playwright install`).
+///
+/// Why not plain `kill_on_drop`: tokio's `kill_on_drop` signals only the
+/// direct leader PID. When the connect/idle timeout fires *mid-startup* — while
+/// the leader is blocked inside a foreground `npx`/`install` grandchild — killing
+/// the leader alone orphans that grandchild (reparented to init, still running,
+/// its stderr-drain task blocked forever on EOF). A negative-pid `kill(2)` hits
+/// the whole group, so nothing lingers. Unix only; elsewhere this degrades to
+/// the inner `kill_on_drop` (the group primitive is unix-specific).
+struct GroupChild(tokio::process::Child);
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.id() {
+            // SAFETY: `kill(2)` with a negative pid targets the process group
+            // whose id is `pid` — this child is that group's leader (spawned
+            // with `process_group(0)`). SIGKILL cannot be caught, so no
+            // descendant survives; a missing group (already exited) just
+            // returns ESRCH, which we ignore. The inner `Child` drops next and
+            // its `kill_on_drop` reaps the (now-dead) leader.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+        }
+        // On drop, `self.0`'s `kill_on_drop(true)` reaps the leader.
+    }
+}
+
 /// A live, pooled MCP connection: the rmcp service plus the shared
 /// [`ActivityClock`] its transport bumps on every byte (so [`with_idle_timeout`]
 /// can tell a slow-but-alive connection from a hung one) and, for the
-/// child-process transport, the owned child handle (spawned with
-/// `kill_on_drop`, so dropping this entry reaps the server).
+/// child-process transport, the owned child handle (a [`GroupChild`], so
+/// dropping this entry reaps the server AND its whole process group).
 struct Conn {
     service: RunningService<RoleClient, RelayClientHandler>,
     clock: ActivityClock,
     idle: Duration,
     /// Kept alive for the connection's lifetime; `None` for the HTTP transport.
-    /// `kill_on_drop(true)` means dropping it terminates + reaps the child.
-    _child: Option<tokio::process::Child>,
+    /// Dropping it group-kills the child tree (see [`GroupChild`]).
+    _child: Option<GroupChild>,
 }
 
 /// Production [`McpToolCaller`]: owns the connection registry + the connection
@@ -300,7 +332,7 @@ impl RmcpToolCaller {
         let handler = RelayClientHandler::new(self.upstream.clone());
         let (service, child): (
             RunningService<RoleClient, RelayClientHandler>,
-            Option<tokio::process::Child>,
+            Option<GroupChild>,
         ) = if let Some(url) = &conn.url {
             let transport = StreamableHttpClientTransport::<reqwest::Client>::from_uri(url.clone());
             // HTTP has no child stdio to tap, so the clock isn't byte-bumped:
@@ -333,6 +365,14 @@ impl RmcpToolCaller {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
+            // Make the child its own process-group leader (pgid == its pid) so
+            // that dropping the `GroupChild` below can SIGKILL the whole group.
+            // Without this, a connect/idle timeout firing mid-startup (leader
+            // blocked in a foreground `npx`/`playwright install` grandchild)
+            // would orphan that grandchild — `kill_on_drop` reaches only the
+            // leader PID. Unix-only; the group primitive doesn't exist elsewhere.
+            #[cfg(unix)]
+            cmd.process_group(0);
 
             let mut child = cmd
                 .spawn()
@@ -344,6 +384,10 @@ impl RmcpToolCaller {
                 ExecutorError::Connection(format!("mcp '{name}': child stdin unavailable"))
             })?;
             let stderr = child.stderr.take();
+            // From here on the child is a `GroupChild`: any early return —
+            // notably the `with_idle_timeout` error path below — drops it and
+            // group-kills the whole tree, closing the orphan-on-timeout leak.
+            let child = GroupChild(child);
 
             // Drain stderr in the background: it carries the npm/npx download
             // progress that proves a cold start is *alive* (resetting the idle
@@ -842,6 +886,64 @@ mod idle_wiring_tests {
             start.elapsed() < Duration::from_secs(2),
             "must fire near the 300ms idle window, got {:?}",
             start.elapsed()
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod group_kill_tests {
+    //! `GroupChild` must SIGKILL the WHOLE process group on drop — the leader
+    //! AND its descendants — so a mid-startup timeout can't orphan a cold
+    //! `npx`/`playwright install` grandchild (the leak `kill_on_drop`, which
+    //! reaches only the leader PID, leaves for `scripts/browser-mcp.sh`).
+    use super::*;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    /// A grandchild that INHERITED the leader's stdout pipe keeps that pipe's
+    /// write end open until it dies, so the read side sees EOF only once BOTH
+    /// the leader and the grandchild are gone. That makes this a
+    /// reaping-independent proof of group-kill: with only `kill_on_drop` (leader
+    /// PID), the backgrounded `sleep` would orphan, still hold the pipe, and the
+    /// post-drop read would block past its timeout (RED). With the group-kill it
+    /// dies and EOF arrives promptly (GREEN).
+    #[tokio::test]
+    async fn dropping_a_group_child_kills_grandchildren_not_only_the_leader() {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 60 & echo started ; wait")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        // Mirror the production spawn: own process group so the drop can reap it.
+        cmd.process_group(0);
+
+        let mut raw = cmd.spawn().expect("spawn leader shell");
+        let mut stdout = raw.stdout.take().expect("child stdout");
+        let child = GroupChild(raw);
+
+        // Wait until the shell has actually launched the grandchild (it prints
+        // "started" right after backgrounding the sleep).
+        let mut b = [0u8; 32];
+        let n = tokio::time::timeout(Duration::from_secs(5), stdout.read(&mut b))
+            .await
+            .expect("leader must print its start marker promptly")
+            .expect("read start marker");
+        assert!(n > 0, "expected the leader's start marker");
+
+        drop(child); // GroupChild::drop -> kill(-pgid, SIGKILL): leader + sleep.
+
+        // EOF must arrive quickly. A surviving grandchild holding the inherited
+        // pipe would block this read for the full `sleep 60` — the exact leak.
+        let n = tokio::time::timeout(Duration::from_secs(3), stdout.read(&mut b))
+            .await
+            .expect("pipe must reach EOF after the group-kill — a lingering grandchild would block")
+            .expect("read after drop");
+        assert_eq!(
+            n, 0,
+            "expected EOF (0 bytes): the whole process group, grandchild included, must be dead"
         );
     }
 }
