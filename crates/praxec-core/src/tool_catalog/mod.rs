@@ -16,7 +16,7 @@ pub mod catalog;
 pub mod real_io;
 pub mod registry;
 
-pub use adapters::{GithubOrgAdapter, StaticAdapter};
+pub use adapters::{GithubOrgAdapter, McpRegistryAdapter, RestAdapter, StaticAdapter};
 pub use candidate::{RequiredField, Requires, ToolCandidate, ToolSource, Transport, TrustTier};
 pub use catalog::{Cache, assemble, discover, evaluate};
 pub use real_io::RealCatalogIo;

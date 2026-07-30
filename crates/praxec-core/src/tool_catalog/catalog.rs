@@ -8,7 +8,7 @@
 //! ranking over an already-assembled `Vec<ToolCandidate>` plus `now: i64`
 //! passed in by the caller (no `Date::now`/`Instant::now` in this crate).
 
-use super::adapters::{GithubOrgAdapter, StaticAdapter};
+use super::adapters::{GithubOrgAdapter, McpRegistryAdapter, RestAdapter, StaticAdapter};
 use super::candidate::ToolCandidate;
 use super::registry::{CatalogIo, RegistryAdapter, RegistrySpec};
 use std::collections::HashMap;
@@ -57,6 +57,14 @@ pub fn assemble(specs: &[RegistrySpec], io: &dyn CatalogIo) -> (Vec<ToolCandidat
             }
             RegistrySpec::GithubOrg { name, org } => {
                 let adapter = GithubOrgAdapter::new(name.clone(), org.clone());
+                collect(&adapter, io, &mut by_key, &mut warnings);
+            }
+            RegistrySpec::Rest { name, url } => {
+                let adapter = RestAdapter::new(name.clone(), url.clone());
+                collect(&adapter, io, &mut by_key, &mut warnings);
+            }
+            RegistrySpec::McpRegistry { name, url } => {
+                let adapter = McpRegistryAdapter::new(name.clone(), url.clone());
                 collect(&adapter, io, &mut by_key, &mut warnings);
             }
             RegistrySpec::Unknown { name, kind } => {
@@ -235,6 +243,57 @@ mod tests {
         };
         assert!(c.is_stale(86_401, 86_400));
         assert!(!c.is_stale(100, 86_400));
+    }
+
+    #[test]
+    fn assemble_wires_rest_and_mcp_registry_specs_and_dedups_across_them() {
+        // Same tool name from `rest` (community, unset trust_tier) and
+        // `mcp-registry` (always verified) — assemble should keep the
+        // verified copy, proving both new adapters are wired end to end.
+        struct FakeIo;
+        impl CatalogIo for FakeIo {
+            fn github_org_repos(&self, _org: &str) -> Result<Vec<GhRepo>, String> {
+                Err("unused".into())
+            }
+            fn fetch_json(&self, url: &str) -> Result<Value, String> {
+                if url.contains("rest-registry") {
+                    Ok(serde_json::json!([
+                        {
+                            "name": "shared-tool",
+                            "description": "from rest",
+                            "transport": "stdio",
+                            "source": { "npm": { "pkg": "@acme/shared-tool" } }
+                        }
+                    ]))
+                } else {
+                    Ok(serde_json::json!({ "servers": [
+                        {
+                            "name": "shared-tool",
+                            "description": "from mcp-registry",
+                            "packages": [
+                                { "registry_name": "npm", "name": "@acme/shared-tool" }
+                            ]
+                        }
+                    ]}))
+                }
+            }
+        }
+        let specs = vec![
+            RegistrySpec::Rest {
+                name: "rest-registry".into(),
+                url: "https://rest-registry.example.com/tools".into(),
+            },
+            RegistrySpec::McpRegistry {
+                name: "official".into(),
+                url: "https://official.example.com/v0/servers".into(),
+            },
+        ];
+        let (cat, warns) = assemble(&specs, &FakeIo);
+        assert!(warns.is_empty());
+        let matches: Vec<_> = cat.iter().filter(|c| c.name == "shared-tool").collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].trust_tier, TrustTier::Verified);
+        assert_eq!(matches[0].provenance, "official");
     }
 
     #[test]
