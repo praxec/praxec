@@ -76,10 +76,7 @@ pub enum ConnSource {
         expect_version: Option<String>,
     },
     /// npx-launched package (`@latest` tracks upstream; a pin is captured).
-    Npx {
-        pkg: String,
-        pinned: Option<String>,
-    },
+    Npx { pkg: String, pinned: Option<String> },
     /// `command: docker` but no `source: { docker }` — we will not guess the
     /// image out of `docker run` args, so currency is opt-in here.
     DockerUndeclared,
@@ -194,7 +191,11 @@ fn expect_version_of(source: &Option<Value>) -> Option<String> {
 
 /// Classify a connection into the currency probe it needs. Pure given the
 /// cargo metadata + a PATH-existence predicate (both injected).
-pub fn classify(spec: &ConnSpec, crates2: Option<&Value>, on_path: impl Fn(&str) -> bool) -> ConnSource {
+pub fn classify(
+    spec: &ConnSpec,
+    crates2: Option<&Value>,
+    on_path: impl Fn(&str) -> bool,
+) -> ConnSource {
     // A URL connection is a remote MCP regardless of any command.
     if let Some(url) = &spec.url {
         return ConnSource::Remote {
@@ -273,7 +274,12 @@ pub fn check_currency(specs: &[ConnSpec], io: &dyn CurrencyIo) -> Vec<CurrencyDi
     out
 }
 
-fn diag(connection: &str, code: &'static str, severity: Severity, message: String) -> CurrencyDiagnostic {
+fn diag(
+    connection: &str,
+    code: &'static str,
+    severity: Severity,
+    message: String,
+) -> CurrencyDiagnostic {
     CurrencyDiagnostic {
         connection: connection.to_string(),
         code,
@@ -286,7 +292,11 @@ fn diag(connection: &str, code: &'static str, severity: Severity, message: Strin
 /// nothing worth reporting — e.g. a command not on PATH is provision's concern).
 fn diagnose(name: &str, source: &ConnSource, io: &dyn CurrencyIo) -> Option<CurrencyDiagnostic> {
     match source {
-        ConnSource::LocalCargoPath { command, repo, version } => {
+        ConnSource::LocalCargoPath {
+            command,
+            repo,
+            version,
+        } => {
             let bin_mtime = io.binary_mtime(command)?;
             let Some(head) = io.git_head_time(repo) else {
                 return Some(diag(
@@ -321,7 +331,11 @@ fn diagnose(name: &str, source: &ConnSource, io: &dyn CurrencyIo) -> Option<Curr
                 ))
             }
         }
-        ConnSource::LocalCargoOther { command, version, source } => Some(diag(
+        ConnSource::LocalCargoOther {
+            command,
+            version,
+            source,
+        } => Some(diag(
             name,
             "CURRENCY_UNKNOWN",
             Severity::Info,
@@ -368,7 +382,10 @@ fn diagnose(name: &str, source: &ConnSource, io: &dyn CurrencyIo) -> Option<Curr
              registry-digest currency check (the run args are not decoded)."
                 .to_string(),
         )),
-        ConnSource::Remote { url, expect_version } => {
+        ConnSource::Remote {
+            url,
+            expect_version,
+        } => {
             let advertised = io.remote_version(url);
             match (advertised, expect_version) {
                 (Some(v), Some(want)) if &v != want => Some(diag(
@@ -438,7 +455,10 @@ pub fn format_currency(diags: &[CurrencyDiagnostic]) -> String {
             Severity::Warn => "warn",
             Severity::Info => "info",
         };
-        out.push_str(&format!("  {tag}  {}  {} — {}\n", d.code, d.connection, d.message));
+        out.push_str(&format!(
+            "  {tag}  {}  {} — {}\n",
+            d.code, d.connection, d.message
+        ));
     }
     out
 }
@@ -457,7 +477,12 @@ pub fn conn_specs_from(config: &Value) -> Vec<ConnSpec> {
             args: c
                 .get("args")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default(),
             url: c.get("url").and_then(Value::as_str).map(str::to_string),
             source: c.get("source").cloned(),
@@ -504,12 +529,21 @@ impl CurrencyIo for RealCurrencyIo {
         if !out.status.success() {
             return None;
         }
-        String::from_utf8_lossy(&out.stdout).trim().parse::<i64>().ok()
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<i64>()
+            .ok()
     }
 
     fn docker_local_digest(&self, image: &str) -> Option<String> {
         let out = std::process::Command::new("docker")
-            .args(["image", "inspect", "--format", "{{index .RepoDigests 0}}", image])
+            .args([
+                "image",
+                "inspect",
+                "--format",
+                "{{index .RepoDigests 0}}",
+                image,
+            ])
             .output()
             .ok()?;
         if !out.status.success() {
@@ -560,13 +594,11 @@ impl CurrencyIo for RealCurrencyIo {
                 use rmcp::transport::StreamableHttpClientTransport;
                 let transport = StreamableHttpClientTransport::<reqwest::Client>::from_uri(url);
                 // `()` is a no-op ClientHandler; a 3s bound on the whole handshake.
-                let client = tokio::time::timeout(
-                    std::time::Duration::from_secs(3),
-                    ().serve(transport),
-                )
-                .await
-                .ok()?
-                .ok()?;
+                let client =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), ().serve(transport))
+                        .await
+                        .ok()?
+                        .ok()?;
                 let version = client.peer_info().map(|i| i.server_info.version.clone());
                 let _ = client.cancel().await;
                 version
@@ -620,7 +652,11 @@ mod tests {
 
     #[test]
     fn crates2_lookup_finds_by_bin_and_parses_source() {
-        let c = crates2_with("cpm-planner", "0.0.2", "path+file:///home/mc/working/cpm-planner");
+        let c = crates2_with(
+            "cpm-planner",
+            "0.0.2",
+            "path+file:///home/mc/working/cpm-planner",
+        );
         let (ver, src) = crates2_lookup(&c, "cpm-planner").unwrap();
         assert_eq!(ver, "0.0.2");
         assert_eq!(src, "path+file:///home/mc/working/cpm-planner");
@@ -652,14 +688,19 @@ mod tests {
             args: vec!["run".into(), "-i".into(), "ghcr.io/x/y:1".into()],
             ..Default::default()
         };
-        assert_eq!(classify(&undeclared, None, |_| true), ConnSource::DockerUndeclared);
+        assert_eq!(
+            classify(&undeclared, None, |_| true),
+            ConnSource::DockerUndeclared
+        );
         let declared = ConnSpec {
             source: Some(json!({ "docker": "ghcr.io/x/y:1" })),
             ..undeclared
         };
         assert_eq!(
             classify(&declared, None, |_| true),
-            ConnSource::Docker { image: "ghcr.io/x/y:1".into() }
+            ConnSource::Docker {
+                image: "ghcr.io/x/y:1".into()
+            }
         );
     }
 
@@ -699,8 +740,14 @@ mod tests {
 
     #[test]
     fn local_cargo_stale_when_source_commit_is_newer() {
-        assert!(local_cargo_behind(100, 200), "commit newer than build → behind");
-        assert!(!local_cargo_behind(200, 100), "build newer than commit → current");
+        assert!(
+            local_cargo_behind(100, 200),
+            "commit newer than build → behind"
+        );
+        assert!(
+            !local_cargo_behind(200, 100),
+            "build newer than commit → current"
+        );
         assert!(!local_cargo_behind(100, 100), "same → current");
     }
 
@@ -722,7 +769,11 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "TOOL_BEHIND_SOURCE");
         assert_eq!(diags[0].severity, Severity::Warn);
-        assert!(diags[0].message.contains("cargo install --path /repo/cpm --force"));
+        assert!(
+            diags[0]
+                .message
+                .contains("cargo install --path /repo/cpm --force")
+        );
     }
 
     #[test]
@@ -747,8 +798,10 @@ mod tests {
     #[test]
     fn docker_digest_mismatch_warns() {
         let mut io = FakeIo::default();
-        io.docker_local.insert("ghcr.io/x/y:1".into(), "sha256:aaa".into());
-        io.docker_registry.insert("ghcr.io/x/y:1".into(), "sha256:bbb".into());
+        io.docker_local
+            .insert("ghcr.io/x/y:1".into(), "sha256:aaa".into());
+        io.docker_registry
+            .insert("ghcr.io/x/y:1".into(), "sha256:bbb".into());
         let specs = vec![ConnSpec {
             name: "d".into(),
             command: Some("docker".into()),
@@ -764,7 +817,8 @@ mod tests {
     fn docker_digest_match_is_current() {
         let mut io = FakeIo::default();
         io.docker_local.insert("img:2".into(), "sha256:same".into());
-        io.docker_registry.insert("img:2".into(), "sha256:same".into());
+        io.docker_registry
+            .insert("img:2".into(), "sha256:same".into());
         let specs = vec![ConnSpec {
             name: "d".into(),
             command: Some("docker".into()),
@@ -812,7 +866,10 @@ mod tests {
             url: Some("https://down.x".into()),
             ..Default::default()
         }];
-        assert_eq!(check_currency(&specs, &io)[0].code, "REMOTE_MCP_UNREACHABLE");
+        assert_eq!(
+            check_currency(&specs, &io)[0].code,
+            "REMOTE_MCP_UNREACHABLE"
+        );
     }
 
     #[test]
