@@ -383,6 +383,202 @@ async fn query_ambiguous_args_returns_ambiguous_intent_error() {
     );
 }
 
+// ── MCP tool discovery (Phase 1) dispatch tests ───────────────────────────────
+//
+// `discover` / `evaluate` are new `praxec.query` field-shapes (T6). These
+// tests exercise the dispatch routing end-to-end against a real
+// `PraxecServer`, with a fake `CatalogIo` so no network call happens — the
+// registries themselves are `static` (inline candidates), which don't touch
+// `CatalogIo` at all.
+
+struct FakeCatalogIo;
+impl praxec_core::tool_catalog::CatalogIo for FakeCatalogIo {
+    fn github_org_repos(
+        &self,
+        _org: &str,
+    ) -> Result<Vec<praxec_core::tool_catalog::GhRepo>, String> {
+        Err("not used by this test's registries".into())
+    }
+    fn fetch_json(&self, _url: &str) -> Result<Value, String> {
+        Err("not used by this test's registries".into())
+    }
+}
+
+/// One `static` registry with a single `browser-mcp` candidate, verb
+/// `diagnose`, tag `browser` — enough surface to prove name-hit discovery
+/// and verb-overlap evaluate both route correctly.
+fn discover_test_registries() -> Vec<praxec_core::tool_catalog::RegistrySpec> {
+    use praxec_core::tool_catalog::{Requires, ToolCandidate, ToolSource, Transport, TrustTier};
+    vec![praxec_core::tool_catalog::RegistrySpec::Static {
+        name: "local".into(),
+        candidates: vec![ToolCandidate {
+            name: "browser-mcp".into(),
+            description: "Playwright browser automation".into(),
+            transport: Transport::Stdio,
+            source: ToolSource::Npm {
+                pkg: "@playwright/mcp".into(),
+            },
+            verbs: vec!["diagnose".into()],
+            tags: vec!["browser".into()],
+            trust_tier: TrustTier::Verified,
+            requires: Requires::default(),
+            provenance: "".into(),
+        }],
+    }]
+}
+
+async fn discover_test_server() -> PraxecServer {
+    test_server()
+        .await
+        .with_tool_registries(discover_test_registries())
+        .with_catalog_io(Arc::new(FakeCatalogIo))
+}
+
+/// `{ discover: "browser" }` assembles the configured catalog and returns the
+/// matching static candidate as a ranked item.
+#[tokio::test]
+async fn query_discover_shape_routes_to_catalog_discover() {
+    let server = discover_test_server().await;
+    let resp = server
+        .dispatch_query(json!({ "discover": "browser" }), Principal::anonymous())
+        .await
+        .expect("discover dispatch ok");
+    let items = resp["items"].as_array().expect("items array present");
+    assert!(
+        items.iter().any(|i| i["name"] == "browser-mcp"),
+        "expected browser-mcp in discover results; got: {resp}"
+    );
+}
+
+/// An empty `discover` string is a legal (not ambiguous/invalid) input —
+/// it returns the whole assembled catalog.
+#[tokio::test]
+async fn query_discover_empty_string_returns_full_catalog() {
+    let server = discover_test_server().await;
+    let resp = server
+        .dispatch_query(json!({ "discover": "" }), Principal::anonymous())
+        .await
+        .expect("discover dispatch ok");
+    assert_eq!(resp["items"].as_array().expect("items array").len(), 1);
+}
+
+/// A `discover` query that matches nothing returns an empty (not erroring)
+/// item list — the caller still gets the current legal links.
+#[tokio::test]
+async fn query_discover_no_match_returns_empty_items_with_links() {
+    let server = discover_test_server().await;
+    let resp = server
+        .dispatch_query(
+            json!({ "discover": "nothing-matches-this" }),
+            Principal::anonymous(),
+        )
+        .await
+        .expect("discover dispatch ok");
+    assert!(resp["items"].as_array().expect("items array").is_empty());
+    assert!(resp["links"].as_array().is_some(), "resp: {resp}");
+}
+
+/// `{ evaluate: { verbs: ["diagnose"] } }` ranks by cap-verb overlap.
+#[tokio::test]
+async fn query_evaluate_shape_routes_to_catalog_evaluate() {
+    let server = discover_test_server().await;
+    let resp = server
+        .dispatch_query(
+            json!({ "evaluate": { "verbs": ["diagnose"] } }),
+            Principal::anonymous(),
+        )
+        .await
+        .expect("evaluate dispatch ok");
+    let items = resp["items"].as_array().expect("items array present");
+    assert!(
+        items.iter().any(|i| i["name"] == "browser-mcp"),
+        "expected browser-mcp in evaluate results; got: {resp}"
+    );
+}
+
+/// `evaluate` with no overlapping verbs returns an empty item list, not an
+/// error — mirrors `discover`'s no-match behavior.
+#[tokio::test]
+async fn query_evaluate_no_overlap_returns_empty() {
+    let server = discover_test_server().await;
+    let resp = server
+        .dispatch_query(
+            json!({ "evaluate": { "verbs": ["nonexistent-verb"] } }),
+            Principal::anonymous(),
+        )
+        .await
+        .expect("evaluate dispatch ok");
+    assert!(resp["items"].as_array().expect("items array").is_empty());
+}
+
+/// `discover` + `evaluate` together is ambiguous — two distinct verb shapes,
+/// same as `query` + `subject`.
+#[tokio::test]
+async fn query_discover_plus_evaluate_is_ambiguous() {
+    let server = test_server().await;
+    let resp = server
+        .dispatch_query(
+            json!({ "discover": "x", "evaluate": { "verbs": ["diagnose"] } }),
+            Principal::anonymous(),
+        )
+        .await
+        .expect("dispatch ok");
+    assert_eq!(
+        resp["error"]["code"].as_str(),
+        Some("AMBIGUOUS_INTENT"),
+        "resp: {resp}"
+    );
+}
+
+/// `discover` mixed with `query` (search intent) is ambiguous.
+#[tokio::test]
+async fn query_discover_plus_query_is_ambiguous() {
+    let server = test_server().await;
+    let resp = server
+        .dispatch_query(
+            json!({ "discover": "x", "query": "y" }),
+            Principal::anonymous(),
+        )
+        .await
+        .expect("dispatch ok");
+    assert_eq!(
+        resp["error"]["code"].as_str(),
+        Some("AMBIGUOUS_INTENT"),
+        "resp: {resp}"
+    );
+}
+
+/// `evaluate` mixed with `workflowId` is ambiguous.
+#[tokio::test]
+async fn query_evaluate_plus_workflow_id_is_ambiguous() {
+    let server = test_server().await;
+    let resp = server
+        .dispatch_query(
+            json!({ "evaluate": { "verbs": ["diagnose"] }, "workflowId": "wf_X" }),
+            Principal::anonymous(),
+        )
+        .await
+        .expect("dispatch ok");
+    assert_eq!(
+        resp["error"]["code"].as_str(),
+        Some("AMBIGUOUS_INTENT"),
+        "resp: {resp}"
+    );
+}
+
+/// Empty args still returns `home`, and `home` now advertises the `discover`
+/// verb as a HATEOAS link (T6 requirement).
+#[tokio::test]
+async fn query_home_advertises_discover_link() {
+    let server = test_server().await;
+    let resp = server
+        .dispatch_query(json!({}), Principal::anonymous())
+        .await
+        .expect("home ok");
+    let links = resp["links"].as_array().expect("links array present");
+    assert!(links.iter().any(|l| l["rel"] == "discover"), "resp: {resp}");
+}
+
 // ── dispatch_command behavior tests ───────────────────────────────────────────
 
 /// `definitionId` (no workflowId, no subject) → start.

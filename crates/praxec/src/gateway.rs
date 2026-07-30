@@ -1130,6 +1130,11 @@ async fn build_oneshot_server(
     let mut server = PraxecServer::new(runtime.clone())
         .with_discovery(swappable_discovery.clone() as Arc<dyn DiscoveryIndex>)
         .with_registry(swappable_registry.clone())
+        // MCP tool discovery, Phase 1 — parse the config `registries:` block
+        // once here; `discover`/`evaluate` assemble the catalog fresh per
+        // call against the real `CatalogIo` (RealCatalogIo, the server's
+        // default). Empty when no `registries:` is declared.
+        .with_tool_registries(praxec_core::tool_catalog::registries_from(config))
         .with_lexicon(lexicon_base)
         .with_ack_store(guidance_ack.clone())
         .with_script_ack_store(script_ack.clone())

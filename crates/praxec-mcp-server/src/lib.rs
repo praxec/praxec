@@ -195,6 +195,16 @@ pub struct PraxecServer {
     /// does not consult this set — a gate on the response itself is the
     /// canonical same-call contract, not a re-poke.
     pushed_gates: Arc<std::sync::Mutex<std::collections::HashSet<(String, u64)>>>,
+    /// MCP tool discovery, Phase 1 (`docs/design/plans/2026-07-30-mcp-tool-discovery-phase1.md`)
+    /// — the config `registries:` block, parsed once at construction into
+    /// typed specs. `discover`/`evaluate` assemble the catalog fresh per call
+    /// (T5/T6: discovery is not a hot path; persistent TTL caching is a later
+    /// pass — `tool_catalog::Cache` exists but is unused here). Empty by
+    /// default (no registries configured, e.g. CLI one-shot tests).
+    pub(crate) tool_registries: Arc<Vec<praxec_core::tool_catalog::RegistrySpec>>,
+    /// Host IO for tool-catalog assembly (network / `gh`). Defaults to
+    /// [`praxec_core::tool_catalog::RealCatalogIo`]; swappable for tests.
+    pub(crate) catalog_io: Arc<dyn praxec_core::tool_catalog::CatalogIo>,
 }
 
 /// #14 — the shared, hot-swappable repair-gate slot. Cloned into the serve
@@ -275,6 +285,8 @@ impl PraxecServer {
             staleness_hook: None,
             repair_gate: Arc::new(std::sync::RwLock::new(None)),
             pushed_gates: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            tool_registries: Arc::new(Vec::new()),
+            catalog_io: Arc::new(praxec_core::tool_catalog::RealCatalogIo),
         }
     }
 
@@ -675,6 +687,28 @@ impl PraxecServer {
         registry: Arc<praxec_core::hot_reload::SwappableRegistry>,
     ) -> Self {
         self.registry = registry;
+        self
+    }
+
+    /// MCP tool discovery, Phase 1 — wire the config's `registries:` block
+    /// (typically `praxec_core::tool_catalog::registries_from(&config)`), so
+    /// `praxec.query { discover }` / `{ evaluate }` have something to
+    /// assemble. Omit it (default: empty) and both verbs return an empty
+    /// catalog, not an error.
+    pub fn with_tool_registries(
+        mut self,
+        registries: Vec<praxec_core::tool_catalog::RegistrySpec>,
+    ) -> Self {
+        self.tool_registries = Arc::new(registries);
+        self
+    }
+
+    /// MCP tool discovery, Phase 1 — override the host IO used to assemble
+    /// the catalog (default: [`praxec_core::tool_catalog::RealCatalogIo`]).
+    /// Tests substitute a fake so `discover`/`evaluate` dispatch is provable
+    /// without a network call.
+    pub fn with_catalog_io(mut self, io: Arc<dyn praxec_core::tool_catalog::CatalogIo>) -> Self {
+        self.catalog_io = io;
         self
     }
 

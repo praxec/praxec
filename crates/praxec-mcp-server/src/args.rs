@@ -248,6 +248,28 @@ pub struct QueryArgs {
     /// Search result cap. Modifier on `search` and `observe`.
     #[schemars(schema_with = "integer_schema")]
     pub limit: Option<u64>,
+    /// MCP tool-discovery (Phase 1): free-text query into the catalog
+    /// assembled from the config `registries:` block. Present (alone) →
+    /// dispatch to `discover`, ranked by name/description/tags match. An
+    /// empty string returns the whole catalog. Exclusive shape — mixing it
+    /// with any other intent field is ambiguous.
+    pub discover: Option<String>,
+    /// MCP tool-discovery (Phase 1): rank the catalog by overlap with a set
+    /// of needed cap-verbs. Present (alone) → dispatch to `evaluate`.
+    /// Exclusive shape — mixing it with any other intent field (including
+    /// `discover`) is ambiguous.
+    pub evaluate: Option<EvaluateArgs>,
+}
+
+/// Inner shape of `QueryArgs::evaluate` — `{ evaluate: { verbs: [...] } }`.
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EvaluateArgs {
+    /// Cap-verbs (`praxec_core::cap_verb` vocabulary) the caller needs a
+    /// tool for. Candidates are ranked by intersection size (desc) then
+    /// trust tier (desc); an empty list matches nothing.
+    #[serde(default)]
+    pub verbs: Vec<String>,
 }
 
 /// Sparse args for `praxec.command` (§32). Every field optional; the

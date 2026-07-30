@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 
 use crate::PraxecServer;
 use crate::args::{
-    CommandArgs, DescribeArgs, ExplainArgs, GetArgs, QueryArgs, SearchArgs, StartArgs, SubmitArgs,
+    CommandArgs, DescribeArgs, EvaluateArgs, ExplainArgs, GetArgs, QueryArgs, SearchArgs,
+    StartArgs, SubmitArgs,
 };
 use crate::tools::parse_kind;
 
@@ -129,6 +130,54 @@ impl PraxecServer {
             "query": query,
             "kind": kind.map(|k| k.as_str()),
             "items": items,
+            "links": [
+                { "rel": "home", "method": "praxec.query", "args": {} }
+            ]
+        }))
+    }
+
+    /// MCP tool discovery, Phase 1 (T6) — `praxec.query { discover: "<q>" }`.
+    /// Assembles the catalog from the config's `registries:` (parsed once at
+    /// construction into `self.tool_registries`) fresh on every call — Phase
+    /// 1 discovery is not a hot path, so per-call assembly is the simple,
+    /// correct choice (see `tool_catalog::Cache` for the later TTL-caching
+    /// pass). Catalog assembly does blocking network IO, so it runs on a
+    /// blocking-pool thread rather than the async worker.
+    pub(crate) async fn handle_discover(&self, query: String) -> anyhow::Result<Value> {
+        let registries = self.tool_registries.clone();
+        let io = self.catalog_io.clone();
+        let (catalog, warnings) = tokio::task::spawn_blocking(move || {
+            praxec_core::tool_catalog::assemble(&registries, io.as_ref())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("tool-catalog assembly task panicked: {e}"))?;
+        let hits = praxec_core::tool_catalog::discover(&catalog, &query);
+        Ok(json!({
+            "query": query,
+            "items": hits,
+            "warnings": warnings,
+            "links": [
+                { "rel": "home", "method": "praxec.query", "args": {} }
+            ]
+        }))
+    }
+
+    /// MCP tool discovery, Phase 1 (T6) — `praxec.query { evaluate: { verbs } }`.
+    /// Same assembly path as [`Self::handle_discover`]; ranks by cap-verb
+    /// overlap instead of free text.
+    pub(crate) async fn handle_evaluate(&self, verbs: Vec<String>) -> anyhow::Result<Value> {
+        let registries = self.tool_registries.clone();
+        let io = self.catalog_io.clone();
+        let (catalog, warnings) = tokio::task::spawn_blocking(move || {
+            praxec_core::tool_catalog::assemble(&registries, io.as_ref())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("tool-catalog assembly task panicked: {e}"))?;
+        let hits = praxec_core::tool_catalog::evaluate(&catalog, &verbs);
+        Ok(json!({
+            "verbs": verbs,
+            "items": hits,
+            "warnings": warnings,
             "links": [
                 { "rel": "home", "method": "praxec.query", "args": {} }
             ]
@@ -917,6 +966,8 @@ impl PraxecServer {
     /// - `subject + workflowId` → describe-in-workflow (audit fires)
     /// - `workflowId + transition` → explain
     /// - `workflowId` alone     → get
+    /// - `discover` present     → discover (MCP tool-discovery, Phase 1)
+    /// - `evaluate` present     → evaluate (MCP tool-discovery, Phase 1)
     /// - anything else          → AMBIGUOUS_INTENT error
     pub async fn dispatch_query(&self, args: Value, principal: Principal) -> anyhow::Result<Value> {
         let parsed: QueryArgs = parse_args(args.clone())?;
@@ -925,6 +976,8 @@ impl PraxecServer {
         let wid = parsed.workflow_id.is_some();
         let tr = parsed.transition.is_some();
         let d = parsed.definition_id.is_some();
+        let disc = parsed.discover.is_some();
+        let ev = parsed.evaluate.is_some();
 
         // Observe: `observe: true` is an exclusive shape (its only modifiers
         // are `since` and `limit`); mixed with any other intent field it's
@@ -932,7 +985,7 @@ impl PraxecServer {
         // rather than silently ignored (a no-op arg would read as a filter
         // that "worked").
         let ob = parsed.observe.unwrap_or(false);
-        if ob && (q || s || wid || tr || d) {
+        if ob && (q || s || wid || tr || d || disc || ev) {
             return Ok(ambiguous_intent_query());
         }
         if parsed.since.is_some() && !ob {
@@ -947,11 +1000,34 @@ impl PraxecServer {
         // Approvals: `approvals: true` is an exclusive shape (no modifiers) — the
         // MCP-native HITL queue. Mixed with any other intent field it's ambiguous.
         let ap = parsed.approvals.unwrap_or(false);
-        if ap && (q || s || wid || tr || d || parsed.since.is_some()) {
+        if ap && (q || s || wid || tr || d || disc || ev || parsed.since.is_some()) {
             return Ok(ambiguous_intent_query());
         }
         if ap {
             return self.handle_approvals().await;
+        }
+
+        // Discover: MCP tool-discovery Phase 1 — free-text query into the
+        // catalog assembled from the config `registries:` block. Exclusive
+        // shape (its only "modifier" would be `evaluate`, which is a distinct
+        // verb); mixed with any other intent field it's ambiguous.
+        if disc && (q || s || wid || tr || d || ev) {
+            return Ok(ambiguous_intent_query());
+        }
+        if disc {
+            let query = parsed.discover.expect("disc is true");
+            return self.handle_discover(query).await;
+        }
+
+        // Evaluate: MCP tool-discovery Phase 1 — rank the catalog by overlap
+        // with a set of needed cap-verbs. Exclusive shape (disc is already
+        // false by this point, since the disc branch above returns).
+        if ev && (q || s || wid || tr || d) {
+            return Ok(ambiguous_intent_query());
+        }
+        if ev {
+            let EvaluateArgs { verbs } = parsed.evaluate.expect("ev is true");
+            return self.handle_evaluate(verbs).await;
         }
 
         // Detect ambiguity: `query` (search intent) alongside subject/workflow
