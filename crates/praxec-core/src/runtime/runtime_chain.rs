@@ -3,6 +3,8 @@
 //! sibling files — see `runtime.rs` for the type definition and lifecycle
 //! entry points (`start`, `submit`, `get`).
 
+use std::time::{Duration, Instant};
+
 use anyhow::{anyhow, bail};
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -54,6 +56,43 @@ pub(crate) const CHAIN_ABORTED_EVENT: &str = "chain.aborted";
 /// hops and a large CPM program in the low hundreds, so only a pathological
 /// (livelocking) run trips it. Override per-definition with `livelockHopBudget`.
 pub(crate) const DEFAULT_LIVELOCK_HOP_BUDGET: u64 = 300;
+
+/// Engine-internal context slot mirroring [`CHAIN_HOPS_TOTAL_KEY`] but for
+/// cumulative wall-clock MILLISECONDS actually spent DRIVING (executing a
+/// chain hop, including its executor call) across ALL drives/restarts.
+/// Bumped in the SAME read-modify-write-then-save block as the hop counter, so
+/// it costs no extra store I/O and persists exactly like it does.
+///
+/// Deliberately measures only ACTIVE hop time, never time spent PARKED
+/// (`_lock_wait` / `_subworkflow_wait` / `_agent_await` / a human gate) — a
+/// mission legitimately waiting on a human for hours (or days, resumed later)
+/// must not trip the mission deadline; only wall-clock actually spent running
+/// hops counts toward the budget. `_`-prefixed = engine bookkeeping, excluded
+/// from the user-facing blackboard like its hop-count sibling.
+pub(crate) const CHAIN_WALL_MS_TOTAL_KEY: &str = "_chain_wall_ms_total";
+
+/// Default cumulative ACTIVE-DRIVE wall-clock budget (seconds) before a run is
+/// cancelled as `MISSION_DEADLINE_EXCEEDED` — the outer wall-clock backstop.
+///
+/// This is a DIFFERENT failure mode from the three defenses already in the
+/// engine: the 30s MCP idle timeout (`praxec-executors::mcp::DEFAULT_IDLE_TIMEOUT_MS`)
+/// and the per-call model stall-timeout/breaker (`praxec-agents::breaker`) each
+/// bound ONE call; [`DEFAULT_LIVELOCK_HOP_BUDGET`] above bounds hop COUNT. None
+/// of them bound a run's TOTAL wall-clock, and none catch a single call that
+/// blocks past its own defenses (a wedged browser/MCP tool with no live peer to
+/// time it out cleanly). This is the missing outer bound: `WorkflowRuntime`
+/// wraps each chain-drive call in `tokio::time::timeout` for exactly the
+/// REMAINING budget, so it fires even mid-call, not only at a hop boundary.
+///
+/// GENEROUS (1800s = 30 min) by design — a backstop, not a killer of
+/// legitimate long agentic runs: tens of minutes of active tool/model work is
+/// normal for a multi-step auto-driven mission, and the budget excludes any
+/// time spent parked (see [`CHAIN_WALL_MS_TOTAL_KEY`]), so a mission that
+/// waits on a human for hours is unaffected. Override per-definition with
+/// `missionDeadlineSecs`, or per-runtime with
+/// [`crate::runtime::WorkflowRuntime::with_mission_deadline_secs`]; `0`
+/// disables the backstop entirely for that definition/runtime.
+pub const DEFAULT_MISSION_DEADLINE_SECS: u64 = 1800;
 
 impl WorkflowRuntime {
     /// Resolve the next state for a transition. The transition's declared
@@ -433,7 +472,26 @@ impl WorkflowRuntime {
         // per-hop cancellation check below inert.
         let cancel = self.cancel_token();
 
+        // Mission-deadline backstop — resolve once per drive: a per-definition
+        // `missionDeadlineSecs` wins over the runtime's configured default
+        // (see `WorkflowRuntime::with_mission_deadline_secs`), which itself
+        // defaults to `DEFAULT_MISSION_DEADLINE_SECS`. `0` (either level)
+        // disables the backstop entirely — the check below is then inert.
+        let mission_deadline_ms =
+            mission_deadline_secs_for(definition, self.mission_deadline_secs).saturating_mul(1000);
+
         loop {
+            // Mission-deadline backstop — wall-clock stopwatch for THIS hop,
+            // started before any of its work (lease refresh, executor call,
+            // commit). Its elapsed time is folded into the persisted
+            // `_chain_wall_ms_total` alongside the hop counter below, so a hop
+            // that runs a slow/blocking executor call is fully counted even
+            // though this in-loop check only runs at hop BOUNDARIES — the
+            // outer `tokio::time::timeout` in
+            // `WorkflowRuntime::drive_chain_with_deadline` is what actually
+            // cuts a single hop off mid-call.
+            let hop_wall_started = Instant::now();
+
             // Keep this run's exclusive-pool leases alive while it is making
             // progress: a long auto-driven chain (several agent steps in one
             // drive) must not have its browser slot reaped mid-run. Holder-keyed
@@ -555,6 +613,35 @@ impl WorkflowRuntime {
                     },
                     reason,
                 });
+            }
+
+            // Mission-deadline backstop — cumulative ACTIVE-DRIVE wall-clock
+            // budget (excludes parked/waiting time; see
+            // `CHAIN_WALL_MS_TOTAL_KEY`). This catches accumulation across many
+            // quick hops BEFORE starting another one; a single hop that blocks
+            // mid-call is instead caught by the outer `tokio::time::timeout` in
+            // `drive_chain_with_deadline`, which wraps this whole function call.
+            // Read at the top, same as the livelock check, so a run already
+            // over budget from prior drives is cancelled before firing another
+            // hop.
+            if mission_deadline_ms > 0 {
+                let wall_ms_total = instance
+                    .context
+                    .get(CHAIN_WALL_MS_TOTAL_KEY)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if wall_ms_total >= mission_deadline_ms {
+                    return Ok(self
+                        .mission_deadline_exceeded_outcome(
+                            instance,
+                            steps,
+                            accumulated_evidence,
+                            correlation_id,
+                            wall_ms_total,
+                            mission_deadline_ms,
+                        )
+                        .await);
+                }
             }
 
             // Gather transitions for current state
@@ -1322,19 +1409,32 @@ impl WorkflowRuntime {
             instance.state = target.clone();
             instance.version += 1;
 
-            // Bump the persisted cumulative hop counter as part of THIS hop's
-            // snapshot, so it survives every re-drive and restart (the whole
-            // point — a livelock must not reset its budget by restarting or
-            // re-polling). Read-modify-write on the context object; the slot is
-            // engine bookkeeping (`_`-prefixed).
+            // Bump the persisted cumulative hop counter — and, alongside it,
+            // this hop's wall-clock duration (mission-deadline backstop) — as
+            // part of THIS hop's snapshot, so both survive every re-drive and
+            // restart (the whole point — a livelock/deadline must not reset
+            // its budget by restarting or re-polling). Read-modify-write on
+            // the context object; both slots are engine bookkeeping
+            // (`_`-prefixed). No extra store write: this rides the SAME
+            // `save_if_version` call below the hop counter already needed.
             {
                 let prev = instance
                     .context
                     .get(CHAIN_HOPS_TOTAL_KEY)
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
+                let prev_wall_ms = instance
+                    .context
+                    .get(CHAIN_WALL_MS_TOTAL_KEY)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let hop_ms = hop_wall_started.elapsed().as_millis() as u64;
                 if let Some(obj) = instance.context.as_object_mut() {
                     obj.insert(CHAIN_HOPS_TOTAL_KEY.to_string(), json!(prev + 1));
+                    obj.insert(
+                        CHAIN_WALL_MS_TOTAL_KEY.to_string(),
+                        json!(prev_wall_ms.saturating_add(hop_ms)),
+                    );
                 }
             }
 
@@ -1475,6 +1575,160 @@ impl WorkflowRuntime {
             steps,
             evidence: accumulated_evidence,
         }))
+    }
+
+    /// Build the terminal `ChainOutcome::DeadlineExceeded` for a mission that
+    /// exceeded [`DEFAULT_MISSION_DEADLINE_SECS`] (or its override) — shared by
+    /// both places that detect the breach: the in-loop hop-boundary check in
+    /// [`Self::run_deterministic_chain`] and the outer timeout in
+    /// [`Self::drive_chain_with_deadline`]. Records the `chain.deadline_exceeded`
+    /// audit event and hands back a `Quarantined`-shaped outcome (its own typed
+    /// variant, not a repurposed one) for the caller to durably cancel — mirrors
+    /// `chain.quarantined`'s liveness-backstop shape exactly.
+    pub(crate) async fn mission_deadline_exceeded_outcome(
+        &self,
+        instance: WorkflowInstance,
+        steps: Vec<ChainStep>,
+        accumulated_evidence: Vec<Evidence>,
+        correlation_id: &str,
+        elapsed_ms: u64,
+        deadline_ms: u64,
+    ) -> ChainOutcome {
+        self.record_or_self_event(
+            instance
+                .audit_event("chain.deadline_exceeded")
+                .with_correlation(correlation_id)
+                .with_payload(json!({
+                    "state": instance.state,
+                    "elapsedMs": elapsed_ms,
+                    "deadlineMs": deadline_ms,
+                    "reason": "mission_deadline_exceeded",
+                })),
+        )
+        .await;
+        let reason = format!(
+            "mission_deadline_exceeded: run spent {elapsed_ms}ms of active drive time \
+             (deadline {deadline_ms}ms) without reaching a terminal state — cancelling to \
+             stop the burn (raise `missionDeadlineSecs` if this run is legitimately long, \
+             or `0` to disable the backstop for this definition). Active-drive time excludes \
+             any time spent parked on a human/lock/sub-workflow wait."
+        );
+        ChainOutcome::DeadlineExceeded {
+            partial: ChainResult {
+                instance,
+                steps,
+                evidence: accumulated_evidence,
+            },
+            reason,
+            elapsed_ms,
+            deadline_ms,
+        }
+    }
+
+    /// Mission-deadline backstop — wrap [`Self::run_deterministic_chain`] so a
+    /// single hop that BLOCKS mid-call (a wedged browser/MCP tool call) is
+    /// bounded too, not just the hop-boundary check inside the loop. Computes
+    /// the REMAINING budget from the persisted [`CHAIN_WALL_MS_TOTAL_KEY`]
+    /// (already-spent active-drive time, which survives across resumed
+    /// drives) and races the chain call against exactly that much
+    /// `tokio::time::timeout` — so it fires whether the overrun came from many
+    /// quick hops or one that never returns.
+    ///
+    /// `0` (definition or runtime default) disables the backstop: the chain
+    /// runs unwrapped, bit-identical to calling `run_deterministic_chain`
+    /// directly (the pre-this-feature behavior).
+    ///
+    /// Also runs unwrapped when there is no CURRENT Tokio runtime context
+    /// (`tokio::runtime::Handle::try_current()` errs) — `tokio::time::timeout`
+    /// needs the Tokio reactor and panics without one. Every production entry
+    /// point (`serve`, the CLI, `#[tokio::test]`) runs under Tokio, so this
+    /// only matters for a caller that deliberately drives an isolated
+    /// sub-runtime synchronously outside Tokio (e.g. `dry_run`'s executor
+    /// tests via `futures::executor::block_on`, SPEC §17.3's isolation
+    /// invariant) — the deadline backstop simply doesn't apply there, exactly
+    /// as it wouldn't have existed before this feature.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn drive_chain_with_deadline(
+        &self,
+        definition: &Value,
+        instance: WorkflowInstance,
+        principal: &Principal,
+        correlation_id: &str,
+        max_depth: u64,
+        livelock_budget: u64,
+    ) -> anyhow::Result<ChainOutcome> {
+        let deadline_secs = mission_deadline_secs_for(definition, self.mission_deadline_secs);
+        let in_tokio_runtime = tokio::runtime::Handle::try_current().is_ok();
+        if deadline_secs == 0 || !in_tokio_runtime {
+            return self
+                .run_deterministic_chain(
+                    definition,
+                    instance,
+                    principal,
+                    correlation_id,
+                    max_depth,
+                    livelock_budget,
+                )
+                .await;
+        }
+        let deadline_ms = deadline_secs.saturating_mul(1000);
+        let wall_ms_total = instance
+            .context
+            .get(CHAIN_WALL_MS_TOTAL_KEY)
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        // Budget already exhausted (e.g. resumed after prior drives spent it
+        // all) — cancel WITHOUT invoking the chain at all; `instance` is still
+        // ours (nothing moved it), so no reload is needed.
+        if wall_ms_total >= deadline_ms {
+            return Ok(self
+                .mission_deadline_exceeded_outcome(
+                    instance,
+                    Vec::new(),
+                    Vec::new(),
+                    correlation_id,
+                    wall_ms_total,
+                    deadline_ms,
+                )
+                .await);
+        }
+
+        let remaining_ms = deadline_ms - wall_ms_total;
+        let workflow_id = instance.id.clone();
+        match tokio::time::timeout(
+            Duration::from_millis(remaining_ms),
+            self.run_deterministic_chain(
+                definition,
+                instance,
+                principal,
+                correlation_id,
+                max_depth,
+                livelock_budget,
+            ),
+        )
+        .await
+        {
+            Ok(inner) => inner,
+            Err(_elapsed) => {
+                // The chain call itself was cancelled mid-hop — `instance` was
+                // moved into (and dropped with) the timed-out future, so
+                // reload the last COMMITTED snapshot. Any hop in flight when
+                // the timeout fired never reached `save_if_version`, so this
+                // is exactly the instance's last consistent state.
+                let reloaded = self.store.load(&workflow_id).await?;
+                Ok(self
+                    .mission_deadline_exceeded_outcome(
+                        reloaded,
+                        Vec::new(),
+                        Vec::new(),
+                        correlation_id,
+                        deadline_ms,
+                        deadline_ms,
+                    )
+                    .await)
+            }
+        }
     }
 
     /// Enforce the definition's declared invokable outputs against the context
@@ -1646,6 +1900,18 @@ impl WorkflowRuntime {
             ),
         }
     }
+}
+
+/// Resolve the mission-deadline budget (seconds) for a drive: the
+/// definition's `missionDeadlineSecs` wins when present, else the runtime's
+/// configured default (itself defaulting to [`DEFAULT_MISSION_DEADLINE_SECS`]
+/// via [`crate::runtime::WorkflowRuntime::new`]). `0` at either level means
+/// "disabled" and is returned as-is — callers treat `0` as inert.
+pub(crate) fn mission_deadline_secs_for(definition: &Value, runtime_default: u64) -> u64 {
+    definition
+        .get("missionDeadlineSecs")
+        .and_then(Value::as_u64)
+        .unwrap_or(runtime_default)
 }
 
 // ── SPEC §27 helpers — state-local blackboard slot lifecycle ──────────────
@@ -2294,5 +2560,364 @@ mod cancellation_and_heartbeat_tests {
             assert_eq!(p.payload["definitionId"].as_str(), Some("line"));
             assert!(p.payload["chainDepth"].is_number());
         }
+    }
+}
+
+// ── Mission wall-clock deadline backstop — assert-first (red→green) ────────
+//
+// No run may hang indefinitely regardless of cause. These tests exercise BOTH
+// layers of `drive_chain_with_deadline`: (1) a single hop whose executor call
+// BLOCKS past the deadline is cut off by the outer `tokio::time::timeout`
+// (proves "even mid-call", not just at a hop boundary); (2) a mission that
+// already burned its cumulative active-drive budget on a PRIOR drive is
+// cancelled before firing another hop, without needing to re-block. A third
+// test proves a normal run comfortably under the deadline is unaffected
+// (behavior-preserving default).
+#[cfg(test)]
+mod mission_deadline_tests {
+    use crate::audit::{AuditSink, MemoryAuditSink};
+    use crate::error::ExecutorError;
+    use crate::guards::DefaultGuardEvaluator;
+    use crate::model::{ExecuteRequest, ExecuteResult, Principal, StartWorkflow, SubmitTransition};
+    use crate::ports::{Executor, ExecutorRegistry, WorkflowStore};
+    use crate::runtime::WorkflowRuntime;
+    use crate::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
+    use async_trait::async_trait;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A `kind: "slow"` executor that blocks far longer than any deadline used
+    /// below — the stand-in for a wedged browser/MCP tool call with no live
+    /// peer to time it out cleanly. None of the transitions that use it
+    /// declare `reliability.timeoutMs`, so nothing but the mission-deadline
+    /// backstop under test can cut it off.
+    struct SlowExecutor;
+    #[async_trait]
+    impl Executor for SlowExecutor {
+        async fn execute(&self, _req: ExecuteRequest) -> Result<ExecuteResult, ExecutorError> {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(ExecuteResult::default())
+        }
+    }
+    struct SlowRegistry;
+    impl ExecutorRegistry for SlowRegistry {
+        fn get(&self, kind: &str) -> Option<Arc<dyn Executor>> {
+            if kind == "slow" {
+                Some(Arc::new(SlowExecutor))
+            } else {
+                None
+            }
+        }
+    }
+
+    struct EmptyRegistry;
+    impl ExecutorRegistry for EmptyRegistry {
+        fn get(&self, _kind: &str) -> Option<Arc<dyn Executor>> {
+            None
+        }
+    }
+
+    fn runtime_with(
+        cfg: &Value,
+        executors: Arc<dyn ExecutorRegistry>,
+    ) -> (
+        WorkflowRuntime,
+        Arc<InMemoryWorkflowStore>,
+        Arc<MemoryAuditSink>,
+    ) {
+        let definitions = Arc::new(ConfigDefinitionStore::from_config(cfg));
+        let store = Arc::new(InMemoryWorkflowStore::new());
+        let audit = Arc::new(MemoryAuditSink::new());
+        let runtime = WorkflowRuntime::new(
+            definitions,
+            store.clone(),
+            executors,
+            Arc::new(DefaultGuardEvaluator::new()),
+            audit.clone() as Arc<dyn AuditSink>,
+        );
+        (runtime, store, audit)
+    }
+
+    async fn start(runtime: &WorkflowRuntime, def: &str) -> Value {
+        runtime
+            .start(StartWorkflow {
+                definition_id: def.into(),
+                input: json!({}),
+                principal: Principal::anonymous(),
+                run_env: crate::RunEnv::for_test(),
+                depth: 0,
+                parent: None,
+            })
+            .await
+            .expect("start should succeed")
+    }
+
+    async fn events_of_type(audit: &MemoryAuditSink, kind: &str) -> Vec<crate::audit::AuditEvent> {
+        audit
+            .list_events()
+            .await
+            .expect("memory sink lists")
+            .into_iter()
+            .filter(|e| e.event_type == kind)
+            .collect()
+    }
+
+    /// RED (pre-fix): a hop whose executor blocks far longer than the
+    /// mission's `missionDeadlineSecs` would hang `start()` until the wedged
+    /// call itself gave up (here, 10s — in the real incident this grounded
+    /// the feature, ~20 minutes with no live browser to time it out). GREEN
+    /// (this feature): the outer `tokio::time::timeout` in
+    /// `drive_chain_with_deadline` cuts the blocked hop off AT the 1s
+    /// deadline — `start()` returns promptly with a terminal
+    /// `MISSION_DEADLINE_EXCEEDED` failure; the instance is durably
+    /// cancelled, never left hung, and no panic propagates.
+    #[tokio::test]
+    async fn a_hop_blocked_mid_call_is_cancelled_at_the_mission_deadline() {
+        let cfg = json!({
+            "version": "1.0.0",
+            "workflows": { "wedged": {
+                "version": "1.0.0",
+                "initialState": "a",
+                "missionDeadlineSecs": 1,
+                "states": {
+                    "a": { "transitions": { "go": {
+                        "target": "b",
+                        "actor": "deterministic",
+                        "executor": { "kind": "slow" }
+                    } } },
+                    "b": { "terminal": true }
+                }
+            }}
+        });
+        let (runtime, store, audit) = runtime_with(&cfg, Arc::new(SlowRegistry));
+
+        let started = std::time::Instant::now();
+        let response = start(&runtime, "wedged").await;
+        let elapsed = started.elapsed();
+
+        // Never hangs: returns near the 1s deadline, nowhere close to the
+        // wedged executor's 10s sleep.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the deadline backstop must cut the blocked hop off near the 1s \
+             deadline, not wait out the wedged 10s call; took {elapsed:?}"
+        );
+
+        assert_eq!(
+            response["result"]["status"].as_str(),
+            Some("failed"),
+            "a deadline-exceeded run must resolve as a typed failure, got {response:#}"
+        );
+        assert_eq!(
+            response["result"]["reason"].as_str(),
+            Some("cancelled"),
+            "mirrors the livelock-quarantine reason shape, got {response:#}"
+        );
+        assert_eq!(
+            response["error"]["code"].as_str(),
+            Some("MISSION_DEADLINE_EXCEEDED")
+        );
+        assert_eq!(response["error"]["deadlineMs"].as_u64(), Some(1000));
+        assert!(
+            response["error"]["elapsedMs"].as_u64().is_some(),
+            "elapsed must be surfaced, got {response:#}"
+        );
+
+        let id = response["workflow"]["id"].as_str().unwrap().to_string();
+        let inst = store.load(&id).await.unwrap();
+        assert!(
+            inst.cancelled_at.is_some(),
+            "a deadline-exceeded mission must be durably cancelled, not left running"
+        );
+        assert!(
+            inst.cancelled_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("mission_deadline_exceeded"),
+            "got {:?}",
+            inst.cancelled_reason
+        );
+
+        let events = events_of_type(&audit, "chain.deadline_exceeded").await;
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one chain.deadline_exceeded audit event"
+        );
+    }
+
+    /// A mission that already spent its ENTIRE cumulative active-drive budget
+    /// on a prior drive (simulated here by seeding `_chain_wall_ms_total`
+    /// directly, as a resumed-after-restart run would carry it) is cancelled
+    /// BEFORE firing another hop — the hop-boundary check inside
+    /// `drive_chain_with_deadline`/`run_deterministic_chain`, distinct from
+    /// the outer timeout exercised above. No sleep needed: proves the
+    /// cumulative-across-drives accounting without waiting out a real clock.
+    #[tokio::test]
+    async fn a_mission_already_over_budget_from_prior_drives_is_cancelled_before_the_next_hop() {
+        let cfg = json!({
+            "version": "1.0.0",
+            "workflows": { "resumed": {
+                "version": "1.0.0",
+                "initialState": "a",
+                "missionDeadlineSecs": 1,
+                "states": {
+                    "a": {
+                        "actor": "agent",
+                        "transitions": { "go": { "target": "b" } }
+                    },
+                    "b": { "transitions": { "next": { "target": "c", "actor": "deterministic" } } },
+                    "c": { "terminal": true }
+                }
+            }}
+        });
+        let (runtime, store, audit) = runtime_with(&cfg, Arc::new(EmptyRegistry));
+
+        // `a`'s only transition has no `actor: deterministic`, so `start()`
+        // stops there without auto-driving — exactly like a real mission that
+        // already made progress on a prior drive and is now being resumed.
+        let response = start(&runtime, "resumed").await;
+        let id = response["workflow"]["id"].as_str().unwrap().to_string();
+        assert_eq!(store.load(&id).await.unwrap().state, "a");
+
+        // Simulate a mission that already burned its whole budget across
+        // PRIOR drives (well past the 1000ms deadline).
+        let mut inst = store.load(&id).await.unwrap();
+        let expected_version = inst.version;
+        inst.context["_chain_wall_ms_total"] = json!(999_999u64);
+        store
+            .save_if_version(inst, expected_version)
+            .await
+            .expect("seed the exhausted budget");
+
+        let inst = store.load(&id).await.unwrap();
+        let response = runtime
+            .submit(SubmitTransition {
+                workflow_id: id.clone(),
+                expected_version: inst.version,
+                transition: "go".into(),
+                arguments: json!({}),
+                principal: Principal::anonymous(),
+                summary: None,
+                trace_id: None,
+                run_id: None,
+            })
+            .await
+            .expect("submit should complete (not hang, not panic)");
+
+        // The `go` transition itself commits (state -> b), but the
+        // deterministic auto-drive from `b` never fires: the budget was
+        // already exhausted, so `b`'s `next` hop is never taken.
+        assert_eq!(
+            response["error"]["code"].as_str(),
+            Some("MISSION_DEADLINE_EXCEEDED"),
+            "got {response:#}"
+        );
+        assert_eq!(response["error"]["deadlineMs"].as_u64(), Some(1000));
+        assert_eq!(response["error"]["elapsedMs"].as_u64(), Some(999_999));
+
+        let inst = store.load(&id).await.unwrap();
+        assert_eq!(
+            inst.state, "b",
+            "the requested transition itself still commits; only the \
+             FOLLOWING auto-drive hop is refused"
+        );
+        assert!(inst.cancelled_at.is_some());
+
+        let events = events_of_type(&audit, "chain.deadline_exceeded").await;
+        assert_eq!(events.len(), 1);
+    }
+
+    /// Behavior-preserving: a normal run comfortably under the deadline
+    /// completes exactly as it did before this feature existed — no
+    /// `chain.deadline_exceeded` event, no cancellation, reaches its real
+    /// terminal state.
+    #[tokio::test]
+    async fn a_normal_run_under_the_deadline_completes_unchanged() {
+        let cfg = json!({
+            "version": "1.0.0",
+            "workflows": { "line": {
+                "version": "1.0.0",
+                "initialState": "a",
+                "missionDeadlineSecs": 1,
+                "states": {
+                    "a": { "transitions": { "go": { "target": "b", "actor": "deterministic" } } },
+                    "b": { "transitions": { "go": { "target": "c", "actor": "deterministic" } } },
+                    "c": { "terminal": true }
+                }
+            }}
+        });
+        let (runtime, store, audit) = runtime_with(&cfg, Arc::new(EmptyRegistry));
+
+        let response = start(&runtime, "line").await;
+        let id = response["workflow"]["id"].as_str().unwrap().to_string();
+
+        assert_eq!(store.load(&id).await.unwrap().state, "c");
+        assert_eq!(response["result"]["status"].as_str(), Some("succeeded"));
+        assert!(store.load(&id).await.unwrap().cancelled_at.is_none());
+        assert!(
+            events_of_type(&audit, "chain.deadline_exceeded")
+                .await
+                .is_empty(),
+            "a fast, fully-under-budget run must never trip the deadline backstop"
+        );
+    }
+
+    /// `missionDeadlineSecs: 0` disables the backstop for that definition —
+    /// a mission already "over budget" per a seeded counter must still be
+    /// allowed to drive to completion when the operator opted out.
+    #[tokio::test]
+    async fn mission_deadline_secs_zero_disables_the_backstop() {
+        let cfg = json!({
+            "version": "1.0.0",
+            "workflows": { "unbounded": {
+                "version": "1.0.0",
+                "initialState": "a",
+                "missionDeadlineSecs": 0,
+                "states": {
+                    "a": {
+                        "actor": "agent",
+                        "transitions": { "go": { "target": "b" } }
+                    },
+                    "b": { "transitions": { "next": { "target": "c", "actor": "deterministic" } } },
+                    "c": { "terminal": true }
+                }
+            }}
+        });
+        let (runtime, store, _audit) = runtime_with(&cfg, Arc::new(EmptyRegistry));
+
+        let response = start(&runtime, "unbounded").await;
+        let id = response["workflow"]["id"].as_str().unwrap().to_string();
+
+        let mut inst = store.load(&id).await.unwrap();
+        let expected_version = inst.version;
+        inst.context["_chain_wall_ms_total"] = json!(999_999_999u64);
+        store
+            .save_if_version(inst, expected_version)
+            .await
+            .expect("seed a huge counter");
+
+        let inst = store.load(&id).await.unwrap();
+        let response = runtime
+            .submit(SubmitTransition {
+                workflow_id: id.clone(),
+                expected_version: inst.version,
+                transition: "go".into(),
+                arguments: json!({}),
+                principal: Principal::anonymous(),
+                summary: None,
+                trace_id: None,
+                run_id: None,
+            })
+            .await
+            .expect("submit should complete");
+
+        assert_eq!(
+            response["result"]["status"].as_str(),
+            Some("succeeded"),
+            "missionDeadlineSecs: 0 must fully disable the backstop, got {response:#}"
+        );
+        assert_eq!(store.load(&id).await.unwrap().state, "c");
     }
 }
