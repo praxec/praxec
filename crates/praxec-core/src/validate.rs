@@ -3396,6 +3396,9 @@ pub const DETERMINISTIC_PRIMARY_KINDS: &[&str] = &[
     "dry_run",
     "registry",
     "tool_source",
+    // P3.3a — deterministic INSTALLABLE-tool-candidate surfacer, same family
+    // as `inventory` (surveys gateway-adjacent state, no model call).
+    "tool-suggest",
 ];
 
 /// True when `kind` is a model-free deterministic authoring/introspection/gate

@@ -1931,6 +1931,24 @@ async fn build_hot_components(
             "inventory",
             Arc::new(praxec_executors::InventoryExecutor::new(discovery.clone())),
         ));
+    // P3.3a — overlay `tool-suggest` with the config's `registries:`, parsed
+    // once here (same source `praxec.query { evaluate }` reads via
+    // `PraxecServer::with_tool_registries`), deterministically surfacing
+    // INSTALLABLE tool candidates for a set of cap-verbs. Same overlay idiom
+    // as `inventory`/`registry`/`llm`/`agent`; stacked on top since it also
+    // needs a handle (here, config-derived, not the live discovery index).
+    let tool_registries = Arc::new(praxec_core::tool_catalog::registries_from(
+        &effective_config,
+    ));
+    let executors: Arc<dyn praxec_core::ports::ExecutorRegistry> =
+        Arc::new(praxec_core::overlay::SingleKindOverlay::new(
+            executors,
+            "tool-suggest",
+            Arc::new(praxec_executors::ToolSuggestExecutor::new(
+                tool_registries,
+                Arc::new(praxec_core::tool_catalog::RealCatalogIo),
+            )),
+        ));
     Ok((definitions, executors, discovery, registry, workflow_handle))
 }
 

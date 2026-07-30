@@ -27,6 +27,7 @@ pub mod rest;
 pub mod script;
 pub mod structural_analysis;
 pub mod tool_source;
+pub mod tool_suggest;
 pub mod untrusted_execution;
 pub mod workflow;
 
@@ -88,6 +89,11 @@ pub const REGISTERED_EXECUTOR_KINDS: &[&str] = &[
     // D2 (v0.0.17) — surfaces a D1 tool descriptor's operations as callable,
     // delegating to the cli/mcp/rest executors above (no new transport).
     "tool_source",
+    // P3.3a — deterministic INSTALLABLE-tool-candidate surfacer. Like
+    // `inventory`, added by the binary's overlay (needs the config's
+    // `registries:`, parsed once at gateway-build time), not the default
+    // registry. Listed here so `check` recognizes it.
+    "tool-suggest",
 ];
 
 /// Every executor `kind` the codebase implements. This is now identical to
@@ -132,6 +138,9 @@ pub const ALL_EXECUTOR_KINDS: &[&str] = &[
     // gateway self-survey; unblocks `cap.research.tool-inventory`).
     "inventory",
     "tool_source",
+    // P3.3a — overlaid by the binary with the config's `registries:`
+    // (deterministic INSTALLABLE-tool suggestion for authoring).
+    "tool-suggest",
 ];
 pub use registry::HashMapExecutorRegistry;
 pub use registry_executor::RegistryExecutor;
@@ -139,6 +148,7 @@ pub use rest::{RestConnection, RestConnections, RestExecutor};
 pub use script::ScriptExecutor;
 pub use structural_analysis::{REQUIRED_RULES, StructuralAnalysisExecutor};
 pub use tool_source::ToolSourceExecutor;
+pub use tool_suggest::ToolSuggestExecutor;
 pub use workflow::WorkflowExecutor;
 
 use std::sync::Arc;
