@@ -3179,6 +3179,16 @@ fn merge_declared_repos(
     // the loop, once every entry has been visited (the cross-pack
     // composition-mismatch check needs to see them all together).
     let mut git_currency_checks: Vec<(String, crate::repo_git::GitCurrency)> = Vec::new();
+    // pack-provenance-recording (P1/P2) — one [`crate::repo_git::PackProvenance`]
+    // per successfully-loaded, NAMESPACE-bearing pack (local `path:` or remote
+    // `uri:` — a bare FB-2 writable target has no namespace and is out of
+    // scope: provenance answers "which workflow-definition version drove this
+    // run", not "what's writable"). Stamped into the merged config under
+    // `/praxec/_packProvenance` after the loop so the gateway (P1's
+    // `pack.provenance` audit event) and `discovery::home()` (P2's
+    // `loaded_packs`) both read the SAME computed list — one introspection,
+    // two consumers.
+    let mut pack_provenance_records: Vec<crate::repo_git::PackProvenance> = Vec::new();
 
     for RepoDecl {
         source,
@@ -3191,13 +3201,21 @@ fn merge_declared_repos(
     } in repos
     {
         // How the operator wrote the entry — used to name it in skip
-        // warnings (finding #13).
+        // warnings (finding #13) and as this pack's provenance `source`.
         let entry_desc = match &source {
             RepoSource::Local(p) => p.display().to_string(),
             RepoSource::Remote { uri, .. } => uri.clone(),
             RepoSource::WorktreesOf { anchor, name } => {
                 format!("worktrees_of:{} name:{name}", anchor.display())
             }
+        };
+        // pack-provenance-recording — a remote `uri:` entry's declared `ref:`,
+        // captured before `source` is consumed below. Takes priority over the
+        // clone-cache dir's own branch name (an internal `git init`-default
+        // artifact, not a meaningful ref) — see `repo_git::pack_provenance`.
+        let declared_ref: Option<String> = match &source {
+            RepoSource::Remote { gitref, .. } => Some(gitref.clone()),
+            _ => None,
         };
         // pack-staleness-warning — only a LOCAL `path:` entry is a candidate
         // for a git-currency warning. A `uri:` (remote) entry already
@@ -3432,6 +3450,17 @@ fn merge_declared_repos(
             );
         }
         repo_priorities.push((manifest.namespace.clone(), priority));
+        // pack-provenance-recording — this pack has a namespace, so it's in
+        // scope for the durable "what version drove this run" record. Works
+        // for BOTH a local `path:` checkout and a remote `uri:` pack's
+        // clone-cache dir (`repo_path` in both cases — `clone_or_update`
+        // always leaves a normal, non-bare git working tree there).
+        pack_provenance_records.push(crate::repo_git::pack_provenance(
+            &manifest.namespace,
+            &entry_desc,
+            &repo_path,
+            declared_ref.as_deref(),
+        ));
         // Collect ids BEFORE the grant gate strips ungranted connections, so
         // a host definition colliding with an ungranted pack connection still
         // trips V23 (the operator must acknowledge the shadowing either way).
@@ -3573,6 +3602,12 @@ fn merge_declared_repos(
 
     // Spec A §5 — carry namespace priorities forward for `hop_slot:` resolution.
     stamp_repo_priority(&mut merged, repo_priorities);
+
+    // pack-provenance-recording (P1/P2) — carry each loaded pack's provenance
+    // forward so the gateway can emit the durable `pack.provenance` audit
+    // event AND `discovery::home()` can surface it live as `loaded_packs`,
+    // both reading this SAME stamp.
+    stamp_pack_provenance(&mut merged, pack_provenance_records);
 
     // SPEC §9.5 — surface ungranted pack connections as live, self-documenting
     // DEGRADED state (the #23 pattern): each entry carries the exact YAML
@@ -3857,6 +3892,34 @@ fn stamp_repo_priority(config: &mut Value, priorities: Vec<(String, i64)>) {
             map.insert(ns, Value::from(prio));
         }
         fg.insert("_repoPriority".into(), Value::Object(map));
+    }
+}
+
+/// pack-provenance-recording (P1/P2) — record each namespace-bearing loaded
+/// pack's provenance under `/praxec/_packProvenance` (internal resolved-config
+/// metadata, not an operator-authored key — mirrors
+/// [`stamp_writable_repos`]/`_writableRepos`) as `{ namespace, source, sha?,
+/// ref?, dirty? }` objects. The gateway reads this to emit the durable
+/// `pack.provenance` audit event at load/reload; `discovery::home()` reads
+/// the SAME stamp to answer "what workflow versions am I running right now"
+/// live. RECORDS, never constrains: a dirty/drifted/non-git pack is still
+/// stamped exactly as-is, never an error. No-op when empty.
+fn stamp_pack_provenance(config: &mut Value, provenance: Vec<crate::repo_git::PackProvenance>) {
+    if provenance.is_empty() {
+        return;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let praxec = obj
+        .entry("praxec")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(fg) = praxec.as_object_mut() {
+        let entries: Vec<Value> = provenance
+            .into_iter()
+            .map(|p| serde_json::to_value(p).expect("PackProvenance serializes"))
+            .collect();
+        fg.insert("_packProvenance".into(), Value::Array(entries));
     }
 }
 
