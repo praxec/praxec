@@ -19,7 +19,9 @@ use serde_json::json;
 /// `inventory` (like `llm`/`agent`) is overlaid by the binary with the live
 /// `DiscoveryIndex` handle — it cannot resolve from the base registry, which has
 /// no discovery index to survey.
-const WIRED_ELSEWHERE: &[&str] = &["llm", "agent", "inventory"];
+/// `tool-suggest` (like `inventory`) is overlaid by the binary with the
+/// config's `registries:` — it cannot resolve from the base registry either.
+const WIRED_ELSEWHERE: &[&str] = &["llm", "agent", "inventory", "tool-suggest"];
 
 #[test]
 fn default_registry_resolves_every_base_registered_kind() {

@@ -7,10 +7,17 @@
 # example doesn't exercise). Phase 1/3 are read-only: nothing here installs
 # or provisions anything.
 #
+# Also demonstrates the `tool-suggest` executor (P3.3a) — the engine piece of
+# "suggest tools during authoring": a deterministic `cap.search.tool-suggest`
+# capability that, given `verbs` at start, assembles this SAME `registries:`
+# catalog and ranks it by cap-verb overlap. No model, no step budget.
+#
 # Try it:
 #   praxec check --config examples/tool-discovery/gateway.yaml
 #   praxec query --config examples/tool-discovery/gateway.yaml '{"discover":"browser"}'
 #   praxec query --config examples/tool-discovery/gateway.yaml '{"evaluate":{"verbs":["diagnose"]}}'
+#   praxec command --config examples/tool-discovery/gateway.yaml \
+#     '{"definitionId":"cap.search.tool-suggest","input":{"verbs":["diagnose"]}}'
 #
 # The `github-org` entry is best-effort: if the network is unreachable or the
 # org can't be resolved, `assemble` downgrades it to a warning (surfaced in
@@ -58,3 +65,36 @@ registries:
   # in crates/praxec-core/src/tool_catalog/adapters/mcp_registry.rs).
   # - kind: mcp-registry
   #   name: official
+
+workflows:
+  cap.search.tool-suggest:
+    verb: search
+    lifecycle: experimental
+    description: >
+      Surface INSTALLABLE tool candidates from the gateway's configured
+      `registries:` matching the given cap-verbs. Deterministic: assembles the
+      SAME catalog `praxec.query { evaluate }` reads — no model, no step
+      budget, no hallucinated tools. The engine piece of "suggest tools during
+      authoring" (P3.3a).
+    snippet:
+      inputs:
+        verbs: { type: array }
+      outputs:
+        suggestions: { type: array }
+        warnings: { type: array }
+    initialState: ready
+    states:
+      ready:
+        goal: Rank the configured registries' catalog against the requested verbs.
+        transitions:
+          suggest:
+            target: done
+            # Deterministic: fires on `start` via the runtime's deterministic
+            # chain, so the caller's `verbs` (start-time `input`, since chain
+            # arguments are always empty) resolve straight to a suggestion.
+            actor: deterministic
+            executor: { kind: tool-suggest }
+            output:
+              suggestions: "$.output.suggestions"
+              warnings: "$.output.warnings"
+      done: { terminal: true }

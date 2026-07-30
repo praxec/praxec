@@ -1007,7 +1007,8 @@
             "diff",
             "path_grounding",
             "inventory",
-            "tool_source"
+            "tool_source",
+            "tool-suggest"
           ]
         },
         "connection": {
