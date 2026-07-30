@@ -8,6 +8,50 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.41] — 2026-07-29 — pack currency (remote sourcing, staleness, provenance) + L1 entry gate
+
+Adds a workflow-pack **currency** story — consume packs from a git remote, know
+when a loaded pack has drifted, pull the latest, and record exactly which pack
+version drove each run — plus an L1 grounding gate that refuses to dispatch an
+agent step whose goal didn't fully resolve. All additive and non-breaking.
+
+### Added
+
+- **Remote pack sourcing (first-class).** `repos:` entries can source a pack
+  straight from a git remote (`uri:` + `ref:`) instead of a hand-managed local
+  `path:` clone. Auth piggybacks on the operator's own git (SSH/credential
+  helper) — praxec stores no credentials. See `docs/remote-pack-sourcing.md`.
+- **Non-blocking staleness/drift warning** at `check`/`doctor`: warns when a
+  loaded `path:` pack is on a non-default branch, dirty, behind its upstream, or
+  when composed packs are on mismatched branches. Offline-safe (local git only);
+  never blocks a load.
+- **`praxec sync` pull-latest for remote packs** — fetch each remote repo to its
+  `ref`'s newest tip with a per-repo `old → new` report, plus `--dry-run`.
+- **Provenance-recording.** A `pack.provenance` audit event at serve/reload
+  records each loaded pack's `{namespace, source, sha, ref, dirty}`, and `home()`
+  now surfaces `loaded_packs` (the live "what am I running" view). Records only —
+  never pins or constrains what loads.
+- **L1 entry gate** (`enforce_input_grounding`, shadow-first, default off): when
+  enabled, an agent step whose rendered goal has unresolved template paths is
+  refused (`AGENT_INPUT_UNRESOLVED`) before any model dispatch, rather than
+  acting on a corrupt prompt.
+- **Coding-write-evidence forcing function** — a coding step that reaches success
+  with zero file-mutation evidence is corrected in-context, then escalated
+  (never a silently-narrated success).
+- **Test hardening:** an atomic behavioral-contract suite for engine primitives
+  and 18 guard-evaluator contracts (dogfood of the behavioral-coverage flow).
+
+### Fixed
+
+- **Cold clone is all-or-nothing** — a failed remote clone no longer leaves a
+  partial cache behind (the partial `dest` is removed on any failure).
+- **Clone cache keyed on `uri`+`ref`** — two `repos:` entries on the same repo at
+  different refs no longer share one cache dir and thrash each other.
+- **Validation gaps closed:** workflow-ref resolution (V22) now runs on host-only
+  configs too, and a non-string `skills:` entry is rejected loudly instead of
+  being silently skipped.
+- **Publish-job gating** in release CI.
+
 ## [0.0.40] — 2026-07-28 — install works on a minimal box + provider-key setup
 
 Fixes a real fresh-machine install failure (a box with only POSIX `/bin/sh` — no
