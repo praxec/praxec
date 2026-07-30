@@ -3,12 +3,14 @@
 //!
 //! Mirrors [`crate::currency`]'s shape: typed data ([`candidate`]) + pure
 //! decision logic (`catalog`, landing task-by-task) behind an injectable IO
-//! seam (`registry::CatalogIo`), with each registry a small adapter
+//! seam ([`registry::CatalogIo`]), with each registry a small adapter
 //! (`adapters`) that maps its native response to one [`candidate::ToolCandidate`].
 //!
 //! Phase 1 is reads only: no provisioning, no secrets elicitation, no config
 //! mutation.
 
 pub mod candidate;
+pub mod registry;
 
 pub use candidate::{RequiredField, Requires, ToolCandidate, ToolSource, Transport, TrustTier};
+pub use registry::{CatalogIo, GhRepo, RegistryAdapter, RegistrySpec, registries_from};
