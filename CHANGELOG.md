@@ -8,6 +8,38 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.43] — 2026-07-30 — doctor tool-currency (is each MCP tool up to date?)
+
+`praxec doctor` gains a transport-aware currency check for `kind: mcp`
+connections. Existence (`provision`) told you a tool was on PATH; this tells you
+whether what's installed is up to date with its source — which existence
+structurally cannot, since a binary on PATH carries no link back to a source
+commit. Advisory only: a stale-but-working tool never blocks, exactly like a
+missing one.
+
+### Added
+
+- **`doctor` tool currency.** For each `kind: mcp` connection, doctor classifies
+  how it is sourced and checks currency accordingly:
+  - **local cargo binary** — reads the install source cargo recorded in
+    `~/.cargo/.crates2.json`; for a local-`path` install, compares the binary's
+    mtime against that repo's HEAD commit (`TOOL_BEHIND_SOURCE` → rebuild with
+    `cargo install --path <repo> --force`). Commit-level on purpose: dev tools
+    sit on a static `0.0.x` version while commits accrue, so a version compare
+    is blind.
+  - **docker** (`command: docker`, opt-in `source: { docker: "image:tag" }`) —
+    compares the local image digest against the registry manifest digest
+    (`DOCKER_IMAGE_BEHIND`); returns an honest `CURRENCY_UNKNOWN` rather than
+    compare mismatched digest kinds.
+  - **remote** (`url:` MCP over StreamableHttp) — a bounded `initialize`
+    handshake reports the version the server advertises (`REMOTE_MCP_ADVISORY`).
+    Currency is the remote operator's responsibility, so this warns only on an
+    explicit `source: { expect_version }` mismatch or unreachability.
+  - **npx `@latest`** tracks upstream every launch (info); a pinned `@x.y.z` is
+    noted.
+  Every finding is advisory (warn/info) and never flips doctor's exit status —
+  the same stance `provision` takes for a missing tool.
+
 ## [0.0.42] — 2026-07-30 — hang backstops: mission deadline + process-group kill
 
 Two engine-level poka-yokes that make an agentic run structurally unable to hang
