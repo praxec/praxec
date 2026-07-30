@@ -88,8 +88,11 @@ pub trait RegistryAdapter {
 }
 
 /// All host IO the adapters need (network/process), injectable like
-/// `CurrencyIo`.
-pub trait CatalogIo {
+/// `CurrencyIo`. `Send + Sync` so the production impl can be held as
+/// `Arc<dyn CatalogIo>` and moved into a `tokio::task::spawn_blocking`
+/// closure (catalog assembly does blocking network IO — see
+/// [`super::real_io::RealCatalogIo`]).
+pub trait CatalogIo: Send + Sync {
     /// GitHub org repos as (repo_name, description, topics) — used by
     /// `github_org`.
     fn github_org_repos(&self, org: &str) -> Result<Vec<GhRepo>, String>;

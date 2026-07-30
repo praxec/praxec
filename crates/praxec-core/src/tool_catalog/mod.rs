@@ -13,9 +13,11 @@
 pub mod adapters;
 pub mod candidate;
 pub mod catalog;
+pub mod real_io;
 pub mod registry;
 
 pub use adapters::{GithubOrgAdapter, StaticAdapter};
 pub use candidate::{RequiredField, Requires, ToolCandidate, ToolSource, Transport, TrustTier};
 pub use catalog::{Cache, assemble, discover, evaluate};
+pub use real_io::RealCatalogIo;
 pub use registry::{CatalogIo, GhRepo, RegistryAdapter, RegistrySpec, registries_from};
