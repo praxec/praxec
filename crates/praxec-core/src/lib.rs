@@ -77,6 +77,7 @@ pub mod store;
 pub mod structural_fingerprint;
 pub mod templating;
 pub mod tier;
+pub mod tool_catalog;
 pub mod tool_descriptor;
 pub mod tuning;
 pub mod use_binding;

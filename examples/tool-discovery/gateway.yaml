@@ -1,0 +1,43 @@
+# MCP tool discovery (Phase 1) — docs/design/plans/2026-07-30-mcp-tool-discovery-phase1.md
+#
+# A minimal config demonstrating the `registries:` block: one `github-org`
+# (live, best-effort — enumerates a GitHub org's public repos as candidates)
+# and one `static` (a single inline candidate, no network needed). Phase 1 is
+# read-only: nothing here installs or provisions anything.
+#
+# Try it:
+#   praxec check --config examples/tool-discovery/gateway.yaml
+#   praxec query --config examples/tool-discovery/gateway.yaml '{"discover":"browser"}'
+#   praxec query --config examples/tool-discovery/gateway.yaml '{"evaluate":{"verbs":["diagnose"]}}'
+#
+# The `github-org` entry is best-effort: if the network is unreachable or the
+# org can't be resolved, `assemble` downgrades it to a warning (surfaced in
+# the response's `warnings` array) rather than failing the query — the
+# `static` candidate below still lands either way.
+version: "1.0.0"
+
+# This example only exercises `praxec.query { discover }` / `{ evaluate }` —
+# it never starts a workflow, so ephemeral (in-memory/stderr) storage is fine
+# for `praxec check` / `praxec query`. `serve` would still refuse to run it
+# durably without this override.
+gateway:
+  allow_ephemeral: true
+
+registries:
+  - kind: github-org
+    name: praxec-org
+    org: praxec
+
+  - kind: static
+    name: local
+    candidates:
+      - name: browser-mcp
+        description: Playwright-backed browser automation MCP server.
+        transport: stdio
+        source:
+          npm:
+            pkg: "@playwright/mcp"
+        verbs: [diagnose]
+        tags: [browser, e2e]
+        trust_tier: verified
+        provenance: local

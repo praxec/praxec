@@ -555,6 +555,41 @@ fn default_home() -> Value {
                     },
                     "additionalProperties": false
                 }
+            },
+            {
+                "rel": "discover",
+                "title": "Discover MCP tool candidates from the configured `registries:` (free-text ranked search)",
+                "method": "praxec.query",
+                "args": { "discover": "" },
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["discover"],
+                    "properties": {
+                        "discover": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            },
+            {
+                "rel": "evaluate",
+                "title": "Rank MCP tool candidates by overlap with a set of needed cap-verbs",
+                "method": "praxec.query",
+                "args": { "evaluate": { "verbs": [] } },
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["evaluate"],
+                    "properties": {
+                        "evaluate": {
+                            "type": "object",
+                            "required": ["verbs"],
+                            "properties": {
+                                "verbs": { "type": "array", "items": { "type": "string" } }
+                            },
+                            "additionalProperties": false
+                        }
+                    },
+                    "additionalProperties": false
+                }
             }
         ]
     })
