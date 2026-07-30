@@ -1,0 +1,31 @@
+# Minimal gateway config that loads `flow.tools.provision` (see README.md
+# for what this composes and how to run it).
+#
+# `flow.tools.provision` shells out to the `praxec` binary itself
+# (`connections add` / `connections grant` / `doctor`) via the `praxec` cli
+# connection below, and to `npm` for the npx-distributed-server install
+# recipe. Both must be on PATH for a real (non-`check`/`fuzz`) drive;
+# `praxec check` and `praxec fuzz` validate the workflow shape statically /
+# with mock executors and never actually spawn either.
+
+version: "1.0.0"
+
+include:
+  - flow.tools.provision.yaml
+
+connections:
+  # The workflow governs ITSELF through this connection: `staging` calls
+  # `connections add`, `validating` calls `doctor`, `granting` calls
+  # `connections grant`. Assumes the `praxec` binary built from this repo
+  # is on PATH — swap `command` for an absolute path if it isn't.
+  praxec:
+    kind: cli
+    command: praxec
+
+  # `installing`'s stdio/npx install recipe.
+  npm:
+    kind: cli
+    command: npm
+
+audit:
+  sink: stderr
