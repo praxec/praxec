@@ -1,26 +1,33 @@
-# Minimal gateway config that loads `flow.tools.provision` (see README.md
-# for what this composes and how to run it).
+# Minimal gateway config that loads both halves of the MCP tool lifecycle's
+# connection-governance pair: `flow.tools.provision` (P2.3) and its reverse,
+# `flow.tools.deprovision` (P2.4) — see README.md for what each composes and
+# how to run them.
 #
 # `flow.tools.provision` shells out to the `praxec` binary itself
 # (`connections add` / `connections grant` / `doctor`) via the `praxec` cli
 # connection below, and to `npm` for the npx-distributed-server install
-# recipe. Both must be on PATH for a real (non-`check`/`fuzz`) drive;
+# recipe. `flow.tools.deprovision` shells out to the same `praxec` binary
+# (`connections revoke` — the mirror of `connections grant`) and needs
+# nothing else. All must be on PATH for a real (non-`check`/`fuzz`) drive;
 # `praxec check` and `praxec fuzz` validate the workflow shape statically /
 # with mock executors and never actually spawn either. `jq` must also be on
-# PATH — `building`'s script (declared in `flow.tools.provision.yaml`'s own
-# `scripts:` block, colocated with the workflow that owns it) uses it to
-# assemble the staged connection body.
+# PATH — `flow.tools.provision`'s `building` script (declared in
+# `flow.tools.provision.yaml`'s own `scripts:` block, colocated with the
+# workflow that owns it) uses it to assemble the staged connection body.
 
 version: "1.0.0"
 
 include:
   - flow.tools.provision.yaml
+  - flow.tools.deprovision.yaml
 
 connections:
-  # The workflow governs ITSELF through this connection: `staging` calls
-  # `connections add`, `validating` calls `doctor`, `granting` calls
-  # `connections grant`. Assumes the `praxec` binary built from this repo
-  # is on PATH — swap `command` for an absolute path if it isn't.
+  # Both workflows govern themselves through this connection:
+  # `flow.tools.provision`'s `staging` calls `connections add`, `validating`
+  # calls `doctor`, `granting` calls `connections grant`; `flow.tools.
+  # deprovision`'s `revoking` calls `connections revoke`. Assumes the
+  # `praxec` binary built from this repo is on PATH — swap `command` for an
+  # absolute path if it isn't.
   praxec:
     kind: cli
     command: praxec

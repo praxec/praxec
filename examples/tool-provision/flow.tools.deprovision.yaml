@@ -1,0 +1,172 @@
+# flow.tools.deprovision — the REVERSE of flow.tools.provision, Phase 2 of
+# the MCP tool lifecycle (docs/design/2026-07-30-mcp-tool-lifecycle-phase2.md
+# §3, P2.4).
+#
+# Deprovisions a live connection by COMPOSING praxec's own connection-
+# governance CLI — it never writes `grant_connections:` YAML itself:
+#
+#   revoking → `praxec connections revoke` (the mirror of `connections
+#                                            grant`: removes the name from
+#                                            `grant_connections:`, demoting
+#                                            the connection back to
+#                                            inert/staged)
+#
+# select → confirming → revoking → done | failed
+#
+# ── Scope: revoke (un-grant) only ───────────────────────────────────────
+# This workflow's deprovision act is exactly `connections revoke` — the
+# reverse of `connections grant`, nothing more. It demotes a connection back
+# to inert/staged; it does NOT touch the staged body. Two follow-ups are
+# DELIBERATELY out of scope here (documented, not built):
+#
+#   - Uninstall: for an npx-distributed stdio server (`installing`'s recipe
+#     in flow.tools.provision.yaml runs `npm install -g`), there is no
+#     matching `npm uninstall -g` step here. The package stays on disk;
+#     only its praxec connection is un-granted.
+#   - Secret purge: `collecting` (flow.tools.provision.yaml) records only
+#     env-var NAMES the operator already had set in `providers.env` — the
+#     values live in the operator's own process environment, not in praxec.
+#     Revoking a connection does not (and structurally cannot, from here)
+#     unset the operator's env vars.
+#
+# Both are legitimate future work if a fuller "uninstall" verb is wanted,
+# but P2.4 is deliberately just the trust-removal act — the same scoping
+# discipline flow.tools.provision.yaml uses transport-by-transport.
+
+workflows:
+  flow.tools.deprovision:
+    description: >
+      Revoke a granted connection's trust — demoting it back to
+      inert/staged — via the existing `connections revoke` CLI, the
+      explicit auditable mirror of `connections grant`. Uninstall and
+      secret-purge are explicitly out of scope (see the header note).
+    tags: [tool-lifecycle, governed, phase2]
+
+    inputSchema:
+      type: object
+      required: [connection_name, config_path]
+      additionalProperties: false
+      properties:
+        connection_name:
+          type: string
+          description: The name of the granted connection to revoke.
+        config_path:
+          type: string
+          description: The gateway YAML config the connection is granted in.
+
+    initialState: select
+
+    # Every field any state's output touches is seeded here — no state's
+    # first read of a slot is ever an unset-context-slot guard error.
+    initialContext:
+      connection_name: null
+      config_path: null
+      revokeExitCode: null
+      revokeSuccess: null
+      result: null
+      reason: null
+
+    states:
+
+      # ── select ──────────────────────────────────────────────────────
+      select:
+        description: >
+          Resolve the target connection: project the input's
+          `connection_name`/`config_path` into the flat context fields the
+          later states read. Pure data projection (`kind: noop` executor),
+          mirroring `flow.tools.provision`'s `select` state.
+        onEnter:
+          executor: { kind: noop }
+          output:
+            connection_name: "$.workflow.input.connection_name"
+            config_path:     "$.workflow.input.config_path"
+        transitions:
+          resolved:
+            title: Connection resolved — confirm before revoking.
+            target: confirming
+
+      # ── confirming ──────────────────────────────────────────────────
+      confirming:
+        description: >
+          Human gate showing what will be revoked (`connection_name`,
+          `config_path`) before the revoke CLI runs. Parks in headless
+          drives exactly like any other `actor: human` transition — the
+          mirror of `flow.tools.provision`'s `granting` gate, run in
+          reverse: there the human MINTS trust (and the composed CLI call
+          needs `--yes`, since a non-interactive `grant` is refused
+          fail-closed); here the human only REMOVES trust, which is why
+          `revoking` below composes `connections revoke` with no `--yes` /
+          origin gate at all (revoke carries no such CLI-side gate — see
+          `crates/praxec/src/gateway.rs`'s `connections_revoke`).
+        linkFilter: byGuards
+        transitions:
+          approve_revoke:
+            title: Approve — revoke connection_name's grant.
+            actor: human
+            target: revoking
+            guards:
+              - { kind: permission, permission: workflow.approve }
+
+          decline_revoke:
+            title: Decline — do not revoke. Nothing is touched.
+            actor: human
+            target: done
+            guards:
+              - { kind: permission, permission: workflow.approve }
+            output:
+              result: "cancelled"
+
+      # ── revoking ────────────────────────────────────────────────────
+      revoking:
+        description: >
+          THE deprovision act: `praxec connections revoke`, composing
+          praxec's own governance exactly as `flow.tools.provision`'s
+          `staging`/`granting` states compose `connections add`/`grant` —
+          this workflow never edits `grant_connections:` YAML itself. A
+          non-zero exit is DATA here (`treatNonZeroAsFailure: false`);
+          `branches` — not an executor error — decides the route, so a real
+          `REVOKE_FAILED` reason lands in `failed`.
+        transitions:
+          revoke_connection:
+            title: "Revoke: `connections revoke` demotes the connection back to inert/staged."
+            target: failed # fallback if the branch below doesn't match
+            executor:
+              kind: cli
+              connection: praxec
+              args:
+                - "connections"
+                - "revoke"
+                - "--config"
+                - "$.context.config_path"
+                - "$.context.connection_name"
+              treatNonZeroAsFailure: false
+            branches:
+              - when: { kind: expr, expr: "$.context.revokeSuccess == true" }
+                target: done
+            output:
+              revokeExitCode: "$.output.exitCode"
+              revokeSuccess:  "$.output.success"
+              # Applied unconditionally (same convention as `reason` below):
+              # dead/unused if the branch above doesn't fire and `failed` is
+              # reached instead; correct if `done` is reached.
+              result:         "succeeded"
+              reason:         "REVOKE_FAILED"
+
+      # ── terminal states ─────────────────────────────────────────────
+      done:
+        terminal: true
+        description: >
+          Terminal success. `result` distinguishes SUCCEEDED (the
+          connection was revoked — demoted back to inert/staged) from
+          CANCELLED (the operator declined at `confirming` — nothing was
+          touched).
+        onEnter:
+          executor: { kind: noop }
+          output:
+            reason: null
+
+      failed:
+        terminal: true
+        description: >
+          Deprovisioning did not complete. `context.reason` carries the
+          typed cause (REVOKE_FAILED).
