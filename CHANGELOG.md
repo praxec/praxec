@@ -8,6 +8,30 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.45] — 2026-07-30 — `praxec init`: one-command onboarding
+
+Turns new-user setup into a single command + one API key, cross-platform
+(the vehicle is a subcommand, so Windows is native — no `sh`).
+
+### Added
+
+- **`praxec init`** — scaffolds a working `gateway.yaml` (durable sqlite + file
+  audit defaults, `auto_drive` off) and a commodity `models.yaml` into the OS
+  config dir (`~/.config/praxec`, `%APPDATA%\praxec` on Windows), prompts for one
+  provider API key (written to `providers.env`, never echoed), **auto-detects and
+  wires the editor MCP config** (Cursor `.cursor/mcp.json` / Claude `.mcp.json`,
+  with OS-correct absolute paths via `current_exe()`, merging into any existing
+  file), and runs `doctor`. Idempotent (skip-unless-`--force`); flags
+  `--editor cursor|claude|both|none`, `--dir`, `--global`, `--yes`, `--force`.
+
+### Docs
+
+- README leads with `praxec init`.
+- Archived superseded version-specific planning docs into `docs/design/`; removed
+  leaked scratch build-reports; `connections.md` / `configuration.md` now cover
+  the `connections add`/`grant`/`revoke` CLI, tool discovery/provisioning, and
+  `praxec init`.
+
 ## [0.0.44] — 2026-07-30 — MCP tool discovery & lifecycle (discover → evaluate → provision → deprovision)
 
 A complete surface for discovering, recommending, and governing MCP tools — built
