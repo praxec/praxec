@@ -4636,6 +4636,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "clap",
+ "dirs 5.0.1",
  "futures",
  "praxec-agents",
  "praxec-core",

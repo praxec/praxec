@@ -97,6 +97,28 @@ The `praxec` binary above is the gateway — the MCP server you wire into an age
 host. The optional interactive control-plane TUI ships separately as the `px`
 binary (`cargo install praxec-tui`, coming soon); you don't need it to run the gateway.
 
+## Get started — one command
+
+```bash
+# Install the praxec binary from the latest GitHub release (Windows / macOS /
+# Linux; a crates.io `cargo install` is coming soon), then:
+praxec init                 # scaffold config + models + wire your editor
+```
+
+`praxec init` does the whole setup: it writes a working `gateway.yaml` and a
+commodity `models.yaml` into your config dir (`~/.config/praxec`, or
+`%APPDATA%\praxec` on Windows), prompts for one provider API key, **auto-detects
+and wires your editor** (Cursor / Claude Code — the correct MCP entry with
+absolute paths), and runs `doctor` to confirm you're ready. Restart your editor
+and `praxec.query` / `praxec.command` appear.
+
+```
+praxec init [--editor cursor|claude|both|none] [--dir <path>] [--global] [--yes] [--force]
+```
+
+Prefer to see the pieces it assembles? The manual quick start below writes the
+same kind of config by hand.
+
 ## Quick start
 
 ```bash
