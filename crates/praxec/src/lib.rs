@@ -16,5 +16,9 @@ pub mod affinity_resolver;
 pub mod currency;
 pub mod gateway;
 pub mod gateway_config;
+/// `praxec init` scaffolding (gateway.yaml/models.yaml content, idempotent
+/// file writer, editor MCP-config merge) + the `InitIo` detection/prompt
+/// seam. Orchestrated by `gateway::init`.
+mod init;
 pub mod preflight;
 pub mod provision;

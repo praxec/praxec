@@ -158,6 +158,42 @@ capabilities:
 See [../architecture/mcp-control-architecture.md](../architecture/mcp-control-architecture.md) for the
 design patterns around composing imports with policy.
 
+## Managing connections from the CLI (stage → grant → revoke)
+
+Beyond declaring connections in the config file, praxec governs adding them as an
+explicit operator trust flow:
+
+- `praxec connections add --config <cfg> --name <n> --kind mcp --command …` —
+  **stages** a connection under `stagedConnections:` (inert — never in the live
+  registry until granted). `--block '<json>'` stages a whole connection body
+  (including `env:`) in one argument.
+- `praxec connections grant --config <cfg> <n>` — the explicit, auditable
+  operator **trust act** that promotes a staged connection into the live
+  `/connections` registry (records a `connections.granted` audit event;
+  fail-closed with `GRANT_REQUIRES_OPERATOR` when run non-interactively).
+- `praxec connections revoke --config <cfg> <n>` — the mirror: un-grants a
+  connection (records `connections.revoked`).
+
+`praxec doctor` additionally validates a connection's declared `required_secrets:`
+(the env-var names it needs at runtime, resolved from `providers.env` — never
+secret values in config).
+
+## Discovering and provisioning tools
+
+You don't have to hand-write every connection. praxec can **discover** MCP tools
+from configured `registries:` and **provision** them through the governed
+stage→grant flow above:
+
+- `praxec.query { discover: "<text>" }` / `{ evaluate: { verbs: [...] } }` — find
+  installable tool candidates from the `registries:` catalog (adapters:
+  `github-org`, `static`, `rest`, `mcp-registry`).
+- `flow.tools.provision` — a governed workflow that installs, collects
+  secrets/config, stages, validates, then grants a chosen candidate (community
+  candidates run through an extra approval + a sandboxed install);
+  `flow.tools.deprovision` reverses it.
+
+See the [tool-discovery reference](../reference/tool-discovery.md).
+
 ---
 
 ## Where to next
