@@ -4,6 +4,11 @@ The full schema lives at `schemas/gateway-config.schema.json`. Typify-
 generated Rust types are in the `praxec-schema` crate. This page
 is the human-shaped tour.
 
+> **New here?** Run `praxec init` to scaffold a working `gateway.yaml` +
+> `models.yaml` into your config dir (`~/.config/praxec`, or `%APPDATA%\praxec`
+> on Windows) and wire your editor, then edit from there. This page documents
+> everything that file can contain.
+
 ---
 
 ## Top level
@@ -13,6 +18,7 @@ version: "1.0.0"
 include: []         # other YAML files to merge in (deep merge; later wins)
 capabilities: {}    # named, reusable capabilities
 connections: {}     # named handles to MCP / CLI / REST endpoints
+registries: []      # tool-discovery registries (github-org / static / rest / mcp-registry) — see reference/tool-discovery.md
 proxy:              # capability surface (with optional imports)
   expose: []        #   inline {name, executor, …} OR reference {capability, as?, …}
   import: []
