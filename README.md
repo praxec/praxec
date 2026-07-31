@@ -100,8 +100,9 @@ binary (`cargo install praxec-tui`, coming soon); you don't need it to run the g
 ## Get started — one command
 
 ```bash
-cargo install praxec        # or download a release binary (Windows / macOS / Linux)
-praxec init                 # scaffold config + wire your editor
+# Install the praxec binary from the latest GitHub release (Windows / macOS /
+# Linux; a crates.io `cargo install` is coming soon), then:
+praxec init                 # scaffold config + models + wire your editor
 ```
 
 `praxec init` does the whole setup: it writes a working `gateway.yaml` and a
