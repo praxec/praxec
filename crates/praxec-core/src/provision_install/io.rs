@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 
 use super::InstallError;
 
-/// The host-touching operations the release provider needs. Kept minimal: an
+/// The host-touching operations the provider chain needs. Kept minimal: an
 /// HTTP GET (for the asset + its `checksums.sha256`), an executable placement,
-/// an installed-version probe (idempotency), and the praxec-managed bin dir.
+/// an installed-version probe (idempotency), the praxec-managed bin dir, a
+/// command-on-PATH probe (docker-provider availability), and a `docker pull`.
 ///
 /// Unlike [`crate::currency::CurrencyIo`] — whose probes degrade to `None` — a
 /// download/placement failure is *fatal* to an install, so the fallible methods
@@ -39,6 +40,17 @@ pub trait InstallerIo {
     /// On the seam so tests inject a tempdir; the real impl resolves it via
     /// `dirs`, the same convention `init` uses for the config dir.
     fn bin_dir(&self) -> Result<PathBuf, InstallError>;
+
+    /// Is `cmd` an executable on `PATH`? The docker provider's availability
+    /// gate — `which("docker")` false means the chain falls through to release
+    /// (a fresh machine with no daemon is never blocked). A pure read: it never
+    /// mutates, so it is safe to call from `resolve_provider` / offer paths.
+    fn which(&self, cmd: &str) -> bool;
+
+    /// `docker pull <image_ref>` (`<image>:<version>`). The mutating half of the
+    /// docker provider — invoked only under `Consent::Granted`. Fails loud with
+    /// the image ref on a non-zero exit / spawn failure.
+    fn docker_pull(&self, image_ref: &str) -> Result<(), InstallError>;
 }
 
 /// The production [`InstallerIo`]: the blocking `reqwest` client already in the
@@ -118,5 +130,41 @@ impl InstallerIo for RealInstallerIo {
                         .to_string(),
                 )
             })
+    }
+
+    fn which(&self, cmd: &str) -> bool {
+        let Some(paths) = std::env::var_os("PATH") else {
+            return false;
+        };
+        // On Windows an executable may carry a PATHEXT suffix; the empty ext
+        // covers an explicit name and every unix binary.
+        let exts: &[&str] = if cfg!(windows) {
+            &["", ".exe", ".cmd", ".bat"]
+        } else {
+            &[""]
+        };
+        std::env::split_paths(&paths).any(|dir| {
+            exts.iter()
+                .any(|ext| dir.join(format!("{cmd}{ext}")).is_file())
+        })
+    }
+
+    fn docker_pull(&self, image_ref: &str) -> Result<(), InstallError> {
+        let status = std::process::Command::new("docker")
+            .arg("pull")
+            .arg(image_ref)
+            .status()
+            .map_err(|e| InstallError::DockerPull {
+                image: image_ref.to_string(),
+                reason: e.to_string(),
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(InstallError::DockerPull {
+                image: image_ref.to_string(),
+                reason: format!("`docker pull` exited with {status}"),
+            })
+        }
     }
 }

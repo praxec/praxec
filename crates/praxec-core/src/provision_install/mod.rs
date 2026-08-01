@@ -37,6 +37,9 @@ use crate::tool_descriptor::ProvisionProvider;
 pub mod io;
 pub use io::{InstallerIo, RealInstallerIo};
 
+pub mod provider;
+pub use provider::{Consent, InstallPlan, Provider, install, resolve_provider};
+
 /// The host an install targets. `os` matches `std::env::consts::OS`
 /// (`"linux"`, `"macos"`, `"windows"`) — `"darwin"` is accepted as an alias —
 /// and `arch` matches `std::env::consts::ARCH` (`"x86_64"`, `"aarch64"`).
@@ -57,6 +60,14 @@ pub enum InstallOutcome {
     AlreadyCurrent,
     /// Integrity refused the asset (checksum mismatch) — nothing was placed.
     Refused { reason: String },
+    /// A non-mutating *plan* only: the provider the chain would use and the
+    /// exact human-readable command, produced by [`Consent::OfferOnly`] (and by
+    /// the emit-only cargo arm under [`Consent::Granted`]). Nothing was
+    /// downloaded, pulled, or written — this is doctor's "offer".
+    Offered {
+        provider: provider::Provider,
+        command: String,
+    },
 }
 
 /// Typed failures from the release provider. Every message carries a stable
@@ -96,6 +107,13 @@ pub enum InstallError {
     /// A filesystem / placement failure from the [`InstallerIo`] impl.
     #[error("INSTALL_IO: {0}")]
     Io(String),
+    /// `docker pull` failed (spawn error or non-zero exit) — names the image.
+    #[error("INSTALL_DOCKER_PULL: `docker pull {image}` failed: {reason}")]
+    DockerPull { image: String, reason: String },
+    /// The provider chain (release → docker → cargo) resolved no available
+    /// provider for this tool + host — fail fast naming the tool.
+    #[error("INSTALL_NO_PROVIDER: no available provider (release/docker/cargo) for tool `{tool}`")]
+    NoProvider { tool: String },
 }
 
 /// Resolve a host `(os, arch)` to the `(target-triple, archive-ext)` the
@@ -341,6 +359,12 @@ mod tests {
         }
         fn bin_dir(&self) -> Result<PathBuf, InstallError> {
             Ok(self.bin_dir.clone())
+        }
+        fn which(&self, _cmd: &str) -> bool {
+            false
+        }
+        fn docker_pull(&self, _image_ref: &str) -> Result<(), InstallError> {
+            Ok(())
         }
     }
 
