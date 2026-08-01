@@ -96,11 +96,15 @@
 # enum — `stdio`/`docker` DELEGATE the local install to `praxec tools
 # install` (the installer resolves release vs docker internally), while
 # `remote→mcp+url` / `rest→rest` need nothing installed (noop). `building`
-# then assembles a connection body for the three the design doc names
-# (`stdio→mcp+command`, `remote→mcp+url`, `rest→rest`); a `docker`-transport
-# candidate installs but currently fails fast at `building` with a typed
-# `BUILD_RECIPE_UNAVAILABLE` (no docker connection-body recipe yet) rather
-# than silently no-opping — extend the `building` transitions to add it.
+# then assembles a connection body for all four transports the closed enum
+# names (`stdio→mcp+command`, `docker→mcp+command:"docker" run --rm -i
+# <image>`, `remote→mcp+url`, `rest→rest`). The `docker` recipe wires the
+# pulled image as a `docker run` stdio-over-mcp command: `installing` has
+# already `docker pull`ed it via the installer, so `building` references the
+# image the candidate carries (`source.image.image`, projected to
+# `dockerImage` in `select`) as `{command:"docker", args:["run","--rm","-i",
+# "<image>"]}` — the same identity/env/required_secrets structure the stdio
+# recipe uses, only the argv head differs.
 
 # Lexicon entry for the one script subject this workflow defines (SPEC §30.10.4).
 lexicon:
@@ -150,6 +154,22 @@ scripts:
             --argjson secrets "$required_secrets" \
             --argjson cfg "$collected_config_json" \
             '{kind:"mcp", command:$cmd}
+             + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
+             + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
+          ;;
+        docker)
+          # `installing` already `docker pull`ed the image via the installer;
+          # wire it as a `docker run` stdio-over-mcp command. For this lane the
+          # `command` positional ($2) carries the pinned image reference
+          # (`source.image.image`, e.g. `ghcr.io/org/tool:1.2.3`) — the same
+          # slot the stdio lane uses for the release binary's name — so the
+          # env:/required_secrets: assembly is identical; only the argv head
+          # (`docker run --rm -i <image>`) differs.
+          jq -nc \
+            --arg image "$command" \
+            --argjson secrets "$required_secrets" \
+            --argjson cfg "$collected_config_json" \
+            '{kind:"mcp", command:"docker", args:["run","--rm","-i",$image]}
              + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
              + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
           ;;
@@ -260,6 +280,7 @@ workflows:
       config_path: null
       npmPkg: null
       sourceUrl: null
+      dockerImage: null
       secretEnvNames: []
       collectedConfig: {}
       secrets_set: []
@@ -303,8 +324,9 @@ workflows:
             config_path:      "$.workflow.input.config_path"
             # Source-variant projections — null unless that variant is
             # actually present (see the header note on why this is safe).
-            npmPkg:    "$.workflow.input.candidate.source.npm.pkg"
-            sourceUrl: "$.workflow.input.candidate.source.url.url"
+            npmPkg:      "$.workflow.input.candidate.source.npm.pkg"
+            sourceUrl:   "$.workflow.input.candidate.source.url.url"
+            dockerImage: "$.workflow.input.candidate.source.image.image"
         transitions:
           resolved:
             title: Candidate resolved — evaluate trust tier.
@@ -582,6 +604,35 @@ workflows:
               built_body:    "$.output.json"
               reason: "BUILD_FAILED"
 
+          build_docker_mcp:
+            title: "Build: docker mcp connection body (`docker run` the pulled image)."
+            target: failed
+            # `installing` already `docker pull`ed the image via the one
+            # installer; the connection body wires it as a `docker run --rm -i
+            # <image>` stdio-over-mcp command. `dockerImage` is the pinned image
+            # the candidate carries (`source.image.image`), projected in `select`.
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'docker'" }
+              - { kind: expr, expr: "$.context.dockerImage != null" }
+            executor:
+              kind: script
+              subject: build.connection-body
+              args:
+                - "docker"
+                - "$.context.dockerImage"
+                - "$.context.sourceUrl"
+                - "$.context.secretEnvNames"
+                - "$.context.collectedConfig"
+              treatNonZeroAsFailure: false
+            branches:
+              - when: { kind: expr, expr: "$.context.buildSuccess == true" }
+                target: staging
+            output:
+              buildExitCode: "$.output.exitCode"
+              buildSuccess:  "$.output.success"
+              built_body:    "$.output.json"
+              reason: "BUILD_FAILED"
+
           build_remote_mcp:
             title: "Build: remote (streamable-http) mcp connection body."
             target: failed
@@ -641,6 +692,12 @@ workflows:
                   # stdio always has a build recipe now (installed binary → mcp
                   # command); only a non-stdio transport can fall through here.
                   - { kind: expr, expr: "$.context.transport != 'stdio'" }
+                  - kind: not
+                    guard:
+                      kind: all_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'docker'" }
+                        - { kind: expr, expr: "$.context.dockerImage != null" }
                   - kind: not
                     guard:
                       kind: all_of

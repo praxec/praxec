@@ -85,6 +85,111 @@ fn tool_provision_install_delegates_and_dead_paths_are_gone() {
     }
 }
 
+// ── Task A1 — docker connection-body recipe (clears BUILD_RECIPE_UNAVAILABLE) ─
+
+/// The gateway-config schema bytes, single-sourced from the shipped file, so
+/// the docker recipe's output is validated against the SAME `mcpConnection`
+/// def a granted connection is validated against.
+const GATEWAY_CONFIG_SCHEMA: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../schemas/gateway-config.schema.json"
+));
+
+/// Extract `scripts.build.connection-body.body` (the real recipe bash) from the
+/// provision flow, run it for the given `transport`/`command` inputs with empty
+/// secrets/config, and return the emitted connection-body JSON. Runs the actual
+/// shipped script — not a hand-copied approximation — so the test tracks the
+/// recipe, not a derivation of it.
+fn run_build_recipe(transport: &str, command: &str) -> serde_json::Value {
+    let flow = examples_dir().join("tool-provision/flow.tools.provision.yaml");
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&flow).expect("flow readable"))
+            .expect("flow parses as YAML");
+    let body = doc["scripts"]["build.connection-body"]["body"]
+        .as_str()
+        .expect("build.connection-body.body is a string");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("build.sh");
+    std::fs::write(&script, body).expect("write script");
+
+    // Positional args mirror the flow's `build_*` executor `args:`:
+    //   $1 transport  $2 command/image  $3 source_url  $4 secretEnvNames  $5 config
+    let out = std::process::Command::new("bash")
+        .arg(&script)
+        .args([transport, command, "", "[]", "{}"])
+        .output()
+        .expect("bash runs the recipe");
+    assert!(
+        out.status.success(),
+        "recipe for transport `{transport}` exited non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "recipe output is not JSON ({e}): {}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    })
+}
+
+/// A docker-transport candidate reaches a valid connection body — `docker run
+/// --rm -i <image>` as an mcp command — instead of the old
+/// `BUILD_RECIPE_UNAVAILABLE` dead-end, and that body is schema-valid against
+/// `gateway-config.schema.json#/$defs/mcpConnection`.
+#[test]
+fn docker_build_recipe_produces_schema_valid_mcp_body() {
+    let image = "ghcr.io/praxec/corpus:0.0.2";
+    let body = run_build_recipe("docker", image);
+
+    assert_eq!(body["kind"], "mcp", "docker body is an mcp connection");
+    assert_eq!(body["command"], "docker", "docker body invokes `docker`");
+    assert_eq!(
+        body["args"],
+        serde_json::json!(["run", "--rm", "-i", image]),
+        "docker body runs the pulled image via `docker run --rm -i <image>`"
+    );
+
+    // Schema-valid against the real mcpConnection def (self-contained — no
+    // external `$ref`s), the same def a granted staged connection must pass.
+    let schema: serde_json::Value =
+        serde_json::from_str(GATEWAY_CONFIG_SCHEMA).expect("schema parses");
+    let mcp_conn = schema["$defs"]["mcpConnection"].clone();
+    let validator = jsonschema::validator_for(&mcp_conn).expect("mcpConnection def compiles");
+    assert!(
+        validator.is_valid(&body),
+        "docker connection body must satisfy mcpConnection: {body}"
+    );
+}
+
+/// Grep-clean: the docker lane no longer dead-ends at
+/// `BUILD_RECIPE_UNAVAILABLE`. A `build_docker_mcp` transition exists and the
+/// `build_unsupported` fall-through explicitly excludes a docker candidate that
+/// carries an image (the rest-with-secrets typed error is a separate, genuine
+/// unsupported case and is intentionally left intact).
+#[test]
+fn docker_transport_has_a_build_recipe_no_dead_end() {
+    let flow = examples_dir().join("tool-provision/flow.tools.provision.yaml");
+    let text = std::fs::read_to_string(&flow).expect("flow readable");
+
+    assert!(
+        text.contains("build_docker_mcp"),
+        "a `build_docker_mcp` transition must wire the docker recipe"
+    );
+    assert!(
+        text.contains("dockerImage"),
+        "the docker image must be projected into context as `dockerImage`"
+    );
+    // The `building` step's docker lane routes to the recipe, not to the
+    // BUILD_RECIPE_UNAVAILABLE fall-through: the fall-through guard now excludes
+    // `transport == 'docker' && dockerImage != null`.
+    assert!(
+        text.contains("$.context.transport == 'docker'")
+            && text.contains("$.context.dockerImage != null"),
+        "build_unsupported must exclude the docker+image case"
+    );
+}
+
 // ── Regression guard: every *.yaml at examples/ top level must resolve ─────
 
 #[test]
