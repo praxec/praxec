@@ -8,7 +8,7 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
-## [Unreleased] — governed tool provisioning (prebuilt binaries, zero compilation)
+## [0.0.46] — 2026-08-01 — governed tool provisioning (prebuilt binaries, zero compilation)
 
 Closes the onboarding dead-end where a pack's companion MCP tools (cpm-planner,
 fmeca-mcp, …) had to be **compiled** on the operator's machine — which failed on
