@@ -2734,6 +2734,7 @@ fn provider_token(provider: praxec_core::provision_install::Provider) -> &'stati
     match provider {
         Provider::Release => "release",
         Provider::Docker => "docker",
+        Provider::Npx => "npx",
         Provider::Cargo => "cargo",
     }
 }
@@ -2783,7 +2784,7 @@ fn provision_report_lines(
         // same plan `install` would perform. Non-mutating (only `io.which`).
         let Some(plan) = resolve_provider(tool, host, io) else {
             lines.push(format!(
-                "tool {}: cannot offer — no available provider (release/docker/cargo) for this host",
+                "tool {}: cannot offer — no available provider (release/docker/npx/cargo) for this host",
                 tool.id
             ));
             continue;
@@ -2814,9 +2815,9 @@ fn provision_report_lines(
                 "tool {}: provider={provider} action={} result=refused ({reason})",
                 tool.id, plan.command
             )),
-            // A remote tool has nothing to install — it is wired as a url
-            // connection. Unreachable from a registry tool (which always carries
-            // a provider coordinate) but handled for exhaustiveness.
+            // Nothing to place: either a remote tool (wired as a url
+            // connection) or an npm-distributed tool (npx fetches it on run —
+            // the reason surfaces the `npx -y <pkg>` connection form).
             Ok(InstallOutcome::NoInstallNeeded { reason }) => lines.push(format!(
                 "tool {}: provider={provider} action={} result=no-install-needed ({reason})",
                 tool.id, plan.command

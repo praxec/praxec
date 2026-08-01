@@ -105,6 +105,18 @@ pub enum InstallError {
     /// asset — integrity cannot be established, so the install refuses to place.
     #[error("INSTALL_CHECKSUM_ABSENT: `{url}` has no `checksums.sha256` entry for asset `{asset}`")]
     ChecksumAbsent { url: String, asset: String },
+    /// `checksums.sha256` has a line for the asset, but its hash token is not a
+    /// well-formed sha256 (64 hex chars) — a malformed/truncated checksum cannot
+    /// verify anything, so the install refuses to place (fail-CLOSED). Distinct
+    /// from [`ChecksumAbsent`](Self::ChecksumAbsent) (no entry at all).
+    #[error(
+        "INSTALL_CHECKSUM_MALFORMED: `{url}` entry for asset `{asset}` has a malformed sha256 token `{token}` (expected 64 hex chars)"
+    )]
+    ChecksumMalformed {
+        url: String,
+        asset: String,
+        token: String,
+    },
     /// The asset downloaded + verified but could not be unpacked / the expected
     /// `command` binary was not inside it.
     #[error("INSTALL_UNPACK: unpacking `{asset}` (from `{url}`) failed: {reason}")]
@@ -119,9 +131,11 @@ pub enum InstallError {
     /// `docker pull` failed (spawn error or non-zero exit) — names the image.
     #[error("INSTALL_DOCKER_PULL: `docker pull {image}` failed: {reason}")]
     DockerPull { image: String, reason: String },
-    /// The provider chain (release → docker → cargo) resolved no available
+    /// The provider chain (release → docker → npx → cargo) resolved no available
     /// provider for this tool + host — fail fast naming the tool.
-    #[error("INSTALL_NO_PROVIDER: no available provider (release/docker/cargo) for tool `{tool}`")]
+    #[error(
+        "INSTALL_NO_PROVIDER: no available provider (release/docker/npx/cargo) for tool `{tool}`"
+    )]
     NoProvider { tool: String },
 }
 
@@ -166,21 +180,49 @@ fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// The result of looking an asset up in a `checksums.sha256` file: either a
+/// well-formed hash, a matched-but-malformed hash token (fail-CLOSED — never
+/// verify against garbage), or no entry at all. Distinguishing the middle case
+/// is M3 (a truncated/garbage checksum must not read as "absent").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChecksumLookup<'a> {
+    /// A matched line with a well-formed sha256 (64 hex chars).
+    Found(&'a str),
+    /// A matched line whose hash token is NOT a well-formed sha256.
+    Malformed(&'a str),
+    /// No line matched the asset.
+    Absent,
+}
+
+/// Is `token` a well-formed sha256 — exactly 64 ASCII hex digits?
+fn is_sha256_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Find the expected sha256 for `asset` in a `checksums.sha256` file. Each line
 /// is `<hex>  <name>` (sha256sum format); the name may carry a `*` (binary
 /// mode) or `./` prefix. Matches on the file's basename. Pure.
-pub fn expected_sha256<'a>(checksums: &'a str, asset: &str) -> Option<&'a str> {
+///
+/// The matched hash token is shape-validated (M3): a malformed token yields
+/// [`ChecksumLookup::Malformed`] (not silently treated as a match), so the
+/// caller fails-CLOSED with a distinct diagnostic instead of ever verifying
+/// against a truncated/garbage checksum.
+pub fn expected_sha256<'a>(checksums: &'a str, asset: &str) -> ChecksumLookup<'a> {
     for line in checksums.lines() {
         let mut toks = line.split_whitespace();
-        let hash = toks.next()?;
+        let Some(hash) = toks.next() else { continue };
         let Some(name) = toks.next() else { continue };
         let name = name.trim_start_matches('*').trim_start_matches("./");
         let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
         if base == asset {
-            return Some(hash);
+            return if is_sha256_token(hash) {
+                ChecksumLookup::Found(hash)
+            } else {
+                ChecksumLookup::Malformed(hash)
+            };
         }
     }
-    None
+    ChecksumLookup::Absent
 }
 
 /// Extract the `command` executable's bytes from a downloaded archive. `.tar.gz`
@@ -302,14 +344,26 @@ pub fn install_release(
             reason: e.to_string(),
         })?;
 
-    // Integrity: no entry → cannot verify → refuse (error); mismatch → refuse
-    // (outcome). In NEITHER case is a byte written.
+    // Integrity: no entry → cannot verify → refuse (error); malformed token →
+    // refuse (error, M3); mismatch → refuse (outcome). In NO case is a byte
+    // written — every arm is fail-CLOSED.
     let checksums = String::from_utf8_lossy(&checksums_bytes);
-    let expected =
-        expected_sha256(&checksums, &asset).ok_or_else(|| InstallError::ChecksumAbsent {
-            url: checksums_url.clone(),
-            asset: asset.clone(),
-        })?;
+    let expected = match expected_sha256(&checksums, &asset) {
+        ChecksumLookup::Found(hash) => hash,
+        ChecksumLookup::Malformed(token) => {
+            return Err(InstallError::ChecksumMalformed {
+                url: checksums_url.clone(),
+                asset: asset.clone(),
+                token: token.to_string(),
+            });
+        }
+        ChecksumLookup::Absent => {
+            return Err(InstallError::ChecksumAbsent {
+                url: checksums_url.clone(),
+                asset: asset.clone(),
+            });
+        }
+    };
     let actual = sha256_hex(&asset_bytes);
     if !actual.eq_ignore_ascii_case(expected) {
         return Ok(InstallOutcome::Refused {
@@ -481,11 +535,37 @@ mod tests {
 
     #[test]
     fn expected_sha256_matches_the_asset_line_ignoring_star_and_dir() {
-        let file = "deadbeef  *./cpm-planner-x86_64-unknown-linux-gnu.tar.gz\n\
-                    cafef00d  other-asset.zip\n";
+        // A well-formed sha256 is 64 hex chars; use real-shape hashes so the M3
+        // shape-validation passes and the match/basename logic is what's tested.
+        let good = "a".repeat(64);
+        let other = "b".repeat(64);
+        let file = format!(
+            "{good}  *./cpm-planner-x86_64-unknown-linux-gnu.tar.gz\n{other}  other-asset.zip\n"
+        );
+        assert_eq!(
+            expected_sha256(&file, "cpm-planner-x86_64-unknown-linux-gnu.tar.gz"),
+            ChecksumLookup::Found(good.as_str())
+        );
+    }
+
+    #[test]
+    fn expected_sha256_reports_absent_when_no_line_matches() {
+        let good = "c".repeat(64);
+        let file = format!("{good}  some-other-asset.tar.gz\n");
+        assert_eq!(
+            expected_sha256(&file, "cpm-planner-x86_64-unknown-linux-gnu.tar.gz"),
+            ChecksumLookup::Absent
+        );
+    }
+
+    #[test]
+    fn expected_sha256_reports_malformed_for_a_short_hash_token() {
+        // A matched line whose hash token is not 64 hex chars is malformed, NOT
+        // absent — M3 fail-CLOSED: never verify against a truncated checksum.
+        let file = "deadbeef0  cpm-planner-x86_64-unknown-linux-gnu.tar.gz\n";
         assert_eq!(
             expected_sha256(file, "cpm-planner-x86_64-unknown-linux-gnu.tar.gz"),
-            Some("deadbeef")
+            ChecksumLookup::Malformed("deadbeef0")
         );
     }
 
@@ -555,6 +635,42 @@ mod tests {
             io.writes.borrow().len(),
             0,
             "no binary placed on checksum mismatch"
+        );
+    }
+
+    #[test]
+    fn malformed_checksum_token_fails_closed_and_writes_nothing() {
+        // M3: the asset's checksum line carries a 10-char garbage hash (not 64
+        // hex) → CHECKSUM_MALFORMED, fail-CLOSED, nothing placed.
+        let page = "https://github.com/praxec/cpm-planner/releases";
+        let host = Host {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let asset = "cpm-planner-x86_64-unknown-linux-gnu.tar.gz";
+        let asset_bytes = make_targz("cpm-planner", b"real bytes");
+        let mut responses = HashMap::new();
+        responses.insert(format!("{page}/download/v0.0.2/{asset}"), asset_bytes);
+        responses.insert(
+            format!("{page}/download/v0.0.2/checksums.sha256"),
+            format!("deadbeef00  {asset}\n").into_bytes(),
+        );
+        let io = FakeIo {
+            responses,
+            bin_dir: "/fake/bin".into(),
+            ..Default::default()
+        };
+
+        let err = install_release(&tool("cpm-planner", "0.0.2", page), &host, &io).unwrap_err();
+        assert!(
+            matches!(err, InstallError::ChecksumMalformed { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("CHECKSUM_MALFORMED"));
+        assert_eq!(
+            io.writes.borrow().len(),
+            0,
+            "no binary placed on a malformed checksum"
         );
     }
 

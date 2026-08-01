@@ -79,6 +79,59 @@ pub trait InstallerIo {
     fn docker_pull(&self, image_ref: &str) -> Result<(), InstallError>;
 }
 
+/// If `bytes[start..]` begins with a `\d+\.\d+\.\d+` (three dot-separated digit
+/// runs), return the end index (exclusive) of that semver core; else `None`.
+/// Trailing junk (a pre-release/build suffix, punctuation) is left to the
+/// caller — only the `x.y.z` core is matched.
+fn semver_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    for part in 0..3 {
+        let digits_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digits_start {
+            return None; // a component with no digits
+        }
+        if part < 2 {
+            // components 0 and 1 must be followed by a `.` separator
+            if i < bytes.len() && bytes[i] == b'.' {
+                i += 1;
+            } else {
+                return None;
+            }
+        }
+    }
+    Some(i)
+}
+
+/// Extract the first semver-ish token (`\d+\.\d+\.\d+`, optional `v`/`V`
+/// prefix) appearing anywhere in `text` — tolerating `tool 1.2.3`, `tool
+/// v0.4.0`, a bare `1.2.3`, or a version mid-line. Returns the bare `x.y.z`
+/// (any `v` prefix stripped). `None` when none parses — the SAFE direction
+/// (unknown → reinstall, never a wrong "current").
+fn parse_version(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    for i in 0..bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            continue;
+        }
+        // Only start a match at a digit-run boundary so we don't begin partway
+        // through a longer numeric token (e.g. skip into `12345`); a `v`/`V`
+        // prefix is a letter, so it forms a clean boundary and is dropped.
+        if i > 0 {
+            let prev = bytes[i - 1];
+            if prev.is_ascii_digit() || prev == b'.' {
+                continue;
+            }
+        }
+        if let Some(end) = semver_end(bytes, i) {
+            return Some(String::from_utf8_lossy(&bytes[i..end]).into_owned());
+        }
+    }
+    None
+}
+
 /// The production [`InstallerIo`]: the blocking `reqwest` client already in the
 /// workspace + real filesystem, and `dirs` for the config-dir convention.
 pub struct RealInstallerIo;
@@ -144,9 +197,16 @@ impl InstallerIo for RealInstallerIo {
         if !out.status.success() {
             return None;
         }
-        let line = String::from_utf8_lossy(&out.stdout);
-        let first = line.lines().next()?.trim();
-        first.split_whitespace().last().map(str::to_string)
+        // Tolerate common `--version` shapes — `tool 1.2.3`, `tool v1.2.3`, a
+        // bare `1.2.3`, or a version anywhere on the line — and fall back to
+        // stderr (some tools print there). Extract the first semver-ish token;
+        // if none parses, `None` (→ reinstall), NEVER a wrong "current".
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(v) = parse_version(&stdout) {
+            return Some(v);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        parse_version(&stderr)
     }
 
     fn bin_dir(&self) -> Result<PathBuf, InstallError> {
@@ -212,5 +272,38 @@ mod tests {
             http_client().is_ok(),
             "the timeout-bounded blocking client must build"
         );
+    }
+
+    // ── M4: the version-probe parser tolerates common `--version` shapes ──────
+    #[test]
+    fn parse_version_reads_a_name_prefixed_version() {
+        assert_eq!(parse_version("mytool 1.2.3"), Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn parse_version_strips_a_v_prefix() {
+        assert_eq!(parse_version("mytool v0.4.0"), Some("0.4.0".to_string()));
+    }
+
+    #[test]
+    fn parse_version_reads_a_bare_version_line() {
+        assert_eq!(parse_version("1.2.3\n"), Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn parse_version_reads_a_version_anywhere_on_the_line() {
+        assert_eq!(
+            parse_version("mytool version 2.10.0 (build abc)"),
+            Some("2.10.0".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_version_returns_none_for_garbage() {
+        // No semver-ish token → None (the SAFE direction: reinstall, never a
+        // wrong "current").
+        assert_eq!(parse_version("no version here"), None);
+        assert_eq!(parse_version("build 42"), None);
+        assert_eq!(parse_version(""), None);
     }
 }
