@@ -4667,6 +4667,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs 5.0.1",
+ "flate2",
  "futures",
  "praxec-agents",
  "praxec-core",
@@ -4681,6 +4682,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4688,6 +4691,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "which",
+ "zip",
 ]
 
 [[package]]

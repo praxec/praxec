@@ -534,6 +534,7 @@ override for dev/testing, set `gateway.allow_ephemeral: true` (or the env var
 discovery:
   index: memory                         # lexical in-memory (default)
   include: [proxy, workflows, connections]
+  registry: { uri: "git+https://github.com/praxec/packs", ref: main }
 ```
 
 `praxec.query` lexically scores items against the query (title 6× /
@@ -543,6 +544,25 @@ semantic embedding-backed index (`SemanticDiscoveryIndex`) activates and ranks
 by a hybrid of the lexical score and cosine similarity; with no embedding model
 the runtime stays on the free lexical index. The trait is `DiscoveryIndex`, so
 either backend plugs in without changing the runtime.
+
+### `discovery.registry` — the tool/pack registry source
+
+Points praxec at the `packs.yaml` tool/pack registry (the `praxec/packs`
+catalog: each pack's required tools + each tool's `providers:` chain). Two forms:
+
+| Form | Meaning |
+|---|---|
+| `registry: <path>` (string) | A **local** `packs.yaml` on disk — used as-is. |
+| `registry: { uri: <git-uri>, ref: <branch/tag> }` (object) | Sourced **always-latest** — cloned/reset to the tip of `ref` on every load (and on `praxec sync`) through the same machinery as `repos:`. |
+
+The object form is a deliberate **currency-over-pinning** choice: the operator
+always resolves the latest tool coordinates and pack `requires[]` without an
+edit. A `{ uri, hash }` freeze form is **refused** (`DISCOVERY_REGISTRY_HASH_PIN`)
+— hash-pinning is the `include:` path, not the registry. Integrity is enforced
+separately, at install time, by the release `checksums.sha256` verify. If the
+`uri` is unreachable and a cached copy exists, praxec warns
+(`DISCOVERY_REGISTRY_OFFLINE`) and reuses the last cached tip; with no cache it
+fails fast, naming the `uri`.
 
 ---
 

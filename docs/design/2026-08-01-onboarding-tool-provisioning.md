@@ -213,3 +213,28 @@ All High/Medium driven to Low in one iteration; carried here as the acceptance b
 - Managing git/registry credentials (install piggybacks on the operator's own auth, as
   `repos:` already does).
 - Installing the `praxec` binary itself (release + optional wrapper handle that).
+
+## 12. Increment I — as-built notes
+
+Increment I shipped as designed (always-latest `discovery.registry: {uri, ref}`; the
+`praxec_core::provision_install` `ProvisionInstaller` with the release + docker providers,
+checksum-verify, and PATH placement; `doctor --fix`; `init --with-starter-packs
+[--install-tools]`; `praxec tools install <id>`; the provision flow delegated and the
+npm/cargo dead paths deleted). The cpm-planner live-proof
+(`crates/praxec/tests/provision_cpm_planner.rs`) drives the real resolve→verify→place chain
+against the host's own triple with a fake IO and confirms the cargo/source path is never taken.
+Two residuals surfaced during build, recorded here for truthfulness:
+
+- **(a) Docker candidate → `BUILD_RECIPE_UNAVAILABLE`.** `flow.tools.provision`'s install step
+  delegates docker to the one installer (which pulls the image), but a docker-transport candidate
+  then still hits the flow's *pre-existing* `BUILD_RECIPE_UNAVAILABLE` in the `building` state —
+  there is no docker connection-body recipe (the `docker run …` form) wired yet. This is a typed
+  fail-fast, not a wedge, and is out of Increment I's release-binary critical path. **Fast-follow:**
+  synthesize the docker connection body so a docker candidate completes to a ready connection.
+
+- **(b) Community sandbox removed, not replaced 1:1.** The community lane's
+  `confinement: confined` npm-install sandbox state was deleted rather than ported. The one
+  installer downloads **checksum-verified release binaries**, which run no arbitrary install
+  scripts, so the per-step install sandbox protected nothing the checksum verify does not. The
+  community-tier protection is now the existing **double-approval** (`community_gate`) — an extra
+  operator consent — not an install-time sandbox.
