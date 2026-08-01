@@ -72,6 +72,12 @@ pub(crate) enum Command {
         /// Path to the gateway YAML config.
         #[arg(short, long)]
         config: PathBuf,
+        /// Consent to install (ADR-0006): resolve every missing `kind: mcp`
+        /// tool through the provider chain and install it (release → docker;
+        /// cargo stays emit-only). Default is offer-only — doctor names the
+        /// provider + command and mutates nothing.
+        #[arg(long)]
+        fix: bool,
     },
     /// Print a JSON health snapshot: connections, repos, definition_count, store.
     Health {
@@ -269,6 +275,15 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ConnectionsCommand,
     },
+    /// Provision pack tools through the one installer. The thin delegation
+    /// surface a governed `flow.tools.provision` `kind: cli` step reaches (the
+    /// only way a YAML step can call the Rust `ProvisionInstaller`): it resolves
+    /// the tool from the config's `discovery.registry` and installs it via the
+    /// release → docker → cargo provider chain (`Consent::Granted`).
+    Tools {
+        #[command(subcommand)]
+        command: ToolsCommand,
+    },
     /// Cross-platform single-command onboarding: scaffold a working
     /// `gateway.yaml` + starter `models.yaml`, capture a provider API key
     /// (reusing the `providers.env` backend), wire an editor's MCP config
@@ -304,9 +319,23 @@ pub(crate) enum Command {
         /// Non-interactive: skip the API-key prompt (read `OPENROUTER_API_KEY`
         /// from the environment instead, noting if unset) and skip the
         /// editor-wiring confirmation (auto-detected editors are wired
-        /// without asking).
+        /// without asking). Also grants install consent (see `--install-tools`).
         #[arg(long)]
         yes: bool,
+        /// Additionally wire the two OPEN starter packs
+        /// (`cognitive-architectures` + `praxec-meta`) under `repos:` and point
+        /// `discovery.registry` at the always-latest `praxec/packs` registry
+        /// (`{uri, ref: main}`), then run tool provisioning on the result.
+        #[arg(long)]
+        with_starter_packs: bool,
+        /// Wire exactly one pack under `repos:` (`{uri, ref: main}`). Combine
+        /// with `--with-starter-packs` to union (no duplicates).
+        #[arg(long)]
+        pack: Option<String>,
+        /// Grant consent to INSTALL any missing pack tools during the
+        /// provisioning step (default is offer-only). `--yes` implies this.
+        #[arg(long)]
+        install_tools: bool,
     },
 }
 
@@ -434,6 +463,25 @@ pub(crate) enum ConnectionsCommand {
         config: PathBuf,
         /// The granted connection to revoke.
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ToolsCommand {
+    /// Install one pack tool by id (or `command`), resolved against the config's
+    /// `discovery.registry`, through the one [`ProvisionInstaller`] under
+    /// `Consent::Granted` — the same installer `doctor --fix` / `init
+    /// --install-tools` use. This is a THIN wrapper (no new install logic): it
+    /// looks the tool up and delegates. Fail-fast (non-zero) on an unknown
+    /// tool-id, an unconfigured registry, an install error, or a refused
+    /// (checksum-mismatch) / emit-only (cargo) outcome.
+    Install {
+        /// Path to the gateway YAML config (its `discovery.registry` resolves
+        /// the tool coordinates).
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The tool id (or its `command`) to install.
+        tool_id: String,
     },
 }
 

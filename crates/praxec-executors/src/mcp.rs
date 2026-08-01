@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +26,31 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::idle::{ActivityClock, ActivityTracked, with_idle_timeout};
+
+/// Build the `PATH` a stdio MCP child is spawned with: the praxec-managed bin
+/// dir (`<config-dir>/praxec/bin`, resolved via
+/// [`praxec_core::provision_install::managed_bin_dir`]) PREPENDED to the
+/// caller's inherited `PATH`, so a tool installed by `praxec tools install` /
+/// `doctor --fix` resolves for a bare `command:` connection. Prepend (never
+/// clobber): the managed dir wins ties but every inherited entry survives.
+/// `managed = None` (no config dir) leaves the inherited `PATH` unchanged —
+/// fail-safe. Cross-platform via [`std::env::join_paths`], never a hardcoded
+/// separator. Pure, so the prepend order is unit-tested without a real spawn.
+fn child_path_with_managed_bin(current: Option<OsString>, managed: Option<&Path>) -> OsString {
+    let Some(managed) = managed else {
+        return current.unwrap_or_default();
+    };
+    let existing: Vec<PathBuf> = current
+        .as_ref()
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    let mut dirs = Vec::with_capacity(existing.len() + 1);
+    dirs.push(managed.to_path_buf());
+    dirs.extend(existing);
+    // A join failure (a dir containing the platform separator) is degenerate;
+    // fall back to the inherited PATH rather than spawn with a mangled one.
+    std::env::join_paths(dirs).unwrap_or_else(|_| current.unwrap_or_default())
+}
 
 /// #11 — the seam a downstream MCP server's `elicitation/create` is relayed
 /// through. praxec is a MIDDLE node: when a governed `kind: mcp` tool needs a
@@ -356,6 +383,16 @@ impl RmcpToolCaller {
 
             let mut cmd = tokio::process::Command::new(command);
             cmd.args(&conn.args);
+            // Put the praxec-managed bin dir on the child's PATH so a tool
+            // installed via `praxec tools install` (which lands in
+            // `<config-dir>/praxec/bin`) spawns for a bare `command:` connection
+            // — closing the install-succeeds/spawn-fails onboarding gap. Prepend,
+            // don't clobber; a `None` managed dir leaves PATH untouched.
+            let managed = praxec_core::provision_install::managed_bin_dir();
+            cmd.env(
+                "PATH",
+                child_path_with_managed_bin(std::env::var_os("PATH"), managed.as_deref()),
+            );
             for (k, v) in &conn.env {
                 cmd.env(k, v);
             }
@@ -791,6 +828,37 @@ fn classify(message: String) -> ExecutorError {
         ExecutorError::Connection(message)
     } else {
         ExecutorError::Transient(message)
+    }
+}
+
+#[cfg(test)]
+mod child_path_tests {
+    use super::*;
+
+    // The managed bin dir is PREPENDED: it is the first entry, and every
+    // inherited entry survives in its original order (prepend, not clobber).
+    #[test]
+    fn managed_bin_dir_is_prepended_ahead_of_the_inherited_path() {
+        let current = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
+        let managed = PathBuf::from("/home/u/.config/praxec/bin");
+        let out = child_path_with_managed_bin(Some(current), Some(&managed));
+        let parts: Vec<PathBuf> = std::env::split_paths(&out).collect();
+        assert_eq!(
+            parts,
+            vec![
+                PathBuf::from("/home/u/.config/praxec/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+            ]
+        );
+    }
+
+    // Fail-safe: no managed dir → the inherited PATH is returned verbatim.
+    #[test]
+    fn no_managed_dir_leaves_the_path_unchanged() {
+        let current = std::env::join_paths(["/usr/bin", "/bin"]).unwrap();
+        let out = child_path_with_managed_bin(Some(current.clone()), None);
+        assert_eq!(out, current);
     }
 }
 

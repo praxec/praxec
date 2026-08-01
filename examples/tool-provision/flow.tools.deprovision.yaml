@@ -19,10 +19,11 @@
 # to inert/staged; it does NOT touch the staged body. Two follow-ups are
 # DELIBERATELY out of scope here (documented, not built):
 #
-#   - Uninstall: for an npx-distributed stdio server (`installing`'s recipe
-#     in flow.tools.provision.yaml runs `npm install -g`), there is no
-#     matching `npm uninstall -g` step here. The package stays on disk;
-#     only its praxec connection is un-granted.
+#   - Uninstall: `installing` in flow.tools.provision.yaml delegates the
+#     install to `praxec tools install` (the one `ProvisionInstaller`, which
+#     places a prebuilt binary), but there is no matching uninstall step
+#     here. The installed binary stays on disk; only its praxec connection
+#     is un-granted.
 #   - Secret purge: `collecting` (flow.tools.provision.yaml) records only
 #     env-var NAMES the operator already had set in `providers.env` — the
 #     values live in the operator's own process environment, not in praxec.

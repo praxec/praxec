@@ -84,3 +84,10 @@ futures = { workspace = true }
 praxec-executors = { workspace = true }
 praxec-llm-executor = { workspace = true }
 tempfile = "3"
+# cpm-planner live-proof (tests/provision_cpm_planner.rs) — build a real
+# release archive + its checksums.sha256 in-memory so the fake InstallerIo
+# serves a genuine asset through the real resolve→verify→unpack→place chain.
+sha2 = { workspace = true }
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -59,6 +59,15 @@ globset = "0.4"
 dirs = "5"
 tempfile = "3"
 
+# ProvisionInstaller release provider (`provision_install`) — unpack a
+# downloaded release asset. `.tar.gz` (unix assets) via flate2 (pure-Rust
+# miniz_oxide backend) + tar; `.zip` (windows assets) via zip. Checksum verify
+# reuses the workspace `sha2`; the HTTP fetch reuses the blocking `reqwest`
+# already declared above (no new client).
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 [[bench]]
 name = "workflow_bench"
 harness = false

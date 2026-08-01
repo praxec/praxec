@@ -10,62 +10,30 @@
 #   granting → `praxec connections grant` (GRANT: the separate, explicit,
 #                                          auditable operator trust act)
 #
-# select → trust_gate ─┬─(verified/org)→ installing ──────────────┐
-#                       └─(community)──→ community_gate            ├→ collecting
-#                                          ├─approve→ community_installing
-#                                          └─decline→ failed         (rejoins the same
-#                                                                     path as installing)
+# select → trust_gate ─┬─(verified/org)────────────────→ installing ─┐
+#                       └─(community)──→ community_gate               ├→ collecting
+#                                          ├─approve────────→ installing
+#                                          └─decline→ failed
 #        → collecting → building → staging → validating → granting → done | failed
 #
-# ── Phase 3 (P3.2) — the community lane, sandboxed + double-approved ────
+# ── Phase 3 (P3.2) — the community lane, double-approved ────────────────
 # `trust_gate` no longer refuses `community` candidates. It routes them
 # through ONE extra operator gate (`community_gate` — "yes, I understand
-# this is unverified/third-party and I accept the risk of running its
-# install code") before `community_installing` runs the SAME per-transport
-# install recipe as `installing`, except the code-executing branch (stdio's
-# `npm install -g`) is recast from a raw `kind: cli` + `connection: npm`
-# invocation into a hash-pinned `kind: script` (`install.community-npm`,
-# below) carrying a `confinement: "confined"` profile — the ONLY executor
-# kind in this codebase actually wired to `SandboxProvider` (ADR-0006; see
-# `crates/praxec-core/src/sandbox.rs` + `crates/praxec-executors/src/
-# script.rs`). `kind: cli` never reads `confinement` at all (grep-verified:
-# only `script.rs` calls `ConfinementProfile::from_executor_config`), so a
-# `kind: cli` step is UNSANDBOXABLE as-is — that's the real grammar
-# constraint this design respects rather than fakes.
+# this is unverified/third-party and I accept the risk of installing it")
+# before they reach the SAME `installing` state a verified/org candidate
+# does. Net: community gets TWO operator approvals (`community_gate` then
+# `granting`); verified/org get the one (`granting`) they always had.
 #
-# This ALSO happens to be exactly the codebase's existing trust philosophy
-# for untrusted-provenance content (see `crates/praxec-executors/src/
-# untrusted_execution.rs`'s header: "untrusted content may run ONLY
-# hash-pinned `kind: script` ... never a fresh raw command") — that module
-# itself is a DIFFERENT mechanism (a publish-time provenance gate over
-# whole authored workflow DEFINITIONS, invoked by the `registry` executor
-# and `structural_analysis`'s advisory vet; it has no per-step "run
-# sandboxed" marker and is never consulted mid-execution of an already
-# defined flow like this one), but the same "script, not raw command" stance
-# is exactly right here too.
-#
-# `community_installing` rejoins `collecting` on success — from there a
-# community-tier candidate follows the IDENTICAL collect → building →
-# staging → validating → granting path any verified/org tool does, so
-# `granting`'s `connections grant` remains the ONE final activation gate for
-# EVERY tier. Net: community gets TWO operator approvals (`community_gate`
-# then `granting`); verified/org get the one (`granting`) they always had.
-#
-# Known residual (documented, not silently worked around): `confinement:
-# "confined"` is deny-all egress (ADR-0006 default). `npm install -g` needs
-# network to reach the registry, and NEITHER wired sandbox backend supports
-# a working egress ALLOWLIST today (`BwrapProvider`/`OciProvider` both
-# `bail!` with `*_EGRESS_UNSUPPORTED` on one) — so a REAL drive of the
-# stdio/npm community branch currently fails fast at `INSTALL_FAILED`
-# end-to-end until a backend gains selective egress. That failure is typed
-# and routed through this workflow's existing `branches`/`failed` handling
-# exactly like any other install failure — never a silent unconfined
-# fallback. Also note: a real drive additionally needs `praxec.execution.
-# sandbox: bwrap` (or `oci` + an image) configured in the gateway config, or
-# `community_installing`'s script step fails fast with
-# `CONFINEMENT_UNAVAILABLE` (a declared `confinement` profile with no
-# provider configured refuses to run unconfined — see `script.rs`) rather
-# than silently running unsandboxed.
+# `installing` DELEGATES to the one installer (`praxec tools install <id>`
+# → `ProvisionInstaller`), which obtains a checksum-verified prebuilt
+# binary (release provider) or a pulled image (docker provider) — it never
+# runs a package's arbitrary install scripts. That is why the community
+# lane no longer needs a per-step sandbox (the old hash-pinned,
+# `confinement: "confined"` community package-manager install script is
+# gone): there is no untrusted code execution to confine at install time.
+# The extra `community_gate` approval, not a sandbox, is the community-tier
+# control; `granting` remains the ONE final
+# activation gate for EVERY tier.
 #
 # ── The env-wiring gap (P2.3b) — CLOSED, here's exactly how ─────────────
 # `staging` used to template only the CONNECTION IDENTITY (name / kind /
@@ -124,11 +92,15 @@
 # provision exactly as before: `built_body` just has no `env:`/
 # `required_secrets:` keys.
 #
-# Transport coverage is deliberately the three the design doc names
-# (`stdio→mcp+command`, `remote→mcp+url`, `rest→rest`); anything else
-# (e.g. `docker`) fails fast at `installing`/`building` with a typed
-# `*_RECIPE_UNAVAILABLE` reason rather than silently no-opping — extend
-# the guarded transitions below to add a transport.
+# Transport coverage: `installing` is exhaustive over the closed transport
+# enum — `stdio`/`docker` DELEGATE the local install to `praxec tools
+# install` (the installer resolves release vs docker internally), while
+# `remote→mcp+url` / `rest→rest` need nothing installed (noop). `building`
+# then assembles a connection body for the three the design doc names
+# (`stdio→mcp+command`, `remote→mcp+url`, `rest→rest`); a `docker`-transport
+# candidate installs but currently fails fast at `building` with a typed
+# `BUILD_RECIPE_UNAVAILABLE` (no docker connection-body recipe yet) rather
+# than silently no-opping — extend the `building` transitions to add it.
 
 # Lexicon entry for the one script subject this workflow defines (SPEC §30.10.4).
 lexicon:
@@ -136,12 +108,6 @@ lexicon:
     definition_short: >
       Assemble a staged connection's full JSON body (kind, identity,
       env:/required_secrets:) from a candidate + operator-collected values.
-  install.community-npm:
-    definition_short: >
-      Install a COMMUNITY-tier (unverified/third-party) npx-distributed
-      stdio server package. Hash-pinned `kind: script` (not a raw `kind:
-      cli` invocation) so it can carry a `confinement:` profile and run
-      under the ADR-0006 sandbox — see the workflow header's Phase 3 note.
 
 scripts:
   build.connection-body:
@@ -152,7 +118,10 @@ scripts:
       set -euo pipefail
 
       transport="$1"
-      npm_pkg="$2"
+      # For the stdio lane this is the tool's COMMAND (the installed release
+      # binary's name) — the same identity `praxec tools install <id>` places on
+      # PATH. (remote/rest lanes ignore this positional; they wire `url`.)
+      command="$2"
       source_url="$3"
       secret_env_names_json="$4"
       collected_config_json="$5"
@@ -172,11 +141,15 @@ scripts:
 
       case "$transport" in
         stdio)
+          # Wire the INSTALLED release binary as the connection body — its
+          # `command` is what `praxec tools install <id>` placed on PATH. (There
+          # is no npm/npx provider anymore; the installer distributes
+          # release/docker/cargo binaries only.)
           jq -nc \
-            --arg pkg "$npm_pkg" \
+            --arg cmd "$command" \
             --argjson secrets "$required_secrets" \
             --argjson cfg "$collected_config_json" \
-            '{kind:"mcp", command:"npx", args:["-y",$pkg]}
+            '{kind:"mcp", command:$cmd}
              + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
              + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
           ;;
@@ -205,16 +178,6 @@ scripts:
           ;;
       esac
 
-  install.community-npm:
-    verb: install
-    lifecycle: stable
-    body: |
-      #!/usr/bin/env bash
-      set -euo pipefail
-
-      npm_pkg="$1"
-      npm install -g "$npm_pkg"
-
 workflows:
   flow.tools.provision:
     description: >
@@ -222,9 +185,9 @@ workflows:
       the existing `connections add` (stage) → `connections grant`
       (operator trust act) CLI. Verified/org candidates install directly;
       `community` (unverified/third-party) candidates are no longer
-      refused — they take an extra operator-approved, sandboxed detour
-      (`community_gate` → `community_installing`, Phase 3 / P3.2) before
-      rejoining the same collect → validate → grant path every tier shares.
+      refused — they take an extra operator-approved detour through
+      `community_gate` (Phase 3 / P3.2) before reaching the same
+      `installing` and collect → validate → grant path every tier shares.
     tags: [tool-lifecycle, governed, phase2, phase3-community-lane]
 
     inputSchema:
@@ -405,15 +368,15 @@ workflows:
           third-party tool and explicitly accept running its install
           SANDBOXED. This is distinct from `granting` (below), which still
           gates ACTIVATION for every tier — approving here only permits
-          `community_installing` to run; the tool is not wired until
+          `installing` to run for this candidate; the tool is not wired until
           `granting` ALSO approves it. Community tools thus clear TWO
           operator gates; verified/org clear the one (`granting`).
         linkFilter: byGuards
         transitions:
           approve_community_install:
-            title: Approve — install this UNVERIFIED tool, sandboxed.
+            title: Approve — install this UNVERIFIED tool.
             actor: human
-            target: community_installing
+            target: installing
             guards:
               - { kind: permission, permission: workflow.approve }
             output:
@@ -429,35 +392,44 @@ workflows:
               community_approved: false
               reason: "COMMUNITY_DECLINED"
 
-      # ── community_installing ─────────────────────────────────────────
-      community_installing:
+      # ── installing ──────────────────────────────────────────────────
+      installing:
         description: >
-          Phase 3 (P3.2) — the SAME per-transport install recipe as
-          `installing`, reached only after `community_gate` approval, with
-          the one branch that actually executes third-party code (stdio's
-          `npm install -g`) recast as a hash-pinned `kind: script`
-          (`install.community-npm`) carrying `confinement: "confined"` —
-          the real ADR-0006 sandbox marker (`kind: cli`, what `installing`
-          uses, has no confinement support at all — see the workflow
-          header note for why this had to change kind, not just add a
-          field). A non-zero exit is DATA (`treatNonZeroAsFailure: false`);
-          `branches` routes it to `failed` (`INSTALL_FAILED`) exactly like
-          `installing` does. On success, REJOINS the normal path at
-          `collecting` — from here a community tool is indistinguishable
-          from a verified/org one; `granting` still gates its activation.
+          DELEGATE the install to the ONE installer via `praxec tools
+          install <id>` (a `kind: cli` step is the only way a YAML workflow
+          can reach the Rust `ProvisionInstaller`). The installer resolves
+          the release → docker → cargo provider chain, checksum-verifies a
+          downloaded binary, and places it — so this workflow no longer
+          carries a per-transport install recipe (the old package-manager
+          special case and the unsupported-transport dead-end are gone). Exhaustive over the closed transport enum: `stdio`/`docker`
+          need a local install (delegate); `remote`/`rest` need nothing
+          installed (noop). Bounded by `reliability.timeoutMs`; a non-zero
+          exit is DATA (`treatNonZeroAsFailure: false`) so `branches` — not
+          an executor error — routes a real `INSTALL_FAILED` to `failed`.
+          This is the SAME state a community-tier candidate reaches after
+          `community_gate` approves it — one install path, two governance
+          routes to it (no parallel abstraction).
         linkFilter: byGuards
         transitions:
-          install_community_npm:
-            title: "Install (sandboxed): npx-distributed stdio server."
+          # stdio + docker each DELEGATE the local install to the one
+          # installer. Split into two flat single-`expr`-guard transitions
+          # (rather than one `any_of`) so each is independently coverable by
+          # `praxec fuzz`'s satisfier — same reason `trust_gate`'s
+          # `proceed_verified`/`proceed_org` are split.
+          install_stdio:
+            title: "Install (stdio): delegate to `praxec tools install <id>`."
             target: failed # fallback if the branch below doesn't match
             guards:
               - { kind: expr, expr: "$.context.transport == 'stdio'" }
-              - { kind: expr, expr: "$.context.npmPkg != null" }
             executor:
-              kind: script
-              subject: install.community-npm
-              confinement: "confined"
-              args: ["$.context.npmPkg"]
+              kind: cli
+              connection: praxec
+              args:
+                - "tools"
+                - "install"
+                - "--config"
+                - "$.context.config_path"
+                - "$.context.name"
               treatNonZeroAsFailure: false
             reliability:
               timeoutMs: 120000
@@ -469,65 +441,20 @@ workflows:
               installSuccess:  "$.output.success"
               reason: "INSTALL_FAILED"
 
-          community_install_not_needed_remote:
-            title: "Install: remote transport needs nothing installed."
-            target: collecting
-            guards:
-              - { kind: expr, expr: "$.context.transport == 'remote'" }
-            executor: { kind: noop }
-            output:
-              installSuccess: true
-
-          community_install_not_needed_rest:
-            title: "Install: rest transport needs nothing installed."
-            target: collecting
-            guards:
-              - { kind: expr, expr: "$.context.transport == 'rest'" }
-            executor: { kind: noop }
-            output:
-              installSuccess: true
-
-          community_install_unsupported:
-            title: No install recipe for this transport/source combination.
-            target: failed
-            guards:
-              - kind: all_of
-                guards:
-                  - kind: not
-                    guard:
-                      kind: all_of
-                      guards:
-                        - { kind: expr, expr: "$.context.transport == 'stdio'" }
-                        - { kind: expr, expr: "$.context.npmPkg != null" }
-                  - kind: not
-                    guard:
-                      kind: any_of
-                      guards:
-                        - { kind: expr, expr: "$.context.transport == 'remote'" }
-                        - { kind: expr, expr: "$.context.transport == 'rest'" }
-            output:
-              reason: "INSTALL_RECIPE_UNAVAILABLE"
-
-      # ── installing ──────────────────────────────────────────────────
-      installing:
-        description: >
-          Run the candidate's install recipe, derived from
-          transport/source. Bounded by `reliability.timeoutMs`; a non-zero
-          exit is DATA here (`treatNonZeroAsFailure: false`) so the
-          `branches` guard — not an executor error — decides the route,
-          letting a real `INSTALL_FAILED` reason land in `failed`.
-        linkFilter: byGuards
-        transitions:
-          install_npm:
-            title: "Install: npx-distributed stdio server (npm install -g)."
+          install_docker:
+            title: "Install (docker): delegate to `praxec tools install <id>`."
             target: failed # fallback if the branch below doesn't match
             guards:
-              - { kind: expr, expr: "$.context.transport == 'stdio'" }
-              - { kind: expr, expr: "$.context.npmPkg != null" }
+              - { kind: expr, expr: "$.context.transport == 'docker'" }
             executor:
               kind: cli
-              connection: npm
-              args: ["install", "-g", "$.context.npmPkg"]
+              connection: praxec
+              args:
+                - "tools"
+                - "install"
+                - "--config"
+                - "$.context.config_path"
+                - "$.context.name"
               treatNonZeroAsFailure: false
             reliability:
               timeoutMs: 120000
@@ -556,27 +483,6 @@ workflows:
             executor: { kind: noop }
             output:
               installSuccess: true
-
-          install_unsupported:
-            title: No install recipe for this transport/source combination.
-            target: failed
-            guards:
-              - kind: all_of
-                guards:
-                  - kind: not
-                    guard:
-                      kind: all_of
-                      guards:
-                        - { kind: expr, expr: "$.context.transport == 'stdio'" }
-                        - { kind: expr, expr: "$.context.npmPkg != null" }
-                  - kind: not
-                    guard:
-                      kind: any_of
-                      guards:
-                        - { kind: expr, expr: "$.context.transport == 'remote'" }
-                        - { kind: expr, expr: "$.context.transport == 'rest'" }
-            output:
-              reason: "INSTALL_RECIPE_UNAVAILABLE"
 
       # ── collecting ──────────────────────────────────────────────────
       collecting:
@@ -649,17 +555,20 @@ workflows:
         linkFilter: byGuards
         transitions:
           build_stdio_mcp:
-            title: "Build: stdio mcp connection body (npx-distributed server)."
+            title: "Build: stdio mcp connection body (installed release binary)."
             target: failed
+            # No `npmPkg` guard: `installing` already placed the release binary
+            # (release/docker/cargo — there is no npm provider), so the connection
+            # body wires that binary's COMMAND (`$.context.name`, the id `praxec
+            # tools install` used), not a package spec.
             guards:
               - { kind: expr, expr: "$.context.transport == 'stdio'" }
-              - { kind: expr, expr: "$.context.npmPkg != null" }
             executor:
               kind: script
               subject: build.connection-body
               args:
                 - "stdio"
-                - "$.context.npmPkg"
+                - "$.context.name"
                 - "$.context.sourceUrl"
                 - "$.context.secretEnvNames"
                 - "$.context.collectedConfig"
@@ -729,12 +638,9 @@ workflows:
             guards:
               - kind: all_of
                 guards:
-                  - kind: not
-                    guard:
-                      kind: all_of
-                      guards:
-                        - { kind: expr, expr: "$.context.transport == 'stdio'" }
-                        - { kind: expr, expr: "$.context.npmPkg != null" }
+                  # stdio always has a build recipe now (installed binary → mcp
+                  # command); only a non-stdio transport can fall through here.
+                  - { kind: expr, expr: "$.context.transport != 'stdio'" }
                   - kind: not
                     guard:
                       kind: all_of
@@ -872,6 +778,5 @@ workflows:
         description: >
           Provisioning did not complete. `context.reason` carries the typed
           cause (UNKNOWN_TRUST_TIER | COMMUNITY_DECLINED | INSTALL_FAILED |
-          INSTALL_RECIPE_UNAVAILABLE | BUILD_FAILED |
-          BUILD_RECIPE_UNAVAILABLE | STAGE_FAILED | VALIDATION_FAILED |
-          GRANT_FAILED | OPERATOR_DECLINED).
+          BUILD_FAILED | BUILD_RECIPE_UNAVAILABLE | STAGE_FAILED |
+          VALIDATION_FAILED | GRANT_FAILED | OPERATOR_DECLINED).

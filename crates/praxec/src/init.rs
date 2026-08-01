@@ -80,6 +80,135 @@ default:
 "#
 }
 
+/// The two **OPEN** starter packs `--with-starter-packs` wires under `repos:`,
+/// always-latest (`{uri, ref: main}`). Deliberately excludes
+/// `cognitive-architectures-max` (premium/paid) and `frontrails` (`include:`-
+/// based, deferred to a fast-follow — design §7).
+pub(crate) const STARTER_PACK_URIS: [&str; 2] = [
+    "git+https://github.com/praxec/cognitive-architectures",
+    "git+https://github.com/praxec/praxec-meta",
+];
+
+/// The always-latest packs registry `--with-starter-packs` points
+/// `discovery.registry` at, as a `{uri, ref: main}` object — NOT hash-pinned
+/// (design §5: currency over pinning).
+pub(crate) const STARTER_REGISTRY_URI: &str = "git+https://github.com/praxec/packs";
+
+/// What to wire into the scaffolded `gateway.yaml`: a set of pack `uri`s under
+/// `repos:` and (for `--with-starter-packs`) the always-latest
+/// `discovery.registry` pointer.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PackWiring {
+    /// Pack `uri`s to union under `repos:` (each becomes `{uri, ref: main}`).
+    pub packs: Vec<String>,
+    /// Whether to set `discovery.registry` to the always-latest starter registry.
+    pub registry: bool,
+}
+
+/// Result of merging pack wiring into a gateway.yaml: the new text plus what
+/// actually changed (so `init` can report it and a re-run's idempotency is
+/// observable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PackWiringOutcome {
+    /// The re-serialized `gateway.yaml` text.
+    pub yaml: String,
+    /// Pack `uri`s newly appended this call (absent already-present ones — the
+    /// union is idempotent, so a re-run yields an empty list).
+    pub added_packs: Vec<String>,
+    /// `true` iff `discovery.registry` was (re-)written this call — `false` when
+    /// not requested, or preserved because one already existed and `!force`.
+    pub registry_wired: bool,
+}
+
+/// Merge `wiring` into the `existing` `gateway.yaml` text idempotently:
+///
+/// - **`repos:`** — union each requested pack `uri` (never duplicate an entry
+///   whose `uri` already appears), appending `{uri, ref: main}` for the new
+///   ones. An existing `repos:` block is preserved and extended, never
+///   clobbered (poka-yoke against losing an operator's hand-added packs).
+/// - **`discovery.registry`** — when `wiring.registry`, set it to the
+///   always-latest `{uri: praxec/packs, ref: main}` object. An existing
+///   `registry` value is PRESERVED unless `force` (matching the gateway/models
+///   `--force` semantics).
+///
+/// Parses + re-serializes through `serde_yaml` so the merge is structural (a
+/// real YAML union), not a fragile text splice; comments in the base scaffold
+/// are not preserved once packs are wired, which is acceptable — the wired file
+/// still loads cleanly (the scaffold's placeholders were comments anyway).
+pub(crate) fn merge_pack_wiring(
+    existing: &str,
+    wiring: &PackWiring,
+    force: bool,
+) -> anyhow::Result<PackWiringOutcome> {
+    use serde_yaml::Value as Yaml;
+
+    let mut root: Yaml =
+        serde_yaml::from_str(existing).context("parsing existing gateway.yaml for pack wiring")?;
+    let map = root
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("gateway.yaml is not a YAML mapping; cannot wire packs"))?;
+
+    // ── repos: union each requested uri ──────────────────────────────────────
+    let mut added_packs = Vec::new();
+    if !wiring.packs.is_empty() {
+        let repos = map
+            .entry(Yaml::from("repos"))
+            .or_insert_with(|| Yaml::Sequence(Vec::new()));
+        let seq = repos.as_sequence_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "gateway.yaml `repos:` is present but not a sequence; refusing to clobber it"
+            )
+        })?;
+        let present: std::collections::BTreeSet<String> = seq
+            .iter()
+            .filter_map(|e| e.get("uri").and_then(Yaml::as_str).map(str::to_string))
+            .collect();
+        for uri in &wiring.packs {
+            if present.contains(uri) {
+                continue; // idempotent — already wired
+            }
+            let mut entry = serde_yaml::Mapping::new();
+            entry.insert(Yaml::from("uri"), Yaml::from(uri.as_str()));
+            entry.insert(Yaml::from("ref"), Yaml::from("main"));
+            seq.push(Yaml::Mapping(entry));
+            added_packs.push(uri.clone());
+        }
+    }
+
+    // ── discovery.registry: always-latest {uri, ref} ─────────────────────────
+    let mut registry_wired = false;
+    if wiring.registry {
+        let discovery = map
+            .entry(Yaml::from("discovery"))
+            .or_insert_with(|| Yaml::Mapping(serde_yaml::Mapping::new()));
+        let dmap = discovery.as_mapping_mut().ok_or_else(|| {
+            anyhow::anyhow!("gateway.yaml `discovery:` is present but not a mapping")
+        })?;
+        if dmap.get("registry").is_none() || force {
+            let mut reg = serde_yaml::Mapping::new();
+            reg.insert(Yaml::from("uri"), Yaml::from(STARTER_REGISTRY_URI));
+            reg.insert(Yaml::from("ref"), Yaml::from("main"));
+            dmap.insert(Yaml::from("registry"), Yaml::Mapping(reg));
+            registry_wired = true;
+        }
+    }
+
+    let yaml = serde_yaml::to_string(&root).context("serializing wired gateway.yaml")?;
+    Ok(PackWiringOutcome {
+        yaml,
+        added_packs,
+        registry_wired,
+    })
+}
+
+/// The install-consent gate for `init`'s provisioning step: OFFER by default,
+/// INSTALL (`Consent::Granted`) only under `--install-tools` or `--yes`.
+/// Consent by construction — a plain `init --with-starter-packs` can never
+/// mutate the machine (design §3 principle 3).
+pub(crate) fn install_consent(install_tools: bool, yes: bool) -> bool {
+    install_tools || yes
+}
+
 /// Outcome of writing (or skipping) one scaffolded file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScaffoldOutcome {
@@ -602,6 +731,384 @@ mod tests {
         fn read_env(&self, key: &str) -> Option<String> {
             self.env.get(key).cloned()
         }
+    }
+
+    // ── pack wiring (Task 5) ─────────────────────────────────────────────────
+
+    /// Parse a merged gateway.yaml back to a `serde_json::Value` for structural
+    /// assertions (via the YAML→JSON bridge the loader itself uses).
+    fn as_json(yaml: &str) -> Value {
+        let y: serde_yaml::Value = serde_yaml::from_str(yaml).expect("merged yaml parses");
+        serde_json::to_value(y).expect("yaml→json")
+    }
+
+    /// The `uri` of every `repos:` entry in a merged config, in order.
+    fn repo_uris(cfg: &Value) -> Vec<String> {
+        cfg["repos"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e["uri"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn starter_set_is_exactly_the_two_open_packs_no_max_no_frontrails() {
+        // Contract 5 — the premium (`-max`) and `include:`-based (frontrails)
+        // packs are deliberately NOT in the starter set.
+        assert_eq!(
+            STARTER_PACK_URIS,
+            [
+                "git+https://github.com/praxec/cognitive-architectures",
+                "git+https://github.com/praxec/praxec-meta",
+            ]
+        );
+        for uri in STARTER_PACK_URIS {
+            assert!(
+                !uri.contains("cognitive-architectures-max"),
+                "premium -max pack must never be in the starter set: {uri}"
+            );
+            assert!(
+                !uri.contains("frontrails"),
+                "include:-based frontrails must never be in the starter set: {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_starter_packs_wires_both_packs_and_the_always_latest_registry() {
+        // Contract 1 (structure) — both starter packs under `repos:` as
+        // `{uri, ref: main}`, and `discovery.registry` as the `{uri, ref: main}`
+        // object (NOT a hash pin, NOT a bare string path).
+        let base = gateway_yaml_content(Path::new("/tmp/px"));
+        let wiring = PackWiring {
+            packs: STARTER_PACK_URIS.iter().map(|s| s.to_string()).collect(),
+            registry: true,
+        };
+        let outcome = merge_pack_wiring(&base, &wiring, false).unwrap();
+        let cfg = as_json(&outcome.yaml);
+
+        assert_eq!(
+            repo_uris(&cfg),
+            [
+                "git+https://github.com/praxec/cognitive-architectures",
+                "git+https://github.com/praxec/praxec-meta",
+            ],
+            "both starter packs wired under repos: {}",
+            outcome.yaml
+        );
+        for entry in cfg["repos"].as_array().unwrap() {
+            assert_eq!(entry["ref"], json!("main"), "always-latest ref: {entry}");
+        }
+        assert_eq!(
+            cfg["discovery"]["registry"]["uri"],
+            json!(STARTER_REGISTRY_URI),
+            "discovery.registry is the {{uri, ref}} object form: {}",
+            outcome.yaml
+        );
+        assert_eq!(cfg["discovery"]["registry"]["ref"], json!("main"));
+        assert!(
+            cfg["discovery"]["registry"]["hash"].is_null(),
+            "the registry is always-latest, never hash-pinned"
+        );
+        assert_eq!(outcome.added_packs.len(), 2);
+        assert!(outcome.registry_wired);
+    }
+
+    #[test]
+    fn pack_flag_wires_exactly_that_one_pack() {
+        // Contract 2 — `--pack <uri>` alone wires exactly one repo entry and,
+        // being pack-only (no --with-starter-packs), no registry pointer.
+        let base = gateway_yaml_content(Path::new("/tmp/px"));
+        let wiring = PackWiring {
+            packs: vec!["git+https://github.com/acme/private-pack".to_string()],
+            registry: false,
+        };
+        let outcome = merge_pack_wiring(&base, &wiring, false).unwrap();
+        let cfg = as_json(&outcome.yaml);
+
+        assert_eq!(
+            repo_uris(&cfg),
+            ["git+https://github.com/acme/private-pack"],
+            "exactly the one requested pack: {}",
+            outcome.yaml
+        );
+        assert_eq!(cfg["repos"][0]["ref"], json!("main"));
+        assert!(
+            cfg["discovery"].is_null(),
+            "pack-only wiring adds no discovery.registry: {}",
+            outcome.yaml
+        );
+        assert!(!outcome.registry_wired);
+    }
+
+    #[test]
+    fn re_run_merges_without_duplicating_repos_or_clobbering_the_registry() {
+        // Contract 3 — a second merge over the first's output is a no-op union:
+        // no duplicate repos, the existing registry preserved (not re-written).
+        let base = gateway_yaml_content(Path::new("/tmp/px"));
+        let wiring = PackWiring {
+            packs: STARTER_PACK_URIS.iter().map(|s| s.to_string()).collect(),
+            registry: true,
+        };
+        let first = merge_pack_wiring(&base, &wiring, false).unwrap();
+        let second = merge_pack_wiring(&first.yaml, &wiring, false).unwrap();
+
+        let cfg = as_json(&second.yaml);
+        assert_eq!(
+            repo_uris(&cfg),
+            [
+                "git+https://github.com/praxec/cognitive-architectures",
+                "git+https://github.com/praxec/praxec-meta",
+            ],
+            "re-run must not duplicate repos: {}",
+            second.yaml
+        );
+        assert!(
+            second.added_packs.is_empty(),
+            "nothing newly added on the idempotent re-run"
+        );
+        assert!(
+            !second.registry_wired,
+            "an existing registry is preserved, not re-written, without --force"
+        );
+        // The registry pointer survives the re-run unchanged.
+        assert_eq!(
+            cfg["discovery"]["registry"]["uri"],
+            json!(STARTER_REGISTRY_URI)
+        );
+    }
+
+    #[test]
+    fn pack_wiring_preserves_a_hand_added_repo_entry() {
+        // Poka-yoke — an operator's existing `repos:` entry is preserved and the
+        // starter packs are unioned in beside it, never clobbering it.
+        let mut base = gateway_yaml_content(Path::new("/tmp/px"));
+        base.push_str("repos:\n  - { uri: \"git+https://github.com/acme/mine\", ref: dev }\n");
+        let wiring = PackWiring {
+            packs: STARTER_PACK_URIS.iter().map(|s| s.to_string()).collect(),
+            registry: false,
+        };
+        let outcome = merge_pack_wiring(&base, &wiring, false).unwrap();
+        let cfg = as_json(&outcome.yaml);
+        let uris = repo_uris(&cfg);
+        assert!(
+            uris.contains(&"git+https://github.com/acme/mine".to_string()),
+            "the hand-added repo must be preserved: {}",
+            outcome.yaml
+        );
+        assert_eq!(
+            uris.len(),
+            3,
+            "one existing + two unioned: {}",
+            outcome.yaml
+        );
+        // The operator's non-`main` ref is untouched.
+        let mine = cfg["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["uri"] == json!("git+https://github.com/acme/mine"))
+            .unwrap();
+        assert_eq!(mine["ref"], json!("dev"), "existing ref not rewritten");
+    }
+
+    #[test]
+    fn force_resets_an_existing_registry_pointer() {
+        let mut base = gateway_yaml_content(Path::new("/tmp/px"));
+        base.push_str("discovery:\n  registry: /some/local/packs.yaml\n");
+        let wiring = PackWiring {
+            packs: Vec::new(),
+            registry: true,
+        };
+        // Without force: the existing local-path registry is preserved.
+        let kept = merge_pack_wiring(&base, &wiring, false).unwrap();
+        assert!(!kept.registry_wired);
+        assert_eq!(
+            as_json(&kept.yaml)["discovery"]["registry"],
+            json!("/some/local/packs.yaml")
+        );
+        // With force: reset to the always-latest object.
+        let reset = merge_pack_wiring(&base, &wiring, true).unwrap();
+        assert!(reset.registry_wired);
+        assert_eq!(
+            as_json(&reset.yaml)["discovery"]["registry"]["uri"],
+            json!(STARTER_REGISTRY_URI)
+        );
+    }
+
+    #[test]
+    fn install_consent_is_offer_only_unless_install_tools_or_yes() {
+        // Contract 4 (consent mapping) — default is offer-only; `--install-tools`
+        // or `--yes` grants install consent.
+        assert!(!install_consent(false, false), "default → offer-only");
+        assert!(install_consent(true, false), "--install-tools → install");
+        assert!(install_consent(false, true), "--yes → install");
+        assert!(install_consent(true, true));
+    }
+
+    // ── full resolve — the wired config parses AND loads (mocked transport) ───
+
+    fn git(args: &[&str], cwd: &Path) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Build a bare git repo at `bare_dir` whose single `main` commit carries
+    /// `files` (relative path → contents). Returns the `file://` URL — the exact
+    /// shape `repo_git::clone_url` yields once a `git+https://` uri is redirected
+    /// (mocks the git *transport*, never skips the resolve).
+    fn build_bare(bare_dir: &Path, files: &[(&str, &str)]) -> String {
+        let seed = tempfile::tempdir().unwrap();
+        for (rel, body) in files {
+            let p = seed.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        git(&["init", "--quiet", "-b", "main"], seed.path());
+        git(&["add", "-A"], seed.path());
+        git(
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--quiet",
+                "-m",
+                "seed",
+            ],
+            seed.path(),
+        );
+        let out = std::process::Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                "--bare",
+                &seed.path().display().to_string(),
+                &bare_dir.display().to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "bare clone failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        format!("file://{}", bare_dir.display())
+    }
+
+    /// Contract 1 (load) — the `--with-starter-packs` wired config resolves fully
+    /// through the SAME `load_resolved_with_repos` path `praxec check` uses:
+    /// both packs' workflows AND the always-latest registry's tools land. The git
+    /// transport is local `file://` bare repos (mocked, never skipped) — the FULL
+    /// resolve runs. Mirrors `remote_example_validates` + Task 1's `registry_source`.
+    #[test]
+    fn with_starter_packs_scaffolded_config_parses_and_loads() {
+        let host = tempfile::tempdir().unwrap();
+        let target = host.path().join("praxec");
+        std::fs::create_dir_all(&target).unwrap();
+
+        // Bare repos standing in for the three praxec.github remotes.
+        let cog_bare = host.path().join("cog.git");
+        let meta_bare = host.path().join("meta.git");
+        let packs_bare = host.path().join("packs.git");
+        let cog_uri = build_bare(
+            &cog_bare,
+            &[
+                (
+                    "praxec.repo.yaml",
+                    "schema: praxec.repo/v1\nname: cog\nnamespace: cognitive\nversion: 0.0.1\n",
+                ),
+                (
+                    "flows/flow.hello.yaml",
+                    "workflows:\n  flow.hello:\n    title: Hello\n    description: trivial\n    initialState: ready\n    states:\n      ready:\n        terminal: true\n",
+                ),
+            ],
+        );
+        let meta_uri = build_bare(
+            &meta_bare,
+            &[
+                (
+                    "praxec.repo.yaml",
+                    "schema: praxec.repo/v1\nname: meta\nnamespace: meta\nversion: 0.0.1\n",
+                ),
+                (
+                    "flows/flow.hello.yaml",
+                    "workflows:\n  flow.hello:\n    title: Hello\n    description: trivial\n    initialState: ready\n    states:\n      ready:\n        terminal: true\n",
+                ),
+            ],
+        );
+        let packs_uri = build_bare(
+            &packs_bare,
+            &[(
+                "packs.yaml",
+                "schema: praxec.packs/v3\ntools:\n  - id: ripgrep\n    name: ripgrep\n    description: Fast search.\n    command: rg\n    version: 14.1.0\n",
+            )],
+        );
+
+        // Scaffold + wire, then redirect the three `git+https://…praxec/…` uris to
+        // the local bare repos (the transport mock).
+        let base = gateway_yaml_content(&target);
+        let wiring = PackWiring {
+            packs: STARTER_PACK_URIS.iter().map(|s| s.to_string()).collect(),
+            registry: true,
+        };
+        let wired = merge_pack_wiring(&base, &wiring, false).unwrap().yaml;
+        let redirected = wired
+            .replace(
+                "git+https://github.com/praxec/cognitive-architectures",
+                &cog_uri,
+            )
+            .replace("git+https://github.com/praxec/praxec-meta", &meta_uri)
+            .replace("git+https://github.com/praxec/packs", &packs_uri);
+
+        let gateway_path = target.join("gateway.yaml");
+        std::fs::write(&gateway_path, &redirected).unwrap();
+        std::fs::write(target.join("models.yaml"), models_yaml_content()).unwrap();
+
+        let (config, soft) = praxec_core::config::load_resolved_with_repos(&gateway_path)
+            .expect("the wired, transport-mocked gateway.yaml must load cleanly");
+        assert!(
+            soft.is_empty(),
+            "expected zero soft diagnostics, got: {soft:?}"
+        );
+
+        // The packs resolved: both namespaced workflows are present.
+        let workflows = config["workflows"].as_object().expect("workflows object");
+        assert!(
+            workflows.contains_key("cognitive/flow.hello"),
+            "cognitive-architectures pack resolved: {:?}",
+            workflows.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            workflows.contains_key("meta/flow.hello"),
+            "praxec-meta pack resolved: {:?}",
+            workflows.keys().collect::<Vec<_>>()
+        );
+
+        // The always-latest registry resolved: the object was rewritten to the
+        // clone's on-disk `packs.yaml` path, which loads.
+        let reg_path = config["discovery"]["registry"]
+            .as_str()
+            .expect("discovery.registry resolved to a path string");
+        assert!(
+            reg_path.ends_with("packs.yaml"),
+            "registry resolved to the clone's packs.yaml: {reg_path}"
+        );
+        praxec_core::registry_v3::Registry::load_path(Path::new(reg_path))
+            .expect("the always-latest-sourced registry loads");
     }
 
     #[test]

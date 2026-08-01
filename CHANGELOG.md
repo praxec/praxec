@@ -8,6 +8,51 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [Unreleased] — governed tool provisioning (prebuilt binaries, zero compilation)
+
+Closes the onboarding dead-end where a pack's companion MCP tools (cpm-planner,
+fmeca-mcp, …) had to be **compiled** on the operator's machine — which failed on
+Windows. Those tools already publish prebuilt binaries + docker images; now
+praxec installs them (Increment I of ADR-0013 step (c)).
+
+### Added
+
+- **Always-latest registry sourcing** — `discovery.registry` accepts a local
+  path string **or** an object `{ uri, ref }`, sourced always-latest (clone/reset
+  to the tip of `ref` on every load) via the same machinery as `repos:`. A
+  `{ uri, hash }` freeze is refused (`DISCOVERY_REGISTRY_HASH_PIN`) — currency
+  over pinning; offline degrades to the last cached tip with a warning.
+- **`ProvisionInstaller`** (`praxec_core::provision_install`) — obtains a tool
+  binary via the onboarding provider chain **release → docker → cargo**: the
+  prebuilt release binary is preferred (no compiler, no Docker daemon needed),
+  every download is **checksum-verified** against the release `checksums.sha256`
+  and refused on mismatch, placement is on a praxec-managed PATH dir, and the
+  cargo/source path is emit-only (never shells out). Idempotent and fail-fast
+  (errors name the resolved URL + host triple).
+- **`praxec doctor --fix`** — resolves each required-but-missing tool against the
+  registry, prints the exact provider + command it would run (offer-only by
+  default), and installs under `--fix` consent.
+- **`praxec tools install <tool-id>`** — install one registry tool by id.
+- **`praxec init --with-starter-packs [--pack <uri>] [--install-tools]`** —
+  scaffolds a gateway with the starter packs' `repos:` block + the always-latest
+  `discovery.registry` pointer wired, then runs the doctor resolve path (offer by
+  default; installs under `--install-tools`/`--yes`). Idempotent re-run.
+
+### Changed
+
+- `flow.tools.provision`'s install step now **delegates to the one installer**
+  (`praxec tools install`) for release + docker; `currency.rs` remediation points
+  at the release-binary path.
+
+### Removed
+
+- The `npm install -g` install branch, the `INSTALL_RECIPE_UNAVAILABLE`
+  dead-end states, the community lane's separate sandboxed npm-install state, and
+  the `cargo install --path --force` currency remediation — one installer, no
+  parallel abstractions. Community tools keep their extra `community_gate`
+  double-approval (checksum-verified binaries run no arbitrary install scripts,
+  so the per-step sandbox is no longer the protection).
+
 ## [0.0.45] — 2026-07-30 — `praxec init`: one-command onboarding
 
 Turns new-user setup into a single command + one API key, cross-platform
