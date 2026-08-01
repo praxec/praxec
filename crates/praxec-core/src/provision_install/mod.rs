@@ -40,6 +40,9 @@ pub use io::{InstallerIo, RealInstallerIo};
 pub mod provider;
 pub use provider::{Consent, InstallPlan, Provider, install, resolve_provider};
 
+pub mod from_candidate;
+pub use from_candidate::{InstallTarget, from_candidate};
+
 /// The host an install targets. `os` matches `std::env::consts::OS`
 /// (`"linux"`, `"macos"`, `"windows"`) — `"darwin"` is accepted as an alias —
 /// and `arch` matches `std::env::consts::ARCH` (`"x86_64"`, `"aarch64"`).
@@ -68,6 +71,12 @@ pub enum InstallOutcome {
         provider: provider::Provider,
         command: String,
     },
+    /// The requested target is a **remote** tool (a discovered
+    /// [`ToolSource::Url`](crate::tool_catalog::ToolSource::Url)) — there is
+    /// nothing to fetch or place; it is wired as a url connection instead. A
+    /// first-class, non-error outcome (§3 principle 1: discovery normalizes when
+    /// acted on, and a remote endpoint's normalization is "no install needed").
+    NoInstallNeeded { reason: String },
 }
 
 /// Typed failures from the release provider. Every message carries a stable

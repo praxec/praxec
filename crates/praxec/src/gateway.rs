@@ -2814,6 +2814,13 @@ fn provision_report_lines(
                 "tool {}: provider={provider} action={} result=refused ({reason})",
                 tool.id, plan.command
             )),
+            // A remote tool has nothing to install — it is wired as a url
+            // connection. Unreachable from a registry tool (which always carries
+            // a provider coordinate) but handled for exhaustiveness.
+            Ok(InstallOutcome::NoInstallNeeded { reason }) => lines.push(format!(
+                "tool {}: provider={provider} action={} result=no-install-needed ({reason})",
+                tool.id, plan.command
+            )),
             // Cargo is emit-only even under Granted — surface the command to run.
             Ok(InstallOutcome::Offered {
                 provider: p,
@@ -2977,32 +2984,61 @@ fn pack_list(repo: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve `tool_id` to an install and perform it through the ONE installer.
+///
+/// Two sources, in precedence order (curated over discovered):
+///  1. **the loaded registry** (`discovery.registry`) — a `RegistryTool` matched
+///     by id or command, installed as before;
+///  2. **the assembled discovery catalog** (`registries:`) — when the id is in
+///     no registry, a [`ToolCandidate`] matched by exact `name`, normalized to a
+///     provider coordinate ([`from_candidate`]) and routed through the SAME
+///     [`install`], no second installer (§3 principle 1).
+///
+/// Not-found is fail-fast, naming BOTH sources searched.
 fn tools_install_with(
     config: &Value,
     tool_id: &str,
     io: &dyn praxec_core::provision_install::InstallerIo,
+    catalog_io: &dyn praxec_core::tool_catalog::CatalogIo,
 ) -> anyhow::Result<praxec_core::provision_install::InstallOutcome> {
-    use praxec_core::provision_install::{Consent, Host, install};
+    use praxec_core::provision_install::{
+        Consent, Host, InstallOutcome, InstallTarget, from_candidate, install,
+    };
 
-    let registry = load_registry(config)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no `discovery.registry` configured — cannot resolve tool `{tool_id}` to a provider"
-        )
-    })?;
-    let tool = registry
-        .tools
-        .iter()
-        .find(|t| t.id == tool_id || t.command.as_deref() == Some(tool_id))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown tool `{tool_id}`: no `discovery.registry` entry declares this id or command"
-            )
-        })?;
     let host = Host {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
     };
-    Ok(install(tool, &host, Consent::Granted, io)?)
+
+    // 1. Registry precedence: a curated entry always wins over discovery.
+    if let Some(registry) = load_registry(config)? {
+        if let Some(tool) = registry
+            .tools
+            .iter()
+            .find(|t| t.id == tool_id || t.command.as_deref() == Some(tool_id))
+        {
+            return Ok(install(tool, &host, Consent::Granted, io)?);
+        }
+    }
+
+    // 2. Discovery fallback: assemble the `registries:` catalog and normalize a
+    //    candidate matched by exact name to a provider coordinate.
+    let specs = praxec_core::tool_catalog::registries_from(config);
+    let (catalog, _warnings) = praxec_core::tool_catalog::assemble(&specs, catalog_io);
+    if let Some(candidate) = catalog.iter().find(|c| c.name == tool_id) {
+        return match from_candidate(candidate) {
+            InstallTarget::Installable(tool) => Ok(install(&tool, &host, Consent::Granted, io)?),
+            InstallTarget::Remote { url } => Ok(InstallOutcome::NoInstallNeeded {
+                reason: format!("`{tool_id}` is a remote tool — wire a url connection to {url}"),
+            }),
+        };
+    }
+
+    anyhow::bail!(
+        "unknown tool `{tool_id}`: not found in the loaded registry \
+         (`discovery.registry`) nor in the assembled discovery catalog \
+         (`registries:`) — searched both sources"
+    )
 }
 
 /// `praxec tools install <tool-id>` — the thin CLI delegation surface a governed
@@ -3016,7 +3052,8 @@ fn tools_install(config_path: &std::path::Path, tool_id: &str) -> anyhow::Result
 
     let config = load_config(&config_path.to_path_buf())?;
     let io = RealInstallerIo;
-    match tools_install_with(&config, tool_id, &io)? {
+    let catalog_io = praxec_core::tool_catalog::RealCatalogIo;
+    match tools_install_with(&config, tool_id, &io, &catalog_io)? {
         InstallOutcome::Installed { path, version } => {
             println!(
                 "installed `{tool_id}` (version {version}) -> {}",
@@ -3036,6 +3073,12 @@ fn tools_install(config_path: &std::path::Path, tool_id: &str) -> anyhow::Result
         ),
         InstallOutcome::Refused { reason } => {
             anyhow::bail!("install refused for `{tool_id}`: {reason}")
+        }
+        // A discovered remote tool: nothing to fetch, wire a url connection.
+        // Not an error — a first-class "no install needed" outcome.
+        InstallOutcome::NoInstallNeeded { reason } => {
+            println!("`{tool_id}` needs no install: {reason}");
+            Ok(())
         }
     }
 }
@@ -6678,13 +6721,46 @@ mod tests {
             json!({ "discovery": { "registry": reg_path.display().to_string() } })
         }
 
+        /// A catalog IO that never networks — the discovery-fallback tests use a
+        /// `static` registry (whose adapter ignores IO), so this is never called.
+        struct NoopCatalogIo;
+        impl praxec_core::tool_catalog::CatalogIo for NoopCatalogIo {
+            fn github_org_repos(
+                &self,
+                _org: &str,
+            ) -> Result<Vec<praxec_core::tool_catalog::GhRepo>, String> {
+                Err("no network in tests".into())
+            }
+            fn fetch_json(&self, _url: &str) -> Result<serde_json::Value, String> {
+                Err("no network in tests".into())
+            }
+        }
+
+        /// A config with a `registries:` static discovery catalog carrying one
+        /// candidate (name, transport, source) — the discovery fallback's input.
+        fn config_with_discovery(name: &str, source: serde_json::Value) -> serde_json::Value {
+            json!({ "registries": [ {
+                "kind": "static",
+                "name": "local-discovery",
+                "candidates": [ {
+                    "name": name,
+                    "description": format!("{name} from discovery"),
+                    "transport": "docker",
+                    "source": source,
+                    "trust_tier": "verified",
+                    "provenance": "local-discovery"
+                } ]
+            } ] })
+        }
+
         #[test]
         fn tools_install_delegates_to_the_one_installer_by_id() {
             let dir = tempfile::tempdir().unwrap();
             let config = config_with_registry(dir.path());
             let io = FakeIo::default();
-            let outcome = super::super::tools_install_with(&config, "planner-tool", &io)
-                .expect("known tool installs");
+            let outcome =
+                super::super::tools_install_with(&config, "planner-tool", &io, &NoopCatalogIo)
+                    .expect("known tool installs");
             assert!(
                 matches!(
                     outcome,
@@ -6705,7 +6781,8 @@ mod tests {
             let config = config_with_registry(dir.path());
             let io = FakeIo::default();
             // `planner` is the tool's `command`, not its id (`planner-tool`).
-            super::super::tools_install_with(&config, "planner", &io).expect("resolves by command");
+            super::super::tools_install_with(&config, "planner", &io, &NoopCatalogIo)
+                .expect("resolves by command");
             assert_eq!(io.pulls.borrow().len(), 1, "installed via command lookup");
         }
 
@@ -6714,7 +6791,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let config = config_with_registry(dir.path());
             let io = FakeIo::default();
-            let err = super::super::tools_install_with(&config, "nonesuch", &io)
+            let err = super::super::tools_install_with(&config, "nonesuch", &io, &NoopCatalogIo)
                 .expect_err("unknown tool must fail fast");
             assert!(
                 err.to_string().contains("unknown tool `nonesuch`"),
@@ -6726,11 +6803,107 @@ mod tests {
         #[test]
         fn tools_install_without_a_registry_fails_fast() {
             let io = FakeIo::default();
-            let err = super::super::tools_install_with(&json!({}), "planner", &io)
+            let err = super::super::tools_install_with(&json!({}), "planner", &io, &NoopCatalogIo)
                 .expect_err("no registry must fail fast");
             assert!(
                 err.to_string().contains("discovery.registry"),
                 "names the missing registry config: {err}"
+            );
+        }
+
+        // ── Task A4 — discovery → installer reconciliation (Increment III) ──────
+        //
+        // A tool surfaced by `praxec.query {discover}` (a `ToolCandidate` in the
+        // assembled `registries:` catalog) is installable through the SAME ONE
+        // installer, by normalizing the candidate to a provider coordinate. No
+        // second installer; registry precedence preserved; not-found fails fast
+        // naming both sources searched.
+
+        #[test]
+        fn tools_install_reaches_the_installer_for_a_discovered_image_candidate() {
+            // No `discovery.registry`; the tool exists only in the discovery
+            // catalog as a docker `Image` candidate. It must reach `install`
+            // with a docker plan (`docker pull <image>:latest`).
+            let config = config_with_discovery(
+                "acme-mcp",
+                json!({ "image": { "image": "ghcr.io/acme/mcp" } }),
+            );
+            let io = FakeIo::default();
+            let outcome =
+                super::super::tools_install_with(&config, "acme-mcp", &io, &NoopCatalogIo)
+                    .expect("discovered image installs");
+            assert!(
+                matches!(
+                    outcome,
+                    praxec_core::provision_install::InstallOutcome::Installed { .. }
+                ),
+                "got {outcome:?}"
+            );
+            assert_eq!(
+                io.pulls.borrow().as_slice(),
+                &["ghcr.io/acme/mcp:latest".to_string()],
+                "discovered candidate routed through the ONE installer (docker pull)"
+            );
+        }
+
+        #[test]
+        fn tools_install_in_neither_source_fails_fast_naming_both() {
+            // A `registries:` discovery catalog present but without the name;
+            // no `discovery.registry` either → fail-fast naming both sources.
+            let config = config_with_discovery(
+                "acme-mcp",
+                json!({ "image": { "image": "ghcr.io/acme/mcp" } }),
+            );
+            let io = FakeIo::default();
+            let err = super::super::tools_install_with(&config, "ghost", &io, &NoopCatalogIo)
+                .expect_err("a name in neither source must fail fast");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("discovery.registry"),
+                "names the registry source: {msg}"
+            );
+            assert!(
+                msg.contains("registries:"),
+                "names the discovery source: {msg}"
+            );
+            assert_eq!(io.pulls.borrow().len(), 0, "nothing installed");
+        }
+
+        #[test]
+        fn registry_entry_wins_over_a_same_named_discovered_candidate() {
+            // Both sources carry `planner`: the curated registry (docker
+            // ghcr.io/praxec/planner:0.0.2) and a discovered candidate pointing
+            // at a DIFFERENT image. The registry must win.
+            let dir = tempfile::tempdir().unwrap();
+            let reg_path = dir.path().join("packs.yaml");
+            std::fs::write(
+                &reg_path,
+                "schema: praxec.packs/v3\n\
+                 tools:\n  - id: planner\n    name: planner\n    command: planner\n    version: 0.0.2\n    providers:\n      docker: ghcr.io/praxec/planner\n",
+            )
+            .unwrap();
+            let config = json!({
+                "discovery": { "registry": reg_path.display().to_string() },
+                "registries": [ {
+                    "kind": "static",
+                    "name": "local-discovery",
+                    "candidates": [ {
+                        "name": "planner",
+                        "description": "the discovered impostor",
+                        "transport": "docker",
+                        "source": { "image": { "image": "ghcr.io/impostor/planner" } },
+                        "trust_tier": "verified",
+                        "provenance": "local-discovery"
+                    } ]
+                } ]
+            });
+            let io = FakeIo::default();
+            super::super::tools_install_with(&config, "planner", &io, &NoopCatalogIo)
+                .expect("registry entry installs");
+            assert_eq!(
+                io.pulls.borrow().as_slice(),
+                &["ghcr.io/praxec/planner:0.0.2".to_string()],
+                "curated registry wins over the same-named discovered candidate"
             );
         }
     }
