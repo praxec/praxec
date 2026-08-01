@@ -204,10 +204,13 @@ discovery:
   registry: { uri: "git+https://github.com/praxec/packs", ref: main }
 ```
 
-Each tool declares a `providers:` chain (`release`, `docker`, `cargo`). For a
-fresh machine the installer prefers the **prebuilt release binary** (no compiler,
-no Docker daemon required), falling through to docker, then — last-resort,
-emit-only — cargo. Every downloaded binary is **checksum-verified against the
+Each tool declares a `providers:` chain (`release`, `docker`, `npx`, `cargo`).
+For a fresh machine the installer prefers the **prebuilt release binary** (no
+compiler, no Docker daemon required), falling through to docker, then **npx**
+(an npm-distributed stdio MCP server — nothing to download or place; the
+connection wires `npx -y <pkg>` and npx fetches it on run, gated on `npx` being
+on PATH), then — last-resort, emit-only — cargo. Every downloaded binary is
+**checksum-verified against the
 release `checksums.sha256`** and refused on mismatch, so integrity holds however
 the registry was sourced. This verify guarantees the binary matches the
 release's published checksum (anti-corruption / transport-integrity over the
@@ -218,7 +221,17 @@ the asset and its `checksums.sha256` come from the same release page.
   provider + command it *would* run (offer-only; no install without consent).
 - `praxec doctor --fix` — installs the offered tools (consent), verifies, and
   leaves the connection ready.
-- `praxec tools install <tool-id>` — install one tool by its registry id.
+- `praxec tools install <tool-id>` — install one tool by its registry id. If
+  the id isn't in the curated `discovery.registry`, the installer falls back to a
+  **discovered** candidate from the configured `registries:` (matched by name),
+  normalizing it to a provider coordinate (image→docker, repo/crate→release/cargo,
+  npm→npx) and routing it through the **same** installer — so a tool surfaced by
+  `praxec.query { discover }` is installable, with the curated registry always
+  taking precedence over a same-named discovered candidate.
+- `praxec pack list <repo>` — enumerate a pack's `flow.*` and `cap.*` definition
+  ids (namespace-prefixed, grouped + counted) WITHOUT loading a full gateway (no
+  store, no runtime), so you can see what a pack provides before wiring it under
+  `repos:`. Fails fast on a directory with no `praxec.repo.yaml`.
 - `praxec init --with-starter-packs` — scaffold a gateway with the starter
   packs' `repos:` + the always-latest `discovery.registry` pointer wired, then run
   the doctor resolve path (offer by default; add `--install-tools` to install).

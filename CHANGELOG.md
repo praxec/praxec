@@ -38,6 +38,40 @@ praxec installs them (Increment I of ADR-0013 step (c)).
   `discovery.registry` pointer wired, then runs the doctor resolve path (offer by
   default; installs under `--install-tools`/`--yes`). Idempotent re-run.
 
+Increment II/III of ADR-0013 step (c) — pack-level selection and
+discovery→installer reconciliation:
+
+- **`praxec pack list <repo>`** — enumerate a pack's `flow.*` and `cap.*`
+  definition ids (namespace-prefixed, grouped + counted) WITHOUT loading a full
+  gateway (no store, no runtime), so an operator can see what a pack provides
+  before wiring it under `repos:`. Fail-fast on a dir with no `praxec.repo.yaml`.
+- **`praxec init --packs <comma-list>`** — wire a **subset** of the known open
+  starter packs by short id (e.g. `--packs cognitive-architectures,praxec-meta`)
+  + the registry pointer. Unions with `--with-starter-packs` (no duplicates); an
+  unknown id fails fast listing the valid ids. `frontrails` is intentionally NOT
+  a starter pack (licensed `include:{uri,hash}` pack — wire with `--pack <uri>`).
+- **Discovered-tool install** — `praxec tools install <name>` now also installs a
+  tool **discovered** from the configured `registries:` (surfaced by `praxec.query
+  { discover }`), normalizing a `ToolCandidate` to a provider coordinate
+  (image→docker, repo/crate→release/cargo, npm→npx) and routing it through the
+  **same** installer. The curated `discovery.registry` takes precedence on a
+  name collision (a discovered candidate carries no version, so pinned
+  release/cargo installs stay the curated path).
+- **npx provider** — npm-distributed stdio MCP servers now provision via `npx`
+  (no download or placement; `npx -y <pkg>` runs them on demand, gated on `npx`
+  being on PATH). The installer chain is now **release → docker → npx → cargo**
+  (npx before cargo — no toolchain needed).
+- **docker connection-body recipe** — docker-provider tools now wire a `docker
+  run` connection body, clearing the `BUILD_RECIPE_UNAVAILABLE` dead-end for
+  docker candidates in `flow.tools.provision` (stdio / remote / rest lanes
+  unchanged).
+- **Registry currency** (companion [`praxec/packs`](https://github.com/praxec/packs)
+  PR) — `cpm-planner` → 0.0.2, `crossmatrix` → 0.2.0, cognitive-architectures
+  `requires:` completed with `corpus` + `markdown-administrator`, and a new
+  `corpus` tool entry (release/docker/cargo providers).
+- **corpus v0.0.1 release** — cut so its prebuilt binaries publish, making the
+  registry's `corpus` entry release-installable.
+
 ### Changed
 
 - `flow.tools.provision`'s install step now **delegates to the one installer**
