@@ -3,10 +3,10 @@ use std::sync::Arc;
 
 pub(crate) use crate::gateway_config::{
     ApprovalsCommand, AuditCommand, Cli, CliConnectionKind, Command, ConnectionsCommand,
-    CostCommand, InitEditorArg, InspectCommand, IntentCommand, OneshotServer, SchemaCommand,
-    ToolsCommand, ack_guards_used, apply_overlays, build_audit_sink, build_workflow_store,
-    cli_principal, headless_policy_from, is_ephemeral_path, load_config, parse_since,
-    resolve_embedder,
+    CostCommand, InitEditorArg, InspectCommand, IntentCommand, OneshotServer, PackCommand,
+    SchemaCommand, ToolsCommand, ack_guards_used, apply_overlays, build_audit_sink,
+    build_workflow_store, cli_principal, headless_policy_from, is_ephemeral_path, load_config,
+    parse_since, resolve_embedder,
 };
 pub use crate::gateway_config::{
     GatewayOverlays, OverlayCtx, build_evidence_store, build_guidance_ack_store,
@@ -213,6 +213,9 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 connections_grant(&config, &name, yes).await
             }
             ConnectionsCommand::Revoke { config, name } => connections_revoke(&config, &name).await,
+        },
+        Command::Pack { command } => match command {
+            PackCommand::List { repo } => pack_list(&repo),
         },
         Command::Tools { command } => match command {
             ToolsCommand::Install { config, tool_id } => tools_install(&config, &tool_id),
@@ -2879,6 +2882,99 @@ fn provisioning_report(
 ///
 /// Fail-fast (never a silent no-op): an unconfigured registry, an unknown
 /// tool-id, or an [`InstallError`] all return `Err`.
+/// The read-only result of enumerating a pack: its manifest identity plus the
+/// namespace-prefixed definition ids grouped by kind. `flows` are `flow.*`
+/// (orchestrators), `caps` are `cap.*` (capabilities); anything else a pack
+/// happens to declare lands in `other` so nothing silently drops. Each list is
+/// sorted for stable output.
+#[derive(Debug)]
+struct PackListing {
+    name: String,
+    namespace: String,
+    version: String,
+    flows: Vec<String>,
+    caps: Vec<String>,
+    other: Vec<String>,
+}
+
+/// Enumerate a pack's definitions WITHOUT building a gateway. Fail-fast (with
+/// context) when `<repo>` does not exist or carries no `praxec.repo.yaml` (not a
+/// pack). Reuses [`praxec_core::repo::load_repo`] — the exact layout walk
+/// `check`/`serve` use — so the ids reported are precisely what the gateway
+/// would load (namespace-prefixed `<namespace>/<id>`), then classifies each by
+/// its local (post-namespace) segment.
+fn enumerate_pack(repo: &Path) -> anyhow::Result<PackListing> {
+    if !repo.exists() {
+        anyhow::bail!("pack directory `{}` does not exist", repo.display());
+    }
+    let manifest_path = repo.join("praxec.repo.yaml");
+    if !manifest_path.exists() {
+        anyhow::bail!(
+            "`{}` is not a pack: no `praxec.repo.yaml` at {}",
+            repo.display(),
+            manifest_path.display()
+        );
+    }
+
+    let (manifest, aggregate) = praxec_core::repo::load_repo(repo)
+        .with_context(|| format!("loading pack at {}", repo.display()))?;
+
+    let mut flows = Vec::new();
+    let mut caps = Vec::new();
+    let mut other = Vec::new();
+    if let Some(workflows) = aggregate.pointer("/workflows").and_then(Value::as_object) {
+        for key in workflows.keys() {
+            // Keys are `<namespace>/<id>`; classify by the local id segment
+            // (`rsplit('/')` also handles a re-exported fully-qualified id).
+            let local = key.rsplit('/').next().unwrap_or(key.as_str());
+            if local.starts_with("flow.") {
+                flows.push(key.clone());
+            } else if local.starts_with("cap.") {
+                caps.push(key.clone());
+            } else {
+                other.push(key.clone());
+            }
+        }
+    }
+    flows.sort();
+    caps.sort();
+    other.sort();
+
+    Ok(PackListing {
+        name: manifest.name,
+        namespace: manifest.namespace,
+        version: manifest.version,
+        flows,
+        caps,
+        other,
+    })
+}
+
+/// `praxec pack list <repo>` — print a pack's flows/caps without a gateway.
+fn pack_list(repo: &Path) -> anyhow::Result<()> {
+    let listing = enumerate_pack(repo)?;
+    println!(
+        "pack: {} (namespace {}, version {})",
+        listing.name, listing.namespace, listing.version
+    );
+    println!();
+    println!("flows ({}):", listing.flows.len());
+    for id in &listing.flows {
+        println!("  {id}");
+    }
+    println!("caps ({}):", listing.caps.len());
+    for id in &listing.caps {
+        println!("  {id}");
+    }
+    if !listing.other.is_empty() {
+        println!("other ({}):", listing.other.len());
+        for id in &listing.other {
+            println!("  {id}");
+        }
+    }
+    Ok(())
+}
+
 fn tools_install_with(
     config: &Value,
     tool_id: &str,

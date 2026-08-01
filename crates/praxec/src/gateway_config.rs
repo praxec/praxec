@@ -275,6 +275,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ConnectionsCommand,
     },
+    /// Inspect a pack (resource repo) without building a gateway.
+    Pack {
+        #[command(subcommand)]
+        command: PackCommand,
+    },
     /// Provision pack tools through the one installer. The thin delegation
     /// surface a governed `flow.tools.provision` `kind: cli` step reaches (the
     /// only way a YAML step can call the Rust `ProvisionInstaller`): it resolves
@@ -463,6 +468,22 @@ pub(crate) enum ConnectionsCommand {
         config: PathBuf,
         /// The granted connection to revoke.
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum PackCommand {
+    /// Enumerate a pack's `flow.*` (orchestrator) and `cap.*` (capability)
+    /// definition ids WITHOUT loading a full gateway (no store, no runtime).
+    /// Reuses the same `praxec.repo.yaml` layout walk `check`/`serve` use
+    /// ([`praxec_core::repo::load_repo`]) and prints the namespace-prefixed ids
+    /// grouped + counted, so an operator can see what a pack provides before
+    /// wiring it under `repos:`. Read-only and side-effect-free. Fail-fast
+    /// (non-zero) if `<repo>` does not exist or carries no `praxec.repo.yaml`.
+    List {
+        /// Path to the pack (resource repo) directory — the one holding
+        /// `praxec.repo.yaml`.
+        repo: PathBuf,
     },
 }
 
