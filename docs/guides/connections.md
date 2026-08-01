@@ -209,7 +209,10 @@ fresh machine the installer prefers the **prebuilt release binary** (no compiler
 no Docker daemon required), falling through to docker, then — last-resort,
 emit-only — cargo. Every downloaded binary is **checksum-verified against the
 release `checksums.sha256`** and refused on mismatch, so integrity holds however
-the registry was sourced.
+the registry was sourced. This verify guarantees the binary matches the
+release's published checksum (anti-corruption / transport-integrity over the
+release page's TLS) — it is **not** independent provenance or anti-MITM, since
+the asset and its `checksums.sha256` come from the same release page.
 
 - `praxec doctor` — reports each required-but-missing tool with the exact
   provider + command it *would* run (offer-only; no install without consent).

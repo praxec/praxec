@@ -94,7 +94,11 @@ Input: a resolved `RegistryTool` (from the loaded registry) + the operator's con
 2. **release provider** — resolve `(os, arch)` → the exact asset via the registry's declared
    asset pattern for that tool (or the GH releases API for the pinned `version`); download;
    **verify against `checksums.sha256`; refuse on mismatch**; unpack; place the binary on a
-   praxec-managed PATH dir (e.g. `<config-dir>/bin`).
+   praxec-managed PATH dir (e.g. `<config-dir>/bin`). *Trust model:* the `checksums.sha256`
+   verify guarantees the binary matches the release's published checksum (anti-corruption /
+   transport-integrity over the release page's TLS) — it is **not** independent
+   provenance/anti-MITM, since the asset and its `checksums.sha256` are fetched from the same
+   release page.
 3. **docker provider** — `docker pull <image>@<pinned-digest-or-version>`; the connection's
    `command` becomes the `docker run …` form.
 4. **cargo provider** — last-resort source build; emitted only when release+docker both
@@ -238,3 +242,15 @@ Two residuals surfaced during build, recorded here for truthfulness:
   scripts, so the per-step install sandbox protected nothing the checksum verify does not. The
   community-tier protection is now the existing **double-approval** (`community_gate`) — an extra
   operator consent — not an install-time sandbox.
+
+- **(c) stdio lane wires the installed binary, not npx.** The installer distributes
+  **release/docker/cargo binaries only** — there is no npm provider. `flow.tools.provision`'s
+  `building` step accordingly wires an stdio candidate's connection body as
+  `{kind: mcp, command: <the tool's command>}` — the same `command` (`$.context.name`, the id
+  passed to `praxec tools install`) the registry tool and installer place on PATH — rather than
+  the old `{command: "npx", args: ["-y", <pkg>]}`; the stdio lane's `npmPkg != null` guard was
+  dropped. **Consequence / known limitation (not a silent regression):** npm-*distribution* of a
+  stdio tool is no longer supported. An npm-only third-party tool (one with no release/docker/cargo
+  provider) cannot provision under Increment I; this is out of scope, and the flow fails fast at
+  `installing` (`INSTALL_FAILED`) for such a candidate rather than silently wiring an npx command
+  the installer never placed.

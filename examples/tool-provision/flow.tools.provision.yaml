@@ -118,7 +118,10 @@ scripts:
       set -euo pipefail
 
       transport="$1"
-      npm_pkg="$2"
+      # For the stdio lane this is the tool's COMMAND (the installed release
+      # binary's name) — the same identity `praxec tools install <id>` places on
+      # PATH. (remote/rest lanes ignore this positional; they wire `url`.)
+      command="$2"
       source_url="$3"
       secret_env_names_json="$4"
       collected_config_json="$5"
@@ -138,11 +141,15 @@ scripts:
 
       case "$transport" in
         stdio)
+          # Wire the INSTALLED release binary as the connection body — its
+          # `command` is what `praxec tools install <id>` placed on PATH. (There
+          # is no npm/npx provider anymore; the installer distributes
+          # release/docker/cargo binaries only.)
           jq -nc \
-            --arg pkg "$npm_pkg" \
+            --arg cmd "$command" \
             --argjson secrets "$required_secrets" \
             --argjson cfg "$collected_config_json" \
-            '{kind:"mcp", command:"npx", args:["-y",$pkg]}
+            '{kind:"mcp", command:$cmd}
              + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
              + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
           ;;
@@ -548,17 +555,20 @@ workflows:
         linkFilter: byGuards
         transitions:
           build_stdio_mcp:
-            title: "Build: stdio mcp connection body (npx-distributed server)."
+            title: "Build: stdio mcp connection body (installed release binary)."
             target: failed
+            # No `npmPkg` guard: `installing` already placed the release binary
+            # (release/docker/cargo — there is no npm provider), so the connection
+            # body wires that binary's COMMAND (`$.context.name`, the id `praxec
+            # tools install` used), not a package spec.
             guards:
               - { kind: expr, expr: "$.context.transport == 'stdio'" }
-              - { kind: expr, expr: "$.context.npmPkg != null" }
             executor:
               kind: script
               subject: build.connection-body
               args:
                 - "stdio"
-                - "$.context.npmPkg"
+                - "$.context.name"
                 - "$.context.sourceUrl"
                 - "$.context.secretEnvNames"
                 - "$.context.collectedConfig"
@@ -628,12 +638,9 @@ workflows:
             guards:
               - kind: all_of
                 guards:
-                  - kind: not
-                    guard:
-                      kind: all_of
-                      guards:
-                        - { kind: expr, expr: "$.context.transport == 'stdio'" }
-                        - { kind: expr, expr: "$.context.npmPkg != null" }
+                  # stdio always has a build recipe now (installed binary → mcp
+                  # command); only a non-stdio transport can fall through here.
+                  - { kind: expr, expr: "$.context.transport != 'stdio'" }
                   - kind: not
                     guard:
                       kind: all_of

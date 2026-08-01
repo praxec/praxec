@@ -5,8 +5,34 @@
 //! a `Real*` production impl).
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use super::InstallError;
+
+/// Total-request and connect bounds for release downloads. `reqwest`'s default
+/// client has NO timeout, so a stalled release host would hang `praxec tools
+/// install` / `doctor --fix` indefinitely; 60s covers a slow-but-live CDN asset
+/// while the 10s connect bound fails fast on a dead host.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The process-wide blocking HTTP client, built ONCE with an explicit timeout
+/// (see [`HTTP_TIMEOUT`]). Reused across every `http_get` so no download can
+/// hang unbounded. A builder failure surfaces as an [`InstallError::Io`].
+fn http_client() -> Result<&'static reqwest::blocking::Client, InstallError> {
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(HTTP_TIMEOUT)
+                .connect_timeout(HTTP_CONNECT_TIMEOUT)
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| InstallError::Io(e.clone()))
+}
 
 /// The host-touching operations the provider chain needs. Kept minimal: an
 /// HTTP GET (for the asset + its `checksums.sha256`), an executable placement,
@@ -59,7 +85,9 @@ pub struct RealInstallerIo;
 
 impl InstallerIo for RealInstallerIo {
     fn http_get(&self, url: &str) -> Result<Vec<u8>, InstallError> {
-        let resp = reqwest::blocking::get(url)
+        let resp = http_client()?
+            .get(url)
+            .send()
             .and_then(reqwest::blocking::Response::error_for_status)
             .map_err(|e| InstallError::Io(e.to_string()))?;
         Ok(resp
@@ -166,5 +194,23 @@ impl InstallerIo for RealInstallerIo {
                 reason: format!("`docker pull` exited with {status}"),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The release-download client is built (once) with an explicit timeout —
+    /// construction must succeed, offline and without issuing any request. This
+    /// pins that the timeout-carrying builder is well-formed; `reqwest` exposes
+    /// no getter for the configured timeout, so the bound itself is covered by
+    /// inspection of `http_client` (see `HTTP_TIMEOUT`).
+    #[test]
+    fn http_client_builds_with_an_explicit_timeout() {
+        assert!(
+            http_client().is_ok(),
+            "the timeout-bounded blocking client must build"
+        );
     }
 }
