@@ -1848,6 +1848,11 @@ async fn reload_gated(
 /// expect to find are simply missing from `praxec.query`, with nothing to read
 /// but silence. A typed `REGISTRY_*` error at boot (and at reload, where it keeps
 /// the previous config live) is the only honest answer.
+///
+/// By the time this reads `/discovery/registry` it is always a **local path
+/// string**: config resolution (`config::resolve_registry_source`) has already
+/// sourced an always-latest `{ uri, ref }` object into its cached `packs.yaml`
+/// and rewritten the knob to that path.
 fn load_registry(config: &Value) -> anyhow::Result<Option<Arc<Registry>>> {
     let Some(path) = config
         .pointer("/discovery/registry")

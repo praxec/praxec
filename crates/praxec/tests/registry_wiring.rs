@@ -144,6 +144,72 @@ fn write_registry(dir: &Path, body: &str) -> std::path::PathBuf {
     path
 }
 
+/// Write `CONFIG` plus a `discovery.registry: { uri, ref }` object — the
+/// always-latest sourcing form (Task 1) — pointing at `uri`@`gitref`.
+fn write_config_registry_uri(dir: &Path, uri: &str, gitref: &str) -> String {
+    let mut config = CONFIG.to_string();
+    config.push_str(&format!(
+        "discovery:\n  registry:\n    uri: \"{uri}\"\n    ref: {gitref}\n"
+    ));
+    let config_path = dir.join("praxec.yaml");
+    std::fs::write(&config_path, config).expect("write config");
+    config_path.to_string_lossy().to_string()
+}
+
+/// Build a bare git repo at `bare_dir` whose single `main` commit carries
+/// `packs.yaml` = `body`. Returns the `file://` URL — the exact string
+/// `repo_git::clone_url` yields once a `git+https://` uri is redirected (the
+/// same shape a CI `url.insteadOf` mock produces). Mocks the git *transport*,
+/// never skips the resolve.
+fn build_bare_registry(bare_dir: &Path, body: &str) -> String {
+    fn git(args: &[&str], cwd: &Path) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let seed = tempfile::tempdir().expect("seed tempdir");
+    std::fs::write(seed.path().join("packs.yaml"), body).expect("seed packs.yaml");
+    git(&["init", "--quiet", "-b", "main"], seed.path());
+    git(&["add", "-A"], seed.path());
+    git(
+        &[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--quiet",
+            "-m",
+            "registry seed",
+        ],
+        seed.path(),
+    );
+    let out = Command::new("git")
+        .args([
+            "clone",
+            "--quiet",
+            "--bare",
+            &seed.path().display().to_string(),
+            &bare_dir.display().to_string(),
+        ])
+        .output()
+        .expect("bare clone");
+    assert!(
+        out.status.success(),
+        "bare clone failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    format!("file://{}", bare_dir.display())
+}
+
 /// `praxec query --config <cfg> <json>` → the command output. Not asserted
 /// successful: the fail-fast cases assert on the FAILURE.
 fn query_raw(config_path: &str, args: &str) -> std::process::Output {
@@ -230,6 +296,27 @@ fn registry_tools_are_searchable_through_the_live_query_surface() {
         Some("ripgrep"),
         "{rg}"
     );
+}
+
+/// Task 1 — always-latest sourcing end to end: a `discovery.registry: { uri, ref }`
+/// object is resolved through the proven `repos:` clone-and-reset machinery to
+/// its cached `packs.yaml`, and the registry's tools reach the LIVE query surface
+/// exactly as the local-path form does. The git transport is a local `file://`
+/// bare repo (mocked, not skipped); the FULL resolve runs.
+#[test]
+fn registry_sourced_via_uri_ref_is_searchable_through_the_live_query_surface() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bare = dir.path().join("packs-registry.git");
+    let uri = build_bare_registry(&bare, REGISTRY);
+    let cfg = write_config_registry_uri(dir.path(), &uri, "main");
+
+    let response = query(&cfg, r#"{"query":"metrics alerting","kind":"tool"}"#);
+    assert_eq!(
+        ids(&response),
+        ["prometheus"],
+        "the always-latest-sourced registry's catalog is searchable: {response}"
+    );
+    assert_eq!(response["items"][0]["item"]["kind"], "tool");
 }
 
 /// D6-T1/T4 through the gateway — the crossmatrix changes what the gateway
