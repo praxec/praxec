@@ -109,9 +109,26 @@ Every step emits an audit event (`tool.install_resolved`, `tool.install_verified
 
 *How does praxec obtain the registry?* Today: only from a **local** `packs.yaml` an operator
 points `discovery.registry` at; the published `praxec/packs/packs.yaml` is not fetched.
-Resolution: **`init` obtains a pinned `packs.yaml`** (vendor a copy or fetch `{uri, hash}` via
-the existing remote-include mechanism) and sets `discovery.registry`. `praxec sync` refreshes
-it. No new fetch subsystem — reuse `{uri, hash}` + `sync`. The v2/v3 concern is void (superset).
+
+Resolution: **source the registry always-latest, the same way packs already are** — point
+`discovery.registry` at `praxec/packs` via `{uri, ref: main}`, resolved through the *exact*
+`repos:` machinery that re-fetches and resets to the tip on every load (and via `praxec sync`).
+No pinning, no vendored copy, no `{uri, hash}` freeze. This is a deliberate **currency-over-pinning**
+choice, consistent with the workflow-currency stance (a lockfile was rejected for workflows for
+the same reason): the operator always resolves the latest tool coordinates + the latest pack
+`requires[]`, so a newly released tool or a newly added dependency shows up without an operator
+edit. `init` writes this `discovery.registry` block; no new fetch subsystem (reuse `{uri, ref}`);
+the v2/v3 concern is void (superset).
+
+**Currency and integrity are separable and both satisfied.** Registry freshness comes from
+always-latest sourcing; binary safety comes from the `checksums.sha256` verify at *install*
+time (§4) — which runs regardless of how the registry was obtained. Pinning the registry was
+never the integrity mechanism, so dropping it costs no safety.
+
+**Finer point — tool `version:`.** The registry's per-tool `version:` is the org's *blessed-latest*
+pin, kept current in `praxec/packs`; always-fetching-latest-registry is therefore how "latest"
+is delivered — a curated currency point, not each operator independently chasing raw
+`releases/latest` (which would reintroduce the version-drift ADR-0013 guards against).
 
 ## 6. Increment I — build small (the first shippable slice)
 
@@ -173,7 +190,8 @@ All High/Medium driven to Low in one iteration; carried here as the acceptance b
 | Docker-absent blocks onboarding | chain falls through to release binary; doctor names chosen provider | doctor per-tool line | Low |
 | Silent install | consent = explicit flag; default offer-only | `tool.install_consented{flag}` | Low |
 | Partial/half-wired (install ok, grant fails) | staged checkpoints install→verify→stage→grant; idempotent re-run resumes | doctor shows stage reached | Low |
-| Registry unobtainable / stale | init obtains pinned `packs.yaml`; fail-fast if absent; `sync` refreshes | startup logs registry source+version | Low |
+| Registry unobtainable | `{uri, ref: main}` resolved via the proven `repos:` path; fail-fast if unreachable (offline reuses the last cached tip, warns) | startup logs registry source+resolved commit | Low |
+| Registry stale (operator behind latest) | **always-latest by construction** (re-fetch/reset to tip on load; `sync`); no pin to drift | staleness warning already shipped; startup logs resolved commit | Low |
 
 ## 10. Verification (for I)
 
