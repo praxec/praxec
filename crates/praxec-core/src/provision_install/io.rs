@@ -150,14 +150,14 @@ impl InstallerIo for RealInstallerIo {
     }
 
     fn bin_dir(&self) -> Result<PathBuf, InstallError> {
-        dirs::config_dir()
-            .map(|d| d.join("praxec").join("bin"))
-            .ok_or_else(|| {
-                InstallError::Io(
-                    "cannot locate a config directory on this machine for the praxec bin dir"
-                        .to_string(),
-                )
-            })
+        // Delegate to the ONE definition of the managed bin dir (mod.rs) so the
+        // installer and the MCP child-spawn PATH injection never drift.
+        super::managed_bin_dir().ok_or_else(|| {
+            InstallError::Io(
+                "cannot locate a config directory on this machine for the praxec bin dir"
+                    .to_string(),
+            )
+        })
     }
 
     fn which(&self, cmd: &str) -> bool {

@@ -131,6 +131,15 @@ pub fn resolve_target(os: &str, arch: &str) -> Option<(&'static str, &'static st
     }
 }
 
+/// The praxec-managed bin directory (`<config-dir>/praxec/bin`) that
+/// [`install_release`] places tool binaries into — the ONE definition of this
+/// path. Both [`io::RealInstallerIo::bin_dir`] and the MCP child-spawn PATH
+/// injection resolve it here, so there is a single source of truth. `None` when
+/// the host has no config directory (the same `dirs` convention `init` uses).
+pub fn managed_bin_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("praxec").join("bin"))
+}
+
 /// The release asset name for a tool `command` on a `(triple, ext)` — the
 /// uniform `{command}-{triple}.{ext}` convention (§3 principle 5: the
 /// convention *is* the data; no per-tool registry field).
@@ -419,6 +428,23 @@ mod tests {
     }
 
     // ── pure-unit contracts (one assertion each) ─────────────────────────────
+
+    #[test]
+    fn managed_bin_dir_is_config_dir_praxec_bin() {
+        // The one managed-bin-dir definition is `<config-dir>/praxec/bin`. Assert
+        // the shape only when the host exposes a config dir (CI always does); a
+        // `None` host is the fail-safe path, covered by the delegation test below.
+        if let Some(cfg) = dirs::config_dir() {
+            assert_eq!(managed_bin_dir(), Some(cfg.join("praxec").join("bin")));
+        }
+    }
+
+    #[test]
+    fn real_installer_bin_dir_delegates_to_the_one_managed_dir() {
+        // Single source of truth: the trait impl resolves the exact same path as
+        // the free fn (both `Some` on a normal host, or both absent).
+        assert_eq!(RealInstallerIo.bin_dir().ok(), managed_bin_dir());
+    }
 
     #[test]
     fn linux_x86_64_resolves_to_the_gnu_triple_not_musl() {
