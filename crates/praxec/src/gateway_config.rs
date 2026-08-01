@@ -72,6 +72,12 @@ pub(crate) enum Command {
         /// Path to the gateway YAML config.
         #[arg(short, long)]
         config: PathBuf,
+        /// Consent to install (ADR-0006): resolve every missing `kind: mcp`
+        /// tool through the provider chain and install it (release → docker;
+        /// cargo stays emit-only). Default is offer-only — doctor names the
+        /// provider + command and mutates nothing.
+        #[arg(long)]
+        fix: bool,
     },
     /// Print a JSON health snapshot: connections, repos, definition_count, store.
     Health {
