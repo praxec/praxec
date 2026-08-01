@@ -228,6 +228,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             force,
             yes,
             with_starter_packs,
+            packs,
             pack,
             install_tools,
         } => init(
@@ -238,6 +239,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             force,
             yes,
             with_starter_packs,
+            packs,
             pack,
             install_tools,
         ),
@@ -3268,13 +3270,14 @@ fn init(
     force: bool,
     yes: bool,
     with_starter_packs: bool,
+    packs: Option<String>,
     pack: Option<String>,
     install_tools: bool,
 ) -> anyhow::Result<()> {
     use crate::init::{
-        EditorTarget, EditorWriteOutcome, InitIo, PackWiring, RealInitIo, STARTER_PACK_URIS,
-        STARTER_REGISTRY_URI, ScaffoldOutcome, gateway_yaml_content, install_consent,
-        merge_pack_wiring, models_yaml_content, resolve_target_dir, scaffold_file,
+        EditorTarget, EditorWriteOutcome, InitIo, RealInitIo, STARTER_REGISTRY_URI,
+        ScaffoldOutcome, gateway_yaml_content, install_consent, merge_pack_wiring,
+        models_yaml_content, resolve_pack_wiring, resolve_target_dir, scaffold_file,
         write_editor_mcp_config,
     };
 
@@ -3284,6 +3287,10 @@ fn init(
          --provider (or pass --provider openrouter) — add other providers by hand afterward via \
          the providers.env file"
     );
+
+    // Resolve the pack selection up front so an unknown `--packs` id fails fast,
+    // before anything is scaffolded (nothing written on a bad selection).
+    let wiring = resolve_pack_wiring(with_starter_packs, packs.as_deref(), pack.as_deref())?;
 
     let io = RealInitIo;
 
@@ -3315,28 +3322,17 @@ fn init(
         ),
     }
 
-    // ── pack wiring (Task 5) ─────────────────────────────────────────────────
-    // `--with-starter-packs` unions the two OPEN starter packs + points
-    // `discovery.registry` at the always-latest `praxec/packs` registry;
-    // `--pack <uri>` unions one more. Idempotent: an existing `repos:`/
+    // ── pack wiring (Task A3) ────────────────────────────────────────────────
+    // `--with-starter-packs` unions ALL the OPEN starter packs; `--packs <ids>`
+    // unions a selected subset; `--pack <uri>` unions one arbitrary uri. Any of
+    // the starter-set paths (`--with-starter-packs`/`--packs`) also points
+    // `discovery.registry` at the always-latest `praxec/packs` registry so the
+    // selected packs' tools resolve. Idempotent: an existing `repos:`/
     // `discovery` block is preserved and extended, never clobbered (unless
     // `--force`). Runs on whatever `gateway.yaml` is now on disk, so a re-run
-    // merges rather than skips.
-    let mut packs: Vec<String> = Vec::new();
-    if with_starter_packs {
-        packs.extend(STARTER_PACK_URIS.iter().map(|s| s.to_string()));
-    }
-    if let Some(p) = &pack {
-        if !packs.iter().any(|u| u == p) {
-            packs.push(p.clone());
-        }
-    }
-    let wiring_requested = !packs.is_empty();
-    if wiring_requested {
-        let wiring = PackWiring {
-            packs,
-            registry: with_starter_packs,
-        };
+    // merges rather than skips. The selection was already resolved (fail-fast on
+    // an unknown `--packs` id) above.
+    if !wiring.packs.is_empty() {
         let existing = std::fs::read_to_string(&gateway_yaml_path)
             .with_context(|| format!("reading {} for pack wiring", gateway_yaml_path.display()))?;
         let outcome = merge_pack_wiring(&existing, &wiring, force)?;
@@ -3354,7 +3350,7 @@ fn init(
         }
         if outcome.registry_wired {
             println!("  wired   discovery.registry -> {STARTER_REGISTRY_URI} (always-latest)");
-        } else if with_starter_packs {
+        } else if wiring.registry {
             println!("  registry pointer already present (kept; --force to reset)");
         }
     }
@@ -3457,7 +3453,7 @@ fn init(
             // resolve-and-offer path `doctor` uses against the freshly written
             // config. OFFER missing tools by default; INSTALL them only under
             // `--install-tools`/`--yes` (consent by construction).
-            if wiring_requested {
+            if !wiring.packs.is_empty() {
                 let fix = install_consent(install_tools, yes);
                 let io = praxec_core::provision_install::RealInstallerIo;
                 match provisioning_report(&config, &report.tools.missing, fix, &io) {

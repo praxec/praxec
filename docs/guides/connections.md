@@ -222,6 +222,13 @@ the asset and its `checksums.sha256` come from the same release page.
 - `praxec init --with-starter-packs` — scaffold a gateway with the starter
   packs' `repos:` + the always-latest `discovery.registry` pointer wired, then run
   the doctor resolve path (offer by default; add `--install-tools` to install).
+- `praxec init --packs cognitive-architectures,praxec-meta` — wire a **subset**
+  of the known open starter packs by short id (the last `/`-segment of each pack
+  uri) + the registry pointer; unions with `--with-starter-packs`, no duplicates.
+  An unknown id fails fast, listing the valid ids.
+- **`frontrails` is intentionally NOT in the starter set** — it is an
+  `include:{uri,hash}` pattern pack that needs licensed FrontRails servers. If you
+  are licensed, wire it by hand with `praxec init --pack <uri>` (arbitrary-uri).
 
 See the [tool-discovery reference](../reference/tool-discovery.md) and
 [`configuration.md`](../reference/configuration.md#discovery) for the

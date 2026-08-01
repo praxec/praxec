@@ -327,14 +327,27 @@ pub(crate) enum Command {
         /// without asking). Also grants install consent (see `--install-tools`).
         #[arg(long)]
         yes: bool,
-        /// Additionally wire the two OPEN starter packs
+        /// Additionally wire ALL the OPEN starter packs
         /// (`cognitive-architectures` + `praxec-meta`) under `repos:` and point
         /// `discovery.registry` at the always-latest `praxec/packs` registry
         /// (`{uri, ref: main}`), then run tool provisioning on the result.
+        /// Note: `frontrails` is intentionally NOT a starter pack — it is an
+        /// `include:{uri,hash}` pattern pack needing licensed FrontRails servers;
+        /// wire it by hand with `--pack <uri>` if licensed.
         #[arg(long)]
         with_starter_packs: bool,
-        /// Wire exactly one pack under `repos:` (`{uri, ref: main}`). Combine
-        /// with `--with-starter-packs` to union (no duplicates).
+        /// Wire a SUBSET of the known open starter packs by short id
+        /// (comma-list, e.g. `--packs cognitive-architectures,praxec-meta`) under
+        /// `repos:` and point `discovery.registry` at the always-latest registry.
+        /// Unions with `--with-starter-packs` (no duplicates). An unknown id
+        /// fails fast, listing the valid ids. `frontrails` is deliberately absent
+        /// (licensed `include:` pack — use `--pack <uri>`).
+        #[arg(long)]
+        packs: Option<String>,
+        /// Wire exactly one arbitrary pack uri under `repos:` (`{uri, ref: main}`).
+        /// Combine with `--with-starter-packs` / `--packs` to union (no
+        /// duplicates). Use this for a pack outside the known open set (e.g. a
+        /// private pack, or the licensed `frontrails` pack).
         #[arg(long)]
         pack: Option<String>,
         /// Grant consent to INSTALL any missing pack tools during the
