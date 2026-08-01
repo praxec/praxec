@@ -94,13 +94,25 @@
 #
 # Transport coverage: `installing` is exhaustive over the closed transport
 # enum — `stdio`/`docker` DELEGATE the local install to `praxec tools
-# install` (the installer resolves release vs docker internally), while
-# `remote→mcp+url` / `rest→rest` need nothing installed (noop). `building`
-# then assembles a connection body for the three the design doc names
-# (`stdio→mcp+command`, `remote→mcp+url`, `rest→rest`); a `docker`-transport
-# candidate installs but currently fails fast at `building` with a typed
-# `BUILD_RECIPE_UNAVAILABLE` (no docker connection-body recipe yet) rather
-# than silently no-opping — extend the `building` transitions to add it.
+# install` (the installer resolves the release → docker → npx → cargo chain
+# internally), while `remote→mcp+url` / `rest→rest` need nothing installed
+# (noop). `building` then assembles a connection body for all four transports
+# the closed enum names. The `stdio` lane splits by SOURCE: an npm-distributed
+# server (`ToolSource::Npm`, A5's `Provider::Npx` no-op-install path — nothing
+# is placed on PATH, npx fetches on run) wires `{command:"npx", args:["-y",
+# <pkg>]}`; a plain binary source wires `{command:<installed-binary>}`. The
+# `docker` recipe wires the pulled image as a `docker run --rm -i <image>`
+# stdio-over-mcp command from the ref the candidate carries
+# (`source.image.image`, projected to `dockerImage` in `select`).
+#
+# The docker image ref MUST be pinned (a `:tag` or `@digest`) — this is
+# ENFORCED, not assumed. `installing` `docker pull`s the image PINNED
+# (`docker pull <image>:<version>`), so `docker run <image>` on an UNPINNED
+# ref would resolve `:latest` at spawn — a DIFFERENT, unpinned image than was
+# pulled/validated. A `ToolCandidate` carries no registry `version` to append,
+# so the `docker` recipe FAILS FAST (`BUILD_REQUIRES_PINNED_IMAGE` → `failed`)
+# on an unpinned ref rather than wire it. Otherwise every lane shares the same
+# identity/env/required_secrets structure; only the argv head differs.
 
 # Lexicon entry for the one script subject this workflow defines (SPEC §30.10.4).
 lexicon:
@@ -142,14 +154,68 @@ scripts:
       case "$transport" in
         stdio)
           # Wire the INSTALLED release binary as the connection body — its
-          # `command` is what `praxec tools install <id>` placed on PATH. (There
-          # is no npm/npx provider anymore; the installer distributes
-          # release/docker/cargo binaries only.)
+          # `command` is what `praxec tools install <id>` placed on PATH. This
+          # lane is a PLAIN binary source only: an npm-distributed stdio server
+          # (`ToolSource::Npm`, the A5 `Provider::Npx` no-op-install path) is
+          # NOT placed on PATH and is routed by `building` to the `npx)` case
+          # below instead — never wired as a bare command here.
           jq -nc \
             --arg cmd "$command" \
             --argjson secrets "$required_secrets" \
             --argjson cfg "$collected_config_json" \
             '{kind:"mcp", command:$cmd}
+             + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
+             + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
+          ;;
+        npx)
+          # An npm-source stdio candidate (`ToolSource::Npm{pkg}`) — A5's
+          # `Provider::Npx` no-op install: nothing is placed on PATH because npx
+          # fetches the package on run, so the connection MUST be `npx -y <pkg>`,
+          # never a bare command that isn't installed. Here `$command` ($2)
+          # carries the npm package (`candidate.source.npm.pkg`, projected to
+          # `npmPkg` in `select`). env:/required_secrets: assembly is identical
+          # to the other mcp lanes; only the argv (`npx -y <pkg>`) differs.
+          jq -nc \
+            --arg pkg "$command" \
+            --argjson secrets "$required_secrets" \
+            --argjson cfg "$collected_config_json" \
+            '{kind:"mcp", command:"npx", args:["-y",$pkg]}
+             + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
+             + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
+          ;;
+        docker)
+          # `installing` already `docker pull`ed the image PINNED
+          # (`docker pull <image>:<version>`); wire it as a `docker run`
+          # stdio-over-mcp command. For this lane the `command` positional ($2)
+          # carries the image reference (`source.image.image`), the same slot the
+          # stdio lane uses for the release binary's name — so the
+          # env:/required_secrets: assembly is identical; only the argv head
+          # (`docker run --rm -i <image>`) differs.
+          #
+          # Poka-yoke — a governed docker connection MUST run the EXACT image
+          # that was pulled/validated. `docker run <image>` with an UNPINNED ref
+          # resolves `:latest` at spawn, a different, unpinned tag than the
+          # installer pulled. Discovery's `mcp_registry` adapter often sets
+          # `ToolSource::Image{image:<pkg-name>}` with NO tag, and a
+          # `ToolCandidate` carries no registry `version` we could append — so
+          # rather than silently wire an unpinned image, require the ref to carry
+          # a `:tag` or `@digest` on its final path component and FAIL FAST
+          # (→ `failed`) if it does not. `${image##*/}` strips any
+          # `registry[:port]/…/` prefix so a host port is never mistaken for a tag.
+          image="$command"
+          ref_tail="${image##*/}"
+          case "$ref_tail" in
+            *@*|*:*) : ;;  # pinned: `@digest` or `:tag` on the final component.
+            *)
+              echo "BUILD_REQUIRES_PINNED_IMAGE: docker candidate image '$image' is not pinned (needs :tag or @digest) — a governed docker connection must run the exact image that was pulled/validated" >&2
+              exit 1
+              ;;
+          esac
+          jq -nc \
+            --arg image "$image" \
+            --argjson secrets "$required_secrets" \
+            --argjson cfg "$collected_config_json" \
+            '{kind:"mcp", command:"docker", args:["run","--rm","-i",$image]}
              + (if ($cfg|length) > 0 then {env:($cfg | with_entries(.value |= tostring))} else {} end)
              + (if ($secrets|length) > 0 then {required_secrets:$secrets} else {} end)'
           ;;
@@ -260,6 +326,7 @@ workflows:
       config_path: null
       npmPkg: null
       sourceUrl: null
+      dockerImage: null
       secretEnvNames: []
       collectedConfig: {}
       secrets_set: []
@@ -303,8 +370,9 @@ workflows:
             config_path:      "$.workflow.input.config_path"
             # Source-variant projections — null unless that variant is
             # actually present (see the header note on why this is safe).
-            npmPkg:    "$.workflow.input.candidate.source.npm.pkg"
-            sourceUrl: "$.workflow.input.candidate.source.url.url"
+            npmPkg:      "$.workflow.input.candidate.source.npm.pkg"
+            sourceUrl:   "$.workflow.input.candidate.source.url.url"
+            dockerImage: "$.workflow.input.candidate.source.image.image"
         transitions:
           resolved:
             title: Candidate resolved — evaluate trust tier.
@@ -398,7 +466,7 @@ workflows:
           DELEGATE the install to the ONE installer via `praxec tools
           install <id>` (a `kind: cli` step is the only way a YAML workflow
           can reach the Rust `ProvisionInstaller`). The installer resolves
-          the release → docker → cargo provider chain, checksum-verifies a
+          the release → docker → npx → cargo provider chain, checksum-verifies a
           downloaded binary, and places it — so this workflow no longer
           carries a per-transport install recipe (the old package-manager
           special case and the unsupported-transport dead-end are gone). Exhaustive over the closed transport enum: `stdio`/`docker`
@@ -554,21 +622,88 @@ workflows:
           never reaches the script at all.
         linkFilter: byGuards
         transitions:
+          # The stdio transport splits by SOURCE: an npm-distributed server
+          # (A5's `Provider::Npx` no-op-install path) must run `npx -y <pkg>`
+          # because nothing was placed on PATH; a plain binary source keeps its
+          # installed `command`. Split into two flat single-`expr`-guard-list
+          # transitions (mutually exclusive on `npmPkg`) — same shape as the
+          # docker+image split, so `linkFilter: byGuards` never shows two
+          # simultaneously-legal outcomes and `praxec fuzz`'s satisfier covers
+          # each independently.
+          build_stdio_npx:
+            title: "Build: stdio mcp connection body (npm source → `npx -y <pkg>`)."
+            target: failed
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'stdio'" }
+              - { kind: expr, expr: "$.context.npmPkg != null" }
+            executor:
+              kind: script
+              subject: build.connection-body
+              args:
+                - "npx"
+                - "$.context.npmPkg"
+                - "$.context.sourceUrl"
+                - "$.context.secretEnvNames"
+                - "$.context.collectedConfig"
+              treatNonZeroAsFailure: false
+            branches:
+              - when: { kind: expr, expr: "$.context.buildSuccess == true" }
+                target: staging
+            output:
+              buildExitCode: "$.output.exitCode"
+              buildSuccess:  "$.output.success"
+              built_body:    "$.output.json"
+              reason: "BUILD_FAILED"
+
           build_stdio_mcp:
             title: "Build: stdio mcp connection body (installed release binary)."
             target: failed
-            # No `npmPkg` guard: `installing` already placed the release binary
-            # (release/docker/cargo — there is no npm provider), so the connection
-            # body wires that binary's COMMAND (`$.context.name`, the id `praxec
-            # tools install` used), not a package spec.
+            # Plain binary source (`npmPkg == null`): `installing` already placed
+            # the release binary (release/docker/npx/cargo chain), so the
+            # connection body wires that binary's COMMAND (`$.context.name`, the
+            # id `praxec tools install` used), not a package spec. The npm source
+            # is handled by `build_stdio_npx` above (→ `npx -y <pkg>`).
             guards:
               - { kind: expr, expr: "$.context.transport == 'stdio'" }
+              - { kind: expr, expr: "$.context.npmPkg == null" }
             executor:
               kind: script
               subject: build.connection-body
               args:
                 - "stdio"
                 - "$.context.name"
+                - "$.context.sourceUrl"
+                - "$.context.secretEnvNames"
+                - "$.context.collectedConfig"
+              treatNonZeroAsFailure: false
+            branches:
+              - when: { kind: expr, expr: "$.context.buildSuccess == true" }
+                target: staging
+            output:
+              buildExitCode: "$.output.exitCode"
+              buildSuccess:  "$.output.success"
+              built_body:    "$.output.json"
+              reason: "BUILD_FAILED"
+
+          build_docker_mcp:
+            title: "Build: docker mcp connection body (`docker run` the pulled image)."
+            target: failed
+            # `installing` already `docker pull`ed the image PINNED via the one
+            # installer; the connection body wires it as a `docker run --rm -i
+            # <image>` stdio-over-mcp command. `dockerImage` is the image ref the
+            # candidate carries (`source.image.image`), projected in `select`. The
+            # recipe ENFORCES that ref is pinned (`:tag`/`@digest`) — an unpinned
+            # image fails fast with `BUILD_REQUIRES_PINNED_IMAGE` (→ `failed`), so
+            # a governed connection can never `docker run` a `:latest` it didn't pull.
+            guards:
+              - { kind: expr, expr: "$.context.transport == 'docker'" }
+              - { kind: expr, expr: "$.context.dockerImage != null" }
+            executor:
+              kind: script
+              subject: build.connection-body
+              args:
+                - "docker"
+                - "$.context.dockerImage"
                 - "$.context.sourceUrl"
                 - "$.context.secretEnvNames"
                 - "$.context.collectedConfig"
@@ -638,9 +773,17 @@ workflows:
             guards:
               - kind: all_of
                 guards:
-                  # stdio always has a build recipe now (installed binary → mcp
-                  # command); only a non-stdio transport can fall through here.
+                  # stdio always has a build recipe now — npm source →
+                  # `npx -y <pkg>` (`build_stdio_npx`), else installed binary →
+                  # mcp command (`build_stdio_mcp`); only a non-stdio transport
+                  # can fall through here.
                   - { kind: expr, expr: "$.context.transport != 'stdio'" }
+                  - kind: not
+                    guard:
+                      kind: all_of
+                      guards:
+                        - { kind: expr, expr: "$.context.transport == 'docker'" }
+                        - { kind: expr, expr: "$.context.dockerImage != null" }
                   - kind: not
                     guard:
                       kind: all_of
@@ -779,4 +922,7 @@ workflows:
           Provisioning did not complete. `context.reason` carries the typed
           cause (UNKNOWN_TRUST_TIER | COMMUNITY_DECLINED | INSTALL_FAILED |
           BUILD_FAILED | BUILD_RECIPE_UNAVAILABLE | STAGE_FAILED |
-          VALIDATION_FAILED | GRANT_FAILED | OPERATOR_DECLINED).
+          VALIDATION_FAILED | GRANT_FAILED | OPERATOR_DECLINED). A build-script
+          fail-fast (`BUILD_REQUIRES_PINNED_IMAGE` — unpinned docker image;
+          `BUILD_RECIPE_UNAVAILABLE` — rest-with-requires) surfaces its typed
+          marker on stderr and routes here as `BUILD_FAILED`.

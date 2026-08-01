@@ -21,6 +21,11 @@
 //!   triple ([`super::resolve_target`]). Preferred whenever available.
 //! - **Docker** — available only when `io.which("docker")` is true and the tool
 //!   has a `docker` image + `version`. Install = `docker pull <image>:<version>`.
+//! - **Npx** — available when `io.which("npx")` is true and the tool has an
+//!   `npx` coordinate (the package name). "Install" is a **no-op**: an
+//!   npm-distributed stdio server is nothing to download or place — npx fetches
+//!   it on run, and its connection wires `{command: npx, args: ["-y", <pkg>]}`.
+//!   Ordered before cargo (no toolchain needed); never a source build.
 //! - **Cargo** — last-resort source path, **emit-only**: even under
 //!   `Consent::Granted` it only *returns* the `cargo install <crate>` command;
 //!   it never shells out to cargo (that source-build is the exact Windows pain
@@ -36,10 +41,15 @@ use super::{Host, InstallError, InstallOutcome, asset_name, install_release, res
 
 /// Which provider the chain resolved to. Ordered by onboarding preference
 /// (`Release` highest); shared verbatim with the doctor/init surfaces (T4/T5).
+///
+/// `Npx` sits before `Cargo`: an npm-distributed stdio MCP server needs **no
+/// toolchain** (npx fetches it on run), so it beats the last-resort source
+/// build — but still after release/docker, which are pinned/reproducible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Release,
     Docker,
+    Npx,
     Cargo,
 }
 
@@ -94,6 +104,22 @@ fn docker_plan(tool: &RegistryTool, io: &dyn InstallerIo) -> Option<InstallPlan>
     })
 }
 
+/// The npx plan, gated on `io.which("npx")` and the tool having an `npx`
+/// coordinate (the package name). An npm-distributed stdio MCP server is **not**
+/// downloaded or placed — npx fetches it on run — so the plan's command is the
+/// connection form `npx -y <pkg>`. `which` is a pure read (no mutation).
+/// Ordered before cargo: it needs no toolchain, never a source build.
+fn npx_plan(tool: &RegistryTool, io: &dyn InstallerIo) -> Option<InstallPlan> {
+    let pkg = tool.providers.get(ProvisionProvider::Npx.as_token())?;
+    if !io.which("npx") {
+        return None;
+    }
+    Some(InstallPlan {
+        provider: Provider::Npx,
+        command: format!("npx -y {pkg}"),
+    })
+}
+
 /// The cargo plan — the last-resort source path. Emit-only: it names the
 /// command but is never executed by this module (§4 point 4).
 fn cargo_plan(tool: &RegistryTool) -> Option<InstallPlan> {
@@ -110,7 +136,7 @@ fn cargo_plan(tool: &RegistryTool) -> Option<InstallPlan> {
 
 /// Resolve the highest-preference **available** provider for `tool` on `host`
 /// WITHOUT installing (doctor's "offer"). Onboarding order: Release → Docker →
-/// Cargo (§3 principle 2). Returns `None` when no provider resolves.
+/// Npx → Cargo (§3 principle 2). Returns `None` when no provider resolves.
 ///
 /// Guaranteed non-mutating: the only IO it performs is `io.which` (a read).
 pub fn resolve_provider(
@@ -120,6 +146,7 @@ pub fn resolve_provider(
 ) -> Option<InstallPlan> {
     release_plan(tool, host)
         .or_else(|| docker_plan(tool, io))
+        .or_else(|| npx_plan(tool, io))
         .or_else(|| cargo_plan(tool))
 }
 
@@ -129,8 +156,10 @@ pub fn resolve_provider(
 ///   [`InstallOutcome::Offered`].
 /// - [`Consent::Granted`] performs the chosen provider: Release delegates to
 ///   [`super::install_release`] (download + checksum-verify + place); Docker
-///   runs `docker pull`; Cargo remains **emit-only** (returns the command as
-///   `Offered`, never shells out).
+///   runs `docker pull`; Npx is a **no-op success** (nothing to place — npx
+///   fetches on run — returned as `NoInstallNeeded` surfacing `npx -y <pkg>`);
+///   Cargo remains **emit-only** (returns the command as `Offered`, never
+///   shells out).
 ///
 /// Fails fast with [`InstallError::NoProvider`] (naming the tool) when the chain
 /// resolves nothing.
@@ -180,6 +209,16 @@ pub fn install(
                 version: version.to_string(),
             })
         }
+        // Npx is a no-op success even under Granted: an npm-distributed stdio
+        // server is nothing to download or place — npx fetches it on run. The
+        // tool is "ready" because its connection (`npx -y <pkg>`, surfaced in
+        // the reason) will fetch it on demand. Never a source build.
+        Provider::Npx => Ok(InstallOutcome::NoInstallNeeded {
+            reason: format!(
+                "npm-distributed tool runs on demand via `{}` — nothing to download or place",
+                plan.command
+            ),
+        }),
         // Cargo is emit-only even under Granted: never trigger a source build.
         Provider::Cargo => Ok(InstallOutcome::Offered {
             provider: Provider::Cargo,
@@ -203,6 +242,7 @@ mod tests {
         installed: Option<String>,
         bin_dir: PathBuf,
         has_docker: bool,
+        has_npx: bool,
         writes: RefCell<Vec<(PathBuf, String, usize)>>,
         pulls: RefCell<Vec<String>>,
     }
@@ -232,7 +272,7 @@ mod tests {
             Ok(self.bin_dir.clone())
         }
         fn which(&self, cmd: &str) -> bool {
-            cmd == "docker" && self.has_docker
+            (cmd == "docker" && self.has_docker) || (cmd == "npx" && self.has_npx)
         }
         fn docker_pull(&self, image_ref: &str) -> Result<(), InstallError> {
             self.pulls.borrow_mut().push(image_ref.to_string());
@@ -483,5 +523,111 @@ mod tests {
         );
         assert_eq!(io.pulls.borrow().len(), 0, "cargo must not pull docker");
         assert_eq!(io.writes.borrow().len(), 0, "cargo must not place a binary");
+    }
+
+    // ── contract 7: npx resolves + is a no-op success wiring `npx -y <pkg>` ───
+    #[test]
+    fn npx_candidate_resolves_and_installs_as_a_no_op() {
+        let tool = tool_with("browser-mcp", "0.0.2", &[("npx", "@playwright/mcp")]);
+        let io = FakeIo {
+            bin_dir: "/fake/bin".into(),
+            has_npx: true,
+            ..Default::default()
+        };
+
+        // resolve picks Npx; the plan surfaces the `npx -y <pkg>` connection form.
+        let plan = resolve_provider(&tool, &unmapped_host(), &io).unwrap();
+        assert_eq!(plan.provider, Provider::Npx);
+        assert_eq!(plan.command, "npx -y @playwright/mcp");
+
+        // Granted install is a no-op success: nothing downloaded, nothing placed,
+        // and the reported outcome surfaces the `npx -y <pkg>` command.
+        let out = install(&tool, &unmapped_host(), Consent::Granted, &io).unwrap();
+        match &out {
+            InstallOutcome::NoInstallNeeded { reason } => {
+                assert!(
+                    reason.contains("npx -y @playwright/mcp"),
+                    "outcome surfaces the connection command: {reason}"
+                );
+            }
+            other => panic!("expected NoInstallNeeded, got {other:?}"),
+        }
+        assert_eq!(io.writes.borrow().len(), 0, "npx places no binary");
+        assert_eq!(io.pulls.borrow().len(), 0, "npx pulls no image");
+        assert!(io.responses.is_empty(), "no http_get responses were needed");
+    }
+
+    // ── contract 8: npx gated on which("npx") — absent → falls through ────────
+    #[test]
+    fn npx_absent_falls_through_to_cargo() {
+        // Both an npx and a cargo coordinate; npx unavailable → cargo wins.
+        let tool = tool_with(
+            "browser-mcp",
+            "0.0.2",
+            &[("npx", "@playwright/mcp"), ("cargo", "browser-mcp")],
+        );
+        let io = FakeIo {
+            bin_dir: "/fake/bin".into(),
+            has_npx: false,
+            ..Default::default()
+        };
+        let plan = resolve_provider(&tool, &unmapped_host(), &io).unwrap();
+        assert_eq!(plan.provider, Provider::Cargo, "npx gated out → cargo");
+
+        // With only an npx coordinate and no npx → nothing resolves.
+        let npx_only = tool_with("browser-mcp", "0.0.2", &[("npx", "@playwright/mcp")]);
+        assert!(
+            resolve_provider(&npx_only, &unmapped_host(), &io).is_none(),
+            "no npx and no other provider → None"
+        );
+    }
+
+    // ── contract 9: chain order — release wins over npx; npx wins over cargo ──
+    #[test]
+    fn release_beats_npx_and_npx_beats_cargo() {
+        let page = "https://github.com/praxec/browser-mcp/releases";
+        // Release + npx both available on a mapped host → Release wins.
+        let both = tool_with(
+            "browser-mcp",
+            "0.0.2",
+            &[("release", page), ("npx", "@playwright/mcp")],
+        );
+        let io = FakeIo {
+            bin_dir: "/fake/bin".into(),
+            has_npx: true,
+            ..Default::default()
+        };
+        let plan = resolve_provider(&both, &linux_host(), &io).unwrap();
+        assert_eq!(plan.provider, Provider::Release, "release beats npx");
+
+        // Only npx + cargo (no release/docker) → Npx beats the source build.
+        let npx_cargo = tool_with(
+            "browser-mcp",
+            "0.0.2",
+            &[("npx", "@playwright/mcp"), ("cargo", "browser-mcp")],
+        );
+        let plan = resolve_provider(&npx_cargo, &unmapped_host(), &io).unwrap();
+        assert_eq!(plan.provider, Provider::Npx, "npx beats cargo");
+    }
+
+    // ── contract 10: npx OfferOnly reports the plan, mutates nothing ──────────
+    #[test]
+    fn npx_offer_only_reports_the_plan_without_mutating() {
+        let tool = tool_with("browser-mcp", "0.0.2", &[("npx", "@playwright/mcp")]);
+        let io = FakeIo {
+            bin_dir: "/fake/bin".into(),
+            has_npx: true,
+            ..Default::default()
+        };
+        let offered = install(&tool, &unmapped_host(), Consent::OfferOnly, &io).unwrap();
+        assert_eq!(
+            offered,
+            InstallOutcome::Offered {
+                provider: Provider::Npx,
+                command: "npx -y @playwright/mcp".into(),
+            }
+        );
+        assert_eq!(io.writes.borrow().len(), 0);
+        assert_eq!(io.pulls.borrow().len(), 0);
     }
 }

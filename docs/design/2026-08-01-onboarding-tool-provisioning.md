@@ -254,3 +254,51 @@ Two residuals surfaced during build, recorded here for truthfulness:
   provider) cannot provision under Increment I; this is out of scope, and the flow fails fast at
   `installing` (`INSTALL_FAILED`) for such a candidate rather than silently wiring an npx command
   the installer never placed.
+
+### Increment II/III — as-built notes
+
+Increment II (pack-level selection) and Increment III (discovery→installer) shipped on
+`feat/onboarding-increment-ii-iii`, and residuals (a) and (c) above are now cleared:
+
+- **`praxec pack list <repo>`** (Task A2). Reuses `praxec_core::repo::load_repo` on a bare pack
+  dir — the same `praxec.repo.yaml` walk `check`/`serve` use — and prints the namespace-prefixed
+  `flow.*` / `cap.*` ids, grouped + counted, with no store/runtime. Read-only, fail-fast on a
+  non-pack dir. Local-dir path only for v1 (remote `{uri,ref}` clone deferred).
+
+- **`init --packs <comma-list>`** (Task A3). Selects a subset of the open `STARTER_PACK_URIS` by
+  short id (the final `/`-segment, derived — not a parallel list), wires each as `{uri, ref: main}`
+  through the existing `merge_pack_wiring`, and sets `registry=true`. Unions idempotently with
+  `--with-starter-packs` / `--pack`; unknown id → fail-fast listing valid ids. **frontrails is
+  deliberately excluded** — an `include:{uri,hash}` pack needing licensed FrontRails servers; wire
+  it by hand with `--pack <uri>`. (Documented in `docs/guides/connections.md`.)
+
+- **Discovery → installer** (Task A4) clears the split-brain gap in §7. `provision_install::from_candidate`
+  normalizes a `tool_catalog::ToolCandidate` to a provider coordinate (`Image→docker`,
+  `Repo→release`, `Crate→cargo`, `Npm→npx`, `Url→Remote/no-install`) and `praxec tools install`
+  falls back to a discovered candidate (matched by name) when the id isn't in the curated
+  `discovery.registry`, routing through the **one** `provision_install::install`. Curated wins on
+  a name collision. **No-version caveat:** discovery candidates carry no version, so docker defaults
+  to the honest `:latest` tag while a discovered `Repo`/release tool needs a pinned semver before
+  it resolves a real asset — the curated registry stays the pinned path.
+
+- **npx provider** (Task A5) clears residual (c). `Provider::Npx` slots into the chain **release →
+  docker → npx → cargo** (before cargo — no toolchain). An npm-distributed stdio tool "installs"
+  as a **no-op** (`NoInstallNeeded`; npx fetches on run) and wires `{command: npx, args: [-y,
+  <pkg>]}`, gated on `io.which("npx")`. Never a source build. (Also hardened: `CHECKSUM_MALFORMED`
+  for a short/malformed hash token, and a sturdier `--version` probe.)
+
+- **docker connection-body recipe** (Task A1) clears residual (a). `flow.tools.provision`'s
+  `building` step now emits a `docker run --rm -i <image>` connection body for a docker-transport
+  candidate (image from `providers.docker`, version pinned), so docker candidates complete to a
+  ready connection instead of hitting `BUILD_RECIPE_UNAVAILABLE`. stdio / remote / rest lanes
+  unchanged.
+
+Two cross-repo deliverables landed alongside the code:
+
+- **`praxec/packs` registry currency** (Track B, separate PR
+  [praxec/packs#9](https://github.com/praxec/packs/pull/9)). `cpm-planner` 0.0.1→0.0.2,
+  `crossmatrix` 0.1.0→0.2.0, cognitive-architectures `requires:` completed with `corpus` +
+  `markdown-administrator`, and a new `corpus` tool entry (docker/release/cargo providers).
+
+- **corpus v0.0.1 release** (Track C). Tagged so corpus's prebuilt binaries publish, making the
+  Track B `corpus` registry entry release-installable and matching the pinned `version:`.

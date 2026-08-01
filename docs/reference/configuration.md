@@ -564,6 +564,20 @@ separately, at install time, by the release `checksums.sha256` verify. If the
 (`DISCOVERY_REGISTRY_OFFLINE`) and reuses the last cached tip; with no cache it
 fails fast, naming the `uri`.
 
+Each registry tool declares a `providers:` chain the installer walks in order —
+**release → docker → npx → cargo**: prebuilt release binary first (no compiler,
+no Docker daemon), then a `docker run` image, then an npm-distributed stdio
+server run on demand via `npx -y <pkg>` (no download; gated on `npx` being on
+PATH), then last-resort emit-only cargo. `praxec doctor --fix`, `praxec tools
+install <id>`, and `praxec init --with-starter-packs` / `--packs <ids>` all
+drive this one installer; `praxec tools install` additionally falls back to a
+tool **discovered** from the configured `registries:` (normalized to a provider
+coordinate) when the id isn't in the curated registry, the curated registry
+winning on a name collision. See
+[connections.md](../guides/connections.md#the-praxecpacks-registry--the-installer)
+for the operator-facing walkthrough and `praxec pack list <repo>` (enumerate a
+pack's flows/caps before wiring it).
+
 ---
 
 ## Audit

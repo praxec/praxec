@@ -94,6 +94,97 @@ pub(crate) const STARTER_PACK_URIS: [&str; 2] = [
 /// (design §5: currency over pinning).
 pub(crate) const STARTER_REGISTRY_URI: &str = "git+https://github.com/praxec/packs";
 
+/// The short id of a starter pack `uri` — its final `/`-segment (e.g.
+/// `git+https://github.com/praxec/cognitive-architectures` →
+/// `cognitive-architectures`). This is the token an operator selects with
+/// `init --packs`.
+pub(crate) fn starter_pack_short_id(uri: &str) -> &str {
+    uri.rsplit('/').next().unwrap_or(uri)
+}
+
+/// The valid `--packs` short ids, in `STARTER_PACK_URIS` order — the single
+/// source of the known open pack set (never a hand-maintained parallel list).
+pub(crate) fn starter_pack_ids() -> Vec<&'static str> {
+    STARTER_PACK_URIS
+        .iter()
+        .map(|u| starter_pack_short_id(u))
+        .collect()
+}
+
+/// Resolve a comma-separated `--packs` selection of short ids into the matching
+/// starter-pack `uri`s (deduped, in first-seen order). Fail-fast (listing the
+/// valid ids) on any unknown id — `--packs` is short-id selection from the known
+/// open set, NOT an arbitrary-uri channel (that is what `--pack <uri>` is for).
+pub(crate) fn resolve_selected_packs(packs_csv: &str) -> anyhow::Result<Vec<String>> {
+    let mut selected: Vec<String> = Vec::new();
+    for raw in packs_csv.split(',') {
+        let id = raw.trim();
+        if id.is_empty() {
+            continue;
+        }
+        match STARTER_PACK_URIS
+            .iter()
+            .find(|u| starter_pack_short_id(u) == id)
+        {
+            Some(uri) => {
+                let uri = (*uri).to_string();
+                if !selected.contains(&uri) {
+                    selected.push(uri);
+                }
+            }
+            None => {
+                anyhow::bail!(
+                    "unknown pack id `{id}` in --packs; valid starter pack ids are: {} \
+                     (to wire an arbitrary pack uri instead, use --pack <uri>)",
+                    starter_pack_ids().join(", ")
+                );
+            }
+        }
+    }
+    Ok(selected)
+}
+
+/// Fold the three pack-selection flags into one [`PackWiring`]:
+/// - `--with-starter-packs` → all of [`STARTER_PACK_URIS`] + the registry pointer;
+/// - `--packs <ids>` → the selected subset of the known open packs + the registry
+///   pointer (so the selected packs' tools resolve);
+/// - `--pack <uri>` → one arbitrary uri, no registry pointer of its own.
+///
+/// Combining any of these unions the pack `uri`s with no duplicates. Fail-fast
+/// (listing valid ids) on an unknown `--packs` id.
+pub(crate) fn resolve_pack_wiring(
+    with_starter_packs: bool,
+    packs: Option<&str>,
+    pack: Option<&str>,
+) -> anyhow::Result<PackWiring> {
+    let mut uris: Vec<String> = Vec::new();
+    let mut registry = with_starter_packs;
+    if with_starter_packs {
+        uris.extend(STARTER_PACK_URIS.iter().map(|s| s.to_string()));
+    }
+    if let Some(csv) = packs {
+        let selected = resolve_selected_packs(csv)?;
+        if !selected.is_empty() {
+            registry = true; // selected packs' tools resolve via the registry
+        }
+        for uri in selected {
+            if !uris.contains(&uri) {
+                uris.push(uri);
+            }
+        }
+    }
+    if let Some(p) = pack {
+        let p = p.to_string();
+        if !uris.contains(&p) {
+            uris.push(p);
+        }
+    }
+    Ok(PackWiring {
+        packs: uris,
+        registry,
+    })
+}
+
 /// What to wire into the scaffolded `gateway.yaml`: a set of pack `uri`s under
 /// `repos:` and (for `--with-starter-packs`) the always-latest
 /// `discovery.registry` pointer.
@@ -937,6 +1028,149 @@ mod tests {
             as_json(&reset.yaml)["discovery"]["registry"]["uri"],
             json!(STARTER_REGISTRY_URI)
         );
+    }
+
+    // ── --packs pack-level selection (Task A3) ───────────────────────────────
+
+    #[test]
+    fn starter_pack_short_id_is_the_final_path_segment() {
+        // The `--packs` token is the last `/`-segment of each starter uri —
+        // derived from STARTER_PACK_URIS, never a hand-maintained parallel list.
+        assert_eq!(
+            starter_pack_short_id("git+https://github.com/praxec/cognitive-architectures"),
+            "cognitive-architectures"
+        );
+        assert_eq!(
+            starter_pack_short_id("git+https://github.com/praxec/praxec-meta"),
+            "praxec-meta"
+        );
+        assert_eq!(
+            starter_pack_ids(),
+            ["cognitive-architectures", "praxec-meta"]
+        );
+    }
+
+    #[test]
+    fn packs_selects_exactly_one_pack_plus_the_registry_pointer() {
+        // Test 1 — `--packs cognitive-architectures` wires exactly that one pack
+        // (NOT praxec-meta) and the always-latest registry pointer; the wired
+        // YAML has the expected shape.
+        let wiring = resolve_pack_wiring(false, Some("cognitive-architectures"), None).unwrap();
+        assert_eq!(
+            wiring.packs,
+            ["git+https://github.com/praxec/cognitive-architectures"],
+            "exactly the one selected pack, not praxec-meta"
+        );
+        assert!(wiring.registry, "selected packs point discovery.registry");
+
+        let base = gateway_yaml_content(Path::new("/tmp/px"));
+        let outcome = merge_pack_wiring(&base, &wiring, false).unwrap();
+        let cfg = as_json(&outcome.yaml);
+        assert_eq!(
+            repo_uris(&cfg),
+            ["git+https://github.com/praxec/cognitive-architectures"],
+            "scaffolded config wires only the selected pack: {}",
+            outcome.yaml
+        );
+        assert_eq!(cfg["repos"][0]["ref"], json!("main"));
+        assert_eq!(
+            cfg["discovery"]["registry"]["uri"],
+            json!(STARTER_REGISTRY_URI),
+            "the selected pack's tools resolve via the always-latest registry: {}",
+            outcome.yaml
+        );
+        assert_eq!(cfg["discovery"]["registry"]["ref"], json!("main"));
+    }
+
+    #[test]
+    fn packs_both_ids_equals_with_starter_packs_no_duplicates() {
+        // Test 2 — `--packs cognitive-architectures,praxec-meta` wires both, no
+        // duplicates, and is identical to `--with-starter-packs`.
+        let by_ids =
+            resolve_pack_wiring(false, Some("cognitive-architectures,praxec-meta"), None).unwrap();
+        let by_all = resolve_pack_wiring(true, None, None).unwrap();
+        assert_eq!(
+            by_ids.packs,
+            STARTER_PACK_URIS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "both selected packs, in order"
+        );
+        assert_eq!(
+            by_ids.packs, by_all.packs,
+            "--packs a,b equals --with-starter-packs"
+        );
+        assert!(by_ids.registry && by_all.registry);
+        // A repeated id is deduped by resolve_selected_packs.
+        let dup =
+            resolve_selected_packs("cognitive-architectures,cognitive-architectures").unwrap();
+        assert_eq!(dup.len(), 1, "a repeated id is not duplicated");
+    }
+
+    #[test]
+    fn packs_unknown_id_fails_fast_listing_valid_ids_and_wires_nothing() {
+        // Test 3 — an unknown id is rejected (naming the valid ids); the wiring
+        // is never produced, so nothing is scaffolded/wired downstream.
+        let err = resolve_pack_wiring(false, Some("bogus"), None)
+            .expect_err("an unknown pack id must fail fast");
+        let msg = err.to_string();
+        assert!(msg.contains("bogus"), "names the offending id: {msg}");
+        assert!(
+            msg.contains("cognitive-architectures") && msg.contains("praxec-meta"),
+            "lists the valid ids: {msg}"
+        );
+        // A valid id mixed with a bogus one still fails (no partial wiring).
+        assert!(resolve_selected_packs("cognitive-architectures,bogus").is_err());
+    }
+
+    #[test]
+    fn packs_unions_with_with_starter_packs_without_duplicates() {
+        // Test 4 — `--packs` + `--with-starter-packs` union to exactly the
+        // starter set, with no duplicate `repos:` entries.
+        let wiring =
+            resolve_pack_wiring(true, Some("cognitive-architectures,praxec-meta"), None).unwrap();
+        assert_eq!(
+            wiring.packs,
+            STARTER_PACK_URIS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "the union is the starter set, no duplicates"
+        );
+        assert!(wiring.registry);
+
+        let base = gateway_yaml_content(Path::new("/tmp/px"));
+        let outcome = merge_pack_wiring(&base, &wiring, false).unwrap();
+        assert_eq!(
+            repo_uris(&as_json(&outcome.yaml)),
+            [
+                "git+https://github.com/praxec/cognitive-architectures",
+                "git+https://github.com/praxec/praxec-meta",
+            ],
+            "no duplicate repos entries: {}",
+            outcome.yaml
+        );
+    }
+
+    #[test]
+    fn packs_unions_with_arbitrary_pack_uri_and_keeps_registry() {
+        // `--packs` (known open subset) composes with `--pack <uri>` (arbitrary),
+        // deduped, and still points the registry (from the --packs selection).
+        let wiring = resolve_pack_wiring(
+            false,
+            Some("cognitive-architectures"),
+            Some("git+https://github.com/acme/private-pack"),
+        )
+        .unwrap();
+        assert_eq!(
+            wiring.packs,
+            [
+                "git+https://github.com/praxec/cognitive-architectures",
+                "git+https://github.com/acme/private-pack",
+            ]
+        );
+        assert!(wiring.registry);
     }
 
     #[test]
