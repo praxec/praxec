@@ -310,9 +310,23 @@ pub(crate) enum Command {
         /// Non-interactive: skip the API-key prompt (read `OPENROUTER_API_KEY`
         /// from the environment instead, noting if unset) and skip the
         /// editor-wiring confirmation (auto-detected editors are wired
-        /// without asking).
+        /// without asking). Also grants install consent (see `--install-tools`).
         #[arg(long)]
         yes: bool,
+        /// Additionally wire the two OPEN starter packs
+        /// (`cognitive-architectures` + `praxec-meta`) under `repos:` and point
+        /// `discovery.registry` at the always-latest `praxec/packs` registry
+        /// (`{uri, ref: main}`), then run tool provisioning on the result.
+        #[arg(long)]
+        with_starter_packs: bool,
+        /// Wire exactly one pack under `repos:` (`{uri, ref: main}`). Combine
+        /// with `--with-starter-packs` to union (no duplicates).
+        #[arg(long)]
+        pack: Option<String>,
+        /// Grant consent to INSTALL any missing pack tools during the
+        /// provisioning step (default is offer-only). `--yes` implies this.
+        #[arg(long)]
+        install_tools: bool,
     },
 }
 

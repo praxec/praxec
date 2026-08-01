@@ -220,7 +220,20 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             global,
             force,
             yes,
-        } => init(editor, provider, dir, global, force, yes),
+            with_starter_packs,
+            pack,
+            install_tools,
+        } => init(
+            editor,
+            provider,
+            dir,
+            global,
+            force,
+            yes,
+            with_starter_packs,
+            pack,
+            install_tools,
+        ),
     }
 }
 
@@ -2831,6 +2844,27 @@ fn format_provisioning(lines: &[String], fix: bool) -> String {
     out
 }
 
+/// Shared provisioning entrypoint for `doctor` and `init`: load the registry
+/// declared by `config`, resolve each `missing` tool's provider against it, and
+/// OFFER it — or, under `fix` consent, INSTALL it — returning the rendered
+/// "tool provisioning" section. `io` is injected so the real path
+/// (`RealInstallerIo`) and tests (a recording fake) drive the SAME code — the
+/// single install entrypoint both surfaces reach, never a parallel one.
+fn provisioning_report(
+    config: &Value,
+    missing: &[String],
+    fix: bool,
+    io: &dyn praxec_core::provision_install::InstallerIo,
+) -> anyhow::Result<String> {
+    let registry = load_registry(config)?;
+    let host = praxec_core::provision_install::Host {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+    };
+    let lines = provision_report_lines(missing, registry.as_deref(), &host, fix, io);
+    Ok(format_provisioning(&lines, fix))
+}
+
 /// P15 — the operator's "is my machine set up for this config" command: run
 /// the credential/tooling preflight and print the report. Exits non-zero iff
 /// a required provider credential is missing (a missing `kind: mcp` binary is
@@ -2855,16 +2889,12 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
     // `report.tools`), resolve its install provider from the loaded registry and
     // OFFER the exact command. Under `--fix` (the operator's ADR-0006 consent),
     // install it — continuing past a single tool's failure. Advisory like
-    // currency: it never blocks the doctor exit.
-    let registry = load_registry(&config)?;
-    let host = praxec_core::provision_install::Host {
-        os: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-    };
+    // currency: it never blocks the doctor exit. Shared with `init` (Task 5).
     let io = praxec_core::provision_install::RealInstallerIo;
-    let provisioning =
-        provision_report_lines(&report.tools.missing, registry.as_deref(), &host, fix, &io);
-    print!("{}", format_provisioning(&provisioning, fix));
+    print!(
+        "{}",
+        provisioning_report(&config, &report.tools.missing, fix, &io)?
+    );
 
     // Tool currency (v0.0.43): is each `kind: mcp` connection actually up to
     // date with its source (local cargo repo / docker registry / remote)?
@@ -3057,6 +3087,7 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
 /// existing editor MCP config is only ever MERGED (add/replace the `praxec`
 /// server key, never touching another server or top-level key).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn init(
     editor: Option<InitEditorArg>,
     provider: String,
@@ -3064,10 +3095,14 @@ fn init(
     global: bool,
     force: bool,
     yes: bool,
+    with_starter_packs: bool,
+    pack: Option<String>,
+    install_tools: bool,
 ) -> anyhow::Result<()> {
     use crate::init::{
-        EditorTarget, EditorWriteOutcome, InitIo, RealInitIo, ScaffoldOutcome,
-        gateway_yaml_content, models_yaml_content, resolve_target_dir, scaffold_file,
+        EditorTarget, EditorWriteOutcome, InitIo, PackWiring, RealInitIo, STARTER_PACK_URIS,
+        STARTER_REGISTRY_URI, ScaffoldOutcome, gateway_yaml_content, install_consent,
+        merge_pack_wiring, models_yaml_content, resolve_target_dir, scaffold_file,
         write_editor_mcp_config,
     };
 
@@ -3106,6 +3141,50 @@ fn init(
             "  skipped {} (already exists; pass --force to overwrite)",
             models_yaml_path.display()
         ),
+    }
+
+    // ── pack wiring (Task 5) ─────────────────────────────────────────────────
+    // `--with-starter-packs` unions the two OPEN starter packs + points
+    // `discovery.registry` at the always-latest `praxec/packs` registry;
+    // `--pack <uri>` unions one more. Idempotent: an existing `repos:`/
+    // `discovery` block is preserved and extended, never clobbered (unless
+    // `--force`). Runs on whatever `gateway.yaml` is now on disk, so a re-run
+    // merges rather than skips.
+    let mut packs: Vec<String> = Vec::new();
+    if with_starter_packs {
+        packs.extend(STARTER_PACK_URIS.iter().map(|s| s.to_string()));
+    }
+    if let Some(p) = &pack {
+        if !packs.iter().any(|u| u == p) {
+            packs.push(p.clone());
+        }
+    }
+    let wiring_requested = !packs.is_empty();
+    if wiring_requested {
+        let wiring = PackWiring {
+            packs,
+            registry: with_starter_packs,
+        };
+        let existing = std::fs::read_to_string(&gateway_yaml_path)
+            .with_context(|| format!("reading {} for pack wiring", gateway_yaml_path.display()))?;
+        let outcome = merge_pack_wiring(&existing, &wiring, force)?;
+        std::fs::write(&gateway_yaml_path, &outcome.yaml)
+            .with_context(|| format!("writing wired {}", gateway_yaml_path.display()))?;
+        if outcome.added_packs.is_empty() {
+            println!(
+                "  repos   {} (all requested packs already wired)",
+                gateway_yaml_path.display()
+            );
+        } else {
+            for uri in &outcome.added_packs {
+                println!("  wired   repo {uri} (ref: main)");
+            }
+        }
+        if outcome.registry_wired {
+            println!("  wired   discovery.registry -> {STARTER_REGISTRY_URI} (always-latest)");
+        } else if with_starter_packs {
+            println!("  registry pointer already present (kept; --force to reset)");
+        }
     }
 
     // ── API key ──────────────────────────────────────────────────────────────
@@ -3201,6 +3280,19 @@ fn init(
             let report = crate::preflight::preflight(&config);
             print!("{}", crate::preflight::format_report(&report));
             print_soft_diagnostics(&soft_diagnostics);
+
+            // Tool provisioning (Task 5): when packs were wired, run the SAME
+            // resolve-and-offer path `doctor` uses against the freshly written
+            // config. OFFER missing tools by default; INSTALL them only under
+            // `--install-tools`/`--yes` (consent by construction).
+            if wiring_requested {
+                let fix = install_consent(install_tools, yes);
+                let io = praxec_core::provision_install::RealInstallerIo;
+                match provisioning_report(&config, &report.tools.missing, fix, &io) {
+                    Ok(section) => print!("{section}"),
+                    Err(e) => println!("  tool provisioning could not run: {e:#}"),
+                }
+            }
         }
         Err(e) => println!("  doctor could not load the scaffolded config: {e:#}"),
     }
@@ -6324,6 +6416,46 @@ mod tests {
                 lines[0]
             );
             assert_eq!(io.pulls.borrow().len(), 0, "unknown tool must not install");
+        }
+
+        /// Task 5 — the shared `provisioning_report` entrypoint `init` calls: it
+        /// loads the registry from the config's `discovery.registry`, then OFFERS
+        /// (default) or INSTALLS (under `fix` consent) via the injected IO. Pins
+        /// that `init`'s `--install-tools`/`--yes` → `fix=true` reaches the
+        /// installer under `Consent::Granted`, and the default mutates nothing.
+        #[test]
+        fn shared_provisioning_report_installs_only_under_consent() {
+            use serde_json::json;
+
+            let dir = tempfile::tempdir().unwrap();
+            let reg_path = dir.path().join("packs.yaml");
+            std::fs::write(
+                &reg_path,
+                "schema: praxec.packs/v3\n\
+                 tools:\n  - id: planner-tool\n    name: planner\n    command: planner\n    version: 0.0.2\n    providers:\n      docker: ghcr.io/praxec/planner\n",
+            )
+            .unwrap();
+            let config = json!({ "discovery": { "registry": reg_path.display().to_string() } });
+            let missing = ["planner".to_string()];
+
+            // Default (offer-only) — zero mutation.
+            let offer_io = FakeIo::default();
+            let offered = super::super::provisioning_report(&config, &missing, false, &offer_io)
+                .expect("offer path");
+            assert!(offered.contains("offer-only") && offered.contains("result=offered"));
+            assert_eq!(offer_io.pulls.borrow().len(), 0, "offer must not pull");
+            assert_eq!(offer_io.writes.borrow().len(), 0, "offer must not write");
+
+            // Consent granted (`--install-tools`/`--yes`) — reaches the installer.
+            let fix_io = FakeIo::default();
+            let installed =
+                super::super::provisioning_report(&config, &missing, true, &fix_io).expect("fix");
+            assert!(installed.contains("result=installed"), "{installed}");
+            assert_eq!(
+                fix_io.pulls.borrow().as_slice(),
+                &["ghcr.io/praxec/planner:0.0.2".to_string()],
+                "install runs under Consent::Granted"
+            );
         }
 
         #[test]
