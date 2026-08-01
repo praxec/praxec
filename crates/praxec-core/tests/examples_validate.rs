@@ -133,6 +133,137 @@ fn run_build_recipe(transport: &str, command: &str) -> serde_json::Value {
     })
 }
 
+/// Same as [`run_build_recipe`] but asserts the recipe FAILS (non-zero exit)
+/// and emits NO connection body on stdout, returning its stderr for the
+/// caller to assert the typed error marker on.
+fn run_build_recipe_expect_fail(transport: &str, command: &str) -> String {
+    let flow = examples_dir().join("tool-provision/flow.tools.provision.yaml");
+    let doc: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&flow).expect("flow readable"))
+            .expect("flow parses as YAML");
+    let body = doc["scripts"]["build.connection-body"]["body"]
+        .as_str()
+        .expect("build.connection-body.body is a string");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("build.sh");
+    std::fs::write(&script, body).expect("write script");
+
+    let out = std::process::Command::new("bash")
+        .arg(&script)
+        .args([transport, command, "", "[]", "{}"])
+        .output()
+        .expect("bash runs the recipe");
+    assert!(
+        !out.status.success(),
+        "recipe for transport `{transport}` / `{command}` was expected to fail but succeeded; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "a failing build recipe must emit NO connection body, got stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+// ── FIX I1 — docker connection body must run the EXACT pulled/validated image ─
+
+/// Poka-yoke: a docker candidate whose image is UNPINNED (no `:tag`, no
+/// `@digest` — discovery's `mcp_registry` adapter sets
+/// `ToolSource::Image{image:<pkg-name>}` with no tag) fails fast with
+/// `BUILD_REQUIRES_PINNED_IMAGE` and emits no body — `docker run <image>`
+/// would otherwise resolve `:latest` at spawn, a different image than
+/// `docker pull <image>:<version>` fetched.
+#[test]
+fn docker_unpinned_image_fails_fast_with_typed_error() {
+    let stderr = run_build_recipe_expect_fail("docker", "ghcr.io/praxec/corpus");
+    assert!(
+        stderr.contains("BUILD_REQUIRES_PINNED_IMAGE"),
+        "unpinned docker image must fail with BUILD_REQUIRES_PINNED_IMAGE, got: {stderr}"
+    );
+}
+
+/// A bare `<pkg-name>` (the untagged mcp_registry shape, no registry host at
+/// all) is likewise rejected — a lone name resolves `:latest` on `docker run`.
+#[test]
+fn docker_bare_untagged_name_fails_fast() {
+    let stderr = run_build_recipe_expect_fail("docker", "corpus");
+    assert!(
+        stderr.contains("BUILD_REQUIRES_PINNED_IMAGE"),
+        "bare untagged docker name must fail with BUILD_REQUIRES_PINNED_IMAGE, got: {stderr}"
+    );
+}
+
+/// A digest-pinned image (`@sha256:…`) is accepted — that is the strongest
+/// pin, and it must NOT be mistaken for unpinned just because it lacks `:tag`.
+#[test]
+fn docker_digest_pinned_image_is_accepted() {
+    let image = "ghcr.io/praxec/corpus@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    let body = run_build_recipe("docker", image);
+    assert_eq!(body["command"], "docker");
+    assert_eq!(
+        body["args"],
+        serde_json::json!(["run", "--rm", "-i", image]),
+        "digest-pinned docker body runs the exact pinned ref"
+    );
+}
+
+// ── FIX M1 — npm-source stdio candidate wires the npx runnable form ──────────
+
+/// An npm-source candidate (`ToolSource::Npm{pkg}` — the A5 `Provider::Npx`
+/// no-op-install path) wires `{command:"npx", args:["-y",<pkg>]}` rather than a
+/// bare `<name>` that was never placed on PATH, and that body is schema-valid.
+#[test]
+fn npm_source_wires_npx_connection_body() {
+    let pkg = "@playwright/mcp";
+    let body = run_build_recipe("npx", pkg);
+
+    assert_eq!(body["kind"], "mcp", "npx body is an mcp connection");
+    assert_eq!(body["command"], "npx", "npm-source body invokes `npx`");
+    assert_eq!(
+        body["args"],
+        serde_json::json!(["-y", pkg]),
+        "npx body runs the npm package via `npx -y <pkg>`"
+    );
+
+    let schema: serde_json::Value =
+        serde_json::from_str(GATEWAY_CONFIG_SCHEMA).expect("schema parses");
+    let mcp_conn = schema["$defs"]["mcpConnection"].clone();
+    let validator = jsonschema::validator_for(&mcp_conn).expect("mcpConnection def compiles");
+    assert!(
+        validator.is_valid(&body),
+        "npx connection body must satisfy mcpConnection: {body}"
+    );
+}
+
+/// The `building` step routes an npm-source stdio candidate to the npx recipe
+/// (a `build_stdio_npx` transition guarded on `npmPkg != null`), while a plain
+/// binary stdio source (`npmPkg == null`) keeps the bare-`{command}` recipe.
+#[test]
+fn stdio_lane_splits_npm_source_from_binary() {
+    let flow = examples_dir().join("tool-provision/flow.tools.provision.yaml");
+    let text = std::fs::read_to_string(&flow).expect("flow readable");
+
+    assert!(
+        text.contains("build_stdio_npx"),
+        "a `build_stdio_npx` transition must wire the npx recipe for an npm source"
+    );
+    assert!(
+        text.contains("$.context.npmPkg != null"),
+        "the npx lane must be guarded on the candidate carrying an npm package"
+    );
+    assert!(
+        text.contains("$.context.npmPkg == null"),
+        "the bare-binary stdio lane must exclude the npm-source case"
+    );
+    // The stale claim that npx is not a provider must be gone.
+    assert!(
+        !text.contains("no npm/npx provider anymore"),
+        "the stale `no npm/npx provider anymore` comment must be corrected"
+    );
+}
+
 /// A docker-transport candidate reaches a valid connection body — `docker run
 /// --rm -i <image>` as an mcp command — instead of the old
 /// `BUILD_RECIPE_UNAVAILABLE` dead-end, and that body is schema-valid against
