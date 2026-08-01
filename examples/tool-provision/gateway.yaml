@@ -3,15 +3,16 @@
 # `flow.tools.deprovision` (P2.4) — see README.md for what each composes and
 # how to run them.
 #
-# `flow.tools.provision` shells out to the `praxec` binary itself
-# (`connections add` / `connections grant` / `doctor`) via the `praxec` cli
-# connection below, and to `npm` for the npx-distributed-server install
-# recipe. `flow.tools.deprovision` shells out to the same `praxec` binary
+# `flow.tools.provision` shells out to the `praxec` binary itself for
+# EVERY step that touches the host — `tools install` (the `installing` step
+# delegates the install to the one `ProvisionInstaller`), `connections add`,
+# `doctor`, `connections grant` — via the single `praxec` cli connection
+# below. `flow.tools.deprovision` shells out to the same `praxec` binary
 # (`connections revoke` — the mirror of `connections grant`) and needs
-# nothing else. All must be on PATH for a real (non-`check`/`fuzz`) drive;
-# `praxec check` and `praxec fuzz` validate the workflow shape statically /
-# with mock executors and never actually spawn either. `jq` must also be on
-# PATH — `flow.tools.provision`'s `building` script (declared in
+# nothing else. `praxec` must be on PATH for a real (non-`check`/`fuzz`)
+# drive; `praxec check` and `praxec fuzz` validate the workflow shape
+# statically / with mock executors and never actually spawn it. `jq` must
+# also be on PATH — `flow.tools.provision`'s `building` script (declared in
 # `flow.tools.provision.yaml`'s own `scripts:` block, colocated with the
 # workflow that owns it) uses it to assemble the staged connection body.
 
@@ -31,11 +32,6 @@ connections:
   praxec:
     kind: cli
     command: praxec
-
-  # `installing`'s stdio/npx install recipe.
-  npm:
-    kind: cli
-    command: npm
 
 audit:
   sink: stderr

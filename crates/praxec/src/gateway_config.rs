@@ -275,6 +275,15 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ConnectionsCommand,
     },
+    /// Provision pack tools through the one installer. The thin delegation
+    /// surface a governed `flow.tools.provision` `kind: cli` step reaches (the
+    /// only way a YAML step can call the Rust `ProvisionInstaller`): it resolves
+    /// the tool from the config's `discovery.registry` and installs it via the
+    /// release → docker → cargo provider chain (`Consent::Granted`).
+    Tools {
+        #[command(subcommand)]
+        command: ToolsCommand,
+    },
     /// Cross-platform single-command onboarding: scaffold a working
     /// `gateway.yaml` + starter `models.yaml`, capture a provider API key
     /// (reusing the `providers.env` backend), wire an editor's MCP config
@@ -454,6 +463,25 @@ pub(crate) enum ConnectionsCommand {
         config: PathBuf,
         /// The granted connection to revoke.
         name: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ToolsCommand {
+    /// Install one pack tool by id (or `command`), resolved against the config's
+    /// `discovery.registry`, through the one [`ProvisionInstaller`] under
+    /// `Consent::Granted` — the same installer `doctor --fix` / `init
+    /// --install-tools` use. This is a THIN wrapper (no new install logic): it
+    /// looks the tool up and delegates. Fail-fast (non-zero) on an unknown
+    /// tool-id, an unconfigured registry, an install error, or a refused
+    /// (checksum-mismatch) / emit-only (cargo) outcome.
+    Install {
+        /// Path to the gateway YAML config (its `discovery.registry` resolves
+        /// the tool coordinates).
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The tool id (or its `command`) to install.
+        tool_id: String,
     },
 }
 

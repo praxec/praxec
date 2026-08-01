@@ -45,6 +45,46 @@ fn simple_proxy_yaml_resolves_cleanly() {
     let _ = resolve_example("simple-proxy.yaml");
 }
 
+// ── Task 6 — the rewired governed provision flow ───────────────────────────
+
+/// The tool-provision example (its `installing` step now DELEGATES to
+/// `praxec tools install`) still resolves cleanly through the validator stack —
+/// i.e. `praxec check` passes on it.
+#[test]
+fn tool_provision_gateway_resolves_cleanly() {
+    let _ = resolve_example("tool-provision/gateway.yaml");
+}
+
+/// The `installing` step routes through the ONE installer delegation, and the
+/// deleted dead paths (`npm install -g`, `INSTALL_RECIPE_UNAVAILABLE`,
+/// `install_unsupported` / `community_installing`) are grep-clean gone.
+#[test]
+fn tool_provision_install_delegates_and_dead_paths_are_gone() {
+    let flow = examples_dir().join("tool-provision/flow.tools.provision.yaml");
+    let text = std::fs::read_to_string(&flow).expect("flow readable");
+
+    // The install step delegates to the one installer.
+    assert!(
+        text.contains("\"tools\"") && text.contains("\"install\""),
+        "installing must delegate via `praxec tools install`"
+    );
+
+    // Dead paths removed — no parallel install abstraction left beside it.
+    for dead in [
+        "npm install -g",
+        "INSTALL_RECIPE_UNAVAILABLE",
+        "install_unsupported",
+        "community_installing",
+        "install.community-npm",
+        "connection: npm",
+    ] {
+        assert!(
+            !text.contains(dead),
+            "dead path `{dead}` must be deleted from the provision flow"
+        );
+    }
+}
+
 // ── Regression guard: every *.yaml at examples/ top level must resolve ─────
 
 #[test]
