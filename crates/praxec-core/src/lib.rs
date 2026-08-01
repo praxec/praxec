@@ -62,6 +62,7 @@ pub mod ports;
 pub mod promotion;
 pub mod provider_keys;
 pub mod providers;
+pub mod provision_install;
 pub mod proxy_workflow;
 pub mod registry_v3;
 pub mod reliability;
