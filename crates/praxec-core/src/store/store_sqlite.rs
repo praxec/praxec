@@ -39,37 +39,35 @@ impl SqliteWorkflowStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating dir {}", parent.display()))?;
         }
-        let conn = Connection::open(&path)
+        let mut conn = Connection::open(&path)
             .with_context(|| format!("opening sqlite at {}", path.display()))?;
+        // Concurrent `praxec serve` processes share this file and each runs the
+        // schema migration below in its own `open()`. Wait (rather than fail)
+        // for a peer that holds the write lock so the migrations serialize
+        // instead of racing.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // WAL gives much better concurrent-read performance for our pattern
-        // (many reads, occasional writes).
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // (many reads, occasional writes). The one-time conversion from the
+        // default rollback journal needs a brief EXCLUSIVE lock and — unlike
+        // ordinary writes — does NOT honour `busy_timeout`, so under a
+        // thundering herd of concurrent `open()`s it surfaces SQLITE_BUSY
+        // ("database is locked") immediately. Retry it: the losers succeed the
+        // moment the winner has flipped the file to WAL (a no-op thereafter).
+        with_busy_retry("set journal_mode=WAL", || {
+            conn.pragma_update(None, "journal_mode", "WAL")
+        })?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS workflows (
+        with_busy_retry("create table workflows", || {
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflows (
                 id       TEXT PRIMARY KEY,
                 version  INTEGER NOT NULL,
                 instance TEXT NOT NULL
             )",
-            [],
-        )?;
-        // run_id uniqueness identifies a RUN (a tree) and only its ROOT
-        // establishes it. A sub-workflow inherits the parent's run_id so
-        // correlation survives the spawn, so children (`$.parent` present) are
-        // EXCLUDED from the constraint — otherwise every spawn would violate it
-        // once every root run carries a minted run_id. `$.parent IS NULL` holds
-        // for a root whether serde omits the field or writes an explicit null.
-        // Drop-then-create (not IF NOT EXISTS): an older DB may hold the prior,
-        // childless predicate, and the index is derived data — recreating is
-        // lossless.
-        conn.execute("DROP INDEX IF EXISTS idx_workflows_run_id", [])?;
-        conn.execute(
-            "CREATE UNIQUE INDEX idx_workflows_run_id \
-             ON workflows (json_extract(instance, '$.run_env.run_id')) \
-             WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL \
-               AND json_extract(instance, '$.parent') IS NULL",
-            [],
-        )?;
+                [],
+            )
+        })?;
+        Self::migrate_run_id_index(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
@@ -77,7 +75,7 @@ impl SqliteWorkflowStore {
     }
 
     pub fn open_in_memory() -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS workflows (
                 id       TEXT PRIMARY KEY,
@@ -86,32 +84,127 @@ impl SqliteWorkflowStore {
             )",
             [],
         )?;
-        // run_id uniqueness identifies a RUN (a tree) and only its ROOT
-        // establishes it. A sub-workflow inherits the parent's run_id so
-        // correlation survives the spawn, so children (`$.parent` present) are
-        // EXCLUDED from the constraint — otherwise every spawn would violate it
-        // once every root run carries a minted run_id. `$.parent IS NULL` holds
-        // for a root whether serde omits the field or writes an explicit null.
-        // Drop-then-create (not IF NOT EXISTS): an older DB may hold the prior,
-        // childless predicate, and the index is derived data — recreating is
-        // lossless.
-        conn.execute("DROP INDEX IF EXISTS idx_workflows_run_id", [])?;
-        conn.execute(
-            "CREATE UNIQUE INDEX idx_workflows_run_id \
-             ON workflows (json_extract(instance, '$.run_env.run_id')) \
-             WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL \
-               AND json_extract(instance, '$.parent') IS NULL",
-            [],
-        )?;
+        Self::migrate_run_id_index(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path: PathBuf::from(":memory:"),
         })
     }
 
+    /// Create the `idx_workflows_run_id` unique index, concurrency-safely.
+    ///
+    /// run_id uniqueness identifies a RUN (a tree) and only its ROOT
+    /// establishes it. A sub-workflow inherits the parent's run_id so
+    /// correlation survives the spawn, so children (`$.parent` present) are
+    /// EXCLUDED from the constraint — otherwise every spawn would violate it
+    /// once every root run carries a minted run_id. `$.parent IS NULL` holds
+    /// for a root whether serde omits the field or writes an explicit null.
+    /// Drop-then-create (not IF NOT EXISTS): an older DB may hold the prior,
+    /// childless predicate, and the index is derived data — recreating is
+    /// lossless.
+    ///
+    /// The DROP + CREATE run in a single IMMEDIATE transaction so the pair is
+    /// atomic per process and (paired with `busy_timeout`) serializes across
+    /// the concurrent `praxec serve` processes that share one on-disk file:
+    /// a second process's IMMEDIATE tx waits for the first to commit, then
+    /// re-runs DROP+CREATE against the already-migrated DB and succeeds.
+    fn migrate_run_id_index(conn: &mut Connection) -> anyhow::Result<()> {
+        // The whole DROP+CREATE tx is idempotent, so retry it as a unit on
+        // SQLITE_BUSY (`busy_timeout` covers these statements, but wrapping the
+        // migration too is belt-and-suspenders and lets a fresh IMMEDIATE tx
+        // re-acquire the lock cleanly after a peer commits).
+        with_busy_retry("migrate idx_workflows_run_id", || {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute("DROP INDEX IF EXISTS idx_workflows_run_id", [])?;
+            match tx.execute(
+                "CREATE UNIQUE INDEX idx_workflows_run_id \
+                 ON workflows (json_extract(instance, '$.run_env.run_id')) \
+                 WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL \
+                   AND json_extract(instance, '$.parent') IS NULL",
+                [],
+            ) {
+                Ok(_) => {}
+                // Belt-and-suspenders: if a lock the busy_timeout didn't cover
+                // let a peer recreate the index between our DROP and CREATE,
+                // treat "already exists" as benign — the index is derived data
+                // with a fixed definition, so a peer's copy is identical to
+                // ours. Any OTHER error still fails the open.
+                Err(rusqlite::Error::SqliteFailure(_, ref msg))
+                    if msg
+                        .as_deref()
+                        .is_some_and(|m| m.contains("idx_workflows_run_id already exists")) => {}
+                Err(e) => return Err(e),
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     pub fn path(&self) -> &std::path::Path {
         &self.path
     }
+}
+
+/// Run a contended, **idempotent** sqlite write, retrying a bounded number of
+/// times on SQLITE_BUSY / SQLITE_LOCKED with short randomized backoff.
+///
+/// `busy_timeout` makes ordinary writes WAIT for a peer's lock, but a few
+/// operations bypass the busy handler and surface `SQLITE_BUSY` immediately —
+/// notably the `PRAGMA journal_mode=WAL` conversion. Under a thundering herd of
+/// concurrent `open()`s (many `praxec serve` processes sharing one on-disk
+/// file, released simultaneously) the losers get "database is locked" with no
+/// wait. Every call site here is idempotent, so retrying with jittered backoff
+/// lets the losers succeed once the winner releases the lock. The loop is
+/// BOUNDED (never an unbounded spin), and a genuine non-BUSY error fails
+/// immediately — so schema/constraint/IO faults still fail-fast.
+fn with_busy_retry<T>(
+    what: &str,
+    mut op: impl FnMut() -> rusqlite::Result<T>,
+) -> anyhow::Result<T> {
+    const MAX_ATTEMPTS: u32 = 10;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_sqlite_busy(&e) && attempt < MAX_ATTEMPTS => {
+                // Jittered backoff de-synchronizes the herd: a small base that
+                // grows with the attempt, plus a per-thread/time spread so peers
+                // don't retry in lockstep. Worst case (all 9 sleeps) is well
+                // under 1s. Jitter is dependency-free (no rand in lib deps).
+                let spread = 1 + jitter_hash() % (4 * attempt as u64);
+                std::thread::sleep(std::time::Duration::from_millis(attempt as u64 + spread));
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("sqlite: {what}"))),
+        }
+    }
+    unreachable!("with_busy_retry iterates 1..=MAX_ATTEMPTS and returns on the final attempt")
+}
+
+/// Cheap, dependency-free backoff jitter: hash of the current thread id and the
+/// wall-clock subsecond, so concurrent peers pick different spreads and don't
+/// retry in lockstep. Quality doesn't matter here — only that peers diverge.
+fn jitter_hash() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut h);
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0)
+        .hash(&mut h);
+    h.finish()
+}
+
+/// SQLITE_BUSY / SQLITE_LOCKED — a lock-contention failure that is safe to retry
+/// (unlike a schema, constraint, or I/O error, which must fail-fast).
+fn is_sqlite_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 #[async_trait]
