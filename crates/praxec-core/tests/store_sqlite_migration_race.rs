@@ -22,7 +22,7 @@ fn concurrent_open_never_races_on_index_migration() {
     let tmp = tempfile::NamedTempFile::new().expect("temp db file");
     let path = tmp.path().to_path_buf();
 
-    const N: usize = 8;
+    const N: usize = 16;
     let barrier = Arc::new(Barrier::new(N));
     let mut handles = Vec::with_capacity(N);
     for _ in 0..N {
