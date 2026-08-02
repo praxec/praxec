@@ -39,8 +39,13 @@ impl SqliteWorkflowStore {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating dir {}", parent.display()))?;
         }
-        let conn = Connection::open(&path)
+        let mut conn = Connection::open(&path)
             .with_context(|| format!("opening sqlite at {}", path.display()))?;
+        // Concurrent `praxec serve` processes share this file and each runs the
+        // schema migration below in its own `open()`. Wait (rather than fail)
+        // for a peer that holds the write lock so the migrations serialize
+        // instead of racing.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // WAL gives much better concurrent-read performance for our pattern
         // (many reads, occasional writes).
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -53,23 +58,7 @@ impl SqliteWorkflowStore {
             )",
             [],
         )?;
-        // run_id uniqueness identifies a RUN (a tree) and only its ROOT
-        // establishes it. A sub-workflow inherits the parent's run_id so
-        // correlation survives the spawn, so children (`$.parent` present) are
-        // EXCLUDED from the constraint — otherwise every spawn would violate it
-        // once every root run carries a minted run_id. `$.parent IS NULL` holds
-        // for a root whether serde omits the field or writes an explicit null.
-        // Drop-then-create (not IF NOT EXISTS): an older DB may hold the prior,
-        // childless predicate, and the index is derived data — recreating is
-        // lossless.
-        conn.execute("DROP INDEX IF EXISTS idx_workflows_run_id", [])?;
-        conn.execute(
-            "CREATE UNIQUE INDEX idx_workflows_run_id \
-             ON workflows (json_extract(instance, '$.run_env.run_id')) \
-             WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL \
-               AND json_extract(instance, '$.parent') IS NULL",
-            [],
-        )?;
+        Self::migrate_run_id_index(&mut conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
@@ -77,7 +66,7 @@ impl SqliteWorkflowStore {
     }
 
     pub fn open_in_memory() -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS workflows (
                 id       TEXT PRIMARY KEY,
@@ -86,27 +75,54 @@ impl SqliteWorkflowStore {
             )",
             [],
         )?;
-        // run_id uniqueness identifies a RUN (a tree) and only its ROOT
-        // establishes it. A sub-workflow inherits the parent's run_id so
-        // correlation survives the spawn, so children (`$.parent` present) are
-        // EXCLUDED from the constraint — otherwise every spawn would violate it
-        // once every root run carries a minted run_id. `$.parent IS NULL` holds
-        // for a root whether serde omits the field or writes an explicit null.
-        // Drop-then-create (not IF NOT EXISTS): an older DB may hold the prior,
-        // childless predicate, and the index is derived data — recreating is
-        // lossless.
-        conn.execute("DROP INDEX IF EXISTS idx_workflows_run_id", [])?;
-        conn.execute(
+        Self::migrate_run_id_index(&mut conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            path: PathBuf::from(":memory:"),
+        })
+    }
+
+    /// Create the `idx_workflows_run_id` unique index, concurrency-safely.
+    ///
+    /// run_id uniqueness identifies a RUN (a tree) and only its ROOT
+    /// establishes it. A sub-workflow inherits the parent's run_id so
+    /// correlation survives the spawn, so children (`$.parent` present) are
+    /// EXCLUDED from the constraint — otherwise every spawn would violate it
+    /// once every root run carries a minted run_id. `$.parent IS NULL` holds
+    /// for a root whether serde omits the field or writes an explicit null.
+    /// Drop-then-create (not IF NOT EXISTS): an older DB may hold the prior,
+    /// childless predicate, and the index is derived data — recreating is
+    /// lossless.
+    ///
+    /// The DROP + CREATE run in a single IMMEDIATE transaction so the pair is
+    /// atomic per process and (paired with `busy_timeout`) serializes across
+    /// the concurrent `praxec serve` processes that share one on-disk file:
+    /// a second process's IMMEDIATE tx waits for the first to commit, then
+    /// re-runs DROP+CREATE against the already-migrated DB and succeeds.
+    fn migrate_run_id_index(conn: &mut Connection) -> anyhow::Result<()> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("DROP INDEX IF EXISTS idx_workflows_run_id", [])?;
+        match tx.execute(
             "CREATE UNIQUE INDEX idx_workflows_run_id \
              ON workflows (json_extract(instance, '$.run_env.run_id')) \
              WHERE json_extract(instance, '$.run_env.run_id') IS NOT NULL \
                AND json_extract(instance, '$.parent') IS NULL",
             [],
-        )?;
-        Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
-            path: PathBuf::from(":memory:"),
-        })
+        ) {
+            Ok(_) => {}
+            // Belt-and-suspenders: if a lock the busy_timeout didn't cover let a
+            // peer recreate the index between our DROP and CREATE, treat "already
+            // exists" as benign — the index is derived data with a fixed
+            // definition, so a peer's copy is identical to ours. Any OTHER error
+            // still fails the open.
+            Err(rusqlite::Error::SqliteFailure(_, ref msg))
+                if msg
+                    .as_deref()
+                    .is_some_and(|m| m.contains("idx_workflows_run_id already exists")) => {}
+            Err(e) => return Err(e.into()),
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn path(&self) -> &std::path::Path {
