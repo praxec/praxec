@@ -26,6 +26,11 @@
 //!   npm-distributed stdio server is nothing to download or place — npx fetches
 //!   it on run, and its connection wires `{command: npx, args: ["-y", <pkg>]}`.
 //!   Ordered before cargo (no toolchain needed); never a source build.
+//! - **Uvx** — the PyPI analogue of npx: available when `io.which("uvx")` is true
+//!   and the tool has a `uvx` coordinate (the PyPI package name). "Install" is a
+//!   **no-op** — uvx fetches the package on run, its connection wires
+//!   `{command: uvx, args: [<pkg>]}`. Ordered after npx and before cargo (both
+//!   are on-demand runtime fetchers needing no compiler); never a source build.
 //! - **Cargo** — last-resort source path, **emit-only**: even under
 //!   `Consent::Granted` it only *returns* the `cargo install <crate>` command;
 //!   it never shells out to cargo (that source-build is the exact Windows pain
@@ -42,14 +47,16 @@ use super::{Host, InstallError, InstallOutcome, asset_name, install_release, res
 /// Which provider the chain resolved to. Ordered by onboarding preference
 /// (`Release` highest); shared verbatim with the doctor/init surfaces (T4/T5).
 ///
-/// `Npx` sits before `Cargo`: an npm-distributed stdio MCP server needs **no
-/// toolchain** (npx fetches it on run), so it beats the last-resort source
-/// build — but still after release/docker, which are pinned/reproducible.
+/// `Npx` and `Uvx` sit before `Cargo`: an npm-/PyPI-distributed stdio MCP server
+/// needs **no toolchain** (the fetcher pulls it on run), so both beat the
+/// last-resort source build — but still after release/docker, which are
+/// pinned/reproducible. `Npx` precedes `Uvx` in the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Release,
     Docker,
     Npx,
+    Uvx,
     Cargo,
 }
 
@@ -120,6 +127,23 @@ fn npx_plan(tool: &RegistryTool, io: &dyn InstallerIo) -> Option<InstallPlan> {
     })
 }
 
+/// The uvx plan, gated on `io.which("uvx")` and the tool having a `uvx`
+/// coordinate (the PyPI package name). A PyPI-distributed stdio MCP server is
+/// **not** downloaded or placed — uvx fetches it on run — so the plan's command
+/// is the connection form `uvx <pkg>`. `which` is a pure read (no mutation).
+/// Ordered after npx and before cargo: like npx it needs no toolchain and never
+/// triggers a source build.
+fn uvx_plan(tool: &RegistryTool, io: &dyn InstallerIo) -> Option<InstallPlan> {
+    let pkg = tool.providers.get(ProvisionProvider::Uvx.as_token())?;
+    if !io.which("uvx") {
+        return None;
+    }
+    Some(InstallPlan {
+        provider: Provider::Uvx,
+        command: format!("uvx {pkg}"),
+    })
+}
+
 /// The cargo plan — the last-resort source path. Emit-only: it names the
 /// command but is never executed by this module (§4 point 4).
 fn cargo_plan(tool: &RegistryTool) -> Option<InstallPlan> {
@@ -136,7 +160,7 @@ fn cargo_plan(tool: &RegistryTool) -> Option<InstallPlan> {
 
 /// Resolve the highest-preference **available** provider for `tool` on `host`
 /// WITHOUT installing (doctor's "offer"). Onboarding order: Release → Docker →
-/// Npx → Cargo (§3 principle 2). Returns `None` when no provider resolves.
+/// Npx → Uvx → Cargo (§3 principle 2). Returns `None` when no provider resolves.
 ///
 /// Guaranteed non-mutating: the only IO it performs is `io.which` (a read).
 pub fn resolve_provider(
@@ -147,6 +171,7 @@ pub fn resolve_provider(
     release_plan(tool, host)
         .or_else(|| docker_plan(tool, io))
         .or_else(|| npx_plan(tool, io))
+        .or_else(|| uvx_plan(tool, io))
         .or_else(|| cargo_plan(tool))
 }
 
@@ -219,6 +244,16 @@ pub fn install(
                 plan.command
             ),
         }),
+        // Uvx mirrors Npx: a no-op success even under Granted. A PyPI-distributed
+        // stdio server is nothing to download or place — uvx fetches it on run.
+        // The tool is "ready" because its connection (`uvx <pkg>`, surfaced in the
+        // reason) fetches it on demand. Never a source build.
+        Provider::Uvx => Ok(InstallOutcome::NoInstallNeeded {
+            reason: format!(
+                "PyPI-distributed tool runs on demand via `{}` — nothing to download or place",
+                plan.command
+            ),
+        }),
         // Cargo is emit-only even under Granted: never trigger a source build.
         Provider::Cargo => Ok(InstallOutcome::Offered {
             provider: Provider::Cargo,
@@ -243,6 +278,7 @@ mod tests {
         bin_dir: PathBuf,
         has_docker: bool,
         has_npx: bool,
+        has_uvx: bool,
         writes: RefCell<Vec<(PathBuf, String, usize)>>,
         pulls: RefCell<Vec<String>>,
     }
@@ -272,7 +308,9 @@ mod tests {
             Ok(self.bin_dir.clone())
         }
         fn which(&self, cmd: &str) -> bool {
-            (cmd == "docker" && self.has_docker) || (cmd == "npx" && self.has_npx)
+            (cmd == "docker" && self.has_docker)
+                || (cmd == "npx" && self.has_npx)
+                || (cmd == "uvx" && self.has_uvx)
         }
         fn docker_pull(&self, image_ref: &str) -> Result<(), InstallError> {
             self.pulls.borrow_mut().push(image_ref.to_string());
@@ -625,6 +663,131 @@ mod tests {
             InstallOutcome::Offered {
                 provider: Provider::Npx,
                 command: "npx -y @playwright/mcp".into(),
+            }
+        );
+        assert_eq!(io.writes.borrow().len(), 0);
+        assert_eq!(io.pulls.borrow().len(), 0);
+    }
+
+    // ── contract 11: uvx resolves + is a no-op success wiring `uvx <pkg>` ──────
+    #[test]
+    fn uvx_candidate_resolves_and_installs_as_a_no_op() {
+        let tool = tool_with("git-mcp", "0.0.2", &[("uvx", "mcp-server-git")]);
+        let io = FakeIo {
+            bin_dir: "/fake/bin".into(),
+            has_uvx: true,
+            ..Default::default()
+        };
+
+        // resolve picks Uvx; the plan surfaces the `uvx <pkg>` connection form.
+        let plan = resolve_provider(&tool, &unmapped_host(), &io).unwrap();
+        assert_eq!(plan.provider, Provider::Uvx);
+        assert_eq!(plan.command, "uvx mcp-server-git");
+
+        // Granted install is a no-op success: nothing downloaded, nothing placed,
+        // and the reported outcome surfaces the `uvx <pkg>` command.
+        let out = install(&tool, &unmapped_host(), Consent::Granted, &io).unwrap();
+        match &out {
+            InstallOutcome::NoInstallNeeded { reason } => {
+                assert!(
+                    reason.contains("uvx mcp-server-git"),
+                    "outcome surfaces the connection command: {reason}"
+                );
+            }
+            other => panic!("expected NoInstallNeeded, got {other:?}"),
+        }
+        assert_eq!(io.writes.borrow().len(), 0, "uvx places no binary");
+        assert_eq!(io.pulls.borrow().len(), 0, "uvx pulls no image");
+        assert!(io.responses.is_empty(), "no http_get responses were needed");
+    }
+
+    // ── contract 12: uvx gated on which("uvx") — absent → falls through ───────
+    #[test]
+    fn uvx_absent_falls_through_to_cargo() {
+        // Both a uvx and a cargo coordinate; uvx unavailable → cargo wins.
+        let tool = tool_with(
+            "git-mcp",
+            "0.0.2",
+            &[("uvx", "mcp-server-git"), ("cargo", "git-mcp")],
+        );
+        let io = FakeIo {
+            bin_dir: "/fake/bin".into(),
+            has_uvx: false,
+            ..Default::default()
+        };
+        let plan = resolve_provider(&tool, &unmapped_host(), &io).unwrap();
+        assert_eq!(plan.provider, Provider::Cargo, "uvx gated out → cargo");
+
+        // With only a uvx coordinate and no uvx → nothing resolves.
+        let uvx_only = tool_with("git-mcp", "0.0.2", &[("uvx", "mcp-server-git")]);
+        assert!(
+            resolve_provider(&uvx_only, &unmapped_host(), &io).is_none(),
+            "no uvx and no other provider → None"
+        );
+    }
+
+    // ── contract 13: chain order — release wins over uvx; uvx wins over cargo ──
+    #[test]
+    fn release_beats_uvx_and_uvx_beats_cargo() {
+        let page = "https://github.com/praxec/git-mcp/releases";
+        // Release + uvx both available on a mapped host → Release wins.
+        let both = tool_with(
+            "git-mcp",
+            "0.0.2",
+            &[("release", page), ("uvx", "mcp-server-git")],
+        );
+        let io = FakeIo {
+            bin_dir: "/fake/bin".into(),
+            has_uvx: true,
+            ..Default::default()
+        };
+        let plan = resolve_provider(&both, &linux_host(), &io).unwrap();
+        assert_eq!(plan.provider, Provider::Release, "release beats uvx");
+
+        // Only uvx + cargo (no release/docker/npx) → Uvx beats the source build.
+        let uvx_cargo = tool_with(
+            "git-mcp",
+            "0.0.2",
+            &[("uvx", "mcp-server-git"), ("cargo", "git-mcp")],
+        );
+        let plan = resolve_provider(&uvx_cargo, &unmapped_host(), &io).unwrap();
+        assert_eq!(plan.provider, Provider::Uvx, "uvx beats cargo");
+    }
+
+    // ── contract 14: npx wins over uvx when both available ────────────────────
+    #[test]
+    fn npx_beats_uvx_when_both_available() {
+        // Both on-demand fetchers present; npx is ordered first in the chain.
+        let tool = tool_with(
+            "poly-mcp",
+            "0.0.2",
+            &[("npx", "@scope/poly-mcp"), ("uvx", "poly-mcp")],
+        );
+        let io = FakeIo {
+            bin_dir: "/fake/bin".into(),
+            has_npx: true,
+            has_uvx: true,
+            ..Default::default()
+        };
+        let plan = resolve_provider(&tool, &unmapped_host(), &io).unwrap();
+        assert_eq!(plan.provider, Provider::Npx, "npx is ordered before uvx");
+    }
+
+    // ── contract 15: uvx OfferOnly reports the plan, mutates nothing ──────────
+    #[test]
+    fn uvx_offer_only_reports_the_plan_without_mutating() {
+        let tool = tool_with("git-mcp", "0.0.2", &[("uvx", "mcp-server-git")]);
+        let io = FakeIo {
+            bin_dir: "/fake/bin".into(),
+            has_uvx: true,
+            ..Default::default()
+        };
+        let offered = install(&tool, &unmapped_host(), Consent::OfferOnly, &io).unwrap();
+        assert_eq!(
+            offered,
+            InstallOutcome::Offered {
+                provider: Provider::Uvx,
+                command: "uvx mcp-server-git".into(),
             }
         );
         assert_eq!(io.writes.borrow().len(), 0);
