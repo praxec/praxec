@@ -953,6 +953,25 @@ mod tests {
     }
 
     #[test]
+    fn managed_release_with_unreadable_version_is_unknown() {
+        // A managed release binary exists AND the registry declares a version,
+        // but the binary's version is unreadable (no install-time marker and no
+        // parseable `--version`) → CURRENCY_UNKNOWN, never a wrong verdict.
+        let mut io = FakeIo::default();
+        io.managed.insert("cpm-planner".into(), None); // exists, version unreadable
+        let mut versions = HashMap::new();
+        versions.insert("cpm-planner".to_string(), "0.0.5".to_string());
+        let specs = vec![ConnSpec {
+            name: "cpm".into(),
+            command: Some("cpm-planner".into()),
+            ..Default::default()
+        }];
+        let diags = check_currency(&specs, &versions, &io);
+        assert_eq!(diags[0].code, "CURRENCY_UNKNOWN");
+        assert_eq!(diags[0].severity, Severity::Info);
+    }
+
+    #[test]
     fn managed_release_without_expected_version_is_unknown() {
         let mut io = FakeIo::default();
         io.managed

@@ -9,13 +9,19 @@
 //! 1. resolves `(os, arch)` → the release **target triple the tools publish**
 //!    and the asset name (uniform convention `{command}-{triple}.{ext}` —
 //!    *derived*, because the convention is itself the data: §3 principle 5);
-//! 2. downloads the asset + its `checksums.sha256` from the tool's `release`
-//!    provider page (`<page>/download/v{version}/<asset>`);
-//! 3. **verifies the asset bytes against the sha256 in `checksums.sha256`;
-//!    refuses on mismatch and never places the binary** (§4, FMECA "tampered/
-//!    corrupt binary" → Low);
+//! 2. downloads the asset from the tool's `release` provider page
+//!    (`<page>/download/v{version}/<asset>`) and resolves its expected sha256
+//!    from EITHER checksum convention — the aggregate `checksums.sha256`
+//!    (praxec's own) OR, on its 404, the per-asset `<asset>.sha256` sidecar
+//!    (`taiki-e/upload-rust-binary-action` with `checksum: sha256`);
+//! 3. **verifies the asset bytes against that sha256; refuses on mismatch and
+//!    fails-CLOSED (never places the binary) when neither convention yields a
+//!    usable hash** (§4, FMECA "tampered/corrupt binary" → Low);
 //! 4. unpacks (`.tar.gz` unix / `.zip` windows), extracts the `command` binary,
-//!    and places it on the praxec-managed bin dir via [`InstallerIo`];
+//!    places it on the praxec-managed bin dir via [`InstallerIo`], and records
+//!    an install-time version marker ([`version_marker_path`]) so currency can
+//!    read the version back even though the MCP tool binaries have no
+//!    `--version`;
 //! 5. is idempotent (an already-current binary → [`InstallOutcome::AlreadyCurrent`]
 //!    with no download or write) and fails fast with the resolved URL + triple
 //!    on any 404 / mismatch / unpack failure.
@@ -92,8 +98,11 @@ pub enum InstallError {
     /// `version`, or a `release` provider URL).
     #[error("INSTALL_MISSING_FIELD: tool `{tool}` release provider requires `{field}`")]
     MissingField { tool: String, field: &'static str },
-    /// Fetching a URL failed (404 / unreachable / transport). Names the URL and
-    /// the `(os, arch)` triple so a wrong-asset resolution is self-evident.
+    /// Fetching a URL failed (unreachable / transport / non-404 status). Names
+    /// the URL and the `(os, arch)` triple so a wrong-asset resolution is
+    /// self-evident. A **404** is the distinct [`NotFound`](Self::NotFound) —
+    /// it lets checksum resolution fall through one convention to the next
+    /// rather than aborting.
     #[error("INSTALL_DOWNLOAD: fetching `{url}` for (os `{os}`, arch `{arch}`) failed: {reason}")]
     Download {
         url: String,
@@ -101,6 +110,13 @@ pub enum InstallError {
         arch: String,
         reason: String,
     },
+    /// A URL returned **404 Not Found** — distinct from [`Download`](Self::Download)
+    /// (transport / other non-2xx) so [`http_get`](InstallerIo::http_get) can
+    /// signal "absent" and checksum resolution can fall through from the
+    /// aggregate `checksums.sha256` convention to the per-asset sidecar
+    /// convention instead of aborting.
+    #[error("INSTALL_NOT_FOUND: `{url}` returned 404")]
+    NotFound { url: String },
     /// `checksums.sha256` was fetched but carries no line for the resolved
     /// asset — integrity cannot be established, so the install refuses to place.
     #[error("INSTALL_CHECKSUM_ABSENT: `{url}` has no `checksums.sha256` entry for asset `{asset}`")]
@@ -116,6 +132,18 @@ pub enum InstallError {
         url: String,
         asset: String,
         token: String,
+    },
+    /// Neither checksum convention published a hash for the asset: both the
+    /// aggregate `checksums.sha256` AND the per-asset `<asset>.sha256` sidecar
+    /// 404'd. Integrity cannot be established from either, so the install
+    /// refuses to place (fail-CLOSED — an unverified binary is NEVER placed).
+    #[error(
+        "INSTALL_CHECKSUM_UNAVAILABLE: no checksum for asset `{asset}` — neither the aggregate `{aggregate_url}` nor the per-asset sidecar `{sidecar_url}` exists (both 404)"
+    )]
+    ChecksumUnavailable {
+        aggregate_url: String,
+        sidecar_url: String,
+        asset: String,
     },
     /// The asset downloaded + verified but could not be unpacked / the expected
     /// `command` binary was not inside it.
@@ -202,6 +230,20 @@ pub fn asset_name(command: &str, triple: &str, ext: &str) -> String {
     format!("{command}-{triple}.{ext}")
 }
 
+/// The install-time version marker for `command` inside `dir`:
+/// `<dir>/.<command>.version`, holding the exact version string recorded when
+/// [`install_release`] placed the binary. Dot-prefixed AND `.version`-suffixed
+/// so it can never collide with the spawnable binary (`<command>` or
+/// `<command>.exe`) that lives in the same dir. It exists because the MCP tool
+/// binaries do not implement `--version` (they ignore the flag and start their
+/// stdio server), so the `--version` probe returns `None`; reading this marker
+/// back gives a managed release binary a truthful installed version for both
+/// install idempotency and `doctor` currency. The ONE definition of the marker
+/// name — [`io::RealInstallerIo`] writes and reads it here so the two never drift.
+pub fn version_marker_path(dir: &Path, command: &str) -> PathBuf {
+    dir.join(format!(".{command}.version"))
+}
+
 /// Lowercase hex of the sha256 of `bytes`.
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -257,6 +299,20 @@ pub fn expected_sha256<'a>(checksums: &'a str, asset: &str) -> ChecksumLookup<'a
     ChecksumLookup::Absent
 }
 
+/// Extract the sha256 from a **per-asset sidecar** (`<asset>.sha256`, the shape
+/// `taiki-e/upload-rust-binary-action` emits with `checksum: sha256`). The
+/// content is either a bare `<hex>` or sha256sum's `<hex>  <asset>` — in both
+/// the hash is the first whitespace token. Pure; never [`ChecksumLookup::Absent`]
+/// (the sidecar file IS the asset's line, so an empty / hash-less body is
+/// [`ChecksumLookup::Malformed`], fail-CLOSED — never verify against nothing).
+pub fn sidecar_sha256(sidecar: &str) -> ChecksumLookup<'_> {
+    match sidecar.split_whitespace().next() {
+        Some(tok) if is_sha256_token(tok) => ChecksumLookup::Found(tok),
+        Some(tok) => ChecksumLookup::Malformed(tok),
+        None => ChecksumLookup::Malformed(""),
+    }
+}
+
 /// Extract the `command` executable's bytes from a downloaded archive. `.tar.gz`
 /// is gunzipped + untarred; `.zip` is read directly. The entry matched is the
 /// one whose basename is `command` or `{command}.exe`. Returns the executable
@@ -304,6 +360,89 @@ fn unpack_command(ext: &str, bytes: &[u8], command: &str) -> Result<Vec<u8>, Str
             ))
         }
         other => Err(format!("unsupported archive extension `{other}`")),
+    }
+}
+
+/// Resolve the expected sha256 (lowercase hex) for `asset`, tolerating BOTH
+/// checksum-publishing conventions, in order:
+///   1. the aggregate `<page>/download/v{v}/checksums.sha256` (praxec's own
+///      convention) parsed via [`expected_sha256`];
+///   2. the per-asset `<page>/download/v{v}/<asset>.sha256` sidecar (what
+///      `taiki-e/upload-rust-binary-action` emits with `checksum: sha256`).
+///
+/// A **404 on the aggregate falls through** to the sidecar (the two conventions
+/// are mutually exclusive per release). A malformed hash in EITHER →
+/// [`InstallError::ChecksumMalformed`]; an aggregate that exists but lacks the
+/// asset's line → [`InstallError::ChecksumAbsent`] (a genuine gap in praxec's
+/// own convention); BOTH 404 → [`InstallError::ChecksumUnavailable`]. Every arm
+/// is fail-CLOSED — resolution never yields an unverified "ok".
+fn resolve_expected_sha256(
+    io: &dyn InstallerIo,
+    host: &Host,
+    asset: &str,
+    aggregate_url: &str,
+    sidecar_url: &str,
+) -> Result<String, InstallError> {
+    let download_err = |url: &str, e: InstallError| InstallError::Download {
+        url: url.to_string(),
+        os: host.os.clone(),
+        arch: host.arch.clone(),
+        reason: e.to_string(),
+    };
+
+    // (1) aggregate — a 404 falls through to the sidecar; any other transport
+    // failure is fatal (we cannot know whether integrity is establishable).
+    match io.http_get(aggregate_url) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            match expected_sha256(&text, asset) {
+                ChecksumLookup::Found(hash) => return Ok(hash.to_string()),
+                ChecksumLookup::Malformed(token) => {
+                    return Err(InstallError::ChecksumMalformed {
+                        url: aggregate_url.to_string(),
+                        asset: asset.to_string(),
+                        token: token.to_string(),
+                    });
+                }
+                ChecksumLookup::Absent => {
+                    return Err(InstallError::ChecksumAbsent {
+                        url: aggregate_url.to_string(),
+                        asset: asset.to_string(),
+                    });
+                }
+            }
+        }
+        Err(InstallError::NotFound { .. }) => { /* fall through to the sidecar */ }
+        Err(e) => return Err(download_err(aggregate_url, e)),
+    }
+
+    // (2) per-asset sidecar — its absence (both 404) is the fail-CLOSED
+    // ChecksumUnavailable naming both URLs; a present-but-garbage body is
+    // ChecksumMalformed.
+    match io.http_get(sidecar_url) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            match sidecar_sha256(&text) {
+                ChecksumLookup::Found(hash) => Ok(hash.to_string()),
+                ChecksumLookup::Malformed(token) => Err(InstallError::ChecksumMalformed {
+                    url: sidecar_url.to_string(),
+                    asset: asset.to_string(),
+                    token: token.to_string(),
+                }),
+                // sidecar_sha256 never yields Absent — an empty body is Malformed.
+                ChecksumLookup::Absent => Err(InstallError::ChecksumMalformed {
+                    url: sidecar_url.to_string(),
+                    asset: asset.to_string(),
+                    token: String::new(),
+                }),
+            }
+        }
+        Err(InstallError::NotFound { .. }) => Err(InstallError::ChecksumUnavailable {
+            aggregate_url: aggregate_url.to_string(),
+            sidecar_url: sidecar_url.to_string(),
+            asset: asset.to_string(),
+        }),
+        Err(e) => Err(download_err(sidecar_url, e)),
     }
 }
 
@@ -355,7 +494,8 @@ pub fn install_release(
 
     let page = page.trim_end_matches('/');
     let asset_url = format!("{page}/download/v{version}/{asset}");
-    let checksums_url = format!("{page}/download/v{version}/checksums.sha256");
+    let aggregate_url = format!("{page}/download/v{version}/checksums.sha256");
+    let sidecar_url = format!("{page}/download/v{version}/{asset}.sha256");
 
     // Download the asset — a 404 / unreachable becomes a Download error naming
     // the resolved URL + host triple regardless of the IO impl's own message.
@@ -367,37 +507,14 @@ pub fn install_release(
             arch: host.arch.clone(),
             reason: e.to_string(),
         })?;
-    let checksums_bytes = io
-        .http_get(&checksums_url)
-        .map_err(|e| InstallError::Download {
-            url: checksums_url.clone(),
-            os: host.os.clone(),
-            arch: host.arch.clone(),
-            reason: e.to_string(),
-        })?;
 
-    // Integrity: no entry → cannot verify → refuse (error); malformed token →
-    // refuse (error, M3); mismatch → refuse (outcome). In NO case is a byte
-    // written — every arm is fail-CLOSED.
-    let checksums = String::from_utf8_lossy(&checksums_bytes);
-    let expected = match expected_sha256(&checksums, &asset) {
-        ChecksumLookup::Found(hash) => hash,
-        ChecksumLookup::Malformed(token) => {
-            return Err(InstallError::ChecksumMalformed {
-                url: checksums_url.clone(),
-                asset: asset.clone(),
-                token: token.to_string(),
-            });
-        }
-        ChecksumLookup::Absent => {
-            return Err(InstallError::ChecksumAbsent {
-                url: checksums_url.clone(),
-                asset: asset.clone(),
-            });
-        }
-    };
+    // Integrity: resolve the expected hash from EITHER checksum convention
+    // (aggregate, then per-asset sidecar). No hash available → error; malformed
+    // token → error; mismatch → refuse (outcome). In NO case is a byte written
+    // before the hash verifies — every arm is fail-CLOSED.
+    let expected = resolve_expected_sha256(io, host, &asset, &aggregate_url, &sidecar_url)?;
     let actual = sha256_hex(&asset_bytes);
-    if !actual.eq_ignore_ascii_case(expected) {
+    if !actual.eq_ignore_ascii_case(&expected) {
         return Ok(InstallOutcome::Refused {
             reason: format!(
                 "checksum mismatch for `{asset}` from {asset_url}: expected {expected}, got {actual}"
@@ -413,6 +530,11 @@ pub fn install_release(
             reason,
         })?;
     let path = io.place_executable(&bin_dir, command, &exe_bytes)?;
+    // Record the install-time version marker so a managed release binary reports
+    // a truthful version even though the MCP tool binaries have no `--version`
+    // (they ignore the flag and start their stdio server). `installed_version`
+    // reads this back — closing the loop for both idempotency and currency.
+    io.write_version_marker(&bin_dir, command, version)?;
     Ok(InstallOutcome::Installed {
         path,
         version: version.to_string(),
@@ -431,13 +553,16 @@ mod tests {
 
     #[derive(Default)]
     struct FakeIo {
-        /// url → bytes (a missing url is a 404-equivalent).
+        /// url → bytes (a missing url is a 404-equivalent → `NotFound`, so the
+        /// checksum resolver falls through aggregate → sidecar as in production).
         responses: HashMap<String, Vec<u8>>,
-        /// what `installed_version` should report for `(dir, name)`.
+        /// what `installed_version` reports when no marker was recorded.
         installed: Option<String>,
         bin_dir: PathBuf,
         /// recorded executable placements: (dir, name, byte-len).
         writes: RefCell<Vec<(PathBuf, String, usize)>>,
+        /// recorded install-time version markers: (dir, command) → version.
+        markers: RefCell<HashMap<(PathBuf, String), String>>,
     }
 
     impl InstallerIo for FakeIo {
@@ -445,7 +570,9 @@ mod tests {
             self.responses
                 .get(url)
                 .cloned()
-                .ok_or_else(|| InstallError::Io(format!("404 {url}")))
+                .ok_or_else(|| InstallError::NotFound {
+                    url: url.to_string(),
+                })
         }
         fn place_executable(
             &self,
@@ -458,8 +585,25 @@ mod tests {
                 .push((dir.to_path_buf(), name.to_string(), bytes.len()));
             Ok(dir.join(name))
         }
-        fn installed_version(&self, _dir: &Path, _name: &str) -> Option<String> {
-            self.installed.clone()
+        fn write_version_marker(
+            &self,
+            dir: &Path,
+            name: &str,
+            version: &str,
+        ) -> Result<(), InstallError> {
+            self.markers
+                .borrow_mut()
+                .insert((dir.to_path_buf(), name.to_string()), version.to_string());
+            Ok(())
+        }
+        fn installed_version(&self, dir: &Path, name: &str) -> Option<String> {
+            // Marker-first, mirroring production: a recorded marker wins over the
+            // `installed` fallback, so install idempotency agrees with the marker.
+            self.markers
+                .borrow()
+                .get(&(dir.to_path_buf(), name.to_string()))
+                .cloned()
+                .or_else(|| self.installed.clone())
         }
         fn bin_dir(&self) -> Result<PathBuf, InstallError> {
             Ok(self.bin_dir.clone())
@@ -853,6 +997,202 @@ mod tests {
             io.writes.borrow()[0].1,
             "widget",
             "placed under the logical command name"
+        );
+    }
+
+    // ── PART A: per-asset sidecar checksum convention ────────────────────────
+
+    #[test]
+    fn sidecar_sha256_parses_a_bare_hex_body() {
+        let hex = "a".repeat(64);
+        let body = format!("{hex}\n");
+        assert_eq!(sidecar_sha256(&body), ChecksumLookup::Found(hex.as_str()));
+    }
+
+    #[test]
+    fn sidecar_sha256_parses_the_hex_two_space_asset_body() {
+        // sha256sum's `<hex>  <asset>` shape — the hash is the first token.
+        let hex = "b".repeat(64);
+        let body = format!("{hex}  cpm-planner-x86_64-unknown-linux-gnu.tar.gz\n");
+        assert_eq!(sidecar_sha256(&body), ChecksumLookup::Found(hex.as_str()));
+    }
+
+    #[test]
+    fn sidecar_sha256_reports_malformed_for_a_short_token_and_empty_body() {
+        assert_eq!(
+            sidecar_sha256("deadbeef00\n"),
+            ChecksumLookup::Malformed("deadbeef00")
+        );
+        assert_eq!(sidecar_sha256("   \n"), ChecksumLookup::Malformed(""));
+    }
+
+    #[test]
+    fn aggregate_404_falls_through_to_a_matching_sidecar_and_installs() {
+        // THE BUG FIX: no aggregate `checksums.sha256` (a taiki-e release), but a
+        // per-asset `<asset>.sha256` sidecar is present + matches → installs.
+        let bin = PathBuf::from("/fake/bin");
+        let page = "https://github.com/praxec/cpm-planner/releases";
+        let host = Host {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let asset = "cpm-planner-x86_64-unknown-linux-gnu.tar.gz";
+        let asset_bytes = make_targz("cpm-planner", b"#!/bin/sh\necho hi\n");
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("{page}/download/v0.0.2/{asset}"),
+            asset_bytes.clone(),
+        );
+        // NO aggregate registered (→ 404). Only the per-asset sidecar exists.
+        responses.insert(
+            format!("{page}/download/v0.0.2/{asset}.sha256"),
+            format!("{}  {asset}\n", sha256_hex(&asset_bytes)).into_bytes(),
+        );
+        let io = FakeIo {
+            responses,
+            bin_dir: bin.clone(),
+            ..Default::default()
+        };
+
+        let out = install_release(&tool("cpm-planner", "0.0.2", page), &host, &io).unwrap();
+        assert_eq!(
+            out,
+            InstallOutcome::Installed {
+                path: bin.join("cpm-planner"),
+                version: "0.0.2".into()
+            },
+            "aggregate 404 must fall through to the sidecar, not abort"
+        );
+        assert_eq!(io.writes.borrow().len(), 1, "the binary was placed");
+    }
+
+    #[test]
+    fn both_checksum_conventions_absent_is_unavailable_and_writes_nothing() {
+        // Neither aggregate NOR sidecar exists (both 404) → fail-CLOSED with
+        // ChecksumUnavailable naming BOTH URLs; no binary placed.
+        let page = "https://github.com/praxec/cpm-planner/releases";
+        let host = Host {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let asset = "cpm-planner-x86_64-unknown-linux-gnu.tar.gz";
+        let asset_bytes = make_targz("cpm-planner", b"real bytes");
+        let mut responses = HashMap::new();
+        responses.insert(format!("{page}/download/v0.0.2/{asset}"), asset_bytes);
+        // No checksum of either convention registered.
+        let io = FakeIo {
+            responses,
+            bin_dir: "/fake/bin".into(),
+            ..Default::default()
+        };
+
+        let err = install_release(&tool("cpm-planner", "0.0.2", page), &host, &io).unwrap_err();
+        let (aggregate_url, sidecar_url, asset_named) = match &err {
+            InstallError::ChecksumUnavailable {
+                aggregate_url,
+                sidecar_url,
+                asset,
+            } => (aggregate_url.clone(), sidecar_url.clone(), asset.clone()),
+            other => panic!("expected ChecksumUnavailable, got {other:?}"),
+        };
+        assert!(
+            aggregate_url.ends_with("/checksums.sha256"),
+            "{aggregate_url}"
+        );
+        assert!(
+            sidecar_url.ends_with(&format!("/{asset}.sha256")),
+            "{sidecar_url}"
+        );
+        assert_eq!(asset_named, asset);
+        assert!(err.to_string().contains("CHECKSUM_UNAVAILABLE"));
+        assert_eq!(
+            io.writes.borrow().len(),
+            0,
+            "an unverifiable asset is NEVER placed"
+        );
+    }
+
+    #[test]
+    fn sidecar_mismatch_refuses_and_writes_nothing() {
+        // Aggregate 404 → sidecar present but for DIFFERENT bytes → Refused.
+        let page = "https://github.com/praxec/cpm-planner/releases";
+        let host = Host {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let asset = "cpm-planner-x86_64-unknown-linux-gnu.tar.gz";
+        let asset_bytes = make_targz("cpm-planner", b"real bytes");
+        let mut responses = HashMap::new();
+        responses.insert(format!("{page}/download/v0.0.2/{asset}"), asset_bytes);
+        responses.insert(
+            format!("{page}/download/v0.0.2/{asset}.sha256"),
+            format!("{}\n", sha256_hex(b"tampered")).into_bytes(),
+        );
+        let io = FakeIo {
+            responses,
+            bin_dir: "/fake/bin".into(),
+            ..Default::default()
+        };
+
+        let out = install_release(&tool("cpm-planner", "0.0.2", page), &host, &io).unwrap();
+        assert!(matches!(out, InstallOutcome::Refused { .. }), "got {out:?}");
+        assert_eq!(
+            io.writes.borrow().len(),
+            0,
+            "no binary placed on a sidecar checksum mismatch"
+        );
+    }
+
+    // ── PART B: install-time version marker ──────────────────────────────────
+
+    #[test]
+    fn install_records_the_version_marker() {
+        // After a successful install the version marker is recorded for the
+        // command, holding the placed version — this is what currency reads back.
+        let bin = PathBuf::from("/fake/bin");
+        let page = "https://github.com/praxec/cpm-planner/releases";
+        let host = Host {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+        };
+        let asset = "cpm-planner-x86_64-unknown-linux-gnu.tar.gz";
+        let asset_bytes = make_targz("cpm-planner", b"#!/bin/sh\necho hi\n");
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("{page}/download/v0.0.2/{asset}"),
+            asset_bytes.clone(),
+        );
+        responses.insert(
+            format!("{page}/download/v0.0.2/checksums.sha256"),
+            checksums_line(asset, &asset_bytes).into_bytes(),
+        );
+        let io = FakeIo {
+            responses,
+            bin_dir: bin.clone(),
+            ..Default::default()
+        };
+
+        let out = install_release(&tool("cpm-planner", "0.0.2", page), &host, &io).unwrap();
+        assert!(matches!(out, InstallOutcome::Installed { .. }));
+        assert_eq!(
+            io.markers
+                .borrow()
+                .get(&(bin.clone(), "cpm-planner".to_string()))
+                .map(String::as_str),
+            Some("0.0.2"),
+            "the install-time version marker records the placed version"
+        );
+        // Idempotency agrees with the marker: a second install short-circuits.
+        let again = install_release(&tool("cpm-planner", "0.0.2", page), &host, &io).unwrap();
+        assert_eq!(again, InstallOutcome::AlreadyCurrent);
+    }
+
+    #[test]
+    fn version_marker_path_is_dot_command_dot_version() {
+        // Namespaced so it never collides with the spawnable `<command>` binary.
+        assert_eq!(
+            version_marker_path(Path::new("/bin"), "cpm-planner"),
+            PathBuf::from("/bin/.cpm-planner.version")
         );
     }
 }

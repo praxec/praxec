@@ -109,6 +109,21 @@ pub trait InstallerIo {
     /// be read (which reads as "not current", i.e. proceed to install).
     fn installed_version(&self, dir: &Path, name: &str) -> Option<String>;
 
+    /// Record the install-time version marker for `name` in `dir` (see
+    /// [`super::version_marker_path`]) so a managed release binary reports its
+    /// version even though the MCP tool binaries have no `--version`. Written
+    /// only after a binary is successfully placed. The default is a no-op —
+    /// seams that never place binaries (provider-resolution / docker-only fakes)
+    /// need not record anything; [`RealInstallerIo`] writes the real file.
+    fn write_version_marker(
+        &self,
+        _dir: &Path,
+        _name: &str,
+        _version: &str,
+    ) -> Result<(), InstallError> {
+        Ok(())
+    }
+
     /// The praxec-managed bin dir binaries are placed on (`<config-dir>/bin`).
     /// On the seam so tests inject a tempdir; the real impl resolves it via
     /// `dirs`, the same convention `init` uses for the config dir.
@@ -224,11 +239,35 @@ impl InstallerIo for RealInstallerIo {
         Ok(path)
     }
 
+    fn write_version_marker(
+        &self,
+        dir: &Path,
+        name: &str,
+        version: &str,
+    ) -> Result<(), InstallError> {
+        std::fs::create_dir_all(dir).map_err(|e| InstallError::Io(e.to_string()))?;
+        let path = super::version_marker_path(dir, name);
+        std::fs::write(&path, version).map_err(|e| InstallError::Io(e.to_string()))?;
+        Ok(())
+    }
+
     fn installed_version(&self, dir: &Path, name: &str) -> Option<String> {
         // Resolve the placed binary through the ONE `.exe`-aware managed-bin
         // predicate (shared with `detect` + currency), so the existence rule
         // never drifts. Absent → `None` (proceed to reinstall).
         let path = super::managed_binary_in(dir, name)?;
+        // The install-time version marker WINS when present: the MCP tool
+        // binaries have no `--version` (they ignore the flag and start their
+        // stdio server), so probing them yields `None`; the marker recorded at
+        // install is the truthful version. A pre-marker binary (older install)
+        // falls through to the bounded probe below and self-heals on reinstall.
+        let marker = super::version_marker_path(dir, name);
+        if let Ok(recorded) = std::fs::read_to_string(&marker) {
+            let recorded = recorded.trim();
+            if !recorded.is_empty() {
+                return Some(recorded.to_string());
+            }
+        }
         // Best-effort: `<bin> --version` typically prints `name x.y.z`; take the
         // last whitespace token of the first line. Any failure → `None` (proceed
         // to reinstall) rather than a false "current". The probe is BOUNDED
@@ -376,5 +415,46 @@ mod tests {
         assert_eq!(parse_version("no version here"), None);
         assert_eq!(parse_version("build 42"), None);
         assert_eq!(parse_version(""), None);
+    }
+
+    // ── PART B: the install-time marker is read back over an absent `--version` ─
+    #[cfg(unix)]
+    #[test]
+    fn installed_version_reads_the_marker_when_the_binary_has_no_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A placed "binary" that has NO parseable `--version` (it errors), just
+        // like the real MCP tool binaries that ignore the flag.
+        let bin = dir.path().join("toolx");
+        std::fs::write(&bin, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // No marker yet → the errored `--version` probe yields None (fail-safe:
+        // unknown → reinstall, never a wrong verdict).
+        assert_eq!(RealInstallerIo.installed_version(dir.path(), "toolx"), None);
+
+        // Record the install-time marker → it now reports that version despite
+        // the binary having no usable `--version`.
+        RealInstallerIo
+            .write_version_marker(dir.path(), "toolx", "0.0.7")
+            .unwrap();
+        assert_eq!(
+            RealInstallerIo.installed_version(dir.path(), "toolx"),
+            Some("0.0.7".to_string()),
+            "the install-time marker wins over an unreadable --version"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_version_is_none_when_the_binary_is_absent_even_with_a_marker() {
+        // A marker without a placed binary is not "installed" — existence is
+        // resolved through the ONE managed-bin predicate first, so a stray marker
+        // never fabricates a currency verdict.
+        let dir = tempfile::tempdir().unwrap();
+        RealInstallerIo
+            .write_version_marker(dir.path(), "ghost", "9.9.9")
+            .unwrap();
+        assert_eq!(RealInstallerIo.installed_version(dir.path(), "ghost"), None);
     }
 }
