@@ -27,7 +27,7 @@
 //! Task 3 (not here); this module is the release provider + the seam only.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -161,6 +161,38 @@ pub fn resolve_target(os: &str, arch: &str) -> Option<(&'static str, &'static st
 /// the host has no config directory (the same `dirs` convention `init` uses).
 pub fn managed_bin_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("praxec").join("bin"))
+}
+
+/// Resolve a spawnable binary named `command` inside `dir`, `.exe`-aware on
+/// Windows: returns the existing file's path, or `None` when absent. This is the
+/// ONE managed-bin-dir existence predicate — `provision::detect`, the currency
+/// managed-dir probe ([`crate::currency`]-side `RealCurrencyIo`), and the
+/// installer's own version probe ([`io::RealInstallerIo::installed_version`]) all
+/// resolve a managed binary THROUGH here, so the bare-name / `.exe` rule cannot
+/// drift between them. `dir` is a parameter (not [`managed_bin_dir`]) so callers
+/// with an injected test dir share the exact same predicate.
+pub fn managed_binary_in(dir: &Path, command: &str) -> Option<PathBuf> {
+    let bare = dir.join(command);
+    if bare.is_file() {
+        return Some(bare);
+    }
+    // On Windows a spawnable binary carries the `.exe` suffix `place_executable`
+    // writes; the bare name still wins if present.
+    if cfg!(windows) {
+        let exe = dir.join(format!("{command}.exe"));
+        if exe.is_file() {
+            return Some(exe);
+        }
+    }
+    None
+}
+
+/// As [`managed_binary_in`] but against the real managed bin dir
+/// (`<config-dir>/praxec/bin`). `None` when the host has no config directory or
+/// no such binary is placed. The convenience wrapper for callers that resolve
+/// against the real dir rather than an injected one.
+pub fn managed_binary_path(command: &str) -> Option<PathBuf> {
+    managed_binary_in(&managed_bin_dir()?, command)
 }
 
 /// The release asset name for a tool `command` on a `(triple, ext)` — the
@@ -500,6 +532,29 @@ mod tests {
         if let Some(cfg) = dirs::config_dir() {
             assert_eq!(managed_bin_dir(), Some(cfg.join("praxec").join("bin")));
         }
+    }
+
+    #[test]
+    fn managed_binary_in_resolves_an_existing_file_and_none_otherwise() {
+        // The ONE managed-bin existence predicate: absent → None; a placed file
+        // (bare name, or `.exe` on Windows) → Some(that path).
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            managed_binary_in(dir.path(), "widget"),
+            None,
+            "absent binary is None"
+        );
+        let file_name = if cfg!(windows) {
+            "widget.exe"
+        } else {
+            "widget"
+        };
+        std::fs::write(dir.path().join(file_name), b"x").unwrap();
+        assert_eq!(
+            managed_binary_in(dir.path(), "widget"),
+            Some(dir.path().join(file_name)),
+            "a placed binary resolves to its path (`.exe`-aware)"
+        );
     }
 
     #[test]

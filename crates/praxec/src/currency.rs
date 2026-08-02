@@ -703,13 +703,9 @@ impl CurrencyIo for RealCurrencyIo {
     }
 
     fn managed_binary_exists(&self, command: &str) -> bool {
-        let Some(dir) = praxec_core::provision_install::managed_bin_dir() else {
-            return false;
-        };
-        if dir.join(command).is_file() {
-            return true;
-        }
-        cfg!(windows) && dir.join(format!("{command}.exe")).is_file()
+        // The ONE `.exe`-aware managed-bin predicate (shared with `detect` and
+        // the installer's version probe) — resolved against the real managed dir.
+        praxec_core::provision_install::managed_binary_path(command).is_some()
     }
 
     fn managed_binary_version(&self, command: &str) -> Option<String> {

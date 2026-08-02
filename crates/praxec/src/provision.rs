@@ -48,16 +48,14 @@ fn detect_with(config: &Config, managed_dir: Option<&std::path::Path>) -> Provis
     ProvisionReport { present, missing }
 }
 
-/// Does a spawnable binary for `command` exist in the managed bin dir? Tries the
-/// bare name and, on Windows, the `.exe` suffix `install_release` places.
+/// Does a spawnable binary for `command` exist in the managed bin dir? Delegates
+/// to the ONE `.exe`-aware managed-bin predicate
+/// ([`praxec_core::provision_install::managed_binary_in`]) so the bare-name /
+/// `.exe` rule never drifts from currency's or the installer's copy.
 fn in_managed_dir(managed_dir: Option<&std::path::Path>, command: &str) -> bool {
-    let Some(dir) = managed_dir else {
-        return false;
-    };
-    if dir.join(command).is_file() {
-        return true;
-    }
-    cfg!(windows) && dir.join(format!("{command}.exe")).is_file()
+    managed_dir
+        .and_then(|dir| praxec_core::provision_install::managed_binary_in(dir, command))
+        .is_some()
 }
 
 #[cfg(test)]

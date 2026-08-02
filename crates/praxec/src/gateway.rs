@@ -2861,25 +2861,43 @@ fn format_provisioning(lines: &[String], fix: bool) -> String {
     out
 }
 
-/// Shared provisioning entrypoint for `doctor` and `init`: load the registry
-/// declared by `config`, resolve each `missing` tool's provider against it, and
-/// OFFER it — or, under `fix` consent, INSTALL it — returning the rendered
-/// "tool provisioning" section. `io` is injected so the real path
-/// (`RealInstallerIo`) and tests (a recording fake) drive the SAME code — the
-/// single install entrypoint both surfaces reach, never a parallel one.
+/// Shared provisioning entrypoint for `doctor` and `init`: resolve each
+/// `missing` tool's provider against the (already-loaded) `registry`, and OFFER
+/// it — or, under `fix` consent, INSTALL it — returning the rendered "tool
+/// provisioning" section. The caller loads the registry (so `doctor` loads it
+/// ONCE and threads the same value into both provisioning and currency/freshen,
+/// never twice). `io` is injected so the real path (`RealInstallerIo`) and tests
+/// (a recording fake) drive the SAME code — the single install entrypoint both
+/// surfaces reach, never a parallel one.
 fn provisioning_report(
-    config: &Value,
     missing: &[String],
+    registry: Option<&Registry>,
     fix: bool,
     io: &dyn praxec_core::provision_install::InstallerIo,
-) -> anyhow::Result<String> {
-    let registry = load_registry(config)?;
+) -> String {
     let host = praxec_core::provision_install::Host {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
     };
-    let lines = provision_report_lines(missing, registry.as_deref(), &host, fix, io);
-    Ok(format_provisioning(&lines, fix))
+    let lines = provision_report_lines(missing, registry, &host, fix, io);
+    format_provisioning(&lines, fix)
+}
+
+/// The command→version map the currency remediation AND the freshen router both
+/// key on — the single source of truth for "is this a freshenable registry
+/// tool". A command appears iff the registry declares BOTH its `command` and its
+/// `version`; a version-less entry is absent (no release binary to install),
+/// which routes it to a manual source rebuild. Deriving both predicates from
+/// this one map is what stops them from drifting (the Fix-1 divergence).
+fn registry_versions_of(registry: Option<&Registry>) -> std::collections::HashMap<String, String> {
+    registry
+        .map(|r| {
+            r.tools
+                .iter()
+                .filter_map(|t| Some((t.command.clone()?, t.version.clone()?)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Task 2 — freshen the STALE tools currency flagged. `doctor --fix` used to
@@ -2897,13 +2915,20 @@ fn provisioning_report(
 /// [`provision_report_lines`], so `fix == false` only resolves (offer-only,
 /// mutating nothing) and `fix == true` installs under `Consent::Granted`; one
 /// tool's failure never aborts the rest. `io` is injected so the whole path is
-/// unit-testable with a fake `InstallerIo` (no network). The registry-membership
-/// test is computed once here and mirrors the one the currency remediation keys
-/// on (a command's presence in the registry).
+/// unit-testable with a fake `InstallerIo` (no network).
+///
+/// The registry-membership test is LITERALLY the one the currency remediation
+/// keys on: both consult the SAME `registry_versions` map (built once by
+/// [`registry_versions_of`]), whose keyset is "a command declared with BOTH a
+/// `command` and a `version`". A registry tool that declares a `command` but no
+/// `version` is therefore NOT freshenable (there is no release binary to
+/// install) — it is routed to the manual bucket, exactly as the currency text
+/// says. Sharing the map means the two predicates cannot drift.
 fn freshen_report_lines(
     diags: &[crate::currency::CurrencyDiagnostic],
     specs: &[crate::currency::ConnSpec],
     registry: Option<&Registry>,
+    registry_versions: &std::collections::HashMap<String, String>,
     host: &praxec_core::provision_install::Host,
     fix: bool,
     io: &dyn praxec_core::provision_install::InstallerIo,
@@ -2915,16 +2940,10 @@ fn freshen_report_lines(
             .find(|s| s.name == connection)
             .and_then(|s| s.command.as_deref())
     };
-    // The SINGLE membership test: is `command` a curated registry tool?
-    let is_registry_tool = |command: &str| -> bool {
-        registry
-            .map(|r| {
-                r.tools
-                    .iter()
-                    .any(|t| t.command.as_deref() == Some(command))
-            })
-            .unwrap_or(false)
-    };
+    // The SINGLE membership test — the exact expression the currency
+    // remediation uses (`registry_versions.contains_key(command)`): a command
+    // is a freshenable registry tool iff it has a registry entry with a version.
+    let is_registry_tool = |command: &str| -> bool { registry_versions.contains_key(command) };
 
     // Partition the stale commands (ordered, de-duplicated) into registry tools
     // (auto-freshenable through the installer) and the rest (manual rebuild).
@@ -3197,6 +3216,13 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
     print!("{}", crate::preflight::format_report(&report));
     print_soft_diagnostics(&soft_diagnostics);
 
+    // Load the registry ONCE — the single source threaded into BOTH tool
+    // provisioning (below) and the currency/freshen path, so `doctor` never
+    // loads it twice (and the freshen membership test shares the exact map the
+    // currency remediation keys on).
+    let registry = load_registry(&config)?;
+    let registry_versions = registry_versions_of(registry.as_deref());
+
     // Tool provisioning (Task 4): for each `kind: mcp` connection whose command
     // binary preflight reported MISSING (reusing `provision::detect` via
     // `report.tools`), resolve its install provider from the loaded registry and
@@ -3206,7 +3232,7 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
     let io = praxec_core::provision_install::RealInstallerIo;
     print!(
         "{}",
-        provisioning_report(&config, &report.tools.missing, fix, &io)?
+        provisioning_report(&report.tools.missing, registry.as_deref(), fix, &io)
     );
 
     // Tool currency (v0.0.43): is each `kind: mcp` connection actually up to
@@ -3214,18 +3240,6 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
     // managed release binary)? Advisory only — like a missing tool, a stale one
     // never blocks the report. The registry supplies the expected version for a
     // managed-installed (release) binary; an empty map when no registry loads.
-    // Load the registry ONCE — the single source for both the currency
-    // expected-version map and the stale-tool freshen path below.
-    let registry = load_registry(&config)?;
-    let registry_versions: std::collections::HashMap<String, String> = registry
-        .as_ref()
-        .map(|r| {
-            r.tools
-                .iter()
-                .filter_map(|t| Some((t.command.clone()?, t.version.clone()?)))
-                .collect()
-        })
-        .unwrap_or_default();
     let specs = crate::currency::conn_specs_from(&config);
     let currency = crate::currency::check_currency(
         &specs,
@@ -3245,7 +3259,15 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
     };
-    let freshen = freshen_report_lines(&currency, &specs, registry.as_deref(), &host, fix, &io);
+    let freshen = freshen_report_lines(
+        &currency,
+        &specs,
+        registry.as_deref(),
+        &registry_versions,
+        &host,
+        fix,
+        &io,
+    );
     print!("{}", format_freshen(&freshen, fix));
 
     // Durability parity with `serve`: report the SAME env-aware condition serve
@@ -3624,8 +3646,11 @@ fn init(
             if !wiring.packs.is_empty() {
                 let fix = install_consent(install_tools, yes);
                 let io = praxec_core::provision_install::RealInstallerIo;
-                match provisioning_report(&config, &report.tools.missing, fix, &io) {
-                    Ok(section) => print!("{section}"),
+                match load_registry(&config) {
+                    Ok(registry) => print!(
+                        "{}",
+                        provisioning_report(&report.tools.missing, registry.as_deref(), fix, &io)
+                    ),
                     Err(e) => println!("  tool provisioning could not run: {e:#}"),
                 }
             }
@@ -6754,11 +6779,12 @@ mod tests {
             assert_eq!(io.pulls.borrow().len(), 0, "unknown tool must not install");
         }
 
-        /// Task 5 — the shared `provisioning_report` entrypoint `init` calls: it
-        /// loads the registry from the config's `discovery.registry`, then OFFERS
-        /// (default) or INSTALLS (under `fix` consent) via the injected IO. Pins
-        /// that `init`'s `--install-tools`/`--yes` → `fix=true` reaches the
-        /// installer under `Consent::Granted`, and the default mutates nothing.
+        /// Task 5 — the shared `provisioning_report` entrypoint `init` calls: the
+        /// caller loads the registry (from the config's `discovery.registry`) and
+        /// threads it in, then it OFFERS (default) or INSTALLS (under `fix`
+        /// consent) via the injected IO. Pins that `init`'s
+        /// `--install-tools`/`--yes` → `fix=true` reaches the installer under
+        /// `Consent::Granted`, and the default mutates nothing.
         #[test]
         fn shared_provisioning_report_installs_only_under_consent() {
             use serde_json::json;
@@ -6772,12 +6798,13 @@ mod tests {
             )
             .unwrap();
             let config = json!({ "discovery": { "registry": reg_path.display().to_string() } });
+            let registry = super::super::load_registry(&config).expect("load registry");
             let missing = ["planner".to_string()];
 
             // Default (offer-only) — zero mutation.
             let offer_io = FakeIo::default();
-            let offered = super::super::provisioning_report(&config, &missing, false, &offer_io)
-                .expect("offer path");
+            let offered =
+                super::super::provisioning_report(&missing, registry.as_deref(), false, &offer_io);
             assert!(offered.contains("offer-only") && offered.contains("result=offered"));
             assert_eq!(offer_io.pulls.borrow().len(), 0, "offer must not pull");
             assert_eq!(offer_io.writes.borrow().len(), 0, "offer must not write");
@@ -6785,7 +6812,7 @@ mod tests {
             // Consent granted (`--install-tools`/`--yes`) — reaches the installer.
             let fix_io = FakeIo::default();
             let installed =
-                super::super::provisioning_report(&config, &missing, true, &fix_io).expect("fix");
+                super::super::provisioning_report(&missing, registry.as_deref(), true, &fix_io);
             assert!(installed.contains("result=installed"), "{installed}");
             assert_eq!(
                 fix_io.pulls.borrow().as_slice(),
@@ -6856,6 +6883,7 @@ mod tests {
         #[test]
         fn fix_freshens_a_stale_registry_tool_behind_registry() {
             let reg = docker_registry("planner");
+            let versions = super::super::registry_versions_of(Some(&reg));
             let specs = vec![spec("planner-conn", "planner")];
             let diags = vec![stale_diag("planner-conn", "TOOL_BEHIND_REGISTRY")];
             let io = FakeIo::default();
@@ -6863,6 +6891,7 @@ mod tests {
                 &diags,
                 &specs,
                 Some(&reg),
+                &versions,
                 &linux_host(),
                 true, // --fix == consent
                 &io,
@@ -6883,6 +6912,7 @@ mod tests {
             // TOOL_BEHIND_SOURCE (a local-cargo verdict) whose command IS a
             // registry tool → still freshenable through the installer.
             let reg = docker_registry("planner");
+            let versions = super::super::registry_versions_of(Some(&reg));
             let specs = vec![spec("planner-conn", "planner")];
             let diags = vec![stale_diag("planner-conn", "TOOL_BEHIND_SOURCE")];
             let io = FakeIo::default();
@@ -6890,6 +6920,7 @@ mod tests {
                 &diags,
                 &specs,
                 Some(&reg),
+                &versions,
                 &linux_host(),
                 true,
                 &io,
@@ -6903,6 +6934,7 @@ mod tests {
             // A stale tool whose command matches NO registry entry: never
             // installed; reported as a manual rebuild.
             let reg = docker_registry("planner");
+            let versions = super::super::registry_versions_of(Some(&reg));
             let specs = vec![spec("widget-conn", "widget")];
             let diags = vec![stale_diag("widget-conn", "TOOL_BEHIND_SOURCE")];
             let io = FakeIo::default();
@@ -6910,6 +6942,7 @@ mod tests {
                 &diags,
                 &specs,
                 Some(&reg),
+                &versions,
                 &linux_host(),
                 true, // even with --fix, a non-registry tool is not installed
                 &io,
@@ -6929,8 +6962,60 @@ mod tests {
         }
 
         #[test]
+        fn version_less_registry_tool_agrees_between_currency_and_freshen() {
+            // Fix-1 regression: a registry tool that declares `command` but NO
+            // `version` is NOT freshenable (there is no release binary to
+            // install). Both predicates must treat it as non-registry, sourced
+            // from the SAME shared map: the currency remediation would print the
+            // `cargo install --path` text (the command is absent from the map),
+            // and freshen must route it to the manual bucket — never to `install`
+            // (which would fail `MissingField{version}` and print a contradictory
+            // `result=error`).
+            let reg = Registry::load_str(
+                "schema: praxec.packs/v3\n\
+                 tools:\n  - id: planner-tool\n    name: planner\n    command: planner\n",
+            )
+            .unwrap();
+            let versions = super::super::registry_versions_of(Some(&reg));
+            assert!(
+                !versions.contains_key("planner"),
+                "a version-less tool is absent from the shared map (currency → cargo-install text)"
+            );
+
+            let specs = vec![spec("planner-conn", "planner")];
+            let diags = vec![stale_diag("planner-conn", "TOOL_BEHIND_SOURCE")];
+            let io = FakeIo::default();
+            let lines = super::super::freshen_report_lines(
+                &diags,
+                &specs,
+                Some(&reg),
+                &versions,
+                &linux_host(),
+                true, // even with --fix, a version-less tool is not installed
+                &io,
+            );
+            assert_eq!(
+                io.pulls.borrow().len(),
+                0,
+                "version-less tool never routed to install"
+            );
+            assert_eq!(io.writes.borrow().len(), 0, "no binary placed");
+            assert!(
+                !lines.iter().any(|l| l.contains("result=error")),
+                "no contradictory error line: {lines:?}"
+            );
+            assert!(
+                lines.iter().any(
+                    |l| l.contains("not a registry tool") && l.contains("cargo install --path")
+                ),
+                "freshen routes it to the manual bucket, agreeing with the currency text: {lines:?}"
+            );
+        }
+
+        #[test]
         fn offer_only_freshen_never_installs() {
             let reg = docker_registry("planner");
+            let versions = super::super::registry_versions_of(Some(&reg));
             let specs = vec![spec("planner-conn", "planner")];
             let diags = vec![stale_diag("planner-conn", "TOOL_BEHIND_REGISTRY")];
             let io = FakeIo::default();
@@ -6938,6 +7023,7 @@ mod tests {
                 &diags,
                 &specs,
                 Some(&reg),
+                &versions,
                 &linux_host(),
                 false, // no --fix
                 &io,
@@ -6954,6 +7040,7 @@ mod tests {
         fn non_stale_diagnostics_are_ignored_by_freshen() {
             // A TOOL_CURRENT / info diagnostic must never trigger an install.
             let reg = docker_registry("planner");
+            let versions = super::super::registry_versions_of(Some(&reg));
             let specs = vec![spec("planner-conn", "planner")];
             let diags = vec![CurrencyDiagnostic {
                 connection: "planner-conn".into(),
@@ -6966,6 +7053,7 @@ mod tests {
                 &diags,
                 &specs,
                 Some(&reg),
+                &versions,
                 &linux_host(),
                 true,
                 &io,
