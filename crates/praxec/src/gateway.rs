@@ -2882,6 +2882,100 @@ fn provisioning_report(
     Ok(format_provisioning(&lines, fix))
 }
 
+/// Task 2 — freshen the STALE tools currency flagged. `doctor --fix` used to
+/// install only MISSING tools; a present-but-stale tool was never freshened even
+/// though the currency remediation promised it. This closes that gap by routing
+/// stale registry tools back through the SAME installer.
+///
+/// For each `TOOL_BEHIND_SOURCE` / `TOOL_BEHIND_REGISTRY` diagnostic whose
+/// connection command matches a [`RegistryTool`], the current release binary is
+/// (re)installed into the managed bin dir — which [Task 1] made authoritative on
+/// the next run. A stale command with NO registry entry is not auto-freshenable
+/// and gets a manual source-rebuild line.
+///
+/// Consent by construction: registry-tool freshening delegates to
+/// [`provision_report_lines`], so `fix == false` only resolves (offer-only,
+/// mutating nothing) and `fix == true` installs under `Consent::Granted`; one
+/// tool's failure never aborts the rest. `io` is injected so the whole path is
+/// unit-testable with a fake `InstallerIo` (no network). The registry-membership
+/// test is computed once here and mirrors the one the currency remediation keys
+/// on (a command's presence in the registry).
+fn freshen_report_lines(
+    diags: &[crate::currency::CurrencyDiagnostic],
+    specs: &[crate::currency::ConnSpec],
+    registry: Option<&Registry>,
+    host: &praxec_core::provision_install::Host,
+    fix: bool,
+    io: &dyn praxec_core::provision_install::InstallerIo,
+) -> Vec<String> {
+    // Map a flagged connection back to the command it spawns.
+    let command_of = |connection: &str| -> Option<&str> {
+        specs
+            .iter()
+            .find(|s| s.name == connection)
+            .and_then(|s| s.command.as_deref())
+    };
+    // The SINGLE membership test: is `command` a curated registry tool?
+    let is_registry_tool = |command: &str| -> bool {
+        registry
+            .map(|r| {
+                r.tools
+                    .iter()
+                    .any(|t| t.command.as_deref() == Some(command))
+            })
+            .unwrap_or(false)
+    };
+
+    // Partition the stale commands (ordered, de-duplicated) into registry tools
+    // (auto-freshenable through the installer) and the rest (manual rebuild).
+    let mut registry_stale: Vec<String> = Vec::new();
+    let mut manual: Vec<String> = Vec::new();
+    for d in diags {
+        if d.code != "TOOL_BEHIND_SOURCE" && d.code != "TOOL_BEHIND_REGISTRY" {
+            continue;
+        }
+        let Some(command) = command_of(&d.connection) else {
+            continue;
+        };
+        let bucket = if is_registry_tool(command) {
+            &mut registry_stale
+        } else {
+            &mut manual
+        };
+        if !bucket.iter().any(|c| c == command) {
+            bucket.push(command.to_string());
+        }
+    }
+
+    // Registry tools: the ONE install path — offer (no --fix) or install
+    // (--fix, Consent::Granted), continuing past per-tool failures.
+    let mut lines = provision_report_lines(&registry_stale, registry, host, fix, io);
+    // Non-registry stale tools: nothing to install — a source rebuild.
+    for command in manual {
+        lines.push(format!(
+            "tool {command}: stale but not a registry tool — `doctor --fix` cannot freshen it; \
+             rebuild from source (`cargo install --path <repo> --force`) or add it to the registry"
+        ));
+    }
+    lines
+}
+
+/// Render the stale-tool freshening section. Empty (nothing stale) prints
+/// nothing — `doctor` stays quiet when every tool is current.
+fn format_freshen(lines: &[String], fix: bool) -> String {
+    use std::fmt::Write as _;
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mode = if fix { "freshen" } else { "offer-only" };
+    let mut out = String::new();
+    let _ = writeln!(out, "stale tool freshening ({mode}):");
+    for line in lines {
+        let _ = writeln!(out, "  {line}");
+    }
+    out
+}
+
 /// Task 6 — the delegation core behind `praxec tools install <tool-id>`: resolve
 /// the tool from the config's `discovery.registry` and hand it to the ONE
 /// installer under [`Consent::Granted`]. No new install logic — it looks up a
@@ -3120,7 +3214,10 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
     // managed release binary)? Advisory only — like a missing tool, a stale one
     // never blocks the report. The registry supplies the expected version for a
     // managed-installed (release) binary; an empty map when no registry loads.
-    let registry_versions: std::collections::HashMap<String, String> = load_registry(&config)?
+    // Load the registry ONCE — the single source for both the currency
+    // expected-version map and the stale-tool freshen path below.
+    let registry = load_registry(&config)?;
+    let registry_versions: std::collections::HashMap<String, String> = registry
         .as_ref()
         .map(|r| {
             r.tools
@@ -3129,12 +3226,27 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
+    let specs = crate::currency::conn_specs_from(&config);
     let currency = crate::currency::check_currency(
-        &crate::currency::conn_specs_from(&config),
+        &specs,
         &registry_versions,
         &crate::currency::RealCurrencyIo,
     );
     print!("{}", crate::currency::format_currency(&currency));
+
+    // Task 2 — freshen stale registry tools. A tool currency flags BEHIND
+    // (TOOL_BEHIND_SOURCE / TOOL_BEHIND_REGISTRY) that is a registry tool is
+    // re-installable to the managed bin dir (authoritative on the next run):
+    // under `--fix` (ADR-0006 consent) install it via the ONE installer,
+    // offer-only just reports intent; a stale tool with no registry entry is
+    // manual. Advisory like currency — continues past per-tool failures, never
+    // blocks the report.
+    let host = praxec_core::provision_install::Host {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+    };
+    let freshen = freshen_report_lines(&currency, &specs, registry.as_deref(), &host, fix, &io);
+    print!("{}", format_freshen(&freshen, fix));
 
     // Durability parity with `serve`: report the SAME env-aware condition serve
     // fails fast on, so `doctor` (the health command) can never greenlight a
@@ -6712,6 +6824,158 @@ mod tests {
                 "the healthy tool still installs past the broken one: {}",
                 lines[1]
             );
+        }
+
+        // ── Task 2 — doctor --fix freshens stale registry tools ──────────────
+        //
+        // A present-but-stale tool used to be ignored by `--fix` (only missing
+        // tools were installed). These pin that a stale REGISTRY tool now routes
+        // back through the ONE installer under `Consent::Granted` (via
+        // `freshen_report_lines`), a stale NON-registry tool does not (manual
+        // rebuild message), and offer-only never installs. Fake `InstallerIo` +
+        // a fixture registry — no network.
+        use crate::currency::{ConnSpec, CurrencyDiagnostic, Severity};
+
+        fn stale_diag(connection: &str, code: &'static str) -> CurrencyDiagnostic {
+            CurrencyDiagnostic {
+                connection: connection.to_string(),
+                code,
+                severity: Severity::Warn,
+                message: String::new(),
+            }
+        }
+
+        fn spec(name: &str, command: &str) -> ConnSpec {
+            ConnSpec {
+                name: name.to_string(),
+                command: Some(command.to_string()),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn fix_freshens_a_stale_registry_tool_behind_registry() {
+            let reg = docker_registry("planner");
+            let specs = vec![spec("planner-conn", "planner")];
+            let diags = vec![stale_diag("planner-conn", "TOOL_BEHIND_REGISTRY")];
+            let io = FakeIo::default();
+            let lines = super::super::freshen_report_lines(
+                &diags,
+                &specs,
+                Some(&reg),
+                &linux_host(),
+                true, // --fix == consent
+                &io,
+            );
+            assert!(
+                lines.iter().any(|l| l.contains("result=installed")),
+                "stale registry tool re-installed: {lines:?}"
+            );
+            assert_eq!(
+                io.pulls.borrow().as_slice(),
+                &["ghcr.io/praxec/planner:0.0.2".to_string()],
+                "freshen runs the ONE installer under Consent::Granted"
+            );
+        }
+
+        #[test]
+        fn fix_freshens_a_stale_local_tool_that_is_a_registry_tool() {
+            // TOOL_BEHIND_SOURCE (a local-cargo verdict) whose command IS a
+            // registry tool → still freshenable through the installer.
+            let reg = docker_registry("planner");
+            let specs = vec![spec("planner-conn", "planner")];
+            let diags = vec![stale_diag("planner-conn", "TOOL_BEHIND_SOURCE")];
+            let io = FakeIo::default();
+            let lines = super::super::freshen_report_lines(
+                &diags,
+                &specs,
+                Some(&reg),
+                &linux_host(),
+                true,
+                &io,
+            );
+            assert!(lines.iter().any(|l| l.contains("result=installed")));
+            assert_eq!(io.pulls.borrow().len(), 1, "installed under consent");
+        }
+
+        #[test]
+        fn stale_non_registry_tool_is_not_auto_freshened() {
+            // A stale tool whose command matches NO registry entry: never
+            // installed; reported as a manual rebuild.
+            let reg = docker_registry("planner");
+            let specs = vec![spec("widget-conn", "widget")];
+            let diags = vec![stale_diag("widget-conn", "TOOL_BEHIND_SOURCE")];
+            let io = FakeIo::default();
+            let lines = super::super::freshen_report_lines(
+                &diags,
+                &specs,
+                Some(&reg),
+                &linux_host(),
+                true, // even with --fix, a non-registry tool is not installed
+                &io,
+            );
+            assert_eq!(
+                io.pulls.borrow().len(),
+                0,
+                "non-registry tool not installed"
+            );
+            assert_eq!(io.writes.borrow().len(), 0, "no binary placed");
+            assert!(
+                lines.iter().any(
+                    |l| l.contains("not a registry tool") && l.contains("cargo install --path")
+                ),
+                "manual-rebuild line for the non-registry tool: {lines:?}"
+            );
+        }
+
+        #[test]
+        fn offer_only_freshen_never_installs() {
+            let reg = docker_registry("planner");
+            let specs = vec![spec("planner-conn", "planner")];
+            let diags = vec![stale_diag("planner-conn", "TOOL_BEHIND_REGISTRY")];
+            let io = FakeIo::default();
+            let lines = super::super::freshen_report_lines(
+                &diags,
+                &specs,
+                Some(&reg),
+                &linux_host(),
+                false, // no --fix
+                &io,
+            );
+            assert_eq!(io.pulls.borrow().len(), 0, "offer must not install");
+            assert_eq!(io.writes.borrow().len(), 0, "offer must not place a binary");
+            assert!(
+                lines.iter().any(|l| l.contains("result=offered")),
+                "offer-only reports intent: {lines:?}"
+            );
+        }
+
+        #[test]
+        fn non_stale_diagnostics_are_ignored_by_freshen() {
+            // A TOOL_CURRENT / info diagnostic must never trigger an install.
+            let reg = docker_registry("planner");
+            let specs = vec![spec("planner-conn", "planner")];
+            let diags = vec![CurrencyDiagnostic {
+                connection: "planner-conn".into(),
+                code: "TOOL_CURRENT",
+                severity: Severity::Info,
+                message: String::new(),
+            }];
+            let io = FakeIo::default();
+            let lines = super::super::freshen_report_lines(
+                &diags,
+                &specs,
+                Some(&reg),
+                &linux_host(),
+                true,
+                &io,
+            );
+            assert_eq!(
+                io.pulls.borrow().len(),
+                0,
+                "current tool never re-installed"
+            );
+            assert!(lines.is_empty(), "nothing to freshen: {lines:?}");
         }
 
         // ── Task 6 — `praxec tools install <id>` delegation surface ──────────

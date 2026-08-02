@@ -326,7 +326,7 @@ pub fn check_currency(
                 })
             },
         );
-        let diag = diagnose(&spec.name, &source, io);
+        let diag = diagnose(&spec.name, &source, io, registry_versions);
         if let Some(d) = diag {
             out.push(d);
         }
@@ -350,7 +350,17 @@ fn diag(
 
 /// Turn one classified source into a diagnostic (or `None` when there is simply
 /// nothing worth reporting — e.g. a command not on PATH is provision's concern).
-fn diagnose(name: &str, source: &ConnSource, io: &dyn CurrencyIo) -> Option<CurrencyDiagnostic> {
+///
+/// `registry_versions` is the SAME command→version map [`check_currency`]
+/// carries: its keyset is the authoritative "is this a registry tool" test the
+/// remediation text keys on, so a `doctor --fix` suggestion appears ONLY where
+/// `doctor --fix` can actually act (a registry tool it can re-install).
+fn diagnose(
+    name: &str,
+    source: &ConnSource,
+    io: &dyn CurrencyIo,
+    registry_versions: &HashMap<String, String>,
+) -> Option<CurrencyDiagnostic> {
     match source {
         ConnSource::ManagedRelease {
             command,
@@ -405,17 +415,26 @@ fn diagnose(name: &str, source: &ConnSource, io: &dyn CurrencyIo) -> Option<Curr
                 ));
             };
             if local_cargo_behind(bin_mtime, head) {
-                Some(diag(
-                    name,
-                    "TOOL_BEHIND_SOURCE",
-                    Severity::Warn,
+                // `doctor --fix` only freshens registry tools (it installs the
+                // current release binary); a local-cargo tool with no registry
+                // entry must be rebuilt from source — don't overpromise.
+                let msg = if registry_versions.contains_key(command) {
                     format!(
                         "`{command}` is STALE — its source {} has commits newer than the installed \
-                         binary. Update to the latest release binary: `praxec tools install \
+                         binary. Update to the current release binary: `praxec tools install \
                          {command}` (or `praxec doctor --fix`).",
                         repo.display(),
-                    ),
-                ))
+                    )
+                } else {
+                    format!(
+                        "`{command}` is STALE — its source {0} has commits newer than the installed \
+                         binary. It has no registry entry (no release binary to install), so \
+                         rebuild it from source: `cargo install --path {0} --force` (or add it to \
+                         the registry).",
+                        repo.display(),
+                    )
+                };
+                Some(diag(name, "TOOL_BEHIND_SOURCE", Severity::Warn, msg))
             } else {
                 Some(diag(
                     name,
@@ -429,16 +448,24 @@ fn diagnose(name: &str, source: &ConnSource, io: &dyn CurrencyIo) -> Option<Curr
             command,
             version,
             source,
-        } => Some(diag(
-            name,
-            "CURRENCY_UNKNOWN",
-            Severity::Info,
-            format!(
-                "`{command}` (v{version}) installed from {source} — currency needs a registry/remote \
-                 fetch (not checked). Update to the latest release binary with `praxec tools install \
-                 {command}` (or `praxec doctor --fix`) to be sure."
-            ),
-        )),
+        } => {
+            // Same registry-membership gate: only name `doctor --fix` when it can
+            // actually re-install this command (a registry tool).
+            let msg = if registry_versions.contains_key(command) {
+                format!(
+                    "`{command}` (v{version}) installed from {source} — currency needs a \
+                     registry/remote fetch (not checked). Update to the current release binary with \
+                     `praxec tools install {command}` (or `praxec doctor --fix`) to be sure."
+                )
+            } else {
+                format!(
+                    "`{command}` (v{version}) installed from {source} — currency needs a \
+                     registry/remote fetch (not checked). It has no registry entry; update it at \
+                     its source or add it to the registry."
+                )
+            };
+            Some(diag(name, "CURRENCY_UNKNOWN", Severity::Info, msg))
+        }
         ConnSource::Docker { image } => {
             let local = io.docker_local_digest(image);
             let remote = io.docker_registry_digest(image);
@@ -975,7 +1002,11 @@ mod tests {
     }
 
     #[test]
-    fn stale_local_tool_produces_a_warn_with_the_fix() {
+    fn stale_non_registry_local_tool_recommends_source_rebuild() {
+        // A local-cargo tool with NO registry entry: `doctor --fix` cannot
+        // freshen it (nothing to install a release binary from), so the
+        // remediation must recommend a source rebuild and must NOT overpromise
+        // `doctor --fix`.
         let c = crates2_with("cpm-planner", "0.0.2", "path+file:///repo/cpm");
         let mut io = FakeIo {
             crates2: Some(c),
@@ -992,20 +1023,45 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "TOOL_BEHIND_SOURCE");
         assert_eq!(diags[0].severity, Severity::Warn);
-        // No parallel install path: the remediation points at the ONE installer
-        // surface (a release binary via `praxec tools install` / `doctor --fix`),
-        // never a `cargo install --path --force` source rebuild.
         assert!(
-            diags[0]
-                .message
-                .contains("praxec tools install cpm-planner")
-                || diags[0].message.contains("praxec doctor --fix"),
-            "remediation names the release-binary path: {}",
+            diags[0].message.contains("cargo install --path"),
+            "non-registry stale tool → source rebuild: {}",
             diags[0].message
         );
         assert!(
-            !diags[0].message.contains("cargo install --path"),
-            "cargo source-build remediation must be gone: {}",
+            !diags[0].message.contains("praxec doctor --fix"),
+            "must not overpromise doctor --fix for a non-registry tool: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn stale_registry_local_tool_points_at_doctor_fix() {
+        // Same stale local-cargo tool, but its command IS a registry tool
+        // (present in the registry-version map). Now `doctor --fix` genuinely
+        // freshens it (installs the current release binary), so the remediation
+        // names it.
+        let c = crates2_with("cpm-planner", "0.0.2", "path+file:///repo/cpm");
+        let mut io = FakeIo {
+            crates2: Some(c),
+            ..Default::default()
+        };
+        io.mtimes.insert("cpm-planner".into(), 1000);
+        io.head_times.insert("/repo/cpm".into(), 2000);
+        // No managed binary → classify falls through to LocalCargoPath, but the
+        // command is a registry tool via the version map.
+        let mut versions = HashMap::new();
+        versions.insert("cpm-planner".to_string(), "0.0.5".to_string());
+        let specs = vec![ConnSpec {
+            name: "cpm".into(),
+            command: Some("cpm-planner".into()),
+            ..Default::default()
+        }];
+        let diags = check_currency(&specs, &versions, &io);
+        assert_eq!(diags[0].code, "TOOL_BEHIND_SOURCE");
+        assert!(
+            diags[0].message.contains("praxec doctor --fix"),
+            "registry tool → doctor --fix freshens it: {}",
             diags[0].message
         );
     }
