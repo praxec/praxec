@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 pub(crate) use crate::gateway_config::{
     ApprovalsCommand, AuditCommand, Cli, CliConnectionKind, Command, ConnectionsCommand,
-    CostCommand, InitEditorArg, InspectCommand, IntentCommand, OneshotServer, SchemaCommand,
-    ack_guards_used, apply_overlays, build_audit_sink, build_workflow_store, cli_principal,
-    headless_policy_from, is_ephemeral_path, load_config, parse_since, resolve_embedder,
+    CostCommand, InitEditorArg, InspectCommand, IntentCommand, OneshotServer, PackCommand,
+    SchemaCommand, ToolsCommand, ack_guards_used, apply_overlays, build_audit_sink,
+    build_workflow_store, cli_principal, headless_policy_from, is_ephemeral_path, load_config,
+    parse_since, resolve_embedder,
 };
 pub use crate::gateway_config::{
     GatewayOverlays, OverlayCtx, build_evidence_store, build_guidance_ack_store,
@@ -106,7 +107,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             args,
         } => run_query(config, human, args, overlays).await,
         Command::Check { config } => check(config, &overlays.diagnostics),
-        Command::Doctor { config } => doctor(config),
+        Command::Doctor { config, fix } => doctor(config, fix),
         Command::Health { config } => health(config),
         Command::Observe {
             config,
@@ -213,6 +214,12 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             }
             ConnectionsCommand::Revoke { config, name } => connections_revoke(&config, &name).await,
         },
+        Command::Pack { command } => match command {
+            PackCommand::List { repo } => pack_list(&repo),
+        },
+        Command::Tools { command } => match command {
+            ToolsCommand::Install { config, tool_id } => tools_install(&config, &tool_id),
+        },
         Command::Init {
             editor,
             provider,
@@ -220,7 +227,22 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             global,
             force,
             yes,
-        } => init(editor, provider, dir, global, force, yes),
+            with_starter_packs,
+            packs,
+            pack,
+            install_tools,
+        } => init(
+            editor,
+            provider,
+            dir,
+            global,
+            force,
+            yes,
+            with_starter_packs,
+            packs,
+            pack,
+            install_tools,
+        ),
     }
 }
 
@@ -1848,6 +1870,11 @@ async fn reload_gated(
 /// expect to find are simply missing from `praxec.query`, with nothing to read
 /// but silence. A typed `REGISTRY_*` error at boot (and at reload, where it keeps
 /// the previous config live) is the only honest answer.
+///
+/// By the time this reads `/discovery/registry` it is always a **local path
+/// string**: config resolution (`config::resolve_registry_source`) has already
+/// sourced an always-latest `{ uri, ref }` object into its cached `packs.yaml`
+/// and rewritten the knob to that path.
 fn load_registry(config: &Value) -> anyhow::Result<Option<Arc<Registry>>> {
     let Some(path) = config
         .pointer("/discovery/registry")
@@ -2699,6 +2726,364 @@ fn print_soft_diagnostics(soft_diagnostics: &[praxec_core::config::Diagnostic]) 
     }
 }
 
+/// The provider-chain token for a structured provisioning line (`provider=…`).
+/// Exhaustive over the closed [`praxec_core::provision_install::Provider`] set —
+/// a new provider fails to compile until its token is decided (poka-yoke).
+fn provider_token(provider: praxec_core::provision_install::Provider) -> &'static str {
+    use praxec_core::provision_install::Provider;
+    match provider {
+        Provider::Release => "release",
+        Provider::Docker => "docker",
+        Provider::Npx => "npx",
+        Provider::Cargo => "cargo",
+    }
+}
+
+/// Task 4 — resolve-and-offer (and, under `fix`, install) the provisioning for
+/// each missing `kind: mcp` tool. One structured line per tool
+/// (`tool <id>: provider=<p> action=<cmd> result=<…>`), the doctor observability
+/// surface.
+///
+/// Consent by construction: `fix == false` only ever calls
+/// [`resolve_provider`](praxec_core::provision_install::resolve_provider) (which
+/// performs no mutating IO), so the offer path cannot install. `fix == true`
+/// calls [`install`](praxec_core::provision_install::install) with
+/// [`Consent::Granted`](praxec_core::provision_install::Consent::Granted) and
+/// continues past a single tool's failure (one broken tool never aborts the
+/// rest). The `io` seam is injected so the offer path is unit-testable with a
+/// fake `InstallerIo` (no network).
+///
+/// A missing command that matches no registry tool yields a "cannot offer —
+/// unknown tool" line (nothing to resolve), never a crash.
+fn provision_report_lines(
+    missing: &[String],
+    registry: Option<&Registry>,
+    host: &praxec_core::provision_install::Host,
+    fix: bool,
+    io: &dyn praxec_core::provision_install::InstallerIo,
+) -> Vec<String> {
+    use praxec_core::provision_install::{Consent, InstallOutcome, install, resolve_provider};
+
+    let mut lines = Vec::with_capacity(missing.len());
+    for command in missing {
+        // Match the missing connection command to a registry tool by its
+        // `command` field (the binary the tool's connection spawns).
+        let tool = registry.and_then(|r| {
+            r.tools
+                .iter()
+                .find(|t| t.command.as_deref() == Some(command.as_str()))
+        });
+        let Some(tool) = tool else {
+            lines.push(format!(
+                "tool {command}: cannot offer — unknown tool (no registry entry declares this command)"
+            ));
+            continue;
+        };
+
+        // Resolve once — names the provider + command for the offer, and is the
+        // same plan `install` would perform. Non-mutating (only `io.which`).
+        let Some(plan) = resolve_provider(tool, host, io) else {
+            lines.push(format!(
+                "tool {}: cannot offer — no available provider (release/docker/npx/cargo) for this host",
+                tool.id
+            ));
+            continue;
+        };
+        let provider = provider_token(plan.provider);
+
+        if !fix {
+            lines.push(format!(
+                "tool {}: provider={provider} action={} result=offered (re-run `doctor --fix` to install)",
+                tool.id, plan.command
+            ));
+            continue;
+        }
+
+        // `--fix` == operator consent: install, continuing past failures.
+        match install(tool, host, Consent::Granted, io) {
+            Ok(InstallOutcome::Installed { path, version }) => lines.push(format!(
+                "tool {}: provider={provider} action={} result=installed (path={}, version={version})",
+                tool.id,
+                plan.command,
+                path.display()
+            )),
+            Ok(InstallOutcome::AlreadyCurrent) => lines.push(format!(
+                "tool {}: provider={provider} action={} result=already-current",
+                tool.id, plan.command
+            )),
+            Ok(InstallOutcome::Refused { reason }) => lines.push(format!(
+                "tool {}: provider={provider} action={} result=refused ({reason})",
+                tool.id, plan.command
+            )),
+            // Nothing to place: either a remote tool (wired as a url
+            // connection) or an npm-distributed tool (npx fetches it on run —
+            // the reason surfaces the `npx -y <pkg>` connection form).
+            Ok(InstallOutcome::NoInstallNeeded { reason }) => lines.push(format!(
+                "tool {}: provider={provider} action={} result=no-install-needed ({reason})",
+                tool.id, plan.command
+            )),
+            // Cargo is emit-only even under Granted — surface the command to run.
+            Ok(InstallOutcome::Offered {
+                provider: p,
+                command: cmd,
+            }) => lines.push(format!(
+                "tool {}: provider={} action={cmd} result=emit-only (run this yourself)",
+                tool.id,
+                provider_token(p)
+            )),
+            Err(e) => lines.push(format!(
+                "tool {}: provider={provider} action={} result=error ({e})",
+                tool.id, plan.command
+            )),
+        }
+    }
+    lines
+}
+
+/// Render the "tool provisioning" doctor section. Empty `lines` (every
+/// connection binary already on PATH, or none configured) prints the clean
+/// all-present state.
+fn format_provisioning(lines: &[String], fix: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mode = if fix { "install" } else { "offer-only" };
+    let _ = writeln!(out, "tool provisioning ({mode}):");
+    if lines.is_empty() {
+        let _ = writeln!(
+            out,
+            "  ok — every `kind: mcp` connection binary is already present"
+        );
+    } else {
+        for line in lines {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+    out
+}
+
+/// Shared provisioning entrypoint for `doctor` and `init`: load the registry
+/// declared by `config`, resolve each `missing` tool's provider against it, and
+/// OFFER it — or, under `fix` consent, INSTALL it — returning the rendered
+/// "tool provisioning" section. `io` is injected so the real path
+/// (`RealInstallerIo`) and tests (a recording fake) drive the SAME code — the
+/// single install entrypoint both surfaces reach, never a parallel one.
+fn provisioning_report(
+    config: &Value,
+    missing: &[String],
+    fix: bool,
+    io: &dyn praxec_core::provision_install::InstallerIo,
+) -> anyhow::Result<String> {
+    let registry = load_registry(config)?;
+    let host = praxec_core::provision_install::Host {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+    };
+    let lines = provision_report_lines(missing, registry.as_deref(), &host, fix, io);
+    Ok(format_provisioning(&lines, fix))
+}
+
+/// Task 6 — the delegation core behind `praxec tools install <tool-id>`: resolve
+/// the tool from the config's `discovery.registry` and hand it to the ONE
+/// installer under [`Consent::Granted`]. No new install logic — it looks up a
+/// [`RegistryTool`](praxec_core::registry_v3::RegistryTool) by `id` (then
+/// `command`) and calls [`install`](praxec_core::provision_install::install),
+/// the same entrypoint `doctor --fix` / `init --install-tools` reach. `io` is
+/// injected so tests drive it with a fake `InstallerIo` (no network).
+///
+/// Fail-fast (never a silent no-op): an unconfigured registry, an unknown
+/// tool-id, or an [`InstallError`] all return `Err`.
+/// The read-only result of enumerating a pack: its manifest identity plus the
+/// namespace-prefixed definition ids grouped by kind. `flows` are `flow.*`
+/// (orchestrators), `caps` are `cap.*` (capabilities); anything else a pack
+/// happens to declare lands in `other` so nothing silently drops. Each list is
+/// sorted for stable output.
+#[derive(Debug)]
+struct PackListing {
+    name: String,
+    namespace: String,
+    version: String,
+    flows: Vec<String>,
+    caps: Vec<String>,
+    other: Vec<String>,
+}
+
+/// Enumerate a pack's definitions WITHOUT building a gateway. Fail-fast (with
+/// context) when `<repo>` does not exist or carries no `praxec.repo.yaml` (not a
+/// pack). Reuses [`praxec_core::repo::load_repo`] — the exact layout walk
+/// `check`/`serve` use — so the ids reported are precisely what the gateway
+/// would load (namespace-prefixed `<namespace>/<id>`), then classifies each by
+/// its local (post-namespace) segment.
+fn enumerate_pack(repo: &Path) -> anyhow::Result<PackListing> {
+    if !repo.exists() {
+        anyhow::bail!("pack directory `{}` does not exist", repo.display());
+    }
+    let manifest_path = repo.join("praxec.repo.yaml");
+    if !manifest_path.exists() {
+        anyhow::bail!(
+            "`{}` is not a pack: no `praxec.repo.yaml` at {}",
+            repo.display(),
+            manifest_path.display()
+        );
+    }
+
+    let (manifest, aggregate) = praxec_core::repo::load_repo(repo)
+        .with_context(|| format!("loading pack at {}", repo.display()))?;
+
+    let mut flows = Vec::new();
+    let mut caps = Vec::new();
+    let mut other = Vec::new();
+    if let Some(workflows) = aggregate.pointer("/workflows").and_then(Value::as_object) {
+        for key in workflows.keys() {
+            // Keys are `<namespace>/<id>`; classify by the local id segment
+            // (`rsplit('/')` also handles a re-exported fully-qualified id).
+            let local = key.rsplit('/').next().unwrap_or(key.as_str());
+            if local.starts_with("flow.") {
+                flows.push(key.clone());
+            } else if local.starts_with("cap.") {
+                caps.push(key.clone());
+            } else {
+                other.push(key.clone());
+            }
+        }
+    }
+    flows.sort();
+    caps.sort();
+    other.sort();
+
+    Ok(PackListing {
+        name: manifest.name,
+        namespace: manifest.namespace,
+        version: manifest.version,
+        flows,
+        caps,
+        other,
+    })
+}
+
+/// `praxec pack list <repo>` — print a pack's flows/caps without a gateway.
+fn pack_list(repo: &Path) -> anyhow::Result<()> {
+    let listing = enumerate_pack(repo)?;
+    println!(
+        "pack: {} (namespace {}, version {})",
+        listing.name, listing.namespace, listing.version
+    );
+    println!();
+    println!("flows ({}):", listing.flows.len());
+    for id in &listing.flows {
+        println!("  {id}");
+    }
+    println!("caps ({}):", listing.caps.len());
+    for id in &listing.caps {
+        println!("  {id}");
+    }
+    if !listing.other.is_empty() {
+        println!("other ({}):", listing.other.len());
+        for id in &listing.other {
+            println!("  {id}");
+        }
+    }
+    Ok(())
+}
+
+/// Resolve `tool_id` to an install and perform it through the ONE installer.
+///
+/// Two sources, in precedence order (curated over discovered):
+///  1. **the loaded registry** (`discovery.registry`) — a `RegistryTool` matched
+///     by id or command, installed as before;
+///  2. **the assembled discovery catalog** (`registries:`) — when the id is in
+///     no registry, a [`ToolCandidate`] matched by exact `name`, normalized to a
+///     provider coordinate ([`from_candidate`]) and routed through the SAME
+///     [`install`], no second installer (§3 principle 1).
+///
+/// Not-found is fail-fast, naming BOTH sources searched.
+fn tools_install_with(
+    config: &Value,
+    tool_id: &str,
+    io: &dyn praxec_core::provision_install::InstallerIo,
+    catalog_io: &dyn praxec_core::tool_catalog::CatalogIo,
+) -> anyhow::Result<praxec_core::provision_install::InstallOutcome> {
+    use praxec_core::provision_install::{
+        Consent, Host, InstallOutcome, InstallTarget, from_candidate, install,
+    };
+
+    let host = Host {
+        os: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+    };
+
+    // 1. Registry precedence: a curated entry always wins over discovery.
+    if let Some(registry) = load_registry(config)? {
+        if let Some(tool) = registry
+            .tools
+            .iter()
+            .find(|t| t.id == tool_id || t.command.as_deref() == Some(tool_id))
+        {
+            return Ok(install(tool, &host, Consent::Granted, io)?);
+        }
+    }
+
+    // 2. Discovery fallback: assemble the `registries:` catalog and normalize a
+    //    candidate matched by exact name to a provider coordinate.
+    let specs = praxec_core::tool_catalog::registries_from(config);
+    let (catalog, _warnings) = praxec_core::tool_catalog::assemble(&specs, catalog_io);
+    if let Some(candidate) = catalog.iter().find(|c| c.name == tool_id) {
+        return match from_candidate(candidate) {
+            InstallTarget::Installable(tool) => Ok(install(&tool, &host, Consent::Granted, io)?),
+            InstallTarget::Remote { url } => Ok(InstallOutcome::NoInstallNeeded {
+                reason: format!("`{tool_id}` is a remote tool — wire a url connection to {url}"),
+            }),
+        };
+    }
+
+    anyhow::bail!(
+        "unknown tool `{tool_id}`: not found in the loaded registry \
+         (`discovery.registry`) nor in the assembled discovery catalog \
+         (`registries:`) — searched both sources"
+    )
+}
+
+/// `praxec tools install <tool-id>` — the thin CLI delegation surface a governed
+/// `flow.tools.provision` `kind: cli` step calls to reach the Rust installer.
+/// Loads the config + registry, installs via [`tools_install_with`] under real
+/// IO, prints the outcome, and exits non-zero on an install error, a refused
+/// (checksum-mismatch) outcome, or an emit-only (cargo) outcome the flow cannot
+/// complete automatically.
+fn tools_install(config_path: &std::path::Path, tool_id: &str) -> anyhow::Result<()> {
+    use praxec_core::provision_install::{InstallOutcome, RealInstallerIo};
+
+    let config = load_config(&config_path.to_path_buf())?;
+    let io = RealInstallerIo;
+    let catalog_io = praxec_core::tool_catalog::RealCatalogIo;
+    match tools_install_with(&config, tool_id, &io, &catalog_io)? {
+        InstallOutcome::Installed { path, version } => {
+            println!(
+                "installed `{tool_id}` (version {version}) -> {}",
+                path.display()
+            );
+            Ok(())
+        }
+        InstallOutcome::AlreadyCurrent => {
+            println!("`{tool_id}` is already current — nothing to install");
+            Ok(())
+        }
+        // Cargo is emit-only even under Granted, and a checksum mismatch is a
+        // refusal — neither placed a binary, so a governed drive must fail fast
+        // (non-zero) rather than proceed as if the tool were installed.
+        InstallOutcome::Offered { provider, command } => anyhow::bail!(
+            "`{tool_id}` was not installed automatically ({provider:?} is emit-only) — run: {command}"
+        ),
+        InstallOutcome::Refused { reason } => {
+            anyhow::bail!("install refused for `{tool_id}`: {reason}")
+        }
+        // A discovered remote tool: nothing to fetch, wire a url connection.
+        // Not an error — a first-class "no install needed" outcome.
+        InstallOutcome::NoInstallNeeded { reason } => {
+            println!("`{tool_id}` needs no install: {reason}");
+            Ok(())
+        }
+    }
+}
+
 /// P15 — the operator's "is my machine set up for this config" command: run
 /// the credential/tooling preflight and print the report. Exits non-zero iff
 /// a required provider credential is missing (a missing `kind: mcp` binary is
@@ -2710,13 +3095,25 @@ fn print_soft_diagnostics(soft_diagnostics: &[praxec_core::config::Diagnostic]) 
 /// the soft diagnostics (e.g. a drifted/stale `path:` pack) that
 /// `load_config` discards. `check` and `doctor` must never disagree about
 /// what a config's soft diagnostics say.
-fn doctor(config_path: PathBuf) -> anyhow::Result<()> {
+fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
     let (config, soft_diagnostics) =
         praxec_core::config::load_resolved_with_repos_resilient(&config_path)
             .with_context(|| format!("loading config {}", config_path.display()))?;
     let report = crate::preflight::preflight(&config);
     print!("{}", crate::preflight::format_report(&report));
     print_soft_diagnostics(&soft_diagnostics);
+
+    // Tool provisioning (Task 4): for each `kind: mcp` connection whose command
+    // binary preflight reported MISSING (reusing `provision::detect` via
+    // `report.tools`), resolve its install provider from the loaded registry and
+    // OFFER the exact command. Under `--fix` (the operator's ADR-0006 consent),
+    // install it — continuing past a single tool's failure. Advisory like
+    // currency: it never blocks the doctor exit. Shared with `init` (Task 5).
+    let io = praxec_core::provision_install::RealInstallerIo;
+    print!(
+        "{}",
+        provisioning_report(&config, &report.tools.missing, fix, &io)?
+    );
 
     // Tool currency (v0.0.43): is each `kind: mcp` connection actually up to
     // date with its source (local cargo repo / docker registry / remote)?
@@ -2916,10 +3313,15 @@ fn init(
     global: bool,
     force: bool,
     yes: bool,
+    with_starter_packs: bool,
+    packs: Option<String>,
+    pack: Option<String>,
+    install_tools: bool,
 ) -> anyhow::Result<()> {
     use crate::init::{
-        EditorTarget, EditorWriteOutcome, InitIo, RealInitIo, ScaffoldOutcome,
-        gateway_yaml_content, models_yaml_content, resolve_target_dir, scaffold_file,
+        EditorTarget, EditorWriteOutcome, InitIo, RealInitIo, STARTER_REGISTRY_URI,
+        ScaffoldOutcome, gateway_yaml_content, install_consent, merge_pack_wiring,
+        models_yaml_content, resolve_pack_wiring, resolve_target_dir, scaffold_file,
         write_editor_mcp_config,
     };
 
@@ -2929,6 +3331,10 @@ fn init(
          --provider (or pass --provider openrouter) — add other providers by hand afterward via \
          the providers.env file"
     );
+
+    // Resolve the pack selection up front so an unknown `--packs` id fails fast,
+    // before anything is scaffolded (nothing written on a bad selection).
+    let wiring = resolve_pack_wiring(with_starter_packs, packs.as_deref(), pack.as_deref())?;
 
     let io = RealInitIo;
 
@@ -2958,6 +3364,39 @@ fn init(
             "  skipped {} (already exists; pass --force to overwrite)",
             models_yaml_path.display()
         ),
+    }
+
+    // ── pack wiring (Task A3) ────────────────────────────────────────────────
+    // `--with-starter-packs` unions ALL the OPEN starter packs; `--packs <ids>`
+    // unions a selected subset; `--pack <uri>` unions one arbitrary uri. Any of
+    // the starter-set paths (`--with-starter-packs`/`--packs`) also points
+    // `discovery.registry` at the always-latest `praxec/packs` registry so the
+    // selected packs' tools resolve. Idempotent: an existing `repos:`/
+    // `discovery` block is preserved and extended, never clobbered (unless
+    // `--force`). Runs on whatever `gateway.yaml` is now on disk, so a re-run
+    // merges rather than skips. The selection was already resolved (fail-fast on
+    // an unknown `--packs` id) above.
+    if !wiring.packs.is_empty() {
+        let existing = std::fs::read_to_string(&gateway_yaml_path)
+            .with_context(|| format!("reading {} for pack wiring", gateway_yaml_path.display()))?;
+        let outcome = merge_pack_wiring(&existing, &wiring, force)?;
+        std::fs::write(&gateway_yaml_path, &outcome.yaml)
+            .with_context(|| format!("writing wired {}", gateway_yaml_path.display()))?;
+        if outcome.added_packs.is_empty() {
+            println!(
+                "  repos   {} (all requested packs already wired)",
+                gateway_yaml_path.display()
+            );
+        } else {
+            for uri in &outcome.added_packs {
+                println!("  wired   repo {uri} (ref: main)");
+            }
+        }
+        if outcome.registry_wired {
+            println!("  wired   discovery.registry -> {STARTER_REGISTRY_URI} (always-latest)");
+        } else if wiring.registry {
+            println!("  registry pointer already present (kept; --force to reset)");
+        }
     }
 
     // ── API key ──────────────────────────────────────────────────────────────
@@ -3053,6 +3492,19 @@ fn init(
             let report = crate::preflight::preflight(&config);
             print!("{}", crate::preflight::format_report(&report));
             print_soft_diagnostics(&soft_diagnostics);
+
+            // Tool provisioning (Task 5): when packs were wired, run the SAME
+            // resolve-and-offer path `doctor` uses against the freshly written
+            // config. OFFER missing tools by default; INSTALL them only under
+            // `--install-tools`/`--yes` (consent by construction).
+            if !wiring.packs.is_empty() {
+                let fix = install_consent(install_tools, yes);
+                let io = praxec_core::provision_install::RealInstallerIo;
+                match provisioning_report(&config, &report.tools.missing, fix, &io) {
+                    Ok(section) => print!("{section}"),
+                    Err(e) => println!("  tool provisioning could not run: {e:#}"),
+                }
+            }
         }
         Err(e) => println!("  doctor could not load the scaffolded config: {e:#}"),
     }
@@ -6038,5 +6490,422 @@ mod tests {
         // agent.completed with no model → counted under "?"
         assert_eq!(report.totals.call_count, 1);
         assert!(report.models.contains_key("?"));
+    }
+
+    // ── Task 4 — doctor resolve-and-offer wiring (fake InstallerIo) ─────────
+    //
+    // The offer path is unit-tested here (and end-to-end in
+    // `tests/doctor_provision.rs`); the `--fix` install path can't be driven
+    // against the live network in a CLI test, so its consent wiring
+    // (`Consent::Granted` vs offer-only resolve) is pinned here with a fake IO
+    // that records every mutating call.
+    mod provisioning {
+        use praxec_core::provision_install::{Host, InstallError, InstallerIo};
+        use praxec_core::registry_v3::Registry;
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+
+        /// A fake seam recording every mutating call; `http_get` serves canned
+        /// asset/checksum bytes so a `--fix` release install can complete
+        /// without a network.
+        #[derive(Default)]
+        struct FakeIo {
+            responses: HashMap<String, Vec<u8>>,
+            bin_dir: PathBuf,
+            writes: RefCell<Vec<String>>,
+            pulls: RefCell<Vec<String>>,
+        }
+        impl InstallerIo for FakeIo {
+            fn http_get(&self, url: &str) -> Result<Vec<u8>, InstallError> {
+                self.responses
+                    .get(url)
+                    .cloned()
+                    .ok_or_else(|| InstallError::Io(format!("404 {url}")))
+            }
+            fn place_executable(
+                &self,
+                dir: &Path,
+                name: &str,
+                _bytes: &[u8],
+            ) -> Result<PathBuf, InstallError> {
+                self.writes.borrow_mut().push(name.to_string());
+                Ok(dir.join(name))
+            }
+            fn installed_version(&self, _dir: &Path, _name: &str) -> Option<String> {
+                None
+            }
+            fn bin_dir(&self) -> Result<PathBuf, InstallError> {
+                Ok(self.bin_dir.clone())
+            }
+            fn which(&self, cmd: &str) -> bool {
+                cmd == "docker"
+            }
+            fn docker_pull(&self, image_ref: &str) -> Result<(), InstallError> {
+                self.pulls.borrow_mut().push(image_ref.to_string());
+                Ok(())
+            }
+        }
+
+        fn linux_host() -> Host {
+            Host {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+            }
+        }
+
+        /// A registry with one docker-provider tool for `command` (docker keeps
+        /// the `--fix` path off the network — `which("docker")` is true and the
+        /// install is a recorded `docker_pull`, no `http_get`).
+        fn docker_registry(command: &str) -> Registry {
+            Registry::load_str(&format!(
+                "schema: praxec.packs/v3\n\
+                 tools:\n  - id: {command}-tool\n    name: {command}\n    command: {command}\n    version: 0.0.2\n    providers:\n      docker: ghcr.io/praxec/{command}\n"
+            ))
+            .unwrap()
+        }
+
+        #[test]
+        fn offer_only_resolves_without_installing() {
+            let reg = docker_registry("planner");
+            let io = FakeIo::default();
+            let lines = super::super::provision_report_lines(
+                &["planner".to_string()],
+                Some(&reg),
+                &linux_host(),
+                false, // no --fix
+                &io,
+            );
+            assert_eq!(lines.len(), 1);
+            assert!(
+                lines[0].contains("provider=docker") && lines[0].contains("result=offered"),
+                "offer names provider + offered: {}",
+                lines[0]
+            );
+            // Consent by construction: offer-only performed ZERO mutation.
+            assert_eq!(io.pulls.borrow().len(), 0, "offer must not pull");
+            assert_eq!(io.writes.borrow().len(), 0, "offer must not place a binary");
+        }
+
+        #[test]
+        fn fix_installs_with_granted_consent() {
+            let reg = docker_registry("planner");
+            let io = FakeIo::default();
+            let lines = super::super::provision_report_lines(
+                &["planner".to_string()],
+                Some(&reg),
+                &linux_host(),
+                true, // --fix == consent
+                &io,
+            );
+            assert!(
+                lines[0].contains("result=installed"),
+                "fix installs: {}",
+                lines[0]
+            );
+            // Granted consent performed exactly the docker pull.
+            assert_eq!(
+                io.pulls.borrow().as_slice(),
+                &["ghcr.io/praxec/planner:0.0.2".to_string()],
+                "fix performs the install under Consent::Granted"
+            );
+        }
+
+        #[test]
+        fn unknown_missing_tool_is_reported_not_resolved() {
+            let reg = docker_registry("planner");
+            let io = FakeIo::default();
+            let lines = super::super::provision_report_lines(
+                &["something-else".to_string()],
+                Some(&reg),
+                &linux_host(),
+                true, // even with --fix, an unknown tool is never installed
+                &io,
+            );
+            assert!(
+                lines[0].contains("unknown tool"),
+                "unknown command → unknown-tool line: {}",
+                lines[0]
+            );
+            assert_eq!(io.pulls.borrow().len(), 0, "unknown tool must not install");
+        }
+
+        /// Task 5 — the shared `provisioning_report` entrypoint `init` calls: it
+        /// loads the registry from the config's `discovery.registry`, then OFFERS
+        /// (default) or INSTALLS (under `fix` consent) via the injected IO. Pins
+        /// that `init`'s `--install-tools`/`--yes` → `fix=true` reaches the
+        /// installer under `Consent::Granted`, and the default mutates nothing.
+        #[test]
+        fn shared_provisioning_report_installs_only_under_consent() {
+            use serde_json::json;
+
+            let dir = tempfile::tempdir().unwrap();
+            let reg_path = dir.path().join("packs.yaml");
+            std::fs::write(
+                &reg_path,
+                "schema: praxec.packs/v3\n\
+                 tools:\n  - id: planner-tool\n    name: planner\n    command: planner\n    version: 0.0.2\n    providers:\n      docker: ghcr.io/praxec/planner\n",
+            )
+            .unwrap();
+            let config = json!({ "discovery": { "registry": reg_path.display().to_string() } });
+            let missing = ["planner".to_string()];
+
+            // Default (offer-only) — zero mutation.
+            let offer_io = FakeIo::default();
+            let offered = super::super::provisioning_report(&config, &missing, false, &offer_io)
+                .expect("offer path");
+            assert!(offered.contains("offer-only") && offered.contains("result=offered"));
+            assert_eq!(offer_io.pulls.borrow().len(), 0, "offer must not pull");
+            assert_eq!(offer_io.writes.borrow().len(), 0, "offer must not write");
+
+            // Consent granted (`--install-tools`/`--yes`) — reaches the installer.
+            let fix_io = FakeIo::default();
+            let installed =
+                super::super::provisioning_report(&config, &missing, true, &fix_io).expect("fix");
+            assert!(installed.contains("result=installed"), "{installed}");
+            assert_eq!(
+                fix_io.pulls.borrow().as_slice(),
+                &["ghcr.io/praxec/planner:0.0.2".to_string()],
+                "install runs under Consent::Granted"
+            );
+        }
+
+        #[test]
+        fn one_broken_tool_does_not_abort_the_rest() {
+            // First tool has no provider at all (resolve → None), second is
+            // installable; the run must report both, install the second.
+            let reg = Registry::load_str(
+                "schema: praxec.packs/v3\n\
+                 tools:\n\
+                 \x20 - id: broken-tool\n    name: broken\n    command: broken\n    version: 0.0.1\n\
+                 \x20 - id: planner-tool\n    name: planner\n    command: planner\n    version: 0.0.2\n    providers:\n      docker: ghcr.io/praxec/planner\n",
+            )
+            .unwrap();
+            let io = FakeIo::default();
+            let lines = super::super::provision_report_lines(
+                &["broken".to_string(), "planner".to_string()],
+                Some(&reg),
+                &linux_host(),
+                true,
+                &io,
+            );
+            assert_eq!(lines.len(), 2, "both tools reported");
+            assert!(
+                lines[0].contains("no available provider"),
+                "broken tool reported, not crashed: {}",
+                lines[0]
+            );
+            assert!(
+                lines[1].contains("result=installed"),
+                "the healthy tool still installs past the broken one: {}",
+                lines[1]
+            );
+        }
+
+        // ── Task 6 — `praxec tools install <id>` delegation surface ──────────
+        //
+        // The thin CLI wrapper a governed `flow.tools.provision` `kind: cli`
+        // step calls. It carries NO install logic: it looks a `RegistryTool` up
+        // (by id, then command) and hands it to the ONE installer under
+        // `Consent::Granted`. Pinned here with a fake IO (no network).
+        use serde_json::json;
+
+        /// Write a docker-provider registry and return a config pointing at it.
+        fn config_with_registry(dir: &std::path::Path) -> serde_json::Value {
+            let reg_path = dir.join("packs.yaml");
+            std::fs::write(
+                &reg_path,
+                "schema: praxec.packs/v3\n\
+                 tools:\n  - id: planner-tool\n    name: planner\n    command: planner\n    version: 0.0.2\n    providers:\n      docker: ghcr.io/praxec/planner\n",
+            )
+            .unwrap();
+            json!({ "discovery": { "registry": reg_path.display().to_string() } })
+        }
+
+        /// A catalog IO that never networks — the discovery-fallback tests use a
+        /// `static` registry (whose adapter ignores IO), so this is never called.
+        struct NoopCatalogIo;
+        impl praxec_core::tool_catalog::CatalogIo for NoopCatalogIo {
+            fn github_org_repos(
+                &self,
+                _org: &str,
+            ) -> Result<Vec<praxec_core::tool_catalog::GhRepo>, String> {
+                Err("no network in tests".into())
+            }
+            fn fetch_json(&self, _url: &str) -> Result<serde_json::Value, String> {
+                Err("no network in tests".into())
+            }
+        }
+
+        /// A config with a `registries:` static discovery catalog carrying one
+        /// candidate (name, transport, source) — the discovery fallback's input.
+        fn config_with_discovery(name: &str, source: serde_json::Value) -> serde_json::Value {
+            json!({ "registries": [ {
+                "kind": "static",
+                "name": "local-discovery",
+                "candidates": [ {
+                    "name": name,
+                    "description": format!("{name} from discovery"),
+                    "transport": "docker",
+                    "source": source,
+                    "trust_tier": "verified",
+                    "provenance": "local-discovery"
+                } ]
+            } ] })
+        }
+
+        #[test]
+        fn tools_install_delegates_to_the_one_installer_by_id() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = config_with_registry(dir.path());
+            let io = FakeIo::default();
+            let outcome =
+                super::super::tools_install_with(&config, "planner-tool", &io, &NoopCatalogIo)
+                    .expect("known tool installs");
+            assert!(
+                matches!(
+                    outcome,
+                    praxec_core::provision_install::InstallOutcome::Installed { .. }
+                ),
+                "got {outcome:?}"
+            );
+            // Reached the ONE installer under Consent::Granted (docker pull).
+            assert_eq!(
+                io.pulls.borrow().as_slice(),
+                &["ghcr.io/praxec/planner:0.0.2".to_string()],
+            );
+        }
+
+        #[test]
+        fn tools_install_resolves_by_command_too() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = config_with_registry(dir.path());
+            let io = FakeIo::default();
+            // `planner` is the tool's `command`, not its id (`planner-tool`).
+            super::super::tools_install_with(&config, "planner", &io, &NoopCatalogIo)
+                .expect("resolves by command");
+            assert_eq!(io.pulls.borrow().len(), 1, "installed via command lookup");
+        }
+
+        #[test]
+        fn tools_install_unknown_id_fails_fast() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = config_with_registry(dir.path());
+            let io = FakeIo::default();
+            let err = super::super::tools_install_with(&config, "nonesuch", &io, &NoopCatalogIo)
+                .expect_err("unknown tool must fail fast");
+            assert!(
+                err.to_string().contains("unknown tool `nonesuch`"),
+                "names the unknown tool: {err}"
+            );
+            assert_eq!(io.pulls.borrow().len(), 0, "nothing installed");
+        }
+
+        #[test]
+        fn tools_install_without_a_registry_fails_fast() {
+            let io = FakeIo::default();
+            let err = super::super::tools_install_with(&json!({}), "planner", &io, &NoopCatalogIo)
+                .expect_err("no registry must fail fast");
+            assert!(
+                err.to_string().contains("discovery.registry"),
+                "names the missing registry config: {err}"
+            );
+        }
+
+        // ── Task A4 — discovery → installer reconciliation (Increment III) ──────
+        //
+        // A tool surfaced by `praxec.query {discover}` (a `ToolCandidate` in the
+        // assembled `registries:` catalog) is installable through the SAME ONE
+        // installer, by normalizing the candidate to a provider coordinate. No
+        // second installer; registry precedence preserved; not-found fails fast
+        // naming both sources searched.
+
+        #[test]
+        fn tools_install_reaches_the_installer_for_a_discovered_image_candidate() {
+            // No `discovery.registry`; the tool exists only in the discovery
+            // catalog as a docker `Image` candidate. It must reach `install`
+            // with a docker plan (`docker pull <image>:latest`).
+            let config = config_with_discovery(
+                "acme-mcp",
+                json!({ "image": { "image": "ghcr.io/acme/mcp" } }),
+            );
+            let io = FakeIo::default();
+            let outcome =
+                super::super::tools_install_with(&config, "acme-mcp", &io, &NoopCatalogIo)
+                    .expect("discovered image installs");
+            assert!(
+                matches!(
+                    outcome,
+                    praxec_core::provision_install::InstallOutcome::Installed { .. }
+                ),
+                "got {outcome:?}"
+            );
+            assert_eq!(
+                io.pulls.borrow().as_slice(),
+                &["ghcr.io/acme/mcp:latest".to_string()],
+                "discovered candidate routed through the ONE installer (docker pull)"
+            );
+        }
+
+        #[test]
+        fn tools_install_in_neither_source_fails_fast_naming_both() {
+            // A `registries:` discovery catalog present but without the name;
+            // no `discovery.registry` either → fail-fast naming both sources.
+            let config = config_with_discovery(
+                "acme-mcp",
+                json!({ "image": { "image": "ghcr.io/acme/mcp" } }),
+            );
+            let io = FakeIo::default();
+            let err = super::super::tools_install_with(&config, "ghost", &io, &NoopCatalogIo)
+                .expect_err("a name in neither source must fail fast");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("discovery.registry"),
+                "names the registry source: {msg}"
+            );
+            assert!(
+                msg.contains("registries:"),
+                "names the discovery source: {msg}"
+            );
+            assert_eq!(io.pulls.borrow().len(), 0, "nothing installed");
+        }
+
+        #[test]
+        fn registry_entry_wins_over_a_same_named_discovered_candidate() {
+            // Both sources carry `planner`: the curated registry (docker
+            // ghcr.io/praxec/planner:0.0.2) and a discovered candidate pointing
+            // at a DIFFERENT image. The registry must win.
+            let dir = tempfile::tempdir().unwrap();
+            let reg_path = dir.path().join("packs.yaml");
+            std::fs::write(
+                &reg_path,
+                "schema: praxec.packs/v3\n\
+                 tools:\n  - id: planner\n    name: planner\n    command: planner\n    version: 0.0.2\n    providers:\n      docker: ghcr.io/praxec/planner\n",
+            )
+            .unwrap();
+            let config = json!({
+                "discovery": { "registry": reg_path.display().to_string() },
+                "registries": [ {
+                    "kind": "static",
+                    "name": "local-discovery",
+                    "candidates": [ {
+                        "name": "planner",
+                        "description": "the discovered impostor",
+                        "transport": "docker",
+                        "source": { "image": { "image": "ghcr.io/impostor/planner" } },
+                        "trust_tier": "verified",
+                        "provenance": "local-discovery"
+                    } ]
+                } ]
+            });
+            let io = FakeIo::default();
+            super::super::tools_install_with(&config, "planner", &io, &NoopCatalogIo)
+                .expect("registry entry installs");
+            assert_eq!(
+                io.pulls.borrow().as_slice(),
+                &["ghcr.io/praxec/planner:0.0.2".to_string()],
+                "curated registry wins over the same-named discovered candidate"
+            );
+        }
     }
 }

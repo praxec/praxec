@@ -3046,10 +3046,124 @@ fn load_resolved_with_repos_mode(
     // Config-resolve time is the ONLY correct site: connection children are
     // process-cached across runs, so a run-scoped token in an arg would be
     // structurally wrong. An unknown repo name is a HARD error in BOTH modes.
-    let merged = interpolate_connection_paths(merged)?;
+    let mut merged = interpolate_connection_paths(merged)?;
+    // always-latest registry sourcing — a `discovery.registry: { uri, ref }`
+    // object is resolved to its local `packs.yaml` through the SAME `repos:`
+    // clone-and-reset machinery, keyed off the host dir (so its cache sits
+    // beside the repo caches). A local-path string is left untouched.
+    resolve_registry_source(&mut merged, &parent_dir, &mut repo_diagnostics)?;
     let (resolved, diagnostics) = resolve_with_diagnostics(merged)?;
     repo_diagnostics.extend(diagnostics);
     Ok((resolved, repo_diagnostics))
+}
+
+/// The registry file an operator's `discovery.registry` points a repo at — the
+/// published `praxec/packs/packs.yaml` (design §5). Same name whether sourced
+/// as a local path or the always-latest `{uri, ref}` clone.
+const DISCOVERY_REGISTRY_FILE: &str = "packs.yaml";
+
+/// Resolve `discovery.registry` in place. A local-path **string** is untouched
+/// (today's behavior). An **object** `{ uri, ref }` is sourced always-latest via
+/// the proven `repos:` clone-and-reset machinery ([`crate::repo_git::clone_or_update`])
+/// into a host-local cache, then rewritten to that clone's `packs.yaml` path — so
+/// every downstream reader (`load_registry`, `check`, …) sees the same plain path
+/// string the local-path form yields.
+///
+/// Currency over pinning (design §5): the registry is always-latest, so a
+/// `{ uri, hash }` freeze form is REFUSED here (hash-pinning is the `include:`
+/// path, never the registry). Offline degrades, it does not break: an unreachable
+/// `uri:` with an existing cache warns and reuses the last cached tip; with no
+/// cache it fails fast, naming the `uri`.
+fn resolve_registry_source(
+    config: &mut Value,
+    host_dir: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> anyhow::Result<()> {
+    let Some(registry) = config.pointer("/discovery/registry") else {
+        return Ok(());
+    };
+    // Local-path string form — unchanged.
+    if registry.is_string() {
+        return Ok(());
+    }
+    let obj = registry.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "DISCOVERY_REGISTRY_INVALID: `discovery.registry` must be a local path string \
+             or an always-latest object `{{ uri, ref }}`"
+        )
+    })?;
+    // Poka-yoke — the registry is sourced always-latest; a `hash:` freeze is the
+    // `include:` form and reintroduces the version-drift ADR-0013 guards against.
+    if obj.contains_key("hash") {
+        anyhow::bail!(
+            "DISCOVERY_REGISTRY_HASH_PIN: `discovery.registry` is sourced always-latest and does \
+             not accept a `hash:` pin — that is the `include:` freeze form. Use `{{ uri, ref }}` \
+             (currency over pinning)."
+        );
+    }
+    let uri = obj
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DISCOVERY_REGISTRY_INVALID: `discovery.registry` object requires a `uri:` string"
+            )
+        })?
+        .to_string();
+    let gitref = obj
+        .get("ref")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DISCOVERY_REGISTRY_INVALID: `discovery.registry` object requires a `ref:` string \
+                 (e.g. `main`) — the registry is always-latest, so pin a branch/tag, not a hash"
+            )
+        })?
+        .to_string();
+
+    // Same cache-layout convention as `repos:`, one slot per (uri, ref).
+    let dest = host_dir
+        .join(".praxec")
+        .join("registry")
+        .join(crate::repo_git::cache_dir_name(&uri, &gitref));
+    let resolved_path = match crate::repo_git::clone_or_update(&uri, &gitref, &dest) {
+        Ok(root) => root.join(DISCOVERY_REGISTRY_FILE),
+        Err(err) => {
+            // Offline / unreachable. Degrade to the last cached tip if one
+            // exists; otherwise fail fast, naming the uri.
+            let cached = dest.join(DISCOVERY_REGISTRY_FILE);
+            if dest.join(".git").is_dir() && cached.is_file() {
+                diagnostics.push(Diagnostic {
+                    severity: DiagnosticSeverity::Warn,
+                    code: "DISCOVERY_REGISTRY_OFFLINE".into(),
+                    message: format!(
+                        "could not refresh `discovery.registry` from `{uri}` ({gitref}); using the \
+                         last cached tip at {}: {err:#}",
+                        cached.display()
+                    ),
+                    location: None,
+                    suggestion: Some(
+                        "reconnect to refresh the registry to its latest tip — the cached copy may \
+                         be stale"
+                            .into(),
+                    ),
+                });
+                cached
+            } else {
+                return Err(err).with_context(|| {
+                    format!(
+                        "DISCOVERY_REGISTRY_FETCH_FAILED: cannot source `discovery.registry` from \
+                         `{uri}` ({gitref}) and no cached copy exists"
+                    )
+                });
+            }
+        }
+    };
+
+    if let Some(slot) = config.pointer_mut("/discovery/registry") {
+        *slot = Value::String(resolved_path.display().to_string());
+    }
+    Ok(())
 }
 
 /// pack-staleness-warning — turn one `path:` repo's

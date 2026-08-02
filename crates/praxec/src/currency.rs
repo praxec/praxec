@@ -317,9 +317,9 @@ fn diagnose(name: &str, source: &ConnSource, io: &dyn CurrencyIo) -> Option<Curr
                     Severity::Warn,
                     format!(
                         "`{command}` is STALE — its source {} has commits newer than the installed \
-                         binary. Rebuild: `cargo install --path {} --force`.",
+                         binary. Update to the latest release binary: `praxec tools install \
+                         {command}` (or `praxec doctor --fix`).",
                         repo.display(),
-                        repo.display()
                     ),
                 ))
             } else {
@@ -341,7 +341,8 @@ fn diagnose(name: &str, source: &ConnSource, io: &dyn CurrencyIo) -> Option<Curr
             Severity::Info,
             format!(
                 "`{command}` (v{version}) installed from {source} — currency needs a registry/remote \
-                 fetch (not checked). Reinstall with `--force` to be sure."
+                 fetch (not checked). Update to the latest release binary with `praxec tools install \
+                 {command}` (or `praxec doctor --fix`) to be sure."
             ),
         )),
         ConnSource::Docker { image } => {
@@ -769,10 +770,21 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "TOOL_BEHIND_SOURCE");
         assert_eq!(diags[0].severity, Severity::Warn);
+        // No parallel install path: the remediation points at the ONE installer
+        // surface (a release binary via `praxec tools install` / `doctor --fix`),
+        // never a `cargo install --path --force` source rebuild.
         assert!(
             diags[0]
                 .message
-                .contains("cargo install --path /repo/cpm --force")
+                .contains("praxec tools install cpm-planner")
+                || diags[0].message.contains("praxec doctor --fix"),
+            "remediation names the release-binary path: {}",
+            diags[0].message
+        );
+        assert!(
+            !diags[0].message.contains("cargo install --path"),
+            "cargo source-build remediation must be gone: {}",
+            diags[0].message
         );
     }
 

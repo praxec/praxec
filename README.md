@@ -114,7 +114,19 @@ and `praxec.query` / `praxec.command` appear.
 
 ```
 praxec init [--editor cursor|claude|both|none] [--dir <path>] [--global] [--yes] [--force]
+            [--with-starter-packs] [--packs <ids>] [--pack <git-uri>] [--install-tools]
 ```
+
+`--with-starter-packs` additionally wires the starter packs' `repos:` block and
+the always-latest `discovery.registry` pointer, then runs the tool-provisioning
+resolve path (offer-only by default; `--install-tools`, or `--yes`, installs the
+required tools as **prebuilt binaries** — no compiler). `--packs
+cognitive-architectures,praxec-meta` wires a **subset** of the known open packs
+by short id (unions with `--with-starter-packs`, no duplicates; unknown id fails
+fast). `--pack <git-uri>` wires one additional arbitrary pack. Preview a pack's
+flows/caps before wiring with `praxec pack list <repo>`, and install any single
+tool — curated or `praxec.query { discover }`-surfaced — with `praxec tools
+install <id>`. See [connections.md](docs/guides/connections.md#the-praxecpacks-registry--the-installer).
 
 Prefer to see the pieces it assembles? The manual quick start below writes the
 same kind of config by hand.

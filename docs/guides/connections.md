@@ -181,18 +181,71 @@ secret values in config).
 ## Discovering and provisioning tools
 
 You don't have to hand-write every connection. praxec can **discover** MCP tools
-from configured `registries:` and **provision** them through the governed
-stage→grant flow above:
+from configured `registries:` and **provision** them as prebuilt binaries (or
+docker images) through the governed stage→grant flow above:
 
 - `praxec.query { discover: "<text>" }` / `{ evaluate: { verbs: [...] } }` — find
   installable tool candidates from the `registries:` catalog (adapters:
   `github-org`, `static`, `rest`, `mcp-registry`).
 - `flow.tools.provision` — a governed workflow that installs, collects
   secrets/config, stages, validates, then grants a chosen candidate (community
-  candidates run through an extra approval + a sandboxed install);
+  candidates run through an extra double-approval gate);
   `flow.tools.deprovision` reverses it.
 
-See the [tool-discovery reference](../reference/tool-discovery.md).
+### The `praxec/packs` registry + the installer
+
+The workflows a pack ships (cpm-planner, fmeca-mcp, …) declare the MCP tools they
+need. praxec resolves and installs those tools from the central **`praxec/packs`
+registry** — sourced **always-latest** so a newly released tool or a newly added
+dependency shows up without an operator edit:
+
+```yaml
+discovery:
+  registry: { uri: "git+https://github.com/praxec/packs", ref: main }
+```
+
+Each tool declares a `providers:` chain (`release`, `docker`, `npx`, `cargo`).
+For a fresh machine the installer prefers the **prebuilt release binary** (no
+compiler, no Docker daemon required), falling through to docker, then **npx**
+(an npm-distributed stdio MCP server — nothing to download or place; the
+connection wires `npx -y <pkg>` and npx fetches it on run, gated on `npx` being
+on PATH), then — last-resort, emit-only — cargo. Every downloaded binary is
+**checksum-verified against the
+release `checksums.sha256`** and refused on mismatch, so integrity holds however
+the registry was sourced. This verify guarantees the binary matches the
+release's published checksum (anti-corruption / transport-integrity over the
+release page's TLS) — it is **not** independent provenance or anti-MITM, since
+the asset and its `checksums.sha256` come from the same release page.
+
+- `praxec doctor` — reports each required-but-missing tool with the exact
+  provider + command it *would* run (offer-only; no install without consent).
+- `praxec doctor --fix` — installs the offered tools (consent), verifies, and
+  leaves the connection ready.
+- `praxec tools install <tool-id>` — install one tool by its registry id. If
+  the id isn't in the curated `discovery.registry`, the installer falls back to a
+  **discovered** candidate from the configured `registries:` (matched by name),
+  normalizing it to a provider coordinate (image→docker, repo/crate→release/cargo,
+  npm→npx) and routing it through the **same** installer — so a tool surfaced by
+  `praxec.query { discover }` is installable, with the curated registry always
+  taking precedence over a same-named discovered candidate.
+- `praxec pack list <repo>` — enumerate a pack's `flow.*` and `cap.*` definition
+  ids (namespace-prefixed, grouped + counted) WITHOUT loading a full gateway (no
+  store, no runtime), so you can see what a pack provides before wiring it under
+  `repos:`. Fails fast on a directory with no `praxec.repo.yaml`.
+- `praxec init --with-starter-packs` — scaffold a gateway with the starter
+  packs' `repos:` + the always-latest `discovery.registry` pointer wired, then run
+  the doctor resolve path (offer by default; add `--install-tools` to install).
+- `praxec init --packs cognitive-architectures,praxec-meta` — wire a **subset**
+  of the known open starter packs by short id (the last `/`-segment of each pack
+  uri) + the registry pointer; unions with `--with-starter-packs`, no duplicates.
+  An unknown id fails fast, listing the valid ids.
+- **`frontrails` is intentionally NOT in the starter set** — it is an
+  `include:{uri,hash}` pattern pack that needs licensed FrontRails servers. If you
+  are licensed, wire it by hand with `praxec init --pack <uri>` (arbitrary-uri).
+
+See the [tool-discovery reference](../reference/tool-discovery.md) and
+[`configuration.md`](../reference/configuration.md#discovery) for the
+`discovery.registry` schema.
 
 ---
 
