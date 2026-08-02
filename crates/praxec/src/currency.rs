@@ -31,6 +31,7 @@
 //! decision logic is unit-tested without touching the host.
 
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +56,18 @@ pub struct ConnSpec {
 /// pure; the actual probes live behind [`CurrencyIo`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnSource {
+    /// A binary `praxec tools install` placed in the managed bin dir
+    /// (`<config-dir>/praxec/bin`). This SUPERSEDES a stale cargo copy for
+    /// currency: the managed release binary is what praxec spawns (its dir is
+    /// prepended to the child PATH), so we compare its `--version` against the
+    /// registry's declared `version` for that command.
+    ManagedRelease {
+        command: String,
+        /// The version the managed binary reports (`--version`), if readable.
+        installed_version: Option<String>,
+        /// The version the registry declares for this command, if any.
+        expected_version: Option<String>,
+    },
     /// cargo-installed binary whose install source is a local git `path`.
     LocalCargoPath {
         command: String,
@@ -115,6 +128,20 @@ pub trait CurrencyIo {
     fn docker_registry_digest(&self, image: &str) -> Option<String>;
     /// Version a remote MCP advertises on `initialize` (bounded), if reachable.
     fn remote_version(&self, url: &str) -> Option<String>;
+
+    /// Does the praxec-managed bin dir (`<config-dir>/praxec/bin`) contain a
+    /// spawnable binary for `command`? Default `false` keeps managed-dir
+    /// awareness opt-in per impl and the decision logic pure in tests.
+    fn managed_binary_exists(&self, _command: &str) -> bool {
+        false
+    }
+
+    /// The version the managed binary for `command` reports (`--version`), if
+    /// readable — `None` when absent or unparseable (an honest "unknown",
+    /// never a false verdict).
+    fn managed_binary_version(&self, _command: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Find the cargo install whose `bins` includes `command` (or whose crate name
@@ -190,11 +217,15 @@ fn expect_version_of(source: &Option<Value>) -> Option<String> {
 }
 
 /// Classify a connection into the currency probe it needs. Pure given the
-/// cargo metadata + a PATH-existence predicate (both injected).
+/// cargo metadata, a PATH-existence predicate, and a managed-bin-dir probe (all
+/// injected). `managed(command)` returns `Some((installed_version,
+/// expected_version))` when a managed release binary exists for `command` — the
+/// tuple carries the binary's reported version and the registry's declared one.
 pub fn classify(
     spec: &ConnSpec,
     crates2: Option<&Value>,
     on_path: impl Fn(&str) -> bool,
+    #[allow(clippy::type_complexity)] managed: impl Fn(&str) -> Option<(Option<String>, Option<String>)>,
 ) -> ConnSource {
     // A URL connection is a remote MCP regardless of any command.
     if let Some(url) = &spec.url {
@@ -225,6 +256,16 @@ pub fn classify(
         if let Some((pkg, pinned)) = parse_npx_pkg(&spec.args) {
             return ConnSource::Npx { pkg, pinned };
         }
+    }
+    // A praxec-installed release binary in the managed bin dir supersedes a
+    // (possibly stale) cargo copy for currency — it is what praxec actually
+    // spawns. Checked BEFORE the crates2/PATH arms so managed wins.
+    if let Some((installed_version, expected_version)) = managed(command) {
+        return ConnSource::ManagedRelease {
+            command: command.clone(),
+            installed_version,
+            expected_version,
+        };
     }
     // A cargo-installed binary: cargo already recorded its source.
     if let Some((version, source)) = crates2.and_then(|c| crates2_lookup(c, command)) {
@@ -259,13 +300,32 @@ pub fn local_cargo_behind(bin_mtime: i64, head_commit_time: i64) -> bool {
 }
 
 /// Produce the currency diagnostics for all connections. The orchestrator is
-/// pure over [`CurrencyIo`]; swap a fake in tests.
-pub fn check_currency(specs: &[ConnSpec], io: &dyn CurrencyIo) -> Vec<CurrencyDiagnostic> {
+/// pure over [`CurrencyIo`]; swap a fake in tests. `registry_versions` maps a
+/// command to the version the registry declares for it (empty when no registry
+/// is loaded) — the `expected` side of a [`ConnSource::ManagedRelease`] verdict.
+pub fn check_currency(
+    specs: &[ConnSpec],
+    registry_versions: &HashMap<String, String>,
+    io: &dyn CurrencyIo,
+) -> Vec<CurrencyDiagnostic> {
     let crates2 = io.crates2();
     let mut out = Vec::new();
     for spec in specs {
-        // classification only needs a cheap existence predicate
-        let source = classify(spec, crates2.as_ref(), |cmd| io.binary_mtime(cmd).is_some());
+        // classification only needs cheap existence predicates + the managed
+        // probe (existence → version, plus the registry's expected version).
+        let source = classify(
+            spec,
+            crates2.as_ref(),
+            |cmd| io.binary_mtime(cmd).is_some(),
+            |cmd| {
+                io.managed_binary_exists(cmd).then(|| {
+                    (
+                        io.managed_binary_version(cmd),
+                        registry_versions.get(cmd).cloned(),
+                    )
+                })
+            },
+        );
         let diag = diagnose(&spec.name, &source, io);
         if let Some(d) = diag {
             out.push(d);
@@ -292,6 +352,40 @@ fn diag(
 /// nothing worth reporting — e.g. a command not on PATH is provision's concern).
 fn diagnose(name: &str, source: &ConnSource, io: &dyn CurrencyIo) -> Option<CurrencyDiagnostic> {
     match source {
+        ConnSource::ManagedRelease {
+            command,
+            installed_version,
+            expected_version,
+        } => match (installed_version, expected_version) {
+            (Some(installed), Some(expected)) if installed == expected => Some(diag(
+                name,
+                "TOOL_CURRENT",
+                Severity::Info,
+                format!(
+                    "`{command}` (v{installed}) is the praxec-managed release binary and matches \
+                     the registry version."
+                ),
+            )),
+            (Some(installed), Some(expected)) => Some(diag(
+                name,
+                "TOOL_BEHIND_REGISTRY",
+                Severity::Warn,
+                format!(
+                    "`{command}` is STALE — the managed release binary is v{installed} but the \
+                     registry declares v{expected}. Update it: `praxec tools install {command}` \
+                     (or `praxec doctor --fix`)."
+                ),
+            )),
+            _ => Some(diag(
+                name,
+                "CURRENCY_UNKNOWN",
+                Severity::Info,
+                format!(
+                    "`{command}` is a praxec-managed release binary, but its version and/or the \
+                     registry's expected version couldn't be read — currency unchecked."
+                ),
+            )),
+        },
         ConnSource::LocalCargoPath {
             command,
             repo,
@@ -581,6 +675,25 @@ impl CurrencyIo for RealCurrencyIo {
         s.starts_with("sha256:").then_some(s)
     }
 
+    fn managed_binary_exists(&self, command: &str) -> bool {
+        let Some(dir) = praxec_core::provision_install::managed_bin_dir() else {
+            return false;
+        };
+        if dir.join(command).is_file() {
+            return true;
+        }
+        cfg!(windows) && dir.join(format!("{command}.exe")).is_file()
+    }
+
+    fn managed_binary_version(&self, command: &str) -> Option<String> {
+        // Reuse the installer's version probe (path-exists → `--version` →
+        // parse_version) against the ONE managed bin dir, so the version-parsing
+        // rules never drift between install-idempotency and currency.
+        use praxec_core::provision_install::InstallerIo;
+        let dir = praxec_core::provision_install::managed_bin_dir()?;
+        praxec_core::provision_install::RealInstallerIo.installed_version(&dir, command)
+    }
+
     fn remote_version(&self, url: &str) -> Option<String> {
         let url = url.to_string();
         // A dedicated thread with its OWN current-thread runtime: safe whether or
@@ -625,6 +738,9 @@ mod tests {
         docker_local: std::collections::HashMap<String, String>,
         docker_registry: std::collections::HashMap<String, String>,
         remote: std::collections::HashMap<String, String>,
+        /// Managed bin dir: presence of the key = the binary exists; the value
+        /// is the version its `--version` reports (`None` = unreadable).
+        managed: std::collections::HashMap<String, Option<String>>,
     }
     impl CurrencyIo for FakeIo {
         fn binary_mtime(&self, c: &str) -> Option<i64> {
@@ -645,6 +761,24 @@ mod tests {
         fn remote_version(&self, url: &str) -> Option<String> {
             self.remote.get(url).cloned()
         }
+        fn managed_binary_exists(&self, command: &str) -> bool {
+            self.managed.contains_key(command)
+        }
+        fn managed_binary_version(&self, command: &str) -> Option<String> {
+            self.managed.get(command).cloned().flatten()
+        }
+    }
+
+    /// No managed binaries — the closure classify wants when a test exercises
+    /// only the cargo/docker/remote/npx arms.
+    fn no_managed(_: &str) -> Option<(Option<String>, Option<String>)> {
+        None
+    }
+
+    /// An empty registry-version map — the common `check_currency` argument when
+    /// a test isn't exercising the `ManagedRelease` (registry) path.
+    fn no_registry() -> HashMap<String, String> {
+        HashMap::new()
     }
 
     fn crates2_with(command: &str, version: &str, source: &str) -> Value {
@@ -673,7 +807,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            classify(&spec, None, |_| true),
+            classify(&spec, None, |_| true, no_managed),
             ConnSource::Remote {
                 url: "https://mcp.example.com".into(),
                 expect_version: Some("2.0.0".into())
@@ -690,7 +824,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            classify(&undeclared, None, |_| true),
+            classify(&undeclared, None, |_| true, no_managed),
             ConnSource::DockerUndeclared
         );
         let declared = ConnSpec {
@@ -698,7 +832,7 @@ mod tests {
             ..undeclared
         };
         assert_eq!(
-            classify(&declared, None, |_| true),
+            classify(&declared, None, |_| true, no_managed),
             ConnSource::Docker {
                 image: "ghcr.io/x/y:1".into()
             }
@@ -714,13 +848,101 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            classify(&spec, Some(&c), |_| true),
+            classify(&spec, Some(&c), |_| true, no_managed),
             ConnSource::LocalCargoPath {
                 command: "cpm-planner".into(),
                 version: "0.0.2".into(),
                 repo: PathBuf::from("/repo/cpm"),
             }
         );
+    }
+
+    #[test]
+    fn classify_managed_release_wins_over_a_cargo_entry() {
+        // A managed release binary exists AND a cargo crates2 entry exists for
+        // the same command — managed must win (it's what praxec spawns).
+        let c = crates2_with("cpm-planner", "0.0.2", "path+file:///repo/cpm");
+        let spec = ConnSpec {
+            name: "cpm".into(),
+            command: Some("cpm-planner".into()),
+            ..Default::default()
+        };
+        let source = classify(
+            &spec,
+            Some(&c),
+            |_| true,
+            |cmd| {
+                (cmd == "cpm-planner")
+                    .then(|| (Some("0.0.5".to_string()), Some("0.0.5".to_string())))
+            },
+        );
+        assert_eq!(
+            source,
+            ConnSource::ManagedRelease {
+                command: "cpm-planner".into(),
+                installed_version: Some("0.0.5".into()),
+                expected_version: Some("0.0.5".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn managed_release_matching_registry_is_current() {
+        let mut io = FakeIo::default();
+        io.managed
+            .insert("cpm-planner".into(), Some("0.0.5".into()));
+        let mut versions = HashMap::new();
+        versions.insert("cpm-planner".to_string(), "0.0.5".to_string());
+        let specs = vec![ConnSpec {
+            name: "cpm".into(),
+            command: Some("cpm-planner".into()),
+            ..Default::default()
+        }];
+        let diags = check_currency(&specs, &versions, &io);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "TOOL_CURRENT");
+        assert_eq!(diags[0].severity, Severity::Info);
+    }
+
+    #[test]
+    fn managed_release_older_than_registry_is_behind() {
+        let mut io = FakeIo::default();
+        io.managed
+            .insert("cpm-planner".into(), Some("0.0.4".into()));
+        let mut versions = HashMap::new();
+        versions.insert("cpm-planner".to_string(), "0.0.5".to_string());
+        let specs = vec![ConnSpec {
+            name: "cpm".into(),
+            command: Some("cpm-planner".into()),
+            ..Default::default()
+        }];
+        let diags = check_currency(&specs, &versions, &io);
+        assert_eq!(diags[0].code, "TOOL_BEHIND_REGISTRY");
+        assert_eq!(diags[0].severity, Severity::Warn);
+        assert!(
+            diags[0]
+                .message
+                .contains("praxec tools install cpm-planner")
+                || diags[0].message.contains("praxec doctor --fix"),
+            "remediation names the install path: {}",
+            diags[0].message
+        );
+    }
+
+    #[test]
+    fn managed_release_without_expected_version_is_unknown() {
+        let mut io = FakeIo::default();
+        io.managed
+            .insert("cpm-planner".into(), Some("0.0.5".into()));
+        // no registry entry for the command → expected version unknown
+        let specs = vec![ConnSpec {
+            name: "cpm".into(),
+            command: Some("cpm-planner".into()),
+            ..Default::default()
+        }];
+        let diags = check_currency(&specs, &no_registry(), &io);
+        assert_eq!(diags[0].code, "CURRENCY_UNKNOWN");
+        assert_eq!(diags[0].severity, Severity::Info);
     }
 
     #[test]
@@ -766,7 +988,7 @@ mod tests {
             command: Some("cpm-planner".into()),
             ..Default::default()
         }];
-        let diags = check_currency(&specs, &io);
+        let diags = check_currency(&specs, &no_registry(), &io);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "TOOL_BEHIND_SOURCE");
         assert_eq!(diags[0].severity, Severity::Warn);
@@ -802,7 +1024,7 @@ mod tests {
             command: Some("corpus".into()),
             ..Default::default()
         }];
-        let diags = check_currency(&specs, &io);
+        let diags = check_currency(&specs, &no_registry(), &io);
         assert_eq!(diags[0].code, "TOOL_CURRENT");
         assert_eq!(diags[0].severity, Severity::Info);
     }
@@ -820,7 +1042,7 @@ mod tests {
             source: Some(json!({ "docker": "ghcr.io/x/y:1" })),
             ..Default::default()
         }];
-        let diags = check_currency(&specs, &io);
+        let diags = check_currency(&specs, &no_registry(), &io);
         assert_eq!(diags[0].code, "DOCKER_IMAGE_BEHIND");
         assert_eq!(diags[0].severity, Severity::Warn);
     }
@@ -837,7 +1059,10 @@ mod tests {
             source: Some(json!({ "docker": "img:2" })),
             ..Default::default()
         }];
-        assert_eq!(check_currency(&specs, &io)[0].code, "DOCKER_IMAGE_CURRENT");
+        assert_eq!(
+            check_currency(&specs, &no_registry(), &io)[0].code,
+            "DOCKER_IMAGE_CURRENT"
+        );
     }
 
     #[test]
@@ -849,7 +1074,7 @@ mod tests {
             url: Some("https://mcp.x".into()),
             ..Default::default()
         }];
-        let d = &check_currency(&specs, &io)[0];
+        let d = &check_currency(&specs, &no_registry(), &io)[0];
         assert_eq!(d.code, "REMOTE_MCP_ADVISORY");
         assert_eq!(d.severity, Severity::Info);
         assert!(d.message.contains("1.62.0"));
@@ -865,7 +1090,7 @@ mod tests {
             source: Some(json!({ "expect_version": "2.0.0" })),
             ..Default::default()
         }];
-        let d = &check_currency(&specs, &io)[0];
+        let d = &check_currency(&specs, &no_registry(), &io)[0];
         assert_eq!(d.code, "REMOTE_MCP_VERSION_MISMATCH");
         assert_eq!(d.severity, Severity::Warn);
     }
@@ -879,7 +1104,7 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(
-            check_currency(&specs, &io)[0].code,
+            check_currency(&specs, &no_registry(), &io)[0].code,
             "REMOTE_MCP_UNREACHABLE"
         );
     }
@@ -893,7 +1118,7 @@ mod tests {
             args: vec!["@playwright/mcp@latest".into(), "--headless".into()],
             ..Default::default()
         }];
-        let d = &check_currency(&specs, &io)[0];
+        let d = &check_currency(&specs, &no_registry(), &io)[0];
         assert_eq!(d.code, "NPX_TRACKS_LATEST");
         assert_eq!(d.severity, Severity::Info);
     }
@@ -912,7 +1137,7 @@ mod tests {
             command: Some("t".into()),
             ..Default::default()
         }];
-        for d in check_currency(&specs, &io) {
+        for d in check_currency(&specs, &no_registry(), &io) {
             assert!(matches!(d.severity, Severity::Warn | Severity::Info));
         }
     }

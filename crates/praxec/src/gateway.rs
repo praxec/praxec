@@ -3116,10 +3116,22 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
     );
 
     // Tool currency (v0.0.43): is each `kind: mcp` connection actually up to
-    // date with its source (local cargo repo / docker registry / remote)?
-    // Advisory only — like a missing tool, a stale one never blocks the report.
+    // date with its source (local cargo repo / docker registry / remote /
+    // managed release binary)? Advisory only — like a missing tool, a stale one
+    // never blocks the report. The registry supplies the expected version for a
+    // managed-installed (release) binary; an empty map when no registry loads.
+    let registry_versions: std::collections::HashMap<String, String> = load_registry(&config)?
+        .as_ref()
+        .map(|r| {
+            r.tools
+                .iter()
+                .filter_map(|t| Some((t.command.clone()?, t.version.clone()?)))
+                .collect()
+        })
+        .unwrap_or_default();
     let currency = crate::currency::check_currency(
         &crate::currency::conn_specs_from(&config),
+        &registry_versions,
         &crate::currency::RealCurrencyIo,
     );
     print!("{}", crate::currency::format_currency(&currency));
