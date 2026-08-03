@@ -6,9 +6,56 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::InstallError;
+
+/// Upper bound on the `<bin> --version` probe [`RealInstallerIo::installed_version`]
+/// runs. `doctor` currency (managed-bin-dir awareness) now shells out to this
+/// during a health check, so a binary that HANGS on `--version` must not hang
+/// doctor. 5s covers a slow-but-live tool; a genuinely stuck probe is killed and
+/// reads as `None` (fail-safe: unknown → reinstall / `CURRENCY_UNKNOWN`, never a
+/// wrong "current").
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Run `cmd` to completion but abandon it after `timeout`: spawn (piped output),
+/// poll [`std::process::Child::try_wait`], and `kill` the child on expiry —
+/// returning `None` so a hung probe degrades to "unknown", never a wrong verdict.
+/// `--version` output is tiny (well under a pipe buffer), so the poll never
+/// deadlocks on a full pipe. No new dependency — plain std threads-of-execution
+/// via a sleep-poll loop.
+fn output_bounded(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            // Exited on its own — collect the (already-buffered) output.
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
 
 /// Total-request and connect bounds for release downloads. `reqwest`'s default
 /// client has NO timeout, so a stalled release host would hang `praxec tools
@@ -61,6 +108,21 @@ pub trait InstallerIo {
     /// idempotency probe. `None` when the binary is absent or its version can't
     /// be read (which reads as "not current", i.e. proceed to install).
     fn installed_version(&self, dir: &Path, name: &str) -> Option<String>;
+
+    /// Record the install-time version marker for `name` in `dir` (see
+    /// [`super::version_marker_path`]) so a managed release binary reports its
+    /// version even though the MCP tool binaries have no `--version`. Written
+    /// only after a binary is successfully placed. The default is a no-op —
+    /// seams that never place binaries (provider-resolution / docker-only fakes)
+    /// need not record anything; [`RealInstallerIo`] writes the real file.
+    fn write_version_marker(
+        &self,
+        _dir: &Path,
+        _name: &str,
+        _version: &str,
+    ) -> Result<(), InstallError> {
+        Ok(())
+    }
 
     /// The praxec-managed bin dir binaries are placed on (`<config-dir>/bin`).
     /// On the seam so tests inject a tempdir; the real impl resolves it via
@@ -177,23 +239,43 @@ impl InstallerIo for RealInstallerIo {
         Ok(path)
     }
 
+    fn write_version_marker(
+        &self,
+        dir: &Path,
+        name: &str,
+        version: &str,
+    ) -> Result<(), InstallError> {
+        std::fs::create_dir_all(dir).map_err(|e| InstallError::Io(e.to_string()))?;
+        let path = super::version_marker_path(dir, name);
+        std::fs::write(&path, version).map_err(|e| InstallError::Io(e.to_string()))?;
+        Ok(())
+    }
+
     fn installed_version(&self, dir: &Path, name: &str) -> Option<String> {
-        let file_name = if cfg!(windows) {
-            format!("{name}.exe")
-        } else {
-            name.to_string()
-        };
-        let path = dir.join(file_name);
-        if !path.exists() {
-            return None;
+        // Resolve the placed binary through the ONE `.exe`-aware managed-bin
+        // predicate (shared with `detect` + currency), so the existence rule
+        // never drifts. Absent → `None` (proceed to reinstall).
+        let path = super::managed_binary_in(dir, name)?;
+        // The install-time version marker WINS when present: the MCP tool
+        // binaries have no `--version` (they ignore the flag and start their
+        // stdio server), so probing them yields `None`; the marker recorded at
+        // install is the truthful version. A pre-marker binary (older install)
+        // falls through to the bounded probe below and self-heals on reinstall.
+        let marker = super::version_marker_path(dir, name);
+        if let Ok(recorded) = std::fs::read_to_string(&marker) {
+            let recorded = recorded.trim();
+            if !recorded.is_empty() {
+                return Some(recorded.to_string());
+            }
         }
         // Best-effort: `<bin> --version` typically prints `name x.y.z`; take the
         // last whitespace token of the first line. Any failure → `None` (proceed
-        // to reinstall) rather than a false "current".
-        let out = std::process::Command::new(&path)
-            .arg("--version")
-            .output()
-            .ok()?;
+        // to reinstall) rather than a false "current". The probe is BOUNDED
+        // (`VERSION_PROBE_TIMEOUT`): a binary that hangs on `--version` is killed
+        // and reads as unknown, never hanging `doctor`.
+        let mut cmd = std::process::Command::new(&path);
+        cmd.arg("--version");
+        let out = output_bounded(cmd, VERSION_PROBE_TIMEOUT)?;
         if !out.status.success() {
             return None;
         }
@@ -298,6 +380,34 @@ mod tests {
         );
     }
 
+    // ── the bounded `--version` probe: a hang is killed, a fast run collected ─
+    #[cfg(unix)]
+    #[test]
+    fn output_bounded_kills_a_hanging_child_and_returns_none() {
+        // A child that never exits within the bound must be killed → None, and
+        // the call must return promptly (well under the child's own lifetime),
+        // proving `doctor` cannot hang on a stuck `--version`.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 10"]);
+        let start = Instant::now();
+        let out = output_bounded(cmd, Duration::from_millis(200));
+        assert!(out.is_none(), "a hanging probe reads as unknown (None)");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the bounded probe returns promptly, not after the child's 10s"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_bounded_collects_a_fast_child_output() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo hi"]);
+        let out = output_bounded(cmd, Duration::from_secs(5)).expect("fast child yields output");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    }
+
     #[test]
     fn parse_version_returns_none_for_garbage() {
         // No semver-ish token → None (the SAFE direction: reinstall, never a
@@ -305,5 +415,46 @@ mod tests {
         assert_eq!(parse_version("no version here"), None);
         assert_eq!(parse_version("build 42"), None);
         assert_eq!(parse_version(""), None);
+    }
+
+    // ── PART B: the install-time marker is read back over an absent `--version` ─
+    #[cfg(unix)]
+    #[test]
+    fn installed_version_reads_the_marker_when_the_binary_has_no_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A placed "binary" that has NO parseable `--version` (it errors), just
+        // like the real MCP tool binaries that ignore the flag.
+        let bin = dir.path().join("toolx");
+        std::fs::write(&bin, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // No marker yet → the errored `--version` probe yields None (fail-safe:
+        // unknown → reinstall, never a wrong verdict).
+        assert_eq!(RealInstallerIo.installed_version(dir.path(), "toolx"), None);
+
+        // Record the install-time marker → it now reports that version despite
+        // the binary having no usable `--version`.
+        RealInstallerIo
+            .write_version_marker(dir.path(), "toolx", "0.0.7")
+            .unwrap();
+        assert_eq!(
+            RealInstallerIo.installed_version(dir.path(), "toolx"),
+            Some("0.0.7".to_string()),
+            "the install-time marker wins over an unreadable --version"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_version_is_none_when_the_binary_is_absent_even_with_a_marker() {
+        // A marker without a placed binary is not "installed" — existence is
+        // resolved through the ONE managed-bin predicate first, so a stray marker
+        // never fabricates a currency verdict.
+        let dir = tempfile::tempdir().unwrap();
+        RealInstallerIo
+            .write_version_marker(dir.path(), "ghost", "9.9.9")
+            .unwrap();
+        assert_eq!(RealInstallerIo.installed_version(dir.path(), "ghost"), None);
     }
 }
