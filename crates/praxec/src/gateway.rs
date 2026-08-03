@@ -2735,6 +2735,7 @@ fn provider_token(provider: praxec_core::provision_install::Provider) -> &'stati
         Provider::Release => "release",
         Provider::Docker => "docker",
         Provider::Npx => "npx",
+        Provider::Uvx => "uvx",
         Provider::Cargo => "cargo",
     }
 }

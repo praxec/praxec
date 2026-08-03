@@ -8,6 +8,45 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.47] — 2026-08-02 — tool-provisioning robustness (dogfooding fixes)
+
+Robustness fixes found dogfooding v0.0.46's governed tool provisioning against real
+releases and a multi-connection live gateway.
+
+### Fixed
+
+- **Managed-bin-dir awareness** — tools installed by `praxec tools install` into the
+  managed bin dir (`<config-dir>/praxec/bin`) are now recognized by `doctor` preflight
+  (present, not "missing") and by currency (a `ManagedRelease` supersedes a stale cargo
+  copy, checked against the registry version → `TOOL_CURRENT`). `praxec doctor --fix`
+  now also freshens *stale* registry tools, not just missing ones; the remediation text
+  no longer over-promises `doctor --fix` for non-registry tools. (#190)
+- **Checksum convention tolerance** — the installer accepts both an aggregate
+  `checksums.sha256` (praxec's own release convention) **and** a per-asset
+  `<asset>.sha256` sidecar (`taiki-e/upload-rust-binary-action`, which the /praxec/*
+  tools use). A missing aggregate falls through to the sidecar; both absent →
+  `INSTALL_CHECKSUM_UNAVAILABLE` (fail-closed, never an unverified binary). Fixes
+  `praxec tools install` 404'ing against real tool releases. (#191)
+- **Install-time version marker** — MCP tool binaries don't implement `--version` (they
+  start their stdio server), so `install_release` now records the installed version in a
+  `<managed-bin-dir>/.<command>.version` marker that currency reads back — so a managed
+  release binary reports `TOOL_CURRENT` instead of `CURRENCY_UNKNOWN`. (#191)
+- **Concurrency-safe store migration** — the sqlite run-id index migration
+  (`DROP INDEX … / CREATE UNIQUE INDEX …`, run on every store open) raced across
+  multiple concurrent `praxec serve` processes (e.g. more than one editor MCP
+  connection), booting the gateway `DEGRADED: index idx_workflows_run_id already exists`.
+  Now: `busy_timeout`, the migration wrapped in an `IMMEDIATE` transaction, a bounded
+  `busy_retry` (jittered backoff) around contended idempotent writes, and `journal_mode=WAL`
+  for better multi-process access. (#192)
+
+### Added
+
+- **uvx provider** — PyPI-distributed MCP servers now provision via `uvx` (the analogue of
+  the npx provider): on-demand, no download, gated on `uvx` being on PATH. Installer chain
+  is now **release → docker → npx → uvx → cargo**.
+
+---
+
 ## [0.0.46] — 2026-08-01 — governed tool provisioning (prebuilt binaries, zero compilation)
 
 Closes the onboarding dead-end where a pack's companion MCP tools (cpm-planner,
