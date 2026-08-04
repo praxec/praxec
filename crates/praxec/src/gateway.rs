@@ -4,8 +4,7 @@ use std::sync::Arc;
 pub(crate) use crate::gateway_config::{
     ApprovalsCommand, AuditCommand, Cli, CliConnectionKind, Command, ConnectionsCommand,
     CostCommand, InitEditorArg, InspectCommand, IntentCommand, ModelsCommand, OneshotServer,
-    PackCommand,
-    SchemaCommand, ToolsCommand, ack_guards_used, apply_overlays, build_audit_sink,
+    PackCommand, SchemaCommand, ToolsCommand, ack_guards_used, apply_overlays, build_audit_sink,
     build_workflow_store, cli_principal, headless_policy_from, is_ephemeral_path, load_config,
     parse_since, resolve_embedder,
 };
@@ -3456,9 +3455,9 @@ fn format_bind_outcome(outcome: &crate::models_bind::BindOutcome) -> String {
         BindOutcome::NoRecommendation { affinity } => {
             format!("no pack recommends affinity `{affinity}` — nothing to bind\n")
         }
-        BindOutcome::NoModelsYaml { affinity } => format!(
-            "cannot bind affinity `{affinity}`: gateway.models_yaml is unset\n"
-        ),
+        BindOutcome::NoModelsYaml { affinity } => {
+            format!("cannot bind affinity `{affinity}`: gateway.models_yaml is unset\n")
+        }
         BindOutcome::NoProviderKey {
             affinity,
             provider,

@@ -128,8 +128,14 @@ fn unbound_agent_affinity_fails_check_bound_passes() {
     write(&models, MODELS_DEFAULT_ONLY);
     let unbound = run(&["check", "--config", cfg.to_str().unwrap()]);
     let out = String::from_utf8_lossy(&unbound.stdout);
-    assert!(!unbound.status.success(), "unbound affinity must FAIL check:\n{out}");
-    assert!(out.contains("AFFINITY_UNBOUND"), "names the invariant:\n{out}");
+    assert!(
+        !unbound.status.success(),
+        "unbound affinity must FAIL check:\n{out}"
+    );
+    assert!(
+        out.contains("AFFINITY_UNBOUND"),
+        "names the invariant:\n{out}"
+    );
     assert!(out.contains("`design`"), "names the affinity:\n{out}");
 
     // Bound via an `activity:` entry → pass.
@@ -203,14 +209,23 @@ fn check_surfaces_pack_recommendation_for_unbound_mounted_affinity() {
     let cfg = pack_config(td.path());
     let check = run(&["check", "--config", cfg.to_str().unwrap()]);
     let out = String::from_utf8_lossy(&check.stdout);
-    assert!(!check.status.success(), "unbound mounted affinity fails:\n{out}");
+    assert!(
+        !check.status.success(),
+        "unbound mounted affinity fails:\n{out}"
+    );
     assert!(out.contains("AFFINITY_UNBOUND"), "{out}");
-    assert!(out.contains("design/flow.anneal"), "names the mounted def:\n{out}");
+    assert!(
+        out.contains("design/flow.anneal"),
+        "names the mounted def:\n{out}"
+    );
     assert!(
         out.contains("openrouter/anthropic/claude-sonnet-4-5"),
         "surfaces the pack recommendation:\n{out}"
     );
-    assert!(out.contains("praxec models bind design"), "offers the fix:\n{out}");
+    assert!(
+        out.contains("praxec models bind design"),
+        "offers the fix:\n{out}"
+    );
 }
 
 #[test]
@@ -221,7 +236,13 @@ fn models_bind_writes_recommended_binding_and_is_idempotent() {
 
     // First bind writes the recommended binding (OPENROUTER_API_KEY is set in the
     // test env, so the write path is taken).
-    let first = run(&["models", "bind", "design", "--config", cfg.to_str().unwrap()]);
+    let first = run(&[
+        "models",
+        "bind",
+        "design",
+        "--config",
+        cfg.to_str().unwrap(),
+    ]);
     assert!(
         first.status.success(),
         "bind should succeed:\n{}",
@@ -234,7 +255,13 @@ fn models_bind_writes_recommended_binding_and_is_idempotent() {
     );
 
     // Second bind is idempotent + non-clobbering.
-    let second = run(&["models", "bind", "design", "--config", cfg.to_str().unwrap()]);
+    let second = run(&[
+        "models",
+        "bind",
+        "design",
+        "--config",
+        cfg.to_str().unwrap(),
+    ]);
     assert!(second.status.success());
     assert!(
         String::from_utf8_lossy(&second.stdout).contains("already bound"),
@@ -255,7 +282,13 @@ fn models_bind_writes_recommended_binding_and_is_idempotent() {
 fn models_bind_unrecommended_affinity_exits_nonzero() {
     let td = tempfile::tempdir().unwrap();
     let cfg = pack_config(td.path());
-    let out = run(&["models", "bind", "no-such-affinity", "--config", cfg.to_str().unwrap()]);
+    let out = run(&[
+        "models",
+        "bind",
+        "no-such-affinity",
+        "--config",
+        cfg.to_str().unwrap(),
+    ]);
     assert!(
         !out.status.success(),
         "binding an affinity no pack recommends must exit non-zero:\n{}",

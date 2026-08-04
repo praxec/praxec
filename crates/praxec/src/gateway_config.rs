@@ -1550,7 +1550,11 @@ mod config_structure_tests {
         let msgs = error_messages(&cfg);
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert!(msgs[0].contains("MODELS_YAML_MISPLACED"), "{}", msgs[0]);
-        assert!(msgs[0].contains("praxec:"), "names wrong location: {}", msgs[0]);
+        assert!(
+            msgs[0].contains("praxec:"),
+            "names wrong location: {}",
+            msgs[0]
+        );
         assert!(
             msgs[0].contains("gateway.models_yaml"),
             "carries the did-you-mean hint: {}",
@@ -1603,7 +1607,11 @@ mod config_structure_tests {
         let msgs = error_messages(&cfg);
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert!(msgs[0].contains("UNKNOWN_GATEWAY_KEY"), "{}", msgs[0]);
-        assert!(msgs[0].contains("modelz_yaml"), "names the key: {}", msgs[0]);
+        assert!(
+            msgs[0].contains("modelz_yaml"),
+            "names the key: {}",
+            msgs[0]
+        );
         assert!(
             msgs[0].contains("models_yaml") && msgs[0].contains("allow_ephemeral"),
             "lists the allowed set: {}",

@@ -978,7 +978,8 @@ activity:
       - { provider: { name: openrouter }, model: anthropic/claude-sonnet-4-5 }
     strategy: ordered
 "#;
-        ModelsFile::from_yaml(yaml).expect("the documented models.yaml shape parses via the real loader");
+        ModelsFile::from_yaml(yaml)
+            .expect("the documented models.yaml shape parses via the real loader");
     }
 }
 

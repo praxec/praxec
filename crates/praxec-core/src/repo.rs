@@ -720,7 +720,10 @@ mod tests {
             Some("openrouter/anthropic/claude-sonnet-4-5"),
             "provider/model-id recommendation round-trips (model-id may contain `/`)"
         );
-        let r = m.affinities.get("rollout").expect("rollout affinity present");
+        let r = m
+            .affinities
+            .get("rollout")
+            .expect("rollout affinity present");
         assert!(r.tier.is_none(), "omitted tier defaults None");
         assert!(r.capability.is_none(), "omitted capability defaults None");
         assert_eq!(r.recommended.as_deref(), Some("openrouter/z-ai/glm-5.2"));
@@ -1147,8 +1150,16 @@ workflows:
         let m = load_manifest(td.path()).unwrap();
         assert!(m.reference_only.is_empty(), "no opt-in declared");
         let warns = unscanned_definition_warnings(td.path(), &m.layout, &m.reference_only);
-        assert_eq!(warns.len(), 1, "unscanned dir without opt-in must warn: {warns:?}");
-        assert!(warns[0].contains("UNSCANNED_DEFINITION_DIR"), "{}", warns[0]);
+        assert_eq!(
+            warns.len(),
+            1,
+            "unscanned dir without opt-in must warn: {warns:?}"
+        );
+        assert!(
+            warns[0].contains("UNSCANNED_DEFINITION_DIR"),
+            "{}",
+            warns[0]
+        );
     }
 
     /// D6 (poka-yoke) — an unknown `reference_only:` tier is a typo that would

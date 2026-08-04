@@ -5884,7 +5884,11 @@ mod tests {
             .iter()
             .filter(|d| d.message().contains("PLACEHOLDER_LIFECYCLE"))
             .collect();
-        assert_eq!(placeholder.len(), 1, "exactly one placeholder warning: {d:?}");
+        assert_eq!(
+            placeholder.len(),
+            1,
+            "exactly one placeholder warning: {d:?}"
+        );
         assert!(
             !placeholder[0].is_error(),
             "placeholder must be a WARNING, not an error: {:?}",
@@ -5918,7 +5922,8 @@ mod tests {
         });
         let d = validate_workflows(&config);
         assert!(
-            !d.iter().any(|d| d.message().contains("PLACEHOLDER_LIFECYCLE")),
+            !d.iter()
+                .any(|d| d.message().contains("PLACEHOLDER_LIFECYCLE")),
             "a working lifecycle must not warn: {d:?}"
         );
     }

@@ -331,7 +331,10 @@ mod tests {
         );
         // The pre-existing binding is untouched — never overwritten.
         let text = std::fs::read_to_string(&models).unwrap();
-        assert!(text.contains("gpt-5"), "existing binding preserved:\n{text}");
+        assert!(
+            text.contains("gpt-5"),
+            "existing binding preserved:\n{text}"
+        );
         assert!(
             !text.contains("claude-sonnet-4-5"),
             "recommendation must NOT clobber:\n{text}"

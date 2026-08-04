@@ -69,7 +69,10 @@ fn models_yaml_under_praxec_fails_check_with_hint() {
         !check.status.success(),
         "misplaced models_yaml must FAIL check (was silently ignored):\n{out}"
     );
-    assert!(out.contains("MODELS_YAML_MISPLACED"), "names the defect:\n{out}");
+    assert!(
+        out.contains("MODELS_YAML_MISPLACED"),
+        "names the defect:\n{out}"
+    );
     assert!(
         out.contains("gateway.models_yaml"),
         "carries the did-you-mean hint:\n{out}"
@@ -87,10 +90,22 @@ fn unknown_gateway_key_fails_check_with_allowed_set() {
     );
     let check = run(&["check", "--config", cfg.to_str().unwrap()]);
     let out = String::from_utf8_lossy(&check.stdout);
-    assert!(!check.status.success(), "unknown gateway key must FAIL check:\n{out}");
-    assert!(out.contains("UNKNOWN_GATEWAY_KEY"), "names the defect:\n{out}");
-    assert!(out.contains("strict_validaton"), "names the offending key:\n{out}");
-    assert!(out.contains("strict_validation"), "lists the allowed set:\n{out}");
+    assert!(
+        !check.status.success(),
+        "unknown gateway key must FAIL check:\n{out}"
+    );
+    assert!(
+        out.contains("UNKNOWN_GATEWAY_KEY"),
+        "names the defect:\n{out}"
+    );
+    assert!(
+        out.contains("strict_validaton"),
+        "names the offending key:\n{out}"
+    );
+    assert!(
+        out.contains("strict_validation"),
+        "lists the allowed set:\n{out}"
+    );
 }
 
 #[test]
@@ -122,8 +137,18 @@ fn correct_gateway_models_yaml_still_passes_check() {
 fn schema_models_config_prints_the_shape() {
     let out = run(&["schema", "models-config"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "schema models-config must exit 0:\n{stdout}");
-    for key in ["version", "default", "overrides", "activity", "provider", "model"] {
+    assert!(
+        out.status.success(),
+        "schema models-config must exit 0:\n{stdout}"
+    );
+    for key in [
+        "version",
+        "default",
+        "overrides",
+        "activity",
+        "provider",
+        "model",
+    ] {
         assert!(stdout.contains(key), "schema documents `{key}`:\n{stdout}");
     }
     // It is valid JSON.
@@ -138,7 +163,10 @@ fn schema_models_config_prints_the_shape() {
 fn health_echoes_absolute_config_path() {
     let td = tempfile::tempdir().unwrap();
     let cfg = td.path().join("gw.yaml");
-    write(&cfg, &config_with_prelude("gateway:\n  allow_ephemeral: true\n"));
+    write(
+        &cfg,
+        &config_with_prelude("gateway:\n  allow_ephemeral: true\n"),
+    );
     let out = run(&["health", "--config", cfg.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "health must exit 0:\n{stdout}");
@@ -173,7 +201,10 @@ fn doctor_echoes_absolute_config_path() {
     // ECHOES the absolute in-force path (D4).
     let out = run(&["doctor", "--config", cfg.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("config in force:"), "doctor labels the path:\n{stdout}");
+    assert!(
+        stdout.contains("config in force:"),
+        "doctor labels the path:\n{stdout}"
+    );
     let canon = std::fs::canonicalize(&cfg).unwrap();
     assert!(
         stdout.contains(&canon.display().to_string()),

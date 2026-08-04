@@ -82,7 +82,10 @@ fn stub_lifecycle_is_a_nonfatal_check_warning() {
         so.contains("PLACEHOLDER_LIFECYCLE"),
         "check must surface the placeholder so a stub is never silently taken for real:\n{so}"
     );
-    assert!(so.contains("wf.stub"), "names the offending definition:\n{so}");
+    assert!(
+        so.contains("wf.stub"),
+        "names the offending definition:\n{so}"
+    );
 }
 
 #[test]

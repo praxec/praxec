@@ -283,7 +283,10 @@ mod tests {
         // A config whose only step is a plain `kind: noop` (no agent, no affinity)
         // must NOT newly error even with a loadable models.yaml.
         let td = tempfile::tempdir().unwrap();
-        let p = write_models(td.path(), "version: 1\ndefault:\n  - { provider: { name: openrouter }, model: z-ai/glm-5.2 }\n");
+        let p = write_models(
+            td.path(),
+            "version: 1\ndefault:\n  - { provider: { name: openrouter }, model: z-ai/glm-5.2 }\n",
+        );
         let cfg = json!({
             "gateway": { "models_yaml": p.to_str().unwrap() },
             "workflows": { "wf": { "states": { "s": { "transitions": {
@@ -318,8 +321,14 @@ mod tests {
             m.contains("openrouter/anthropic/claude-sonnet-4-5"),
             "surfaces the recommendation: {m}"
         );
-        assert!(m.contains("praxec models bind design"), "offers the fix: {m}");
-        assert!(m.contains("UI design annealing"), "surfaces capability: {m}");
+        assert!(
+            m.contains("praxec models bind design"),
+            "offers the fix: {m}"
+        );
+        assert!(
+            m.contains("UI design annealing"),
+            "surfaces capability: {m}"
+        );
     }
 
     #[test]
@@ -362,7 +371,10 @@ mod tests {
         let Diagnostic::Error(m) = &findings[0] else {
             panic!()
         };
-        assert!(m.contains("AFFINITY_UNBOUND") && m.contains("`rollout`"), "{m}");
+        assert!(
+            m.contains("AFFINITY_UNBOUND") && m.contains("`rollout`"),
+            "{m}"
+        );
     }
 
     #[test]
