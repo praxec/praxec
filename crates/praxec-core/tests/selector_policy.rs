@@ -48,6 +48,7 @@ fn hit(id: &str, score: f32, task_class: &str) -> SearchHit {
             body: None,
             source: None,
             structural_fingerprint: None,
+            lifecycle: None,
         },
         evidence: None,
     }

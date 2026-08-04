@@ -88,6 +88,7 @@ fn build_discovery() -> Arc<InMemoryDiscoveryIndex> {
             body: None,
             source: None,
             structural_fingerprint: None,
+            lifecycle: None,
         },
         DiscoveryItem {
             id: "cap.beta".into(),
@@ -103,6 +104,7 @@ fn build_discovery() -> Arc<InMemoryDiscoveryIndex> {
             body: None,
             source: None,
             structural_fingerprint: None,
+            lifecycle: None,
         },
     ]))
 }
@@ -370,6 +372,7 @@ async fn describe_guidance_uses_flat_wire_format() {
         body: Some("Lead with the reader's problem.".into()),
         source: Some("config".into()),
         structural_fingerprint: None,
+        lifecycle: None,
     }]);
     let server = PraxecServer::new(runtime).with_discovery(Arc::new(discovery));
 

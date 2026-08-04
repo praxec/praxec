@@ -383,6 +383,7 @@ fn script_item(subject: &str, entry: &Value) -> DiscoveryItem {
         body,
         source: Some(source),
         structural_fingerprint: None,
+        lifecycle: None,
     }
 }
 
@@ -424,6 +425,7 @@ fn guidance_item(subject: &str, entry: &Value) -> DiscoveryItem {
         body: Some(body),
         source: Some(source),
         structural_fingerprint: None,
+        lifecycle: None,
     }
 }
 
@@ -515,6 +517,7 @@ fn workflow_item(id: &str, def: &Value) -> DiscoveryItem {
         // and hot-reload build the catalog through, so a reloaded/newly-minted
         // flow is fingerprinted the moment it enters the catalog.
         structural_fingerprint: Some(crate::structural_fingerprint::fingerprint(def)),
+        lifecycle: lifecycle_token(def),
     }
 }
 
@@ -565,6 +568,7 @@ fn capability_item(exposure: &Value) -> Option<DiscoveryItem> {
         body: None,
         source: None,
         structural_fingerprint: None,
+        lifecycle: lifecycle_token(exposure),
     })
 }
 
@@ -588,7 +592,19 @@ fn connection_item(name: &str, conn: &Value) -> DiscoveryItem {
         body: None,
         source: None,
         structural_fingerprint: None,
+        lifecycle: None,
     }
+}
+
+/// Extract a definition's declared `lifecycle:` token for the catalog, if any.
+/// Validity (closed enum) is enforced at load by `validate::validate_cap_lifecycle`;
+/// here we index whatever non-empty string is present so `describe` can surface it.
+fn lifecycle_token(def: &Value) -> Option<String> {
+    def.get("lifecycle")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn string_array(value: Option<&Value>) -> Vec<String> {
@@ -946,5 +962,44 @@ mod index_seam_tests {
             Some("optimize"),
             "the edited description was embedded fresh, not reused from v1"
         );
+    }
+
+    // ---- D5: describe surfaces the definition's declared lifecycle ----------
+
+    #[test]
+    fn indexed_workflow_carries_declared_lifecycle() {
+        // The catalog item `describe`/`query {subject}` returns must carry the
+        // definition's `lifecycle:` so an operator sees maturity BEFORE acting.
+        let config = json!({
+            "workflows": {
+                "flow.demo": {
+                    "title": "Demo",
+                    "lifecycle": "stub",
+                    "initialState": "s",
+                    "states": { "s": { "terminal": true } }
+                }
+            }
+        });
+        let items = index_from_config(&config).unwrap();
+        let item = items.iter().find(|i| i.id == "flow.demo").unwrap();
+        assert_eq!(item.lifecycle.as_deref(), Some("stub"));
+    }
+
+    #[test]
+    fn indexed_workflow_without_lifecycle_has_none() {
+        // No false surfacing: a definition that declares no lifecycle carries None
+        // (and, via `skip_serializing_if`, adds no key to the describe payload).
+        let config = json!({
+            "workflows": {
+                "flow.demo": {
+                    "title": "Demo",
+                    "initialState": "s",
+                    "states": { "s": { "terminal": true } }
+                }
+            }
+        });
+        let items = index_from_config(&config).unwrap();
+        let item = items.iter().find(|i| i.id == "flow.demo").unwrap();
+        assert_eq!(item.lifecycle, None);
     }
 }

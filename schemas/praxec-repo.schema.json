@@ -53,6 +53,15 @@
           "recommended": { "type": "string", "description": "Recommended binding as `<provider>/<model-id>` (the model-id itself may contain `/`)." }
         }
       }
+    },
+    "reference_only": {
+      "type": "array",
+      "description": "Tiers whose remapped default directory is INTENTIONALLY reference-only (kept for humans, never loaded). Listing a tier here suppresses the by-design UNSCANNED_DEFINITION_DIR warning FOR THAT TIER ONLY — an explicit opt-in. Each entry must be a known tier name.",
+      "items": {
+        "type": "string",
+        "enum": ["capabilities", "flows", "skills", "scripts", "connections"]
+      },
+      "default": []
     }
   }
 }

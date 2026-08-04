@@ -504,14 +504,24 @@ impl PraxecServer {
         )
         .await;
 
-        Ok(json!({
+        // D5 — surface the definition's `lifecycle:` at the TOP level of the
+        // describe response (in addition to riding inside `item`) so an operator
+        // sees maturity BEFORE acting. Present only when the item declares one;
+        // a `stub` lifecycle here mirrors the `check` soft-warning + the `start`
+        // echo, so a placeholder is visible at every touchpoint.
+        let lifecycle = item.as_ref().and_then(|i| i.lifecycle.clone());
+        let mut resp = json!({
             "id": id,
             "item": item,
             "links": [
                 { "rel": "home", "method": "praxec.query", "args": {} },
                 { "rel": "search", "method": "praxec.query", "args": { "query": "" } }
             ]
-        }))
+        });
+        if let Some(lifecycle) = lifecycle {
+            resp["lifecycle"] = Value::String(lifecycle);
+        }
+        Ok(resp)
     }
 
     /// SPEC §5.8 — emit a `guidance.describe_requested` audit record for a
