@@ -280,6 +280,13 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ModelsCommand,
     },
+    /// Manage the provider API keys praxec's governed agents use — set / list /
+    /// remove, in the same `providers.env` `praxec init` writes. Gateway-native
+    /// and cross-platform (no `px` TUI or shell script required).
+    Providers {
+        #[command(subcommand)]
+        command: ProvidersCommand,
+    },
     /// Inspect a pack (resource repo) without building a gateway.
     Pack {
         #[command(subcommand)]
@@ -547,6 +554,35 @@ pub(crate) enum ModelsCommand {
         /// The affinity to bind (e.g. `design`).
         affinity: String,
     },
+}
+
+/// `praxec providers <cmd>` — native provider-key management (see
+/// [`crate::providers`]). All operate on the resolved `providers.env`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ProvidersCommand {
+    /// List configured providers with their key values masked.
+    List,
+    /// Set a provider's API key(s). Interactive (no-echo) by default; use
+    /// `--key-stdin` (one line per env var) or `--from-env` for scripting / CI.
+    /// Omit `--provider` to walk every supported provider interactively.
+    Set {
+        /// Provider slug (e.g. `openrouter`, `anthropic`, `openai`). Omit to walk all.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Read each key value from stdin (one line per env var) instead of prompting.
+        #[arg(long, requires = "provider")]
+        key_stdin: bool,
+        /// Read each key value from the matching environment variable.
+        #[arg(long, requires = "provider", conflicts_with = "key_stdin")]
+        from_env: bool,
+    },
+    /// Remove a provider's key(s) from the file.
+    Remove {
+        /// Provider slug to clear (e.g. `openrouter`).
+        provider: String,
+    },
+    /// Print the resolved provider-keys file path and exit.
+    Path,
 }
 
 #[derive(Subcommand, Debug)]

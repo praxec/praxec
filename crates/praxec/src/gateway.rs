@@ -228,6 +228,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
         Command::Models { command } => match command {
             ModelsCommand::Bind { config, affinity } => models_bind_cmd(&config, &affinity),
         },
+        Command::Providers { command } => crate::providers::run(command),
         Command::Pack { command } => match command {
             PackCommand::List { repo } => pack_list(&repo),
         },

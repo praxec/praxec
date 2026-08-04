@@ -32,6 +32,11 @@ surface; every change is additive — no gate lowered, no capability removed.
 
 ### Added
 
+- **`praxec providers set / list / remove`** — native, cross-platform provider-key
+  management in the gateway binary itself (over the same `providers.env` `init`
+  writes). No core setup task requires the optional `px` TUI or a POSIX-sh script
+  anymore — it works on Windows too. `set` supports `--key-stdin` / `--from-env`
+  for CI; `list` masks values.
 - **`init` scaffolds a writable project repo** — the first real command works
   with no hand-editing (was `REPO_ROOT_REQUIRED`).
 - **The editor MCP entry carries `PRAXEC_PROVIDER_KEYS_FILE`** — an

@@ -25,6 +25,7 @@ mod init;
 /// pull), never clobbering an existing binding, never fabricating a key.
 pub mod models_bind;
 pub mod preflight;
+pub mod providers;
 pub mod provision;
 /// Config-readiness invariants (the onboarding-hardening keystone + D1): every
 /// mounted agent-step affinity must resolve to a bound model, and a declared

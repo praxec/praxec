@@ -57,17 +57,17 @@ Neither curl nor wget? Install one (`apt-get install -y curl` / `apk add curl`),
 or download a release bundle from the table below on another machine.
 
 **Provider key** — `praxec init` (below) captures one for you. To set or manage
-keys standalone (multiple providers, non-interactive CI), use the gateway-native
-helper:
+keys standalone, it's built into the binary (cross-platform, no extra tool):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/praxec/praxec/main/configure-providers.sh | sh
+praxec providers set --provider openrouter    # no-echo prompt; --key-stdin / --from-env for CI
+praxec providers list                          # show configured providers (masked)
 ```
 
-Interactive (or non-interactive: `--provider openrouter --from-env`, `--key-stdin`,
-`--list`). Writes to `~/.config/praxec/providers.env` (0600), validates the key
-against the provider's models endpoint, and is idempotent. An exported
-`OPENROUTER_API_KEY` (etc.) in your shell overrides the file.
+Writes to `~/.config/praxec/providers.env` (0600). An exported `OPENROUTER_API_KEY`
+(etc.) in your shell overrides the file. (On a box that has the shell but not yet
+the binary, the POSIX-sh `configure-providers.sh` does the same and also validates
+the key against the provider's models endpoint.)
 
 Or grab a prebuilt bundle manually — verify the `praxec` binary against the release's `checksums.sha256`:
 
