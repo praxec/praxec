@@ -1034,22 +1034,28 @@ pub fn config_structure_findings(config: &Value) -> Vec<praxec_core::validate::D
     use praxec_core::validate::Diagnostic;
     let mut out = Vec::new();
 
-    // (1) Misplaced `models_yaml`.
+    // (1) Misplaced `models_yaml`. Gate the SEVERITY on whether the config
+    // consumes models (same invariant as D1): a misplaced key on a config with no
+    // agent/affinity/llm step is inert — a WARNING, so a valid upgrade isn't broken
+    // — while on a model-consuming config it hard-errors (bindings silently fail).
+    let consumes = crate::readiness::config_consumes_models(config);
+    let misplaced = |where_: &str| -> Diagnostic {
+        let msg = format!(
+            "MODELS_YAML_MISPLACED: {where_} is ignored by the loader — the gateway only reads \
+             `gateway.models_yaml`. Move it under `gateway:` (did you mean `gateway.models_yaml`?), \
+             or affinity/agent model bindings will silently fail to load."
+        );
+        if consumes {
+            Diagnostic::Error(msg)
+        } else {
+            Diagnostic::Warning(msg)
+        }
+    };
     if config.pointer("/models_yaml").is_some() {
-        out.push(Diagnostic::Error(
-            "MODELS_YAML_MISPLACED: a top-level `models_yaml` key is ignored by the loader — the \
-             gateway only reads `gateway.models_yaml`. Move it under `gateway:` (did you mean \
-             `gateway.models_yaml`?), or affinity/agent model bindings will silently fail to load."
-                .to_string(),
-        ));
+        out.push(misplaced("a top-level `models_yaml` key"));
     }
     if config.pointer("/praxec/models_yaml").is_some() {
-        out.push(Diagnostic::Error(
-            "MODELS_YAML_MISPLACED: `models_yaml` under `praxec:` is ignored by the loader — the \
-             gateway only reads `gateway.models_yaml`. Move it under `gateway:` (did you mean \
-             `gateway.models_yaml`?), or affinity/agent model bindings will silently fail to load."
-                .to_string(),
-        ));
+        out.push(misplaced("`models_yaml` under `praxec:`"));
     }
 
     // (2) Unknown keys in the closed `gateway:` block.
@@ -1542,11 +1548,19 @@ mod config_structure_tests {
             .collect()
     }
 
+    /// A model-consuming step so D2 applies at ERROR severity (see C2 gating).
+    fn consuming_workflows() -> serde_json::Value {
+        json!({ "wf": { "states": { "s": { "transitions": {
+            "go": { "target": "done", "executor": { "kind": "agent", "affinity": "coding", "goal": "x" } }
+        } } } } })
+    }
+
     /// D2 repro — `models_yaml` under `praxec:` is silently ignored today; now a
-    /// hard error naming the wrong location + the `gateway.models_yaml` hint.
+    /// hard error (on a model-consuming config) naming the wrong location + the
+    /// `gateway.models_yaml` hint.
     #[test]
     fn models_yaml_under_praxec_is_flagged_with_hint() {
-        let cfg = json!({ "praxec": { "models_yaml": "/some/models.yaml" } });
+        let cfg = json!({ "praxec": { "models_yaml": "/some/models.yaml" }, "workflows": consuming_workflows() });
         let msgs = error_messages(&cfg);
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert!(msgs[0].contains("MODELS_YAML_MISPLACED"), "{}", msgs[0]);
@@ -1565,13 +1579,27 @@ mod config_structure_tests {
     /// D2 — a top-level `models_yaml` is likewise misplaced/ignored.
     #[test]
     fn top_level_models_yaml_is_flagged_with_hint() {
-        let cfg = json!({ "models_yaml": "/some/models.yaml" });
+        let cfg = json!({ "models_yaml": "/some/models.yaml", "workflows": consuming_workflows() });
         let msgs = error_messages(&cfg);
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         assert!(
             msgs[0].contains("MODELS_YAML_MISPLACED") && msgs[0].contains("gateway.models_yaml"),
             "{}",
             msgs[0]
+        );
+    }
+
+    /// C2 — a misplaced `models_yaml` on a config that consumes NO models is inert;
+    /// it is a WARNING (not a hard error), so a valid 0.0.47 config upgrades clean.
+    #[test]
+    fn misplaced_models_yaml_without_model_consumer_is_a_warning() {
+        let cfg = json!({ "models_yaml": "/some/models.yaml" });
+        let findings = config_structure_findings(&cfg);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            matches!(&findings[0], Diagnostic::Warning(m) if m.contains("MODELS_YAML_MISPLACED")),
+            "no model-consuming step ⇒ warning: {:?}",
+            findings[0]
         );
     }
 

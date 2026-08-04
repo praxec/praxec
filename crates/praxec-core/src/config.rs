@@ -3052,9 +3052,37 @@ fn load_resolved_with_repos_mode(
     // clone-and-reset machinery, keyed off the host dir (so its cache sits
     // beside the repo caches). A local-path string is left untouched.
     resolve_registry_source(&mut merged, &parent_dir, &mut repo_diagnostics)?;
+    // A relative `gateway.models_yaml` must resolve against the config file's
+    // directory, NOT the process CWD — an editor-launched MCP subprocess (Claude
+    // Code / Cursor) runs from the user's project dir, and CI/tools run from
+    // wherever they were invoked. CWD-relative resolution made a valid config
+    // (its models.yaml sitting right beside it) hard-fail `MODELS_YAML_LOAD_FAILED`
+    // from any other CWD. Normalize once here so every downstream consumer (the D1
+    // load check, the cost/affinity resolver, the runtime) sees a CWD-independent path.
+    normalize_models_yaml_path(&mut merged, &parent_dir);
     let (resolved, diagnostics) = resolve_with_diagnostics(merged)?;
     repo_diagnostics.extend(diagnostics);
     Ok((resolved, repo_diagnostics))
+}
+
+/// Rewrite a relative `gateway.models_yaml` to absolute against the config file's
+/// directory. Absolute paths and an absent key are left untouched. See the call
+/// site: the fix is that a config's `models_yaml` is resolved relative to the
+/// config, not the process CWD.
+fn normalize_models_yaml_path(config: &mut Value, config_dir: &Path) {
+    let Some(raw) = config
+        .pointer("/gateway/models_yaml")
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    if raw.is_empty() || Path::new(raw).is_absolute() {
+        return;
+    }
+    let abs = config_dir.join(raw);
+    if let Some(slot) = config.pointer_mut("/gateway/models_yaml") {
+        *slot = Value::String(abs.to_string_lossy().into_owned());
+    }
 }
 
 /// The registry file an operator's `discovery.registry` points a repo at — the
@@ -4994,6 +5022,43 @@ fn rewrite_executors_in_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── C1: gateway.models_yaml resolves against the config dir, not the CWD ────
+
+    #[test]
+    fn normalize_models_yaml_rewrites_relative_against_config_dir() {
+        use serde_json::json;
+        let mut cfg = json!({ "gateway": { "models_yaml": "./models.yaml" } });
+        normalize_models_yaml_path(&mut cfg, Path::new("/home/user/.config/praxec"));
+        assert_eq!(
+            cfg.pointer("/gateway/models_yaml").and_then(Value::as_str),
+            Some("/home/user/.config/praxec/./models.yaml"),
+            "a relative models_yaml must be joined to the config's dir (CWD-independent)"
+        );
+    }
+
+    #[test]
+    fn normalize_models_yaml_leaves_absolute_paths_untouched() {
+        use serde_json::json;
+        let mut cfg = json!({ "gateway": { "models_yaml": "/etc/praxec/models.yaml" } });
+        normalize_models_yaml_path(&mut cfg, Path::new("/home/user/.config/praxec"));
+        assert_eq!(
+            cfg.pointer("/gateway/models_yaml").and_then(Value::as_str),
+            Some("/etc/praxec/models.yaml"),
+            "an absolute models_yaml is authoritative — never rewritten"
+        );
+    }
+
+    #[test]
+    fn normalize_models_yaml_is_a_noop_when_absent() {
+        use serde_json::json;
+        let mut cfg = json!({ "gateway": { "allow_ephemeral": true } });
+        normalize_models_yaml_path(&mut cfg, Path::new("/anywhere"));
+        assert!(
+            cfg.pointer("/gateway/models_yaml").is_none(),
+            "no models_yaml key ⇒ nothing added"
+        );
+    }
 
     #[test]
     fn inject_halt_adds_kill_switch_only_when_enabled() {

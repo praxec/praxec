@@ -46,6 +46,19 @@ fn config_with_prelude(prelude: &str) -> String {
     )
 }
 
+/// Like [`config_with_prelude`] but the workflow has a MODEL-CONSUMING `kind: agent`
+/// step, so the `models_yaml` findings (D1/D2) apply at ERROR severity (see C2 —
+/// they are warnings on a config that consumes no models).
+fn consuming_config_with_prelude(prelude: &str) -> String {
+    format!(
+        "version: \"1.0.0\"\n{prelude}\
+         workflows:\n  wf.agent:\n    title: Agent\n    initialState: start\n    states:\n      \
+         start:\n        transitions:\n          go:\n            target: done\n            actor: agent\n            \
+         executor: {{ kind: agent, affinity: coding, goal: \"x\" }}\n      \
+         done: {{ terminal: true }}\n"
+    )
+}
+
 // ── D2 — misplaced / unknown key ─────────────────────────────────────────────
 
 #[test]
@@ -58,7 +71,7 @@ fn models_yaml_under_praxec_fails_check_with_hint() {
     // by the loader) — no `gateway.models_yaml` at all.
     write(
         &cfg,
-        &config_with_prelude(&format!(
+        &consuming_config_with_prelude(&format!(
             "gateway:\n  allow_ephemeral: true\npraxec:\n  models_yaml: \"{}\"\n",
             models.display()
         )),

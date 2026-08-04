@@ -42,13 +42,59 @@ pub fn models_yaml_load_finding(config: &Value) -> Option<Diagnostic> {
         .and_then(Value::as_str)?;
     match AgentsYamlAffinityResolver::from_path(Path::new(path)) {
         Ok(_) => None,
-        Err(err) => Some(Diagnostic::Error(format!(
+        // Gate the SEVERITY on whether the config actually consumes models. The
+        // plan's own invariant: a config with no `kind: agent`/`kind: llm`/affinity
+        // step needs no models.yaml, so a broken one is INERT — a hard error there
+        // would break a valid upgrade (0.0.47 silently tolerated it). A config that
+        // DOES consume models (the field-report design-annealing case) still hard-
+        // errors: every such step would fail at dispatch.
+        Err(err) if config_consumes_models(config) => Some(Diagnostic::Error(format!(
             "MODELS_YAML_LOAD_FAILED: gateway.models_yaml = `{path}` is declared but could not be \
              loaded ({err}). `kind: agent` model bindings and affinity-resolved `kind: llm` steps \
              cannot resolve, so every such step would fail at dispatch. Fix the path or the file \
              (or remove the `gateway.models_yaml` key) before serving."
         ))),
+        Err(err) => Some(Diagnostic::Warning(format!(
+            "MODELS_YAML_LOAD_FAILED: gateway.models_yaml = `{path}` is declared but could not be \
+             loaded ({err}). No `kind: agent`/`kind: llm`/affinity step consumes it in this config, \
+             so it is currently inert — but fix the path or remove the key before adding a \
+             model-driven step, or that step will fail at dispatch."
+        ))),
     }
+}
+
+/// Does any definition actually CONSUME models — a `kind: agent` or `kind: llm`
+/// step, or any step declaring an `affinity:`? D1 (and D2's misplaced-`models_yaml`)
+/// are hard errors only when this is true; a config that consumes no models
+/// legitimately runs with a broken/absent/misplaced `models_yaml` (the plan's
+/// invariant: no agent steps ⇒ no false error), so there such a key is a WARNING —
+/// surfaced, not upgrade-breaking.
+pub fn config_consumes_models(config: &Value) -> bool {
+    let Some(workflows) = config.pointer("/workflows").and_then(Value::as_object) else {
+        return false;
+    };
+    let mut consumes = false;
+    for def in workflows.values() {
+        for_each_executor_site(def, |site| {
+            let kind = site
+                .executor
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let has_affinity = site
+                .executor
+                .get("affinity")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if kind == "agent" || kind == "llm" || has_affinity {
+                consumes = true;
+            }
+        });
+        if consumes {
+            break;
+        }
+    }
+    consumes
 }
 
 /// One MOUNTED agent-step affinity that resolves to no model — the structured
@@ -229,11 +275,23 @@ mod tests {
         assert!(models_yaml_load_finding(&json!({})).is_none());
     }
 
+    /// A model-consuming step (a `kind: agent` on an affinity) so D1/D2 apply at
+    /// ERROR severity — the field-report design-annealing shape.
+    fn consuming_workflows() -> Value {
+        json!({ "wf": { "states": { "s": { "transitions": {
+            "go": { "target": "done", "executor": { "kind": "agent", "affinity": "coding", "goal": "x" } }
+        } } } } })
+    }
+
     #[test]
     fn d1_declared_but_missing_file_is_a_hard_error() {
-        // The exact report repro: gateway.models_yaml points at a path that does
-        // not exist. Today the runtime only WARNs; this makes it a hard error.
-        let cfg = json!({ "gateway": { "models_yaml": "/no/such/NONEXISTENT.yaml" } });
+        // The exact report repro: a MODEL-CONSUMING config whose gateway.models_yaml
+        // points at a path that does not exist. Today the runtime only WARNs; this
+        // makes it a hard error (every agent step would fail at dispatch).
+        let cfg = json!({
+            "gateway": { "models_yaml": "/no/such/NONEXISTENT.yaml" },
+            "workflows": consuming_workflows(),
+        });
         let finding = models_yaml_load_finding(&cfg).expect("dangling path must error");
         assert!(
             matches!(&finding, Diagnostic::Error(m) if m.contains("MODELS_YAML_LOAD_FAILED")),
@@ -245,9 +303,29 @@ mod tests {
     fn d1_declared_but_unparseable_file_is_a_hard_error() {
         let td = tempfile::tempdir().unwrap();
         let p = write_models(td.path(), "this: is: not: valid: models: yaml: [");
-        let cfg = json!({ "gateway": { "models_yaml": p.to_str().unwrap() } });
+        let cfg = json!({
+            "gateway": { "models_yaml": p.to_str().unwrap() },
+            "workflows": consuming_workflows(),
+        });
         assert!(
             matches!(models_yaml_load_finding(&cfg), Some(Diagnostic::Error(m)) if m.contains("MODELS_YAML_LOAD_FAILED"))
+        );
+    }
+
+    #[test]
+    fn d1_dangling_but_no_model_consumer_is_a_soft_warning() {
+        // C2 / plan invariant: a config that consumes NO models (only `kind: noop`)
+        // must NOT hard-error on a broken models_yaml — a valid 0.0.47 config
+        // upgrades clean. The broken key is surfaced as a non-fatal warning.
+        let cfg = json!({
+            "gateway": { "models_yaml": "/no/such/NONEXISTENT.yaml" },
+            "workflows": { "wf": { "states": { "s": { "transitions": {
+                "go": { "target": "done", "executor": { "kind": "noop" } }
+            } } } } }
+        });
+        assert!(
+            matches!(models_yaml_load_finding(&cfg), Some(Diagnostic::Warning(m)) if m.contains("MODELS_YAML_LOAD_FAILED")),
+            "no model-consuming step ⇒ warning, not a hard error"
         );
     }
 
