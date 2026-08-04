@@ -30,6 +30,7 @@ praxec-mcp-server = { workspace = true }
 praxec-embeddings = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+rpassword = { workspace = true }
 rmcp = { workspace = true }
 # doctor tool-currency: the remote-MCP `initialize` probe builds a
 # StreamableHttpClientTransport::<reqwest::Client> (same as praxec-executors).

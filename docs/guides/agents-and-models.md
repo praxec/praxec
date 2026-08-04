@@ -38,10 +38,12 @@ overrides:
       model: claude-opus-4-7
 ```
 
-**2. Set a provider key** (writes `~/.praxec/providers.env`, mode 0600):
+**2. Set a provider key** (writes `~/.config/praxec/providers.env`, mode 0600) —
+`praxec init` captures one during setup, or set it standalone with the
+gateway-native helper:
 
 ```bash
-px set-provider-keys --anthropic sk-ant-...
+curl -fsSL https://raw.githubusercontent.com/praxec/praxec/main/configure-providers.sh | sh
 # or, if you'd rather use the environment:
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
@@ -182,11 +184,13 @@ runtime needs that provider's credential. Each provider reads its own env var:
 export ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-**File backend** — `~/.praxec/providers.env`, a flat `KEY=value` dotenv written
-with mode `0600` inside a `0700` parent dir. Manage it with the CLI:
+**File backend** — `~/.config/praxec/providers.env`, a flat `KEY=value` dotenv
+written with mode `0600` inside a `0700` parent dir (legacy `~/.praxec/providers.env`
+is still read as a fallback). Manage it with the gateway-native helper (or the
+optional `px set-provider-keys` TUI, if you run the `px` control plane):
 
 ```bash
-px set-provider-keys --anthropic sk-ant-... --openai sk-...
+sh configure-providers.sh                 # interactive; --list, --from-env, --key-stdin
 # no flags → interactively walks every supported provider
 ```
 
