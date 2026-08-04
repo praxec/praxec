@@ -306,43 +306,24 @@ mod agent {
         Arc::new(|config: &Value| praxec_agents::config_doctor::doctor_check(config))
     }
 
-    /// Load-time fail-fast for an unloadable `gateway.models_yaml`. When the key
-    /// is set, points at a file that exists, but fails to parse/load, emit a
-    /// `Diagnostic::Error` so `serve`'s validation gate refuses to boot. Without
-    /// this, the only signal was a WARN as the resolver silently degraded to
+    /// Load-time fail-fast for a DECLARED but unreadable `gateway.models_yaml`
+    /// (onboarding-hardening D1). When the key is set but the file is
+    /// missing / unreadable / unparseable, emit a `MODELS_YAML_LOAD_FAILED`
+    /// error so `check`/`serve` refuse rather than silently degrading to
     /// `RejectingAgentModelResolver` (every `kind: agent` step — and every
     /// affinity-resolved `kind: llm` step — then failing at first dispatch).
     ///
-    /// `set + present + fails to load` is the trigger: a missing file or an
-    /// unset key is NOT an error here (a build may legitimately run without
-    /// `models.yaml` and use no affinity/agent bindings); only a configured file
-    /// that is present-but-broken fails fast. The runtime resolver fallback is
-    /// kept as defense-in-depth.
+    /// The single source of this check is [`praxec::readiness::models_yaml_load_finding`],
+    /// shared with `doctor`, so the two can never disagree. Key ABSENT is NOT an
+    /// error here (a build may legitimately run with no affinity/agent bindings);
+    /// only a DECLARED key whose file cannot load fails fast. Note: this now also
+    /// covers the declared-but-MISSING file case (previously a silent WARN — the
+    /// D1 bug), not just present-but-unparseable.
     pub fn models_yaml_load_diagnostic() -> DiagnosticProvider {
-        use praxec_core::validate::Diagnostic;
         Arc::new(|config: &Value| {
-            let Some(path) = config
-                .pointer("/gateway/models_yaml")
-                .and_then(Value::as_str)
-            else {
-                return Vec::new(); // not configured → nothing to validate
-            };
-            let p = std::path::Path::new(path);
-            if !p.exists() {
-                // "present" gate: an absent file is reported by other layers
-                // (and may be intentional); this doctor only fails on a file
-                // that IS there but cannot be loaded.
-                return Vec::new();
-            }
-            match praxec::affinity_resolver::AgentsYamlAffinityResolver::from_path(p) {
-                Ok(_) => Vec::new(),
-                Err(err) => vec![Diagnostic::Error(format!(
-                    "MODELS_YAML_LOAD_FAILED: gateway.models_yaml = `{path}` is present but failed \
-                     to load ({err}). `kind: agent` model bindings and affinity-resolved \
-                     `kind: llm` steps cannot resolve, so every such step would fail at dispatch. \
-                     Fix or remove the file before serving."
-                ))],
-            }
+            praxec::readiness::models_yaml_load_finding(config)
+                .into_iter()
+                .collect()
         })
     }
 
@@ -421,11 +402,25 @@ mod models_yaml_doctor_tests {
     }
 
     #[test]
-    fn absent_file_is_not_an_error_here() {
-        // "present" gate: a configured-but-missing file is not flagged by THIS
-        // doctor (it only fails on present-but-unloadable).
-        let cfg = json!({ "gateway": { "models_yaml": "/no/such/models.yaml" } });
-        assert!(run(&cfg).is_empty());
+    fn declared_but_missing_file_is_now_a_hard_error() {
+        // onboarding-hardening D1 (formerly `absent_file_is_not_an_error_here`,
+        // which asserted this was CLEAN — that was the bug: a declared-but-missing
+        // models.yaml let `check`/`doctor` exit 0 while nothing agentic could run).
+        // A DECLARED `gateway.models_yaml` MUST be loadable; a missing file is now
+        // correctly MODELS_YAML_LOAD_FAILED.
+        let cfg = json!({
+            "gateway": { "models_yaml": "/no/such/models.yaml" },
+            "workflows": { "wf": { "states": { "s": { "transitions": {
+                "go": { "target": "done", "executor": { "kind": "agent", "affinity": "coding", "goal": "x" } }
+            } } } } }
+        });
+        let diags = run(&cfg);
+        assert_eq!(diags.len(), 1, "a declared-but-missing file must error");
+        assert!(
+            matches!(&diags[0], Diagnostic::Error(m) if m.contains("MODELS_YAML_LOAD_FAILED")),
+            "got {:?}",
+            diags[0]
+        );
     }
 
     #[test]
@@ -434,7 +429,12 @@ mod models_yaml_doctor_tests {
         let path = dir.join(format!("praxec_bad_models_{}.yaml", std::process::id()));
         // Not valid models.yaml — malformed YAML so from_path fails.
         std::fs::write(&path, "this: is: not: valid: models: yaml: [").unwrap();
-        let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
+        let cfg = json!({
+            "gateway": { "models_yaml": path.to_str().unwrap() },
+            "workflows": { "wf": { "states": { "s": { "transitions": {
+                "go": { "target": "done", "executor": { "kind": "agent", "affinity": "coding", "goal": "x" } }
+            } } } } }
+        });
         let diags = run(&cfg);
         std::fs::remove_file(&path).ok();
         assert_eq!(

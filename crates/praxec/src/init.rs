@@ -45,14 +45,17 @@ fn yaml_quoted(p: &Path) -> String {
     format!("\"{escaped}\"")
 }
 
-/// The scaffolded `gateway.yaml` content for target directory `dir`
-/// (expected absolute). `repos:`/`connections:` are left as commented hints —
-/// an empty-but-present `repos: []` would still be a config the operator has
-/// to notice and remove; a comment is unambiguous "nothing configured yet".
-pub(crate) fn gateway_yaml_content(dir: &Path) -> String {
+/// The scaffolded `gateway.yaml` content. `dir` is the config directory (expected
+/// absolute); `project_dir` is the directory `praxec init` was run from — scaffolded
+/// as a `writable: true` repo so the FIRST run has a `repo_root` and works with no
+/// hand-editing (without it, every real command dies on `REPO_ROOT_REQUIRED`). The
+/// repo is `definitions: false` — it is a WRITE TARGET (where agents edit code), not
+/// a source of workflow definitions.
+pub(crate) fn gateway_yaml_content(dir: &Path, project_dir: &Path) -> String {
     let models = yaml_quoted(&dir.join("models.yaml"));
     let audit = yaml_quoted(&dir.join("audit-logs"));
     let db = yaml_quoted(&dir.join("praxec.db"));
+    let project = yaml_quoted(project_dir);
     format!(
         r#"version: "1.0.0"
 gateway:
@@ -63,7 +66,13 @@ praxec:
   agents: {{ auto_drive: false }}
 audit: {{ sink: file, path: {audit}, rotation: daily }}
 store: {{ kind: sqlite, path: {db} }}
-# repos: []        # add packs here (or run `praxec sync`)
+repos:
+  # The project praxec operates on — a WRITE TARGET for agent edits (not a pack).
+  # This is what gives a run its `repo_root`; point it at the repo you want praxec
+  # to work in (add more `- path:` entries for more repos, or `praxec sync` for packs).
+  - path: {project}
+    writable: true
+    definitions: false
 # connections: {{}}  # add MCP tools here (or provision via flow.tools.provision)
 "#
     )
@@ -329,10 +338,16 @@ pub(crate) fn scaffold_file(
 /// Build the `mcpServers.praxec` entry: the running binary + `serve --config
 /// <gateway.yaml>`, both absolute paths (Windows-safe via `current_exe`, which
 /// resolves the `.exe` suffix).
-pub(crate) fn praxec_mcp_entry(exe: &Path, gateway_yaml: &Path) -> Value {
+pub(crate) fn praxec_mcp_entry(exe: &Path, gateway_yaml: &Path, providers_env: &Path) -> Value {
+    // `env.PRAXEC_PROVIDER_KEYS_FILE` pins the provider-keys file the editor-
+    // launched `serve` reads, so an install into a non-default `--dir` is NOT
+    // silently keyless at serve time (the runtime resolver otherwise only knows
+    // the XDG/legacy home paths). Harmless for a default-dir install (it points at
+    // the same file the resolver would find anyway).
     json!({
         "command": exe.to_string_lossy(),
         "args": ["serve", "--config", gateway_yaml.to_string_lossy()],
+        "env": { "PRAXEC_PROVIDER_KEYS_FILE": providers_env.to_string_lossy() },
     })
 }
 
@@ -376,6 +391,7 @@ pub(crate) fn write_editor_mcp_config(
     path: &Path,
     exe: &Path,
     gateway_yaml: &Path,
+    providers_env: &Path,
 ) -> anyhow::Result<EditorWriteOutcome> {
     let existing = if path.exists() {
         let raw =
@@ -396,7 +412,7 @@ pub(crate) fn write_editor_mcp_config(
     } else {
         EditorWriteOutcome::Created
     };
-    let entry = praxec_mcp_entry(exe, gateway_yaml);
+    let entry = praxec_mcp_entry(exe, gateway_yaml, providers_env);
     let merged = merge_mcp_servers(existing, entry);
 
     if let Some(parent) = path.parent() {
@@ -522,7 +538,7 @@ mod tests {
     #[test]
     fn gateway_yaml_content_embeds_absolute_paths_under_the_target_dir() {
         let dir = Path::new("/tmp/praxec-init-test-xyz");
-        let yaml = gateway_yaml_content(dir);
+        let yaml = gateway_yaml_content(dir, dir);
         assert!(yaml.contains("version: \"1.0.0\""));
         assert!(yaml.contains("\"/tmp/praxec-init-test-xyz/models.yaml\""));
         assert!(yaml.contains("\"/tmp/praxec-init-test-xyz/audit-logs\""));
@@ -531,8 +547,14 @@ mod tests {
         assert!(yaml.contains("auto_drive: false"));
         assert!(yaml.contains("sink: file"));
         assert!(yaml.contains("kind: sqlite"));
-        // Empty-but-present would still be a config to notice/undo; comment instead.
-        assert!(yaml.contains("# repos: []"));
+        // The project dir is scaffolded as a writable repo so the first run works.
+        assert!(yaml.contains("repos:"));
+        assert!(yaml.contains("writable: true"));
+        assert!(yaml.contains("definitions: false"));
+        assert!(
+            yaml.contains("\"/tmp/praxec-init-test-xyz\""),
+            "the project dir is the repo path:\n{yaml}"
+        );
         assert!(yaml.contains("# connections: {}"));
     }
 
@@ -544,7 +566,7 @@ mod tests {
         // already in the input is doubled so the YAML double-quoted scalar
         // round-trips, independent of which separator the join used.
         let dir = Path::new(r"C:\Users\op\AppData\Roaming\praxec");
-        let yaml = gateway_yaml_content(dir);
+        let yaml = gateway_yaml_content(dir, dir);
         let escaped_dir = r"C:\\Users\\op\\AppData\\Roaming\\praxec";
         assert!(
             yaml.contains(escaped_dir),
@@ -573,7 +595,7 @@ mod tests {
         let target = dir.path().join("praxec");
         std::fs::create_dir_all(&target).unwrap();
         let gateway_path = target.join("gateway.yaml");
-        std::fs::write(&gateway_path, gateway_yaml_content(&target)).unwrap();
+        std::fs::write(&gateway_path, gateway_yaml_content(&target, &target)).unwrap();
         std::fs::write(target.join("models.yaml"), models_yaml_content()).unwrap();
 
         let (config, soft_diagnostics) =
@@ -642,7 +664,11 @@ mod tests {
 
     #[test]
     fn merge_mcp_servers_creates_from_scratch() {
-        let entry = praxec_mcp_entry(Path::new("/usr/bin/praxec"), Path::new("/cfg/gateway.yaml"));
+        let entry = praxec_mcp_entry(
+            Path::new("/usr/bin/praxec"),
+            Path::new("/cfg/gateway.yaml"),
+            Path::new("/cfg/providers.env"),
+        );
         let merged = merge_mcp_servers(None, entry);
         assert_eq!(
             merged["mcpServers"]["praxec"]["command"],
@@ -664,7 +690,11 @@ mod tests {
             },
             "unrelatedTopLevelKey": "preserved"
         });
-        let entry = praxec_mcp_entry(Path::new("/usr/bin/praxec"), Path::new("/cfg/gateway.yaml"));
+        let entry = praxec_mcp_entry(
+            Path::new("/usr/bin/praxec"),
+            Path::new("/cfg/gateway.yaml"),
+            Path::new("/cfg/providers.env"),
+        );
         let merged = merge_mcp_servers(Some(existing), entry);
 
         assert_eq!(
@@ -683,7 +713,11 @@ mod tests {
     fn merge_mcp_servers_replaces_a_prior_praxec_entry() {
         let existing =
             json!({ "mcpServers": { "praxec": { "command": "stale-path", "args": [] } } });
-        let entry = praxec_mcp_entry(Path::new("/usr/bin/praxec"), Path::new("/cfg/gateway.yaml"));
+        let entry = praxec_mcp_entry(
+            Path::new("/usr/bin/praxec"),
+            Path::new("/cfg/gateway.yaml"),
+            Path::new("/cfg/providers.env"),
+        );
         let merged = merge_mcp_servers(Some(existing), entry);
         assert_eq!(
             merged["mcpServers"]["praxec"]["command"],
@@ -709,6 +743,7 @@ mod tests {
             &path,
             Path::new("/usr/bin/praxec"),
             Path::new("/cfg/gateway.yaml"),
+            Path::new("/cfg/providers.env"),
         )
         .unwrap();
 
@@ -734,6 +769,7 @@ mod tests {
             &path,
             Path::new("/usr/bin/praxec"),
             Path::new("/cfg/gateway.yaml"),
+            Path::new("/cfg/providers.env"),
         )
         .unwrap();
 
@@ -751,6 +787,7 @@ mod tests {
             &path,
             Path::new("/usr/bin/praxec"),
             Path::new("/cfg/gateway.yaml"),
+            Path::new("/cfg/providers.env"),
         )
         .expect_err("malformed existing JSON must fail fast, never be silently clobbered");
         assert!(err.to_string().contains("not valid JSON"));
@@ -873,7 +910,7 @@ mod tests {
         // Contract 1 (structure) — both starter packs under `repos:` as
         // `{uri, ref: main}`, and `discovery.registry` as the `{uri, ref: main}`
         // object (NOT a hash pin, NOT a bare string path).
-        let base = gateway_yaml_content(Path::new("/tmp/px"));
+        let base = gateway_yaml_content(Path::new("/tmp/px"), Path::new("/tmp/px"));
         let wiring = PackWiring {
             packs: STARTER_PACK_URIS.iter().map(|s| s.to_string()).collect(),
             registry: true,
@@ -890,7 +927,14 @@ mod tests {
             "both starter packs wired under repos: {}",
             outcome.yaml
         );
-        for entry in cfg["repos"].as_array().unwrap() {
+        // Only the PACK entries (uri-based) carry a ref; the scaffolded writable
+        // project repo is path-based and has none.
+        for entry in cfg["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["uri"].is_string())
+        {
             assert_eq!(entry["ref"], json!("main"), "always-latest ref: {entry}");
         }
         assert_eq!(
@@ -912,7 +956,7 @@ mod tests {
     fn pack_flag_wires_exactly_that_one_pack() {
         // Contract 2 — `--pack <uri>` alone wires exactly one repo entry and,
         // being pack-only (no --with-starter-packs), no registry pointer.
-        let base = gateway_yaml_content(Path::new("/tmp/px"));
+        let base = gateway_yaml_content(Path::new("/tmp/px"), Path::new("/tmp/px"));
         let wiring = PackWiring {
             packs: vec!["git+https://github.com/acme/private-pack".to_string()],
             registry: false,
@@ -926,7 +970,15 @@ mod tests {
             "exactly the one requested pack: {}",
             outcome.yaml
         );
-        assert_eq!(cfg["repos"][0]["ref"], json!("main"));
+        assert_eq!(
+            cfg["repos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["uri"].is_string())
+                .unwrap()["ref"],
+            json!("main")
+        );
         assert!(
             cfg["discovery"].is_null(),
             "pack-only wiring adds no discovery.registry: {}",
@@ -939,7 +991,7 @@ mod tests {
     fn re_run_merges_without_duplicating_repos_or_clobbering_the_registry() {
         // Contract 3 — a second merge over the first's output is a no-op union:
         // no duplicate repos, the existing registry preserved (not re-written).
-        let base = gateway_yaml_content(Path::new("/tmp/px"));
+        let base = gateway_yaml_content(Path::new("/tmp/px"), Path::new("/tmp/px"));
         let wiring = PackWiring {
             packs: STARTER_PACK_URIS.iter().map(|s| s.to_string()).collect(),
             registry: true,
@@ -976,8 +1028,11 @@ mod tests {
     fn pack_wiring_preserves_a_hand_added_repo_entry() {
         // Poka-yoke — an operator's existing `repos:` entry is preserved and the
         // starter packs are unioned in beside it, never clobbering it.
-        let mut base = gateway_yaml_content(Path::new("/tmp/px"));
-        base.push_str("repos:\n  - { uri: \"git+https://github.com/acme/mine\", ref: dev }\n");
+        // A config that already carries an operator's `repos:` entry (a single
+        // repos: block — the scaffold's own writable repo is exercised elsewhere).
+        let base = "version: \"1.0.0\"\ngateway: { allow_ephemeral: true }\n\
+                    repos:\n  - { uri: \"git+https://github.com/acme/mine\", ref: dev }\n"
+            .to_string();
         let wiring = PackWiring {
             packs: STARTER_PACK_URIS.iter().map(|s| s.to_string()).collect(),
             registry: false,
@@ -1008,7 +1063,7 @@ mod tests {
 
     #[test]
     fn force_resets_an_existing_registry_pointer() {
-        let mut base = gateway_yaml_content(Path::new("/tmp/px"));
+        let mut base = gateway_yaml_content(Path::new("/tmp/px"), Path::new("/tmp/px"));
         base.push_str("discovery:\n  registry: /some/local/packs.yaml\n");
         let wiring = PackWiring {
             packs: Vec::new(),
@@ -1063,7 +1118,7 @@ mod tests {
         );
         assert!(wiring.registry, "selected packs point discovery.registry");
 
-        let base = gateway_yaml_content(Path::new("/tmp/px"));
+        let base = gateway_yaml_content(Path::new("/tmp/px"), Path::new("/tmp/px"));
         let outcome = merge_pack_wiring(&base, &wiring, false).unwrap();
         let cfg = as_json(&outcome.yaml);
         assert_eq!(
@@ -1072,7 +1127,15 @@ mod tests {
             "scaffolded config wires only the selected pack: {}",
             outcome.yaml
         );
-        assert_eq!(cfg["repos"][0]["ref"], json!("main"));
+        assert_eq!(
+            cfg["repos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["uri"].is_string())
+                .unwrap()["ref"],
+            json!("main")
+        );
         assert_eq!(
             cfg["discovery"]["registry"]["uri"],
             json!(STARTER_REGISTRY_URI),
@@ -1140,7 +1203,7 @@ mod tests {
         );
         assert!(wiring.registry);
 
-        let base = gateway_yaml_content(Path::new("/tmp/px"));
+        let base = gateway_yaml_content(Path::new("/tmp/px"), Path::new("/tmp/px"));
         let outcome = merge_pack_wiring(&base, &wiring, false).unwrap();
         assert_eq!(
             repo_uris(&as_json(&outcome.yaml)),
@@ -1294,7 +1357,7 @@ mod tests {
 
         // Scaffold + wire, then redirect the three `git+https://…praxec/…` uris to
         // the local bare repos (the transport mock).
-        let base = gateway_yaml_content(&target);
+        let base = gateway_yaml_content(&target, &target);
         let wiring = PackWiring {
             packs: STARTER_PACK_URIS.iter().map(|s| s.to_string()).collect(),
             registry: true,

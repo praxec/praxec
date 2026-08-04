@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 pub(crate) use crate::gateway_config::{
     ApprovalsCommand, AuditCommand, Cli, CliConnectionKind, Command, ConnectionsCommand,
-    CostCommand, InitEditorArg, InspectCommand, IntentCommand, OneshotServer, PackCommand,
-    SchemaCommand, ToolsCommand, ack_guards_used, apply_overlays, build_audit_sink,
+    CostCommand, InitEditorArg, InspectCommand, IntentCommand, ModelsCommand, OneshotServer,
+    PackCommand, SchemaCommand, ToolsCommand, ack_guards_used, apply_overlays, build_audit_sink,
     build_workflow_store, cli_principal, headless_policy_from, is_ephemeral_path, load_config,
     parse_since, resolve_embedder,
 };
@@ -184,6 +184,17 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 );
                 Ok(())
             }
+            // D3 — the models.yaml on-disk shape, generated from the canonical
+            // Rust struct at print time (no hand-maintained copy to drift).
+            SchemaCommand::ModelsConfig => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &praxec_core::model_resolver::models_config_schema()
+                    )?
+                );
+                Ok(())
+            }
         },
         Command::Connections { command } => match command {
             ConnectionsCommand::Add {
@@ -214,6 +225,10 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
             }
             ConnectionsCommand::Revoke { config, name } => connections_revoke(&config, &name).await,
         },
+        Command::Models { command } => match command {
+            ModelsCommand::Bind { config, affinity } => models_bind_cmd(&config, &affinity),
+        },
+        Command::Providers { command } => crate::providers::run(command),
         Command::Pack { command } => match command {
             PackCommand::List { repo } => pack_list(&repo),
         },
@@ -1410,9 +1425,12 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         Err(err) => return serve_degraded(config_path, err).await,
     };
 
+    // D4 — echo the ABSOLUTE, resolved config path in force at startup, so an
+    // operator can see WHICH gateway.yaml this long-lived server actually loaded
+    // (the two-config trap: editing a different file than the one serving).
     tracing::info!(
-        path = %config_path.display(),
-        "starting praxec stdio server"
+        config_path = %crate::gateway_config::absolute_config_path(&config_path).display(),
+        "starting praxec stdio server — config in force"
     );
 
     // CR6 — reap orphaned runs. An instance a prior process left mid-`running`
@@ -3213,9 +3231,31 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
     let (config, soft_diagnostics) =
         praxec_core::config::load_resolved_with_repos_resilient(&config_path)
             .with_context(|| format!("loading config {}", config_path.display()))?;
+
+    // D4 — echo the ABSOLUTE, resolved config path in force, and note the
+    // two-config trap: a DIFFERENT, divergent config at the conventional
+    // install location (`~/.config/praxec/gateway.yaml`) that the operator may
+    // be editing instead of this one.
+    println!(
+        "config in force: {}",
+        crate::gateway_config::absolute_config_path(&config_path).display()
+    );
+    if let Some(note) = crate::gateway_config::two_config_trap_note(&config_path) {
+        println!("  {note}");
+    }
+
     let report = crate::preflight::preflight(&config);
     print!("{}", crate::preflight::format_report(&report));
     print_soft_diagnostics(&soft_diagnostics);
+
+    // Config-readiness (onboarding-hardening): D1 (declared-but-unreadable
+    // models.yaml → MODELS_YAML_LOAD_FAILED) + the keystone (every MOUNTED
+    // agent-step affinity must resolve to a bound model). Runs the SAME pure
+    // functions `check` runs, so the two can never disagree about whether a
+    // config is runnable. Under `--fix`, an unbound affinity a pack recommends is
+    // BOUND into models.yaml (never clobbering, never fabricating a key) before
+    // the verdict is recomputed.
+    let readiness_failed = doctor_readiness(&config, fix);
 
     // Load the registry ONCE — the single source threaded into BOTH tool
     // provisioning (below) and the currency/freshen path, so `doctor` never
@@ -3294,6 +3334,13 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
              config would fail at the first model call"
         );
     }
+    if readiness_failed {
+        anyhow::bail!(
+            "doctor: this config is not runnable — a declared models.yaml failed to load or a \
+             mounted agent-step affinity resolves to no model (see the readiness error(s) above); \
+             a drive would fail at first dispatch with no model"
+        );
+    }
     if !durability.is_empty() {
         anyhow::bail!(
             "doctor: this config would start a DEGRADED gateway — durable storage is not \
@@ -3301,6 +3348,134 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The `doctor` config-readiness pass (onboarding-hardening): print D1 +
+/// keystone findings and, under `--fix`, bind any unbound affinity a MOUNTED
+/// pack recommends. Returns `true` iff a readiness ERROR remains AFTER any
+/// `--fix` binding (so `doctor` exits non-zero — a config that can't run must
+/// never greenlight). Advisory-free: every readiness finding is a hard error,
+/// exactly as in `check`.
+fn doctor_readiness(config: &Value, fix: bool) -> bool {
+    use crate::models_bind::BindOutcome;
+
+    // D1 — a declared-but-unreadable models.yaml. When it fails, agent-readiness
+    // can't run (no in-force models.yaml), so this is the whole verdict.
+    if let Some(finding) = crate::readiness::models_yaml_load_finding(config) {
+        println!("readiness: models.yaml unreadable");
+        println!("  {finding}");
+        return true;
+    }
+
+    // Under `--fix`, bind each unbound affinity a pack recommends BEFORE the
+    // verdict, so a self-wireable gap is closed rather than merely reported. The
+    // binder is non-clobbering + never fabricates a key.
+    if fix {
+        let mut bound_any = false;
+        // De-dup by affinity name across definitions (one bind per affinity).
+        let mut attempted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for u in crate::readiness::unbound_affinities(config) {
+            if !attempted.insert(u.affinity.clone()) {
+                continue;
+            }
+            match crate::models_bind::bind_affinity(config, &u.affinity) {
+                Ok(outcome) => {
+                    if matches!(outcome, BindOutcome::Wrote { .. }) {
+                        bound_any = true;
+                    }
+                    print!("  fix: {}", format_bind_outcome(&outcome));
+                }
+                Err(e) => println!("  fix: could not bind `{}`: {e:#}", u.affinity),
+            }
+        }
+        if bound_any {
+            println!(
+                "  note: bound affinities were written to models.yaml — re-run `praxec doctor` \
+                 to re-evaluate against the updated bindings."
+            );
+        }
+    }
+
+    // Recompute the keystone AFTER any fix so a just-bound affinity no longer
+    // errors. (A `--fix` that wrote a new activity entry means this in-memory
+    // config still lacks it — so a freshly-bound affinity is reported as fixed
+    // above and the operator re-runs; an affinity that could NOT be bound stays
+    // an error here.)
+    let findings = crate::readiness::agent_readiness_findings(config);
+    if findings.is_empty() {
+        return false;
+    }
+    println!("readiness: {} agent-affinity error(s)", findings.len());
+    for d in &findings {
+        println!("  {d}");
+    }
+    true
+}
+
+/// `praxec models bind <affinity>` — write a MOUNTED pack's recommended binding
+/// for `affinity` into the operator's models.yaml (self-wiring on pull). Uses
+/// the RESILIENT loader (same as `doctor`) so a single dead `repos:` entry can't
+/// block binding. Prints the outcome; exits non-zero only when there is nothing
+/// to bind (no pack recommends the affinity, or no `gateway.models_yaml` to
+/// write into).
+fn models_bind_cmd(config_path: &Path, affinity: &str) -> anyhow::Result<()> {
+    let (config, _soft) = praxec_core::config::load_resolved_with_repos_resilient(config_path)
+        .with_context(|| format!("loading config {}", config_path.display()))?;
+    let outcome = crate::models_bind::bind_affinity(&config, affinity)?;
+    print!("{}", format_bind_outcome(&outcome));
+    match outcome {
+        crate::models_bind::BindOutcome::NoRecommendation { affinity } => anyhow::bail!(
+            "no loaded pack recommends affinity `{affinity}` — wire the pack that declares it \
+             (its `praxec.repo.yaml` `affinities:` block), or add the binding to models.yaml by hand"
+        ),
+        crate::models_bind::BindOutcome::NoModelsYaml { .. } => anyhow::bail!(
+            "gateway.models_yaml is unset — set it to your models.yaml path so a binding has \
+             somewhere to be written"
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Human-readable report for a [`crate::models_bind::BindOutcome`], shared by
+/// `models bind` and the `doctor --fix` binding path.
+fn format_bind_outcome(outcome: &crate::models_bind::BindOutcome) -> String {
+    use crate::models_bind::BindOutcome;
+    match outcome {
+        BindOutcome::Wrote {
+            affinity,
+            provider,
+            model,
+            path,
+        } => format!(
+            "bound  affinity `{affinity}` -> {provider}:{model} in {}\n",
+            path.display()
+        ),
+        BindOutcome::AlreadyBound { affinity } => {
+            format!("ok     affinity `{affinity}` is already bound — left untouched\n")
+        }
+        BindOutcome::NoRecommendation { affinity } => {
+            format!("no pack recommends affinity `{affinity}` — nothing to bind\n")
+        }
+        BindOutcome::NoModelsYaml { affinity } => {
+            format!("cannot bind affinity `{affinity}`: gateway.models_yaml is unset\n")
+        }
+        BindOutcome::NoProviderKey {
+            affinity,
+            provider,
+            missing_vars,
+            snippet,
+        } => format!(
+            "affinity `{affinity}` recommends provider `{provider}`, but its key is not set \
+             ({}). No key was fabricated. Set the key and re-run, or add this to models.yaml by \
+             hand:\n{}\n",
+            missing_vars.join(", "),
+            snippet
+                .lines()
+                .map(|l| format!("  {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    }
 }
 
 fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyhow::Result<()> {
@@ -3388,7 +3563,20 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
 
     // CMP-002 — the same suite `serve` enforces at startup (validate_workflows
     // + executor-kind doctor + feature-gated cost / kind:llm config doctors).
-    let diagnostics = collect_diagnostics_with(&config, extra_diagnostics);
+    let mut diagnostics = collect_diagnostics_with(&config, extra_diagnostics);
+    // Keystone (onboarding-hardening) — the agent-readiness invariant: every
+    // MOUNTED agent-step affinity must resolve to a bound model, else
+    // AFFINITY_UNBOUND (loud, with the pack's recommendation). Turns "0 errors
+    // but nothing can run" into a hard error. D1 (declared-but-unreadable
+    // models.yaml → MODELS_YAML_LOAD_FAILED) already flows through the
+    // `extra_diagnostics` providers above; this adds the affinity-binding half.
+    diagnostics.extend(crate::readiness::agent_readiness_findings(&config));
+    // D2 (onboarding-hardening) — config-as-closed-structure: a `models_yaml`
+    // misplaced outside `gateway.models_yaml` (top-level / under `praxec:`), or
+    // an unknown key in the closed `gateway:` block, is silently loader-ignored
+    // dead config. Surface each as a hard error (additive; no existing gate is
+    // relaxed).
+    diagnostics.extend(crate::gateway_config::config_structure_findings(&config));
     // Durability parity with `serve` — static / config-only: `check` validates
     // the file itself, so it does NOT consult the runtime PRAXEC_ALLOW_EPHEMERAL
     // env hatch (`doctor` does). A WARNING, not an error: the config may
@@ -3495,8 +3683,15 @@ fn init(
 
     println!("praxec init — target directory: {}", dir.display());
 
+    // The directory `init` runs from is scaffolded as the writable project repo,
+    // so a run has a `repo_root` and the FIRST command works without hand-editing.
+    let project_dir = std::env::current_dir().unwrap_or_else(|_| dir.clone());
     let gateway_yaml_path = dir.join("gateway.yaml");
-    match scaffold_file(&gateway_yaml_path, &gateway_yaml_content(&dir), force)? {
+    match scaffold_file(
+        &gateway_yaml_path,
+        &gateway_yaml_content(&dir, &project_dir),
+        force,
+    )? {
         ScaffoldOutcome::Wrote => println!("  wrote   {}", gateway_yaml_path.display()),
         ScaffoldOutcome::Skipped => println!(
             "  skipped {} (already exists; pass --force to overwrite)",
@@ -3571,6 +3766,17 @@ fn init(
         Some(k) => {
             praxec_core::provider_keys::set_var(&providers_env_path, "OPENROUTER_API_KEY", k)
                 .with_context(|| format!("writing {}", providers_env_path.display()))?;
+            // H1/H2 — make the just-written key visible to THIS process (the doctor
+            // epilogue + any `--fix` affinity binding below) AND resolvable at serve
+            // time regardless of `--dir`. Point the keys-file resolver at exactly
+            // what we wrote, then load it into the env. Without this the epilogue
+            // read stale env and falsely reported the credential missing right after
+            // the user pasted it — the flagship one-click ending on a fake failure.
+            // SAFETY: single-threaded init, before any task/`.await` is spawned.
+            unsafe {
+                std::env::set_var("PRAXEC_PROVIDER_KEYS_FILE", &providers_env_path);
+            }
+            praxec_core::provider_keys::load_into_env_if_present();
             // NEVER print/log `k` itself.
             println!(
                 "  wrote   {} (OPENROUTER_API_KEY)",
@@ -3620,7 +3826,7 @@ fn init(
         let cwd = std::env::current_dir().context("resolving the current directory")?;
         for target in targets {
             let path = target.config_path(&cwd, global)?;
-            match write_editor_mcp_config(&path, &exe, &gateway_yaml_path)? {
+            match write_editor_mcp_config(&path, &exe, &gateway_yaml_path, &providers_env_path)? {
                 EditorWriteOutcome::Created => {
                     println!("  wrote   {} ({})", path.display(), target.label())
                 }
@@ -3631,36 +3837,34 @@ fn init(
         }
     }
 
-    // ── doctor epilogue — reported only; init's job is to scaffold, not gate ─
+    // ── doctor epilogue (D7) — reported only; init's job is to scaffold, not
+    // gate. Running the REAL `doctor` (not a partial preflight) means a fresh
+    // install terminates in a full readiness verdict: credentials, the D1
+    // declared-models.yaml check, the agent-affinity keystone, tool
+    // provisioning, currency, and durability. `--install-tools`/`--yes` grant
+    // the same install/bind consent doctor's `--fix` uses. A non-zero doctor
+    // verdict is REPORTED, never fatal — `check`/`doctor`/`serve` remain the
+    // separate enforcing gates.
     println!();
     println!("running doctor on the scaffolded config...");
-    match praxec_core::config::load_resolved_with_repos_resilient(&gateway_yaml_path) {
-        Ok((config, soft_diagnostics)) => {
-            let report = crate::preflight::preflight(&config);
-            print!("{}", crate::preflight::format_report(&report));
-            print_soft_diagnostics(&soft_diagnostics);
-
-            // Tool provisioning (Task 5): when packs were wired, run the SAME
-            // resolve-and-offer path `doctor` uses against the freshly written
-            // config. OFFER missing tools by default; INSTALL them only under
-            // `--install-tools`/`--yes` (consent by construction).
-            if !wiring.packs.is_empty() {
-                let fix = install_consent(install_tools, yes);
-                let io = praxec_core::provision_install::RealInstallerIo;
-                match load_registry(&config) {
-                    Ok(registry) => print!(
-                        "{}",
-                        provisioning_report(&report.tools.missing, registry.as_deref(), fix, &io)
-                    ),
-                    Err(e) => println!("  tool provisioning could not run: {e:#}"),
-                }
-            }
+    let doctor_fix = install_consent(install_tools, yes);
+    let doctor_ok = match doctor(gateway_yaml_path.clone(), doctor_fix) {
+        Ok(()) => true,
+        Err(e) => {
+            println!("doctor verdict: {e}");
+            false
         }
-        Err(e) => println!("  doctor could not load the scaffolded config: {e:#}"),
-    }
+    };
 
+    // Gate the closing headline on the ACTUAL doctor verdict — a cheerful
+    // "you're ready" printed directly under a `doctor: FAILED` (the old behavior)
+    // reads as success-then-failure and misleads a brand-new user.
     println!();
-    println!("you're ready:");
+    if doctor_ok {
+        println!("you're ready:");
+    } else {
+        println!("scaffolded — one more step before you're ready (see the doctor verdict above):");
+    }
     println!("  - restart your editor (or reload its MCP servers) to pick up praxec");
     println!(
         "  - try:      praxec query --config {} '{{}}'",
@@ -3931,6 +4135,10 @@ fn health(config_path: PathBuf) -> anyhow::Result<()> {
         // to detect a stale server was to read a `server.initialized` audit
         // event, which the observe path could show from a dead session.
         "version": env!("CARGO_PKG_VERSION"),
+        // D4 — the ABSOLUTE, resolved path of the config actually in force, so a
+        // consumer can tell WHICH gateway.yaml this snapshot describes (the
+        // two-config trap: editing a different file than the one loaded).
+        "config_path": crate::gateway_config::absolute_config_path(&config_path).display().to_string(),
         "connections": connections,
         "repos": repos,
         "definition_count": definition_count,

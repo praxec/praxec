@@ -18,6 +18,9 @@ version: "1.0.0"
 # into a real deployment.
 gateway:
   allow_ephemeral: true
+  # Relative to THIS config file's directory (praxec resolves gateway.models_yaml
+  # against the config's dir, not the process CWD) — so it works whether run from
+  # here, the repo root, or an editor-launched MCP subprocess.
   models_yaml: ./models.yaml
 
 audit:

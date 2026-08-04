@@ -358,6 +358,7 @@ mod tests {
                         body: None,
                         source: None,
                         structural_fingerprint: None,
+                        lifecycle: None,
                     })
                     .collect(),
             ))

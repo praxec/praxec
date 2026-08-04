@@ -149,6 +149,7 @@ mod tests {
             body: None,
             source: Some("config".to_string()),
             structural_fingerprint: None,
+            lifecycle: None,
         }
     }
 

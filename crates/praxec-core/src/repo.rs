@@ -57,6 +57,52 @@ pub struct RepoManifest {
     /// (see [`create_scaffold_dirs`]). Default empty (no scaffolding).
     #[serde(default)]
     pub scaffold: Vec<String>,
+    /// onboarding-hardening — OPTIONAL per-affinity requirements this pack's
+    /// definitions use (the requirement TRAVELS with the pack). Empty by default
+    /// (a v1 stub with no `affinities:` still loads — the field is additive).
+    /// Read by the config-readiness keystone (`check`/`doctor`) to surface a pack
+    /// RECOMMENDATION when a MOUNTED affinity resolves to no binding in the
+    /// operator's in-force models.yaml. The operator's models.yaml stays the
+    /// authoritative binding (keys/cost); this only carries the pack's need + a
+    /// swappable recommendation across the pack boundary.
+    #[serde(default)]
+    pub affinities: std::collections::BTreeMap<String, AffinityRequirement>,
+    /// D6 — tiers whose remapped default directory is INTENTIONALLY reference-only
+    /// (kept for humans, never loaded). Listing a tier here (e.g.
+    /// `reference_only: [connections]`) suppresses the by-design
+    /// `UNSCANNED_DEFINITION_DIR` warning FOR THAT TIER ONLY — an EXPLICIT opt-in,
+    /// so a genuinely-unscanned dir with no opt-in still warns. Each entry MUST be
+    /// a known tier name (validated at [`load_manifest`]); a typo is a hard error,
+    /// never a silent blanket-suppression. Empty by default (additive).
+    #[serde(default)]
+    pub reference_only: Vec<String>,
+}
+
+/// The tier names a manifest may reference (in `reference_only:` and as `layout`
+/// keys). A closed set: an unknown token in `reference_only:` is a typo that
+/// would otherwise silently fail to suppress (or, worse, read as suppressing the
+/// wrong thing), so [`load_manifest`] rejects it.
+pub const KNOWN_LAYOUT_TIERS: &[&str] =
+    &["capabilities", "flows", "skills", "scripts", "connections"];
+
+/// One affinity requirement a pack DECLARES it needs. Every field is OPTIONAL —
+/// a pack may declare just a `capability:` blurb, just a `recommended:` binding,
+/// or both. A RECOMMENDATION, never a pin: portability holds because the
+/// operator's models.yaml remains the authoritative binding.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AffinityRequirement {
+    /// Tier hint (`frontier` | `commodity` | …) — advisory, for the operator.
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// One-line human description of what this affinity is used for.
+    #[serde(default)]
+    pub capability: Option<String>,
+    /// The pack's RECOMMENDED binding as `"<provider>/<model-id>"` (the model-id
+    /// itself may contain `/`, e.g. `openrouter/z-ai/glm-5.2`). Surfaced by the
+    /// keystone and written by `praxec models bind` / `doctor --fix`.
+    #[serde(default)]
+    pub recommended: Option<String>,
 }
 
 /// Layout of resource directories within a repo. All fields are optional;
@@ -126,6 +172,19 @@ pub fn load_manifest(repo_root: &Path) -> anyhow::Result<RepoManifest> {
             manifest.schema,
             REPO_MANIFEST_SCHEMA_V1
         );
+    }
+    // D6 — a `reference_only:` entry that isn't a known tier is a typo that would
+    // silently fail to suppress the intended warning; reject it (poka-yoke)
+    // rather than let it read as a no-op or mis-target.
+    for tier in &manifest.reference_only {
+        if !KNOWN_LAYOUT_TIERS.contains(&tier.as_str()) {
+            bail!(
+                "repo manifest {} lists unknown `reference_only:` tier `{}`; valid: {}",
+                manifest_path.display(),
+                tier,
+                KNOWN_LAYOUT_TIERS.join(", ")
+            );
+        }
     }
     Ok(manifest)
 }
@@ -313,7 +372,7 @@ pub fn load_repo(repo_path: &Path) -> anyhow::Result<(RepoManifest, Value)> {
     // directory that this manifest has REMAPPED elsewhere are never scanned. Warn
     // (loudly, at every load — `serve` and `check` both route through here) rather
     // than let authored YAML vanish with no feedback.
-    for w in unscanned_definition_warnings(repo_path, &manifest.layout) {
+    for w in unscanned_definition_warnings(repo_path, &manifest.layout, &manifest.reference_only) {
         tracing::warn!(repo = %manifest.name, "{w}");
     }
     Ok((manifest, aggregate))
@@ -328,7 +387,16 @@ pub fn load_repo(repo_path: &Path) -> anyhow::Result<(RepoManifest, Value)> {
 /// Only the *remapped* case is flagged: if a tier uses its default directory,
 /// nothing is remapped and there is nothing to warn about; a malformed file
 /// *inside* the configured directory is a hard error in [`merge_repo_file`].
-pub fn unscanned_definition_warnings(repo_path: &Path, layout: &RepoLayout) -> Vec<String> {
+///
+/// D6 — a tier listed in `reference_only` is EXPLICITLY declared intentional
+/// (kept for humans, never loaded), so its warning is suppressed FOR THAT TIER.
+/// Suppression is opt-in only: a tier NOT listed still warns, so a genuinely
+/// forgotten dir is never silently swallowed.
+pub fn unscanned_definition_warnings(
+    repo_path: &Path,
+    layout: &RepoLayout,
+    reference_only: &[String],
+) -> Vec<String> {
     let tiers: [(&str, String, &String); 5] = [
         (
             "capabilities",
@@ -348,6 +416,9 @@ pub fn unscanned_definition_warnings(repo_path: &Path, layout: &RepoLayout) -> V
     for (tier, default_dir, configured) in tiers {
         if configured == &default_dir {
             continue; // tier uses its default dir — nothing remapped.
+        }
+        if reference_only.iter().any(|t| t == tier) {
+            continue; // D6 — tier's default dir is EXPLICITLY reference-only.
         }
         let default_path = repo_path.join(&default_dir);
         if !default_path.is_dir() {
@@ -624,6 +695,62 @@ mod tests {
             msg.contains("praxec.repo/v2"),
             "error should mention actual: {msg}"
         );
+    }
+
+    #[test]
+    fn load_manifest_parses_optional_affinities_block() {
+        // The requirement TRAVELS: a pack declares the affinities its definitions
+        // use, with an optional tier/capability/recommendation per affinity.
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: design\nnamespace: design\nversion: 0.1.0\n\
+             affinities:\n  \
+             design:\n    tier: frontier\n    capability: UI design annealing\n    \
+             recommended: openrouter/anthropic/claude-sonnet-4-5\n  \
+             rollout:\n    recommended: openrouter/z-ai/glm-5.2\n",
+        );
+        let m = load_manifest(td.path()).expect("manifest with affinities loads");
+        assert_eq!(m.affinities.len(), 2, "both affinities parsed");
+        let d = m.affinities.get("design").expect("design affinity present");
+        assert_eq!(d.tier.as_deref(), Some("frontier"));
+        assert_eq!(d.capability.as_deref(), Some("UI design annealing"));
+        assert_eq!(
+            d.recommended.as_deref(),
+            Some("openrouter/anthropic/claude-sonnet-4-5"),
+            "provider/model-id recommendation round-trips (model-id may contain `/`)"
+        );
+        let r = m
+            .affinities
+            .get("rollout")
+            .expect("rollout affinity present");
+        assert!(r.tier.is_none(), "omitted tier defaults None");
+        assert!(r.capability.is_none(), "omitted capability defaults None");
+        assert_eq!(r.recommended.as_deref(), Some("openrouter/z-ai/glm-5.2"));
+    }
+
+    #[test]
+    fn load_manifest_defaults_affinities_empty_when_absent() {
+        // Additive: a v1 stub with no `affinities:` still loads (empty map), so
+        // no existing pack manifest needs editing.
+        let td = TempDir::new().unwrap();
+        write_manifest(td.path(), &minimal_manifest("swe"));
+        assert!(
+            load_manifest(td.path()).unwrap().affinities.is_empty(),
+            "absent affinities defaults to an empty map"
+        );
+    }
+
+    #[test]
+    fn load_manifest_rejects_unknown_affinity_field() {
+        // `deny_unknown_fields` on AffinityRequirement — a typo'd key fails loud.
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: design\nnamespace: design\nversion: 0.1.0\n\
+             affinities:\n  design:\n    reccomended: openrouter/x\n",
+        );
+        load_manifest(td.path()).expect_err("unknown affinity field should error");
     }
 
     #[test]
@@ -939,7 +1066,7 @@ workflows:
             "workflows:\n  flow.onboard-tool:\n    title: x\n",
         );
         let m = load_manifest(td.path()).unwrap();
-        let warns = unscanned_definition_warnings(td.path(), &m.layout);
+        let warns = unscanned_definition_warnings(td.path(), &m.layout, &m.reference_only);
         assert_eq!(
             warns.len(),
             1,
@@ -974,9 +1101,97 @@ workflows:
         );
         let m = load_manifest(td.path()).unwrap();
         assert!(
-            unscanned_definition_warnings(td.path(), &m.layout).is_empty(),
+            unscanned_definition_warnings(td.path(), &m.layout, &m.reference_only).is_empty(),
             "default-dir tier must not warn"
         );
+    }
+
+    // ---- D6: reference_only opt-in suppresses UNSCANNED_DEFINITION_DIR --------
+
+    /// D6 (suppress side) — a manifest that maps `connections` elsewhere AND
+    /// declares `reference_only: [connections]` leaves the default `connections/`
+    /// dir holding YAML INTENTIONALLY, so its warning is suppressed FOR THAT TIER.
+    #[test]
+    fn reference_only_tier_suppresses_unscanned_warning() {
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: cog\nnamespace: cog\nversion: 0.1.0\n\
+             layout:\n  connections: wired\nreference_only:\n  - connections\n",
+        );
+        write_file(
+            td.path(),
+            "connections/reference.only.yaml",
+            "connections:\n  ref:\n    kind: mcp\n",
+        );
+        let m = load_manifest(td.path()).unwrap();
+        assert!(
+            unscanned_definition_warnings(td.path(), &m.layout, &m.reference_only).is_empty(),
+            "an explicitly reference_only tier must NOT warn"
+        );
+    }
+
+    /// D6 (no-false-negative side) — the SAME layout WITHOUT the `reference_only`
+    /// opt-in must STILL warn: suppression is opt-in only, a genuinely-unscanned
+    /// dir is never silently swallowed.
+    #[test]
+    fn unscanned_still_warns_without_reference_only_optin() {
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: cog\nnamespace: cog\nversion: 0.1.0\n\
+             layout:\n  connections: wired\n",
+        );
+        write_file(
+            td.path(),
+            "connections/reference.only.yaml",
+            "connections:\n  ref:\n    kind: mcp\n",
+        );
+        let m = load_manifest(td.path()).unwrap();
+        assert!(m.reference_only.is_empty(), "no opt-in declared");
+        let warns = unscanned_definition_warnings(td.path(), &m.layout, &m.reference_only);
+        assert_eq!(
+            warns.len(),
+            1,
+            "unscanned dir without opt-in must warn: {warns:?}"
+        );
+        assert!(
+            warns[0].contains("UNSCANNED_DEFINITION_DIR"),
+            "{}",
+            warns[0]
+        );
+    }
+
+    /// D6 (poka-yoke) — an unknown `reference_only:` tier is a typo that would
+    /// silently fail to suppress; `load_manifest` rejects it hard.
+    #[test]
+    fn reference_only_unknown_tier_is_rejected() {
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: cog\nnamespace: cog\nversion: 0.1.0\n\
+             reference_only:\n  - connection\n", // typo: singular
+        );
+        let err = load_manifest(td.path()).expect_err("unknown tier must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown `reference_only:` tier"), "{msg}");
+        assert!(msg.contains("connection"), "names the bad token: {msg}");
+    }
+
+    /// D6 — a reference_only tier that uses its DEFAULT dir (nothing remapped)
+    /// still yields no warning and does not error; the opt-in is inert but valid.
+    #[test]
+    fn reference_only_backward_compatible_with_string_layout() {
+        // The classic string `layout: { connections: <dir> }` form still parses.
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: cog\nnamespace: cog\nversion: 0.1.0\n\
+             layout:\n  connections: wired\n",
+        );
+        let m = load_manifest(td.path()).expect("string layout still parses");
+        assert_eq!(m.layout.connections, "wired");
+        assert!(m.reference_only.is_empty());
     }
 
     #[test]

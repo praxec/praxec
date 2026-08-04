@@ -44,6 +44,7 @@ fn item(id: &str, kind: DiscoveryKind) -> DiscoveryItem {
         body: None,
         source: Some("config".to_string()),
         structural_fingerprint: None,
+        lifecycle: None,
     }
 }
 

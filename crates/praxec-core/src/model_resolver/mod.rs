@@ -37,6 +37,7 @@ pub use classify::FailureClass;
 pub use config::{
     Affinity, AffinityScores, AnthropicFeatures, Binding, GoogleFeatures, ModelConfigError,
     ModelsFile, OpenAIFeatures, OverrideKey, Provider, ProviderFeatures, Tier, affinity_fit,
+    models_config_schema,
 };
 pub use preflight::{
     PreflightError, api_key_env_for, api_key_env_for_slug, verify_all_primary_bindings,

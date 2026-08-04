@@ -3052,9 +3052,37 @@ fn load_resolved_with_repos_mode(
     // clone-and-reset machinery, keyed off the host dir (so its cache sits
     // beside the repo caches). A local-path string is left untouched.
     resolve_registry_source(&mut merged, &parent_dir, &mut repo_diagnostics)?;
+    // A relative `gateway.models_yaml` must resolve against the config file's
+    // directory, NOT the process CWD — an editor-launched MCP subprocess (Claude
+    // Code / Cursor) runs from the user's project dir, and CI/tools run from
+    // wherever they were invoked. CWD-relative resolution made a valid config
+    // (its models.yaml sitting right beside it) hard-fail `MODELS_YAML_LOAD_FAILED`
+    // from any other CWD. Normalize once here so every downstream consumer (the D1
+    // load check, the cost/affinity resolver, the runtime) sees a CWD-independent path.
+    normalize_models_yaml_path(&mut merged, &parent_dir);
     let (resolved, diagnostics) = resolve_with_diagnostics(merged)?;
     repo_diagnostics.extend(diagnostics);
     Ok((resolved, repo_diagnostics))
+}
+
+/// Rewrite a relative `gateway.models_yaml` to absolute against the config file's
+/// directory. Absolute paths and an absent key are left untouched. See the call
+/// site: the fix is that a config's `models_yaml` is resolved relative to the
+/// config, not the process CWD.
+fn normalize_models_yaml_path(config: &mut Value, config_dir: &Path) {
+    let Some(raw) = config
+        .pointer("/gateway/models_yaml")
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    if raw.is_empty() || Path::new(raw).is_absolute() {
+        return;
+    }
+    let abs = config_dir.join(raw);
+    if let Some(slot) = config.pointer_mut("/gateway/models_yaml") {
+        *slot = Value::String(abs.to_string_lossy().into_owned());
+    }
 }
 
 /// The registry file an operator's `discovery.registry` points a repo at — the
@@ -3303,6 +3331,15 @@ fn merge_declared_repos(
     // `loaded_packs`) both read the SAME computed list — one introspection,
     // two consumers.
     let mut pack_provenance_records: Vec<crate::repo_git::PackProvenance> = Vec::new();
+    // onboarding-hardening — (namespace, declared affinity requirements) for
+    // every loaded pack that declares an `affinities:` block. Carried into the
+    // merged config under `/praxec/_packAffinities` (see `stamp_pack_affinities`)
+    // so the config-readiness keystone in `check`/`doctor` can surface a pack's
+    // RECOMMENDATION when one of its MOUNTED affinities resolves to no binding.
+    let mut pack_affinities: Vec<(
+        String,
+        std::collections::BTreeMap<String, crate::repo::AffinityRequirement>,
+    )> = Vec::new();
 
     for RepoDecl {
         source,
@@ -3564,6 +3601,13 @@ fn merge_declared_repos(
             );
         }
         repo_priorities.push((manifest.namespace.clone(), priority));
+        // onboarding-hardening — carry this pack's declared affinity requirements
+        // forward, keyed by namespace, so the keystone can attribute an unbound
+        // MOUNTED affinity to its pack + surface the recommendation. Only packs
+        // that DECLARE `affinities:` contribute (empty map → nothing stamped).
+        if !manifest.affinities.is_empty() {
+            pack_affinities.push((manifest.namespace.clone(), manifest.affinities.clone()));
+        }
         // pack-provenance-recording — this pack has a namespace, so it's in
         // scope for the durable "what version drove this run" record. Works
         // for BOTH a local `path:` checkout and a remote `uri:` pack's
@@ -3722,6 +3766,11 @@ fn merge_declared_repos(
     // event AND `discovery::home()` can surface it live as `loaded_packs`,
     // both reading this SAME stamp.
     stamp_pack_provenance(&mut merged, pack_provenance_records);
+
+    // onboarding-hardening — carry each loaded pack's declared `affinities:`
+    // forward so the config-readiness keystone can surface a pack recommendation
+    // for an unbound MOUNTED affinity (the "requirement travels" piece).
+    stamp_pack_affinities(&mut merged, pack_affinities);
 
     // SPEC §9.5 — surface ungranted pack connections as live, self-documenting
     // DEGRADED state (the #23 pattern): each entry carries the exact YAML
@@ -4034,6 +4083,53 @@ fn stamp_pack_provenance(config: &mut Value, provenance: Vec<crate::repo_git::Pa
             .map(|p| serde_json::to_value(p).expect("PackProvenance serializes"))
             .collect();
         fg.insert("_packProvenance".into(), Value::Array(entries));
+    }
+}
+
+/// onboarding-hardening — record each loaded pack's declared `affinities:` under
+/// `/praxec/_packAffinities` as `{ <namespace>: { <affinity>: { tier?,
+/// capability?, recommended? } } }` (internal resolved-config metadata, not an
+/// operator-authored key — mirrors [`stamp_pack_provenance`]/`_packProvenance`).
+/// The config-readiness keystone reads this to attribute an unbound MOUNTED
+/// affinity to its pack and surface the pack's recommendation. RECORDS, never
+/// constrains: a pack with no `affinities:` simply contributes nothing. No-op
+/// when empty.
+fn stamp_pack_affinities(
+    config: &mut Value,
+    affinities: Vec<(
+        String,
+        std::collections::BTreeMap<String, crate::repo::AffinityRequirement>,
+    )>,
+) {
+    if affinities.is_empty() {
+        return;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let praxec = obj
+        .entry("praxec")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(fg) = praxec.as_object_mut() {
+        let mut by_ns = Map::new();
+        for (ns, reqs) in affinities {
+            let mut ns_map = Map::new();
+            for (name, req) in reqs {
+                let mut entry = Map::new();
+                if let Some(t) = req.tier {
+                    entry.insert("tier".into(), Value::String(t));
+                }
+                if let Some(c) = req.capability {
+                    entry.insert("capability".into(), Value::String(c));
+                }
+                if let Some(r) = req.recommended {
+                    entry.insert("recommended".into(), Value::String(r));
+                }
+                ns_map.insert(name, Value::Object(entry));
+            }
+            by_ns.insert(ns, Value::Object(ns_map));
+        }
+        fg.insert("_packAffinities".into(), Value::Object(by_ns));
     }
 }
 
@@ -4926,6 +5022,43 @@ fn rewrite_executors_in_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── C1: gateway.models_yaml resolves against the config dir, not the CWD ────
+
+    #[test]
+    fn normalize_models_yaml_rewrites_relative_against_config_dir() {
+        use serde_json::json;
+        let mut cfg = json!({ "gateway": { "models_yaml": "./models.yaml" } });
+        normalize_models_yaml_path(&mut cfg, Path::new("/home/user/.config/praxec"));
+        assert_eq!(
+            cfg.pointer("/gateway/models_yaml").and_then(Value::as_str),
+            Some("/home/user/.config/praxec/./models.yaml"),
+            "a relative models_yaml must be joined to the config's dir (CWD-independent)"
+        );
+    }
+
+    #[test]
+    fn normalize_models_yaml_leaves_absolute_paths_untouched() {
+        use serde_json::json;
+        let mut cfg = json!({ "gateway": { "models_yaml": "/etc/praxec/models.yaml" } });
+        normalize_models_yaml_path(&mut cfg, Path::new("/home/user/.config/praxec"));
+        assert_eq!(
+            cfg.pointer("/gateway/models_yaml").and_then(Value::as_str),
+            Some("/etc/praxec/models.yaml"),
+            "an absolute models_yaml is authoritative — never rewritten"
+        );
+    }
+
+    #[test]
+    fn normalize_models_yaml_is_a_noop_when_absent() {
+        use serde_json::json;
+        let mut cfg = json!({ "gateway": { "allow_ephemeral": true } });
+        normalize_models_yaml_path(&mut cfg, Path::new("/anywhere"));
+        assert!(
+            cfg.pointer("/gateway/models_yaml").is_none(),
+            "no models_yaml key ⇒ nothing added"
+        );
+    }
 
     #[test]
     fn inject_halt_adds_kill_switch_only_when_enabled() {

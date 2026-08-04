@@ -275,6 +275,18 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ConnectionsCommand,
     },
+    /// Manage the operator's `models.yaml` affinity bindings.
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
+    /// Manage the provider API keys praxec's governed agents use — set / list /
+    /// remove, in the same `providers.env` `praxec init` writes. Gateway-native
+    /// and cross-platform (no `px` TUI or shell script required).
+    Providers {
+        #[command(subcommand)]
+        command: ProvidersCommand,
+    },
     /// Inspect a pack (resource repo) without building a gateway.
     Pack {
         #[command(subcommand)]
@@ -377,6 +389,13 @@ pub(crate) enum SchemaCommand {
     /// { observe: true }` read. Includes the execution-tree linkage fields
     /// (`workflow_id`, `parent_workflow_id`, `depth`).
     AuditEvent,
+    /// D3 — the `models.yaml` config on-disk shape: the `default:` fallback
+    /// chain, the closed `overrides:` affinity/tier pools, the OPEN `activity:`
+    /// pools, and the provider+model binding entry (with optional `effort` /
+    /// per-provider `features`). Generated from the canonical
+    /// [`praxec_core::model_resolver::models_config_schema`] struct.
+    #[command(name = "models-config")]
+    ModelsConfig,
 }
 
 /// D4a — the connection kind the operator names on `connections add --kind`.
@@ -517,6 +536,53 @@ pub(crate) enum ToolsCommand {
         /// The tool id (or its `command`) to install.
         tool_id: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ModelsCommand {
+    /// Bind an affinity a MOUNTED pack recommends into the operator's
+    /// `models.yaml`, using the operator's existing provider env. Writes
+    /// `activity: { <affinity>: [ { provider, model } ] }` from the pack's
+    /// `recommended:` binding (self-wiring on pull). NEVER overwrites an existing
+    /// binding; NEVER fabricates a key — if the recommended provider's key is
+    /// absent, it prints the manual snippet instead of writing a dead binding.
+    Bind {
+        /// Path to the gateway YAML config (its `models_yaml` + wired packs
+        /// supply the models.yaml path and the recommendation).
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The affinity to bind (e.g. `design`).
+        affinity: String,
+    },
+}
+
+/// `praxec providers <cmd>` — native provider-key management (see
+/// [`crate::providers`]). All operate on the resolved `providers.env`.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ProvidersCommand {
+    /// List configured providers with their key values masked.
+    List,
+    /// Set a provider's API key(s). Interactive (no-echo) by default; use
+    /// `--key-stdin` (one line per env var) or `--from-env` for scripting / CI.
+    /// Omit `--provider` to walk every supported provider interactively.
+    Set {
+        /// Provider slug (e.g. `openrouter`, `anthropic`, `openai`). Omit to walk all.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Read each key value from stdin (one line per env var) instead of prompting.
+        #[arg(long, requires = "provider")]
+        key_stdin: bool,
+        /// Read each key value from the matching environment variable.
+        #[arg(long, requires = "provider", conflicts_with = "key_stdin")]
+        from_env: bool,
+    },
+    /// Remove a provider's key(s) from the file.
+    Remove {
+        /// Provider slug to clear (e.g. `openrouter`).
+        provider: String,
+    },
+    /// Print the resolved provider-keys file path and exit.
+    Path,
 }
 
 #[derive(Subcommand, Debug)]
@@ -910,6 +976,142 @@ pub fn llm_overlay_registrar() -> OverlayRegistrar {
         let llm_executor: Arc<dyn Executor> = Arc::new(llm_executor);
         Arc::new(SingleKindOverlay::new(ctx.inner, "llm", llm_executor))
     })
+}
+
+/// D4 — the ABSOLUTE, canonicalized path of the config actually in force, for
+/// the `serve` banner / `health` / `doctor` to echo (the two-config trap: an
+/// operator editing a different `gateway.yaml` than the one the server loaded).
+/// Falls back to an absolute join with the cwd, then to the raw path, so it
+/// always returns *something* printable even for a not-yet-existing file.
+pub(crate) fn absolute_config_path(path: &std::path::Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// D4 — the conventional install location `praxec init` scaffolds into
+/// (`dirs::config_dir()/praxec/gateway.yaml`). `doctor` notes when a DIFFERENT
+/// config exists there than the one in force AND its contents differ — the
+/// two-config trap (editing `~/.config/praxec/gateway.yaml` while serving a
+/// project-local one, or vice-versa). Returns `None` when the platform has no
+/// config dir or the conventional file is absent.
+pub(crate) fn conventional_config_path() -> Option<PathBuf> {
+    let p = dirs::config_dir()?.join("praxec").join("gateway.yaml");
+    p.exists().then_some(p)
+}
+
+/// D4 — the two-config-trap NOTE for `doctor`: `Some(message)` iff a config
+/// exists at the [`conventional_config_path`], it is a DIFFERENT file than
+/// `in_force`, and their contents differ. Same-file (the operator IS serving the
+/// conventional one) ⇒ `None`; identical contents ⇒ `None` (no divergence to
+/// warn about).
+pub(crate) fn two_config_trap_note(in_force: &std::path::Path) -> Option<String> {
+    let conventional = conventional_config_path()?;
+    let in_force_abs = absolute_config_path(in_force);
+    let conventional_abs = absolute_config_path(&conventional);
+    if in_force_abs == conventional_abs {
+        return None; // serving the conventional file itself — no trap
+    }
+    let in_force_body = std::fs::read_to_string(&in_force_abs).ok()?;
+    let conventional_body = std::fs::read_to_string(&conventional_abs).ok()?;
+    if in_force_body == conventional_body {
+        return None; // same content — a copy, not a divergent second config
+    }
+    Some(format!(
+        "NOTE: a DIFFERENT config exists at the conventional location `{}` and its contents \
+         differ from the in-force config `{}`. If you meant to edit the running config, confirm \
+         which file this gateway loads — edits to the other one have no effect (the two-config trap).",
+        conventional_abs.display(),
+        in_force_abs.display(),
+    ))
+}
+
+/// The keys the loader actually reads under `gateway:` — the CLOSED, fully
+/// code-enumerable set (every `config.pointer("/gateway/…")` site). A key here
+/// that is NOT in this set is silently ignored by the loader, so `check` flags
+/// it (D2). Keep in lockstep with the reads in `gateway.rs`/`preflight.rs`/the
+/// cost + llm doctors — a new `gateway.<key>` the loader reads MUST be added
+/// here or it will be falsely flagged.
+const GATEWAY_ALLOWED_KEYS: &[&str] = &[
+    "allow_ephemeral",
+    "cost",
+    "models_yaml",
+    "principal",
+    "strict_validation",
+    "trust_meta_principal",
+];
+
+/// D2 — config-as-closed-structure scan (additive; the config stays
+/// `Value`-parsed). Two conservative, no-false-positive checks over the resolved
+/// config:
+///
+///  1. **Misplaced `models_yaml`** — a `models_yaml` key ANYWHERE other than
+///     `gateway.models_yaml` (top-level, or under `praxec:`) is silently ignored
+///     by the loader. Flag it with the "did you mean `gateway.models_yaml`?"
+///     hint. (The loader-injected `praxec._*` keys are never named `models_yaml`,
+///     so this cannot false-positive.)
+///  2. **Unknown `gateway:` keys** — the `gateway:` block is a CLOSED,
+///     code-enumerable set ([`GATEWAY_ALLOWED_KEYS`]); any other key is
+///     loader-ignored dead config. The `praxec:` block is deliberately NOT
+///     enforced here: it is an open/extensible namespace (the documented
+///     `structural_rules` hook + loader-injected `_*` keys), so its allowed set
+///     cannot be safely enumerated from code — enforcing it would risk a false
+///     positive, which the goal forbids.
+///
+/// Every finding is a hard `Diagnostic::Error` (mirrors the D1 message style:
+/// names the wrong location + the consequence + the fix).
+pub fn config_structure_findings(config: &Value) -> Vec<praxec_core::validate::Diagnostic> {
+    use praxec_core::validate::Diagnostic;
+    let mut out = Vec::new();
+
+    // (1) Misplaced `models_yaml`. Gate the SEVERITY on whether the config
+    // consumes models (same invariant as D1): a misplaced key on a config with no
+    // agent/affinity/llm step is inert — a WARNING, so a valid upgrade isn't broken
+    // — while on a model-consuming config it hard-errors (bindings silently fail).
+    let consumes = crate::readiness::config_consumes_models(config);
+    let misplaced = |where_: &str| -> Diagnostic {
+        let msg = format!(
+            "MODELS_YAML_MISPLACED: {where_} is ignored by the loader — the gateway only reads \
+             `gateway.models_yaml`. Move it under `gateway:` (did you mean `gateway.models_yaml`?), \
+             or affinity/agent model bindings will silently fail to load."
+        );
+        if consumes {
+            Diagnostic::Error(msg)
+        } else {
+            Diagnostic::Warning(msg)
+        }
+    };
+    if config.pointer("/models_yaml").is_some() {
+        out.push(misplaced("a top-level `models_yaml` key"));
+    }
+    if config.pointer("/praxec/models_yaml").is_some() {
+        out.push(misplaced("`models_yaml` under `praxec:`"));
+    }
+
+    // (2) Unknown keys in the closed `gateway:` block.
+    if let Some(gateway) = config.pointer("/gateway").and_then(Value::as_object) {
+        for key in gateway.keys() {
+            if GATEWAY_ALLOWED_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            // `models_yaml` is allowed HERE (this is its correct home), so the
+            // misplaced-scan above never reaches this branch for it.
+            out.push(Diagnostic::Error(format!(
+                "UNKNOWN_GATEWAY_KEY: `gateway.{key}` is not a recognized gateway setting and is \
+                 silently ignored by the loader. Allowed `gateway:` keys: {}. Remove it or fix the \
+                 spelling.",
+                GATEWAY_ALLOWED_KEYS.join(", ")
+            )));
+        }
+    }
+
+    out
 }
 
 /// H5 — scan the resolved config for use of the describe-ack guards and report
@@ -1363,5 +1565,177 @@ mod parked_store_wiring_tests {
             Ok(_) => panic!("sqlite without a path must fail fast"),
         };
         assert!(err.to_string().contains("store.path is required"));
+    }
+}
+
+#[cfg(test)]
+mod config_structure_tests {
+    use super::config_structure_findings;
+    use praxec_core::validate::Diagnostic;
+    use serde_json::json;
+
+    fn error_messages(cfg: &serde_json::Value) -> Vec<String> {
+        config_structure_findings(cfg)
+            .into_iter()
+            .map(|d| match d {
+                Diagnostic::Error(m) => m,
+                other => panic!("D2 findings must be errors, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A model-consuming step so D2 applies at ERROR severity (see C2 gating).
+    fn consuming_workflows() -> serde_json::Value {
+        json!({ "wf": { "states": { "s": { "transitions": {
+            "go": { "target": "done", "executor": { "kind": "agent", "affinity": "coding", "goal": "x" } }
+        } } } } })
+    }
+
+    /// D2 repro — `models_yaml` under `praxec:` is silently ignored today; now a
+    /// hard error (on a model-consuming config) naming the wrong location + the
+    /// `gateway.models_yaml` hint.
+    #[test]
+    fn models_yaml_under_praxec_is_flagged_with_hint() {
+        let cfg = json!({ "praxec": { "models_yaml": "/some/models.yaml" }, "workflows": consuming_workflows() });
+        let msgs = error_messages(&cfg);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("MODELS_YAML_MISPLACED"), "{}", msgs[0]);
+        assert!(
+            msgs[0].contains("praxec:"),
+            "names wrong location: {}",
+            msgs[0]
+        );
+        assert!(
+            msgs[0].contains("gateway.models_yaml"),
+            "carries the did-you-mean hint: {}",
+            msgs[0]
+        );
+    }
+
+    /// D2 — a top-level `models_yaml` is likewise misplaced/ignored.
+    #[test]
+    fn top_level_models_yaml_is_flagged_with_hint() {
+        let cfg = json!({ "models_yaml": "/some/models.yaml", "workflows": consuming_workflows() });
+        let msgs = error_messages(&cfg);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(
+            msgs[0].contains("MODELS_YAML_MISPLACED") && msgs[0].contains("gateway.models_yaml"),
+            "{}",
+            msgs[0]
+        );
+    }
+
+    /// C2 — a misplaced `models_yaml` on a config that consumes NO models is inert;
+    /// it is a WARNING (not a hard error), so a valid 0.0.47 config upgrades clean.
+    #[test]
+    fn misplaced_models_yaml_without_model_consumer_is_a_warning() {
+        let cfg = json!({ "models_yaml": "/some/models.yaml" });
+        let findings = config_structure_findings(&cfg);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(
+            matches!(&findings[0], Diagnostic::Warning(m) if m.contains("MODELS_YAML_MISPLACED")),
+            "no model-consuming step ⇒ warning: {:?}",
+            findings[0]
+        );
+    }
+
+    /// NO FALSE POSITIVE — the CORRECT `gateway.models_yaml` must NOT be flagged.
+    #[test]
+    fn correct_gateway_models_yaml_is_not_flagged() {
+        let cfg = json!({ "gateway": { "models_yaml": "/ok/models.yaml" } });
+        assert!(
+            config_structure_findings(&cfg).is_empty(),
+            "a correct gateway.models_yaml is legitimate config"
+        );
+    }
+
+    /// NO FALSE POSITIVE — every currently-read `gateway:` key passes clean.
+    #[test]
+    fn all_known_gateway_keys_pass_clean() {
+        let cfg = json!({ "gateway": {
+            "allow_ephemeral": true,
+            "cost": { "frontier_cap_usd_per_m": 5.0 },
+            "models_yaml": "/ok/models.yaml",
+            "principal": { "roles": ["human"] },
+            "strict_validation": true,
+            "trust_meta_principal": false,
+        } });
+        assert!(config_structure_findings(&cfg).is_empty());
+    }
+
+    /// D2 — an unknown key in the closed `gateway:` block errors, listing the
+    /// unknown key + the allowed set.
+    #[test]
+    fn unknown_gateway_key_is_flagged_with_allowed_set() {
+        let cfg = json!({ "gateway": { "modelz_yaml": "/typo.yaml" } });
+        let msgs = error_messages(&cfg);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("UNKNOWN_GATEWAY_KEY"), "{}", msgs[0]);
+        assert!(
+            msgs[0].contains("modelz_yaml"),
+            "names the key: {}",
+            msgs[0]
+        );
+        assert!(
+            msgs[0].contains("models_yaml") && msgs[0].contains("allow_ephemeral"),
+            "lists the allowed set: {}",
+            msgs[0]
+        );
+    }
+
+    /// NO FALSE POSITIVE — the `praxec:` namespace is intentionally open
+    /// (extensible `structural_rules` hook + loader-injected `_*` keys), so an
+    /// arbitrary praxec key is NOT rejected. Only a misplaced `models_yaml`
+    /// there is (covered above).
+    #[test]
+    fn arbitrary_praxec_keys_are_not_rejected() {
+        let cfg = json!({ "praxec": {
+            "strict_namespacing": true,
+            "structural_rules": [ { "rule": "x", "severity": "warning" } ],
+            "_packAffinities": {},
+            "some_future_extension": { "k": 1 },
+        } });
+        assert!(
+            config_structure_findings(&cfg).is_empty(),
+            "praxec is an open namespace; only a misplaced models_yaml is flagged"
+        );
+    }
+}
+
+#[cfg(test)]
+mod config_path_echo_tests {
+    use super::{absolute_config_path, two_config_trap_note};
+
+    /// D4 — the echoed in-force path is ABSOLUTE (canonicalized) for a real file.
+    #[test]
+    fn absolute_config_path_is_absolute_for_a_real_file() {
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("gateway.yaml");
+        std::fs::write(&p, "version: \"1.0.0\"\n").unwrap();
+        let abs = absolute_config_path(&p);
+        assert!(abs.is_absolute(), "must be absolute: {}", abs.display());
+    }
+
+    /// D4 — even a relative, not-yet-existing path resolves to an absolute path
+    /// (joined with cwd) rather than staying relative.
+    #[test]
+    fn absolute_config_path_absolutizes_relative_missing_path() {
+        let abs = absolute_config_path(std::path::Path::new("does-not-exist-xyz.yaml"));
+        assert!(abs.is_absolute(), "must be absolute: {}", abs.display());
+    }
+
+    /// D4 — the two-config-trap note fires only when a DIFFERENT conventional
+    /// config exists with DIVERGENT content. Serving the conventional file
+    /// itself (same path) must NOT note a trap.
+    #[test]
+    fn two_config_trap_none_when_in_force_is_the_conventional_file() {
+        // When there is no conventional config, or it equals the in-force one,
+        // there is no trap. We can only assert the same-file branch portably.
+        if let Some(conventional) = super::conventional_config_path() {
+            assert!(
+                two_config_trap_note(&conventional).is_none(),
+                "serving the conventional file itself is not a trap"
+            );
+        }
     }
 }

@@ -40,6 +40,28 @@
         "scripts":       { "type": "string", "default": "scripts" },
         "connections":   { "type": "string", "default": "connections" }
       }
+    },
+    "affinities": {
+      "type": "object",
+      "description": "Optional per-affinity requirements this pack's definitions use — the requirement TRAVELS with the pack. The config-readiness keystone surfaces the recommendation when a MOUNTED affinity resolves to no binding in the operator's models.yaml. A recommendation, never a pin.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "tier":        { "type": "string", "description": "Tier hint (frontier | commodity | …); advisory." },
+          "capability":  { "type": "string", "description": "One-line human description of what this affinity is used for." },
+          "recommended": { "type": "string", "description": "Recommended binding as `<provider>/<model-id>` (the model-id itself may contain `/`)." }
+        }
+      }
+    },
+    "reference_only": {
+      "type": "array",
+      "description": "Tiers whose remapped default directory is INTENTIONALLY reference-only (kept for humans, never loaded). Listing a tier here suppresses the by-design UNSCANNED_DEFINITION_DIR warning FOR THAT TIER ONLY — an explicit opt-in. Each entry must be a known tier name.",
+      "items": {
+        "type": "string",
+        "enum": ["capabilities", "flows", "skills", "scripts", "connections"]
+      },
+      "default": []
     }
   }
 }

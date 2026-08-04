@@ -156,16 +156,24 @@ pub enum Lifecycle {
     Experimental,
     Stable,
     Deprecated,
+    /// A deliberately-unfinished placeholder: the definition is declared but its
+    /// executor is a stub (spec-only), NOT a working implementation. Recognized
+    /// (so it is not rejected as `INVALID_LIFECYCLE`), but `check` emits a SOFT
+    /// warning — a placeholder must not be structurally indistinguishable from a
+    /// working definition — and `start` echoes it so a caller sees it at run.
+    Stub,
 }
 
 impl Lifecycle {
-    pub const ALL_TOKENS: &'static [&'static str] = &["experimental", "stable", "deprecated"];
+    pub const ALL_TOKENS: &'static [&'static str] =
+        &["experimental", "stable", "deprecated", "stub"];
 
     pub fn as_token(self) -> &'static str {
         match self {
             Lifecycle::Experimental => "experimental",
             Lifecycle::Stable => "stable",
             Lifecycle::Deprecated => "deprecated",
+            Lifecycle::Stub => "stub",
         }
     }
 
@@ -174,8 +182,15 @@ impl Lifecycle {
             "experimental" => Some(Lifecycle::Experimental),
             "stable" => Some(Lifecycle::Stable),
             "deprecated" => Some(Lifecycle::Deprecated),
+            "stub" => Some(Lifecycle::Stub),
             _ => None,
         }
+    }
+
+    /// A placeholder lifecycle — declared but not a working implementation.
+    /// Drives the `check` soft-warning and is echoed by `start`.
+    pub fn is_placeholder(self) -> bool {
+        matches!(self, Lifecycle::Stub)
     }
 }
 
@@ -370,6 +385,12 @@ pub struct DiscoveryItem {
     /// dedup pass would act on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structural_fingerprint: Option<String>,
+    /// SPEC §6.2 — the definition's declared `lifecycle:` token (`experimental`,
+    /// `stable`, `deprecated`, `stub`), surfaced so an operator sees maturity in
+    /// `describe`/`query {subject}` BEFORE acting. `None` for items that carry no
+    /// lifecycle (scripts, connections, and workflows that declare none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<String>,
 }
 
 /// The tag prefix that carries a flow's `process` / `taskClass` into the
@@ -446,6 +467,7 @@ impl DiscoveryItem {
             // Provenance, same meaning as a guidance fragment's `source`.
             source: descriptor.source_repo.clone(),
             structural_fingerprint: None,
+            lifecycle: None,
         }
     }
 }
@@ -1238,6 +1260,7 @@ mod semantic_tests {
             body: None,
             source: None,
             structural_fingerprint: None,
+            lifecycle: None,
         }
     }
 
