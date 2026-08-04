@@ -8,6 +8,36 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.48] — 2026-08-04 — onboarding: 10-second setup ("zero resistance to implementation")
+
+A new developer gets from install to a running workflow in seconds, and praxec
+feels like a magic MCP extension of Claude Code / Cursor. Found via three
+adversarial passes (virgin install, upgrade, static review) over the onboarding
+surface; every change is additive — no gate lowered, no capability removed.
+
+### Fixed
+
+- **models.yaml resolves against the config's directory, not the CWD** — an
+  editor-launched MCP subprocess (Claude Code / Cursor) runs from the project
+  dir; a relative `gateway.models_yaml` no longer hard-fails a valid config from
+  a different CWD.
+- **D1/D2 fire only when the config consumes models** — a config with no
+  `kind: agent`/`kind: llm`/affinity step no longer hard-errors on an inert
+  stale/misplaced `models_yaml` (a valid 0.0.47 config upgrades clean); a
+  model-consuming config still errors.
+- **`init` no longer ends on a false "credential missing"** — the pasted key is
+  loaded into the process env before the doctor epilogue.
+- Credential-preflight remedy points at gateway-native commands (`praxec init` /
+  `export`), not the `px` binary a gateway-only install does not have.
+
+### Added
+
+- **`init` scaffolds a writable project repo** — the first real command works
+  with no hand-editing (was `REPO_ROOT_REQUIRED`).
+- **The editor MCP entry carries `PRAXEC_PROVIDER_KEYS_FILE`** — an
+  editor-launched `serve` always finds its keys, even a `--dir` install.
+- The `init` closing banner is gated on the actual `doctor` verdict.
+
 ## [0.0.47] — 2026-08-02 — tool-provisioning robustness (dogfooding fixes)
 
 Robustness fixes found dogfooding v0.0.46's governed tool provisioning against real
