@@ -54,12 +54,15 @@ fn agent_config(models_yaml: &str, affinity: &str) -> String {
 fn d1_declared_but_missing_models_yaml_fails_check_and_doctor() {
     let td = tempfile::tempdir().unwrap();
     let cfg = td.path().join("gw.yaml");
-    // A config with NO agent step, whose declared models.yaml does not exist.
+    // A MODEL-CONSUMING config (a `kind: agent` step) whose declared models.yaml
+    // does not exist — the field-report design-annealing shape. D1 is a hard error
+    // here (every agent step would fail at dispatch).
     write(
         &cfg,
         "version: \"1.0.0\"\ngateway:\n  allow_ephemeral: true\n  models_yaml: \"NONEXISTENT.yaml\"\n\
-         workflows:\n  wf.plain:\n    title: Plain\n    initialState: start\n    states:\n      \
-         start:\n        transitions:\n          go: { target: done, executor: { kind: noop } }\n      \
+         workflows:\n  wf.agent:\n    title: Agent\n    initialState: start\n    states:\n      \
+         start:\n        transitions:\n          go:\n            target: done\n            actor: agent\n            \
+         executor: { kind: agent, affinity: coding, goal: \"x\" }\n      \
          done: { terminal: true }\n",
     );
 
@@ -85,6 +88,32 @@ fn d1_declared_but_missing_models_yaml_fails_check_and_doctor() {
         String::from_utf8_lossy(&doctor.stdout).contains("MODELS_YAML_LOAD_FAILED"),
         "doctor names the failure:\n{}",
         String::from_utf8_lossy(&doctor.stdout)
+    );
+}
+
+#[test]
+fn d1_dangling_models_yaml_without_agent_steps_is_a_nonfatal_warning() {
+    // C2 / frictionless-upgrade: a config that consumes NO models (only `kind: noop`)
+    // must NOT hard-fail on a broken models_yaml — a valid 0.0.47 config upgrades
+    // clean. The broken key is surfaced as a warning; check exits 0.
+    let td = tempfile::tempdir().unwrap();
+    let cfg = td.path().join("gw.yaml");
+    write(
+        &cfg,
+        "version: \"1.0.0\"\ngateway:\n  allow_ephemeral: true\n  models_yaml: \"NONEXISTENT.yaml\"\n\
+         workflows:\n  wf.plain:\n    title: Plain\n    initialState: start\n    states:\n      \
+         start:\n        transitions:\n          go: { target: done, executor: { kind: noop } }\n      \
+         done: { terminal: true }\n",
+    );
+    let check = run(&["check", "--config", cfg.to_str().unwrap()]);
+    let out = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        check.status.success(),
+        "a dangling models.yaml with no model-consuming step must NOT fail check:\n{out}"
+    );
+    assert!(
+        out.contains("MODELS_YAML_LOAD_FAILED"),
+        "but it is still surfaced as a warning:\n{out}"
     );
 }
 

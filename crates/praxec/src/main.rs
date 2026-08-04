@@ -408,7 +408,12 @@ mod models_yaml_doctor_tests {
         // models.yaml let `check`/`doctor` exit 0 while nothing agentic could run).
         // A DECLARED `gateway.models_yaml` MUST be loadable; a missing file is now
         // correctly MODELS_YAML_LOAD_FAILED.
-        let cfg = json!({ "gateway": { "models_yaml": "/no/such/models.yaml" } });
+        let cfg = json!({
+            "gateway": { "models_yaml": "/no/such/models.yaml" },
+            "workflows": { "wf": { "states": { "s": { "transitions": {
+                "go": { "target": "done", "executor": { "kind": "agent", "affinity": "coding", "goal": "x" } }
+            } } } } }
+        });
         let diags = run(&cfg);
         assert_eq!(diags.len(), 1, "a declared-but-missing file must error");
         assert!(
@@ -424,7 +429,12 @@ mod models_yaml_doctor_tests {
         let path = dir.join(format!("praxec_bad_models_{}.yaml", std::process::id()));
         // Not valid models.yaml — malformed YAML so from_path fails.
         std::fs::write(&path, "this: is: not: valid: models: yaml: [").unwrap();
-        let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
+        let cfg = json!({
+            "gateway": { "models_yaml": path.to_str().unwrap() },
+            "workflows": { "wf": { "states": { "s": { "transitions": {
+                "go": { "target": "done", "executor": { "kind": "agent", "affinity": "coding", "goal": "x" } }
+            } } } } }
+        });
         let diags = run(&cfg);
         std::fs::remove_file(&path).ok();
         assert_eq!(
