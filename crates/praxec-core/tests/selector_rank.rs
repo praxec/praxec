@@ -70,6 +70,7 @@ fn item(id: &str, kind: DiscoveryKind) -> DiscoveryItem {
         body: None,
         source: None,
         structural_fingerprint: None,
+        lifecycle: None,
     }
 }
 

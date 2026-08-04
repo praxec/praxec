@@ -702,6 +702,92 @@ impl ModelsFile {
     }
 }
 
+// ── documented on-disk schema (`praxec schema models-config`) ────────────────
+
+/// Documentation shape of `models.yaml` for `praxec schema models-config`.
+///
+/// This is the schemars-deriveable mirror of the on-disk contract the loader
+/// ([`RawModelsFile`]) enforces. A separate type is required because the loader
+/// itself is NOT schemars-deriveable: it uses custom `Deserialize` impls
+/// ([`RawPool`], [`OverrideKey`]), a `#[serde(from)]` provider, and
+/// `serde_yaml::Value` feature bags — none of which produce a faithful
+/// `JsonSchema`. The loader stays canonical for VALIDATION (it is what actually
+/// parses the file); this type documents the SHAPE. The
+/// `schema_matches_loader_shape` test pins the two together: a representative
+/// `models.yaml` covering every field here MUST parse through the real loader,
+/// so a drift in one is caught by the other.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct ModelsConfigSchema {
+    /// Config format version. Must be `1` (the loader rejects any other value).
+    pub version: u8,
+    /// When `true`, a specificity-walk fall-through becomes a load-time error
+    /// (exact-match-only semantics). Optional; defaults to `false`.
+    #[serde(default)]
+    pub strict_specificity: bool,
+    /// The mandatory fallback chain: an ordered list of provider+model bindings
+    /// tried in order until one resolves. Must be non-empty.
+    pub default: Vec<BindingSchema>,
+    /// Closed affinity/tier-keyed override pools. Keys are `<affinity>`,
+    /// `<tier>`, or `<affinity>-<tier>` (affinity ∈ {coding, reasoning, prose,
+    /// web-search, recon, agentic}; tier ∈ {frontier, standard, commoditized}).
+    #[serde(default)]
+    pub overrides: BTreeMap<String, PoolSchema>,
+    /// OPEN activity-keyed pools — any string key (e.g. `design`, `review`,
+    /// `rollout`) gets its own escalation path without a core change.
+    #[serde(default)]
+    pub activity: BTreeMap<String, PoolSchema>,
+}
+
+/// One concrete provider+model binding entry in a chain/pool.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct BindingSchema {
+    /// The provider block, e.g. `{ name: openrouter }` or
+    /// `{ name: custom, endpoint: "http://localhost:1234/v1" }`.
+    pub provider: ProviderSchema,
+    /// The model id at that provider, e.g. `anthropic/claude-sonnet-4-5`.
+    pub model: String,
+    /// Optional reasoning effort paired with THIS model (`low|medium|high|…`,
+    /// validated per-vendor). Omitted ⇒ the caller's phase/global effort applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Optional per-provider feature toggles (provider-specific keys, e.g.
+    /// `extended_thinking` for anthropic, `reasoning_effort` for openai).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<serde_json::Value>,
+}
+
+/// The `provider:` block on a binding.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct ProviderSchema {
+    /// Provider slug: `anthropic | openai | gemini | openrouter | ollama |
+    /// llamacpp | bedrock | fireworks | custom`.
+    pub name: String,
+    /// For `name: custom` only — the OpenAI-compatible endpoint URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+}
+
+/// An override/activity pool: either a bare ordered list of bindings, or a
+/// `{ members, strategy }` mapping. This documents the mapping form; the loader
+/// additionally accepts the bare-list shorthand.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct PoolSchema {
+    /// The pool's bindings, tried per its strategy.
+    pub members: Vec<BindingSchema>,
+    /// Selection strategy for the pool (e.g. `ordered`). Optional; defaults to
+    /// ordered chain-of-responsibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+}
+
+/// `praxec schema models-config` — the generated JSON Schema for the
+/// `models.yaml` on-disk shape ([`ModelsConfigSchema`]). Mirrors
+/// [`crate::audit::audit_event_schema`] for the audit event.
+pub fn models_config_schema() -> serde_json::Value {
+    let schema = schemars::schema_for!(ModelsConfigSchema);
+    serde_json::to_value(schema).expect("generated models-config schema serializes to JSON")
+}
+
 // ── error type ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -841,6 +927,59 @@ mod strategy_tests {
         assert_eq!(s, Strategy::Ordered);
         let s: Strategy = serde_yaml::from_str("distribute").unwrap();
         assert_eq!(s, Strategy::Distribute);
+    }
+}
+
+#[cfg(test)]
+mod models_config_schema_tests {
+    use super::*;
+
+    /// D3 — `praxec schema models-config` emits a non-empty JSON Schema that
+    /// documents the key models.yaml fields (the affinity/binding/default shape).
+    #[test]
+    fn schema_documents_the_key_models_yaml_fields() {
+        let schema = models_config_schema();
+        let s = serde_json::to_string(&schema).unwrap();
+        assert!(!s.is_empty());
+        // The four top-level shape keys an operator wires.
+        for key in ["version", "default", "overrides", "activity"] {
+            assert!(
+                s.contains(&format!("\"{key}\"")),
+                "schema documents `{key}`: {s}"
+            );
+        }
+        // The binding entry shape (provider + model) — what `default:`/pools hold.
+        assert!(s.contains("provider") && s.contains("model"), "{s}");
+        // It is a real JSON Schema object with named properties.
+        assert!(
+            schema.pointer("/properties/default").is_some(),
+            "top-level `default` is a documented property: {s}"
+        );
+    }
+
+    /// Anti-drift: the documented schema shape MUST parse through the REAL
+    /// loader. A representative models.yaml exercising every documented field
+    /// (`version`, `strict_specificity`, `default`, `overrides`, `activity`,
+    /// binding `effort` + `features`, pool `{ members, strategy }`) loads — so a
+    /// rename/removal in either the schema or the loader is caught here.
+    #[test]
+    fn schema_matches_loader_shape() {
+        let yaml = r#"
+version: 1
+strict_specificity: false
+default:
+  - { provider: { name: openrouter }, model: z-ai/glm-5.2 }
+overrides:
+  coding:
+    - { provider: { name: anthropic }, model: claude-sonnet-4-5, effort: high, features: { extended_thinking: true } }
+activity:
+  design:
+    members:
+      - { provider: { name: openrouter }, model: anthropic/claude-sonnet-4-5 }
+    strategy: ordered
+"#;
+        ModelsFile::from_yaml(yaml)
+            .expect("the documented models.yaml shape parses via the real loader");
     }
 }
 

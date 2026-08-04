@@ -507,6 +507,7 @@ fn the_structural_fingerprint_slot_round_trips() {
     assert_eq!(parsed.structural_fingerprint, None);
     let tool_shaped = serde_json::to_value(DiscoveryItem {
         structural_fingerprint: None,
+        lifecycle: None,
         ..parsed
     })
     .unwrap();

@@ -61,6 +61,7 @@ fn fixture_item_with_source(subject: &str, verb: &str, source: &str) -> Discover
         body: Some("body content the test must never see".into()),
         source: Some(source.into()),
         structural_fingerprint: None,
+        lifecycle: None,
     }
 }
 

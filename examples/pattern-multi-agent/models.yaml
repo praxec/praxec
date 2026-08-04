@@ -1,0 +1,11 @@
+# Minimal models.yaml for the multi-agent example — makes `gateway.models_yaml:
+# ./models.yaml` (in gateway.yaml) resolve to a real file so `praxec check`
+# passes. A single commodity `default:` chain is enough: the example's `coding`
+# and `reasoning` affinities are CLOSED keys that resolve through this chain when
+# no `activity:`/`overrides:` entry pins them. Swap the model / add a
+# provider key (via `praxec doctor`) to actually run the agents.
+version: 1
+default:
+  - provider:
+      name: openrouter
+    model: z-ai/glm-5.2

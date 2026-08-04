@@ -3303,6 +3303,15 @@ fn merge_declared_repos(
     // `loaded_packs`) both read the SAME computed list — one introspection,
     // two consumers.
     let mut pack_provenance_records: Vec<crate::repo_git::PackProvenance> = Vec::new();
+    // onboarding-hardening — (namespace, declared affinity requirements) for
+    // every loaded pack that declares an `affinities:` block. Carried into the
+    // merged config under `/praxec/_packAffinities` (see `stamp_pack_affinities`)
+    // so the config-readiness keystone in `check`/`doctor` can surface a pack's
+    // RECOMMENDATION when one of its MOUNTED affinities resolves to no binding.
+    let mut pack_affinities: Vec<(
+        String,
+        std::collections::BTreeMap<String, crate::repo::AffinityRequirement>,
+    )> = Vec::new();
 
     for RepoDecl {
         source,
@@ -3564,6 +3573,13 @@ fn merge_declared_repos(
             );
         }
         repo_priorities.push((manifest.namespace.clone(), priority));
+        // onboarding-hardening — carry this pack's declared affinity requirements
+        // forward, keyed by namespace, so the keystone can attribute an unbound
+        // MOUNTED affinity to its pack + surface the recommendation. Only packs
+        // that DECLARE `affinities:` contribute (empty map → nothing stamped).
+        if !manifest.affinities.is_empty() {
+            pack_affinities.push((manifest.namespace.clone(), manifest.affinities.clone()));
+        }
         // pack-provenance-recording — this pack has a namespace, so it's in
         // scope for the durable "what version drove this run" record. Works
         // for BOTH a local `path:` checkout and a remote `uri:` pack's
@@ -3722,6 +3738,11 @@ fn merge_declared_repos(
     // event AND `discovery::home()` can surface it live as `loaded_packs`,
     // both reading this SAME stamp.
     stamp_pack_provenance(&mut merged, pack_provenance_records);
+
+    // onboarding-hardening — carry each loaded pack's declared `affinities:`
+    // forward so the config-readiness keystone can surface a pack recommendation
+    // for an unbound MOUNTED affinity (the "requirement travels" piece).
+    stamp_pack_affinities(&mut merged, pack_affinities);
 
     // SPEC §9.5 — surface ungranted pack connections as live, self-documenting
     // DEGRADED state (the #23 pattern): each entry carries the exact YAML
@@ -4034,6 +4055,53 @@ fn stamp_pack_provenance(config: &mut Value, provenance: Vec<crate::repo_git::Pa
             .map(|p| serde_json::to_value(p).expect("PackProvenance serializes"))
             .collect();
         fg.insert("_packProvenance".into(), Value::Array(entries));
+    }
+}
+
+/// onboarding-hardening — record each loaded pack's declared `affinities:` under
+/// `/praxec/_packAffinities` as `{ <namespace>: { <affinity>: { tier?,
+/// capability?, recommended? } } }` (internal resolved-config metadata, not an
+/// operator-authored key — mirrors [`stamp_pack_provenance`]/`_packProvenance`).
+/// The config-readiness keystone reads this to attribute an unbound MOUNTED
+/// affinity to its pack and surface the pack's recommendation. RECORDS, never
+/// constrains: a pack with no `affinities:` simply contributes nothing. No-op
+/// when empty.
+fn stamp_pack_affinities(
+    config: &mut Value,
+    affinities: Vec<(
+        String,
+        std::collections::BTreeMap<String, crate::repo::AffinityRequirement>,
+    )>,
+) {
+    if affinities.is_empty() {
+        return;
+    }
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let praxec = obj
+        .entry("praxec")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(fg) = praxec.as_object_mut() {
+        let mut by_ns = Map::new();
+        for (ns, reqs) in affinities {
+            let mut ns_map = Map::new();
+            for (name, req) in reqs {
+                let mut entry = Map::new();
+                if let Some(t) = req.tier {
+                    entry.insert("tier".into(), Value::String(t));
+                }
+                if let Some(c) = req.capability {
+                    entry.insert("capability".into(), Value::String(c));
+                }
+                if let Some(r) = req.recommended {
+                    entry.insert("recommended".into(), Value::String(r));
+                }
+                ns_map.insert(name, Value::Object(entry));
+            }
+            by_ns.insert(ns, Value::Object(ns_map));
+        }
+        fg.insert("_packAffinities".into(), Value::Object(by_ns));
     }
 }
 

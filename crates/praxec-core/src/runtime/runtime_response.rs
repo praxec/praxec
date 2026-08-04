@@ -270,6 +270,17 @@ impl WorkflowRuntime {
             }
         }
 
+        // D5 — echo the definition's declared `lifecycle:` (maturity marker) in
+        // the run response so a caller sees it AT run, not only in `describe`. A
+        // placeholder (`stub`) lifecycle in particular must ride along so a
+        // provisional executor is never silently mistaken for a working one.
+        // Present only when the definition declares one.
+        if let Some(lifecycle) = definition.get("lifecycle").and_then(Value::as_str) {
+            if !lifecycle.is_empty() {
+                body["lifecycle"] = Value::String(lifecycle.to_string());
+            }
+        }
+
         // SPEC §6.3 — surface the reserved `summary` slot at top level so an
         // LLM resuming a workflow cold sees the last human-readable summary
         // without having to dig through context. Absent when never set.

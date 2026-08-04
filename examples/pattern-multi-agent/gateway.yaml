@@ -18,7 +18,9 @@ version: "1.0.0"
 # into a real deployment.
 gateway:
   allow_ephemeral: true
-  models_yaml: ./models.yaml
+  # Repo-root-relative (like tdd's runner_path) so `praxec check --config
+  # examples/pattern-multi-agent/gateway.yaml` resolves it from the repo root.
+  models_yaml: ./examples/pattern-multi-agent/models.yaml
 
 audit:
   sink: stderr

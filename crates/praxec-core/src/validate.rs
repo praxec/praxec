@@ -884,6 +884,12 @@ fn validate_one_workflow(
         }
         Tier::Other => {}
     }
+    // D5 — a placeholder lifecycle (`stub`) is a valid, recognized token but
+    // signals a spec-only definition whose executor is NOT a working
+    // implementation. Surface it as a SOFT warning at `check` time so a
+    // placeholder is never structurally indistinguishable from a real one; it
+    // is echoed by `start` so a caller also sees it at run.
+    validate_lifecycle_placeholder(id, def, out);
     // SPEC §5.3, V24 — every declared output must be written on EVERY path to
     // EVERY terminal. The compile-time half of the terminal output contract.
     validate_declared_outputs_are_written(id, def, out);
@@ -3570,6 +3576,26 @@ fn find_first_workflow_invocation(def: &Value) -> Option<String> {
 /// V15 / V16 — `expects_contract_hash:` validation, walked across every
 /// `kind: workflow` invocation. V15 fires when an explicit pin doesn't
 /// match the target capability's computed contract hash; V16 fires when
+/// D5 — a definition declaring a PLACEHOLDER lifecycle (`stub`) is well-formed
+/// (the token is recognized, so no `INVALID_LIFECYCLE`), but it is a spec-only
+/// declaration whose executor is not a working implementation. Emit a SOFT
+/// warning so `check` makes the placeholder visible — a stub must never be
+/// structurally indistinguishable from a working definition. Non-fatal: a stub
+/// is a legitimate authoring state, just one an operator must SEE.
+fn validate_lifecycle_placeholder(id: &str, def: &Value, out: &mut Vec<Diagnostic>) {
+    let Some(token) = def.get("lifecycle").and_then(Value::as_str) else {
+        return;
+    };
+    if crate::discovery::Lifecycle::from_token(token).is_some_and(|l| l.is_placeholder()) {
+        out.push(Diagnostic::Warning(format!(
+            "PLACEHOLDER_LIFECYCLE: definition '{id}' declares `lifecycle: \"{token}\"` — a \
+             placeholder (spec-only) whose executor is NOT a working implementation. It is \
+             surfaced in `describe`/`start` and callers should treat its result as provisional. \
+             Promote its `lifecycle:` once the executor is real."
+        )));
+    }
+}
+
 /// SPEC §6.2 — a capability's `lifecycle:` token must be one of the closed
 /// [`crate::discovery::Lifecycle`] set. Mirrors how `validate_skills`
 /// validates `Lifecycle::from_token`. Emitting an error here (rather than
@@ -5822,6 +5848,83 @@ mod tests {
         assert!(
             !d.iter().any(|d| d.message().contains("INVALID_LIFECYCLE")),
             "{d:?}"
+        );
+    }
+
+    // ---- D5: placeholder (`stub`) lifecycle → recognized + SOFT warning ----
+
+    #[test]
+    fn stub_lifecycle_is_a_recognized_token() {
+        // The placeholder value must be an ADDITIONAL recognized token, NOT a
+        // replacement — `experimental`/`stable`/`deprecated` still resolve, and
+        // `stub` resolves too (so it is never rejected as INVALID_LIFECYCLE).
+        use crate::discovery::Lifecycle;
+        assert!(Lifecycle::from_token("stub").is_some_and(|l| l.is_placeholder()));
+        assert!(!Lifecycle::from_token("stable").unwrap().is_placeholder());
+        assert!(Lifecycle::ALL_TOKENS.contains(&"stub"));
+    }
+
+    #[test]
+    fn stub_lifecycle_emits_soft_warning_not_error() {
+        // A definition declaring the placeholder lifecycle is well-formed (no
+        // INVALID_LIFECYCLE) but `check` must SOFT-warn so a placeholder is never
+        // structurally indistinguishable from a working definition.
+        let config = json!({
+            "workflows": {
+                "cap.plan.vet": {
+                    "lifecycle": "stub",
+                    "initialState": "start",
+                    "snippet": { "verb": "plan", "outputs": {} },
+                    "states": { "start": { "terminal": true } }
+                }
+            }
+        });
+        let d = validate_workflows(&config);
+        let placeholder: Vec<_> = d
+            .iter()
+            .filter(|d| d.message().contains("PLACEHOLDER_LIFECYCLE"))
+            .collect();
+        assert_eq!(
+            placeholder.len(),
+            1,
+            "exactly one placeholder warning: {d:?}"
+        );
+        assert!(
+            !placeholder[0].is_error(),
+            "placeholder must be a WARNING, not an error: {:?}",
+            placeholder[0]
+        );
+        assert!(
+            placeholder[0].message().contains("cap.plan.vet"),
+            "warning names the definition: {:?}",
+            placeholder[0]
+        );
+        // And it must NOT be rejected as an unknown token.
+        assert!(
+            !d.iter().any(|d| d.message().contains("INVALID_LIFECYCLE")),
+            "stub is recognized, not invalid: {d:?}"
+        );
+    }
+
+    #[test]
+    fn non_placeholder_lifecycle_emits_no_placeholder_warning() {
+        // The legitimate case (no false positive): a normal lifecycle must not
+        // draw the placeholder warning.
+        let config = json!({
+            "workflows": {
+                "cap.plan.vet": {
+                    "lifecycle": "stable",
+                    "initialState": "start",
+                    "snippet": { "verb": "plan", "outputs": {} },
+                    "states": { "start": { "terminal": true } }
+                }
+            }
+        });
+        let d = validate_workflows(&config);
+        assert!(
+            !d.iter()
+                .any(|d| d.message().contains("PLACEHOLDER_LIFECYCLE")),
+            "a working lifecycle must not warn: {d:?}"
         );
     }
 
