@@ -185,6 +185,17 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
                 );
                 Ok(())
             }
+            // D3 — the models.yaml on-disk shape, generated from the canonical
+            // Rust struct at print time (no hand-maintained copy to drift).
+            SchemaCommand::ModelsConfig => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &praxec_core::model_resolver::models_config_schema()
+                    )?
+                );
+                Ok(())
+            }
         },
         Command::Connections { command } => match command {
             ConnectionsCommand::Add {
@@ -1414,9 +1425,12 @@ pub async fn serve_with(config_path: PathBuf, overlays: GatewayOverlays) -> anyh
         Err(err) => return serve_degraded(config_path, err).await,
     };
 
+    // D4 — echo the ABSOLUTE, resolved config path in force at startup, so an
+    // operator can see WHICH gateway.yaml this long-lived server actually loaded
+    // (the two-config trap: editing a different file than the one serving).
     tracing::info!(
-        path = %config_path.display(),
-        "starting praxec stdio server"
+        config_path = %crate::gateway_config::absolute_config_path(&config_path).display(),
+        "starting praxec stdio server — config in force"
     );
 
     // CR6 — reap orphaned runs. An instance a prior process left mid-`running`
@@ -3217,6 +3231,19 @@ fn doctor(config_path: PathBuf, fix: bool) -> anyhow::Result<()> {
     let (config, soft_diagnostics) =
         praxec_core::config::load_resolved_with_repos_resilient(&config_path)
             .with_context(|| format!("loading config {}", config_path.display()))?;
+
+    // D4 — echo the ABSOLUTE, resolved config path in force, and note the
+    // two-config trap: a DIFFERENT, divergent config at the conventional
+    // install location (`~/.config/praxec/gateway.yaml`) that the operator may
+    // be editing instead of this one.
+    println!(
+        "config in force: {}",
+        crate::gateway_config::absolute_config_path(&config_path).display()
+    );
+    if let Some(note) = crate::gateway_config::two_config_trap_note(&config_path) {
+        println!("  {note}");
+    }
+
     let report = crate::preflight::preflight(&config);
     print!("{}", crate::preflight::format_report(&report));
     print_soft_diagnostics(&soft_diagnostics);
@@ -3544,6 +3571,12 @@ fn check(config_path: PathBuf, extra_diagnostics: &[DiagnosticProvider]) -> anyh
     // models.yaml → MODELS_YAML_LOAD_FAILED) already flows through the
     // `extra_diagnostics` providers above; this adds the affinity-binding half.
     diagnostics.extend(crate::readiness::agent_readiness_findings(&config));
+    // D2 (onboarding-hardening) — config-as-closed-structure: a `models_yaml`
+    // misplaced outside `gateway.models_yaml` (top-level / under `praxec:`), or
+    // an unknown key in the closed `gateway:` block, is silently loader-ignored
+    // dead config. Surface each as a hard error (additive; no existing gate is
+    // relaxed).
+    diagnostics.extend(crate::gateway_config::config_structure_findings(&config));
     // Durability parity with `serve` — static / config-only: `check` validates
     // the file itself, so it does NOT consult the runtime PRAXEC_ALLOW_EPHEMERAL
     // env hatch (`doctor` does). A WARNING, not an error: the config may
@@ -4073,6 +4106,10 @@ fn health(config_path: PathBuf) -> anyhow::Result<()> {
         // to detect a stale server was to read a `server.initialized` audit
         // event, which the observe path could show from a dead session.
         "version": env!("CARGO_PKG_VERSION"),
+        // D4 — the ABSOLUTE, resolved path of the config actually in force, so a
+        // consumer can tell WHICH gateway.yaml this snapshot describes (the
+        // two-config trap: editing a different file than the one loaded).
+        "config_path": crate::gateway_config::absolute_config_path(&config_path).display().to_string(),
         "connections": connections,
         "repos": repos,
         "definition_count": definition_count,
