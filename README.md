@@ -56,7 +56,9 @@ installs it to `~/.local/bin`. Pin a version or directory with
 Neither curl nor wget? Install one (`apt-get install -y curl` / `apk add curl`),
 or download a release bundle from the table below on another machine.
 
-**Set an LLM provider key** (praxec's governed agents need one):
+**Provider key** — `praxec init` (below) captures one for you. To set or manage
+keys standalone (multiple providers, non-interactive CI), use the gateway-native
+helper:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/praxec/praxec/main/configure-providers.sh | sh
@@ -97,20 +99,32 @@ The `praxec` binary above is the gateway — the MCP server you wire into an age
 host. The optional interactive control-plane TUI ships separately as the `px`
 binary (`cargo install praxec-tui`, coming soon); you don't need it to run the gateway.
 
-## Get started — one command
+## Get started in 10 seconds
+
+Install the binary (above), then **one command** wires the whole thing — a
+working config, the starter packs, your editor's MCP server, and your provider
+key:
 
 ```bash
-# Install the praxec binary from the latest GitHub release (Windows / macOS /
-# Linux; a crates.io `cargo install` is coming soon), then:
-praxec init                 # scaffold config + models + wire your editor
+praxec init --with-starter-packs --yes
 ```
 
-`praxec init` does the whole setup: it writes a working `gateway.yaml` and a
-commodity `models.yaml` into your config dir (`~/.config/praxec`, or
-`%APPDATA%\praxec` on Windows), prompts for one provider API key, **auto-detects
-and wires your editor** (Cursor / Claude Code — the correct MCP entry with
-absolute paths), and runs `doctor` to confirm you're ready. Restart your editor
-and `praxec.query` / `praxec.command` appear.
+Restart your editor and `praxec.query` / `praxec.command` appear — praxec is now
+a governed extension of Cursor / Claude Code. That single command:
+
+- writes a working `gateway.yaml` + commodity `models.yaml` into your config dir
+  (`~/.config/praxec`, or `%APPDATA%\praxec` on Windows);
+- **scaffolds your current directory as a writable repo** — so your very first
+  `praxec.command` runs with no config editing (no `REPO_ROOT_REQUIRED`);
+- wires the starter packs (`cognitive-architectures` + `praxec-meta`) and the
+  always-latest `discovery.registry`, then provisions their tools as prebuilt
+  binaries (no compiler);
+- **auto-detects and wires your editor** (Cursor / Claude Code — the correct MCP
+  entry with absolute paths, and the key file so `serve` always finds it);
+- captures one provider API key and ends in a `doctor` readiness verdict.
+
+Want just the gateway, no packs? `praxec init`. Prefer to answer the prompts
+(editor, key)? Drop `--yes`. Full flags:
 
 ```
 praxec init [--editor cursor|claude|both|none] [--dir <path>] [--global] [--yes] [--force]
@@ -159,20 +173,21 @@ through them, with discovery, schema validation, and audit built in. Copy-paste
 config for Zed, Cursor, Claude Desktop, Claude Code, and VS Code:
 [Wire praxec into your editor](https://praxec.dev/guides/editors/).
 
-## Run a full pack — one command
+## Add a full workflow pack
 
-Beyond a single tool, get a complete **workflow pack** and every MCP tool it needs
-provisioned and wired in one step:
+A **workflow pack** is a library of governed lifecycle flows plus the MCP tools
+they need. `praxec init --with-starter-packs` (above) already wires the open
+starter packs (`cognitive-architectures` + `praxec-meta`) and provisions their
+tools. To add another pack to an existing setup, wire it and provision its tools:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/praxec/packs/main/setup.sh | sh
-# or: wget -qO- https://raw.githubusercontent.com/praxec/packs/main/setup.sh | sh
+praxec init --pack git+https://github.com/praxec/design   # wire one more pack
+praxec sync                                                # pull latest + provision
 ```
 
-That pulls the `cognitive-architectures` pack (a SWE-lifecycle library) plus its tools
-(cpm-planner, fmeca, elicitation, scientific-process), sets up your provider keys, writes a
-validated gateway config, and prints the `serve` command. Browse the catalog at
-[praxec.dev/packs](https://praxec.dev/packs) or the [pack registry](https://github.com/praxec/packs).
+Preview a pack before wiring it with `praxec pack list <repo>`. Browse the catalog
+at [praxec.dev/packs](https://praxec.dev/packs) or the
+[pack registry](https://github.com/praxec/packs).
 
 ## Two tools
 
