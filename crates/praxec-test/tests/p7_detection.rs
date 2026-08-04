@@ -257,20 +257,28 @@ async fn defect_infinite_deterministic_loop_blind_spot() {
 /// Catching it without false positives requires reading `$.workflow.input.*`
 /// path analysis — deferred.
 #[tokio::test]
-#[ignore = "UNCLOSEABLE without false positives: start-time required-input check flags \
-             both the defect fixture AND legitimate cog-arch workflows that require \
-             operator inputs. The fixture schema (required: [thing], type: string) is \
-             structurally identical to cog-arch required inputs. Keeping cog-arch clean \
-             takes precedence. Detection requires $.workflow.input.* path analysis."]
-async fn defect_required_input_no_default_blind_spot() {
+async fn defect_required_input_no_default_is_a_known_blind_spot() {
+    // TRIPWIRE, not an aspirational xfail. The per-transition fuzz seeds instance
+    // context directly, so it does NOT catch a required-input-with-no-default
+    // defect — and the start-time check that WOULD catch it is unshippable: it
+    // false-positives on legitimate cog-arch workflows whose required inputs
+    // (`required: [thing], type: string`) are structurally identical to the defect
+    // fixture. Keeping cog-arch clean takes precedence; real detection needs
+    // `$.workflow.input.*` path analysis.
+    //
+    // This asserts the gap is STILL open — so it PASSES today and FAILS loudly
+    // (telling us to update the docs and retire this tripwire) if the fuzz ever
+    // starts catching it. Previously it asserted the IDEAL (`has_failures`) under
+    // `#[ignore]`, so the nightly `--ignored` sweep filed a failure every night
+    // for a documented, deliberate limitation.
     let cov = fuzz_coverage(Path::new("fixtures/defects/required_input_no_default.yaml"))
         .await
         .expect("fuzz_coverage");
-    // The per-transition fuzz passes (context seeded directly). The start check
-    // would catch this but cannot be enabled without false positives on cog-arch.
     assert!(
-        cov.has_failures(),
-        "required input no default SHOULD be caught but cannot be without false positives:\n{}",
+        !cov.has_failures(),
+        "required-input-no-default is a KNOWN blind spot (per-transition fuzz seeds context \
+         directly); if this now shows failures the gap CLOSED — update the docs and retire this \
+         tripwire:\n{}",
         cov.render_text()
     );
 }
