@@ -3682,8 +3682,15 @@ fn init(
 
     println!("praxec init — target directory: {}", dir.display());
 
+    // The directory `init` runs from is scaffolded as the writable project repo,
+    // so a run has a `repo_root` and the FIRST command works without hand-editing.
+    let project_dir = std::env::current_dir().unwrap_or_else(|_| dir.clone());
     let gateway_yaml_path = dir.join("gateway.yaml");
-    match scaffold_file(&gateway_yaml_path, &gateway_yaml_content(&dir), force)? {
+    match scaffold_file(
+        &gateway_yaml_path,
+        &gateway_yaml_content(&dir, &project_dir),
+        force,
+    )? {
         ScaffoldOutcome::Wrote => println!("  wrote   {}", gateway_yaml_path.display()),
         ScaffoldOutcome::Skipped => println!(
             "  skipped {} (already exists; pass --force to overwrite)",
@@ -3758,6 +3765,17 @@ fn init(
         Some(k) => {
             praxec_core::provider_keys::set_var(&providers_env_path, "OPENROUTER_API_KEY", k)
                 .with_context(|| format!("writing {}", providers_env_path.display()))?;
+            // H1/H2 — make the just-written key visible to THIS process (the doctor
+            // epilogue + any `--fix` affinity binding below) AND resolvable at serve
+            // time regardless of `--dir`. Point the keys-file resolver at exactly
+            // what we wrote, then load it into the env. Without this the epilogue
+            // read stale env and falsely reported the credential missing right after
+            // the user pasted it — the flagship one-click ending on a fake failure.
+            // SAFETY: single-threaded init, before any task/`.await` is spawned.
+            unsafe {
+                std::env::set_var("PRAXEC_PROVIDER_KEYS_FILE", &providers_env_path);
+            }
+            praxec_core::provider_keys::load_into_env_if_present();
             // NEVER print/log `k` itself.
             println!(
                 "  wrote   {} (OPENROUTER_API_KEY)",
@@ -3807,7 +3825,7 @@ fn init(
         let cwd = std::env::current_dir().context("resolving the current directory")?;
         for target in targets {
             let path = target.config_path(&cwd, global)?;
-            match write_editor_mcp_config(&path, &exe, &gateway_yaml_path)? {
+            match write_editor_mcp_config(&path, &exe, &gateway_yaml_path, &providers_env_path)? {
                 EditorWriteOutcome::Created => {
                     println!("  wrote   {} ({})", path.display(), target.label())
                 }
@@ -3829,12 +3847,23 @@ fn init(
     println!();
     println!("running doctor on the scaffolded config...");
     let doctor_fix = install_consent(install_tools, yes);
-    if let Err(e) = doctor(gateway_yaml_path.clone(), doctor_fix) {
-        println!("doctor verdict: {e}");
-    }
+    let doctor_ok = match doctor(gateway_yaml_path.clone(), doctor_fix) {
+        Ok(()) => true,
+        Err(e) => {
+            println!("doctor verdict: {e}");
+            false
+        }
+    };
 
+    // Gate the closing headline on the ACTUAL doctor verdict — a cheerful
+    // "you're ready" printed directly under a `doctor: FAILED` (the old behavior)
+    // reads as success-then-failure and misleads a brand-new user.
     println!();
-    println!("you're ready:");
+    if doctor_ok {
+        println!("you're ready:");
+    } else {
+        println!("scaffolded — one more step before you're ready (see the doctor verdict above):");
+    }
     println!("  - restart your editor (or reload its MCP servers) to pick up praxec");
     println!(
         "  - try:      praxec query --config {} '{{}}'",

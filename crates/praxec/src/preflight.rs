@@ -386,8 +386,9 @@ fn guard_provider_credentials_with(
     anyhow::bail!(
         "PREFLIGHT_MISSING_CREDENTIAL: refusing to start — this config's model bindings \
          reference provider(s) whose API key is not resolvable:\n{findings}\n\n\
-         Every model call against them would fail at dispatch. Set the env var(s), or add \
-         the key to {keys_file} (`px set-provider-keys`), then retry. \
+         Every model call against them would fail at dispatch. Fix it with any of: \
+         `export OPENROUTER_API_KEY=...`, re-run `praxec init` (it captures the key), or add \
+         the key to {keys_file} directly, then retry. \
          Run `praxec doctor --config <path>` for the full preflight report."
     )
 }
@@ -1302,7 +1303,13 @@ mod tests {
         assert!(err.contains("PREFLIGHT_MISSING_CREDENTIAL"), "{err}");
         assert!(err.contains("`openrouter`"), "{err}");
         assert!(err.contains("OPENROUTER_API_KEY"), "{err}");
-        assert!(err.contains("set-provider-keys"), "{err}");
+        // The remedy must be a GATEWAY-native command (not `px`, which a gateway-
+        // only install does not have): re-run `praxec init` or export the key.
+        assert!(err.contains("praxec init"), "{err}");
+        assert!(
+            !err.contains("px set-provider-keys"),
+            "must not point at the px-only path: {err}"
+        );
     }
 
     #[test]
