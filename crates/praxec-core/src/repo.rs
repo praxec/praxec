@@ -57,6 +57,36 @@ pub struct RepoManifest {
     /// (see [`create_scaffold_dirs`]). Default empty (no scaffolding).
     #[serde(default)]
     pub scaffold: Vec<String>,
+    /// onboarding-hardening — OPTIONAL per-affinity requirements this pack's
+    /// definitions use (the requirement TRAVELS with the pack). Empty by default
+    /// (a v1 stub with no `affinities:` still loads — the field is additive).
+    /// Read by the config-readiness keystone (`check`/`doctor`) to surface a pack
+    /// RECOMMENDATION when a MOUNTED affinity resolves to no binding in the
+    /// operator's in-force models.yaml. The operator's models.yaml stays the
+    /// authoritative binding (keys/cost); this only carries the pack's need + a
+    /// swappable recommendation across the pack boundary.
+    #[serde(default)]
+    pub affinities: std::collections::BTreeMap<String, AffinityRequirement>,
+}
+
+/// One affinity requirement a pack DECLARES it needs. Every field is OPTIONAL —
+/// a pack may declare just a `capability:` blurb, just a `recommended:` binding,
+/// or both. A RECOMMENDATION, never a pin: portability holds because the
+/// operator's models.yaml remains the authoritative binding.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AffinityRequirement {
+    /// Tier hint (`frontier` | `commodity` | …) — advisory, for the operator.
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// One-line human description of what this affinity is used for.
+    #[serde(default)]
+    pub capability: Option<String>,
+    /// The pack's RECOMMENDED binding as `"<provider>/<model-id>"` (the model-id
+    /// itself may contain `/`, e.g. `openrouter/z-ai/glm-5.2`). Surfaced by the
+    /// keystone and written by `praxec models bind` / `doctor --fix`.
+    #[serde(default)]
+    pub recommended: Option<String>,
 }
 
 /// Layout of resource directories within a repo. All fields are optional;
@@ -624,6 +654,59 @@ mod tests {
             msg.contains("praxec.repo/v2"),
             "error should mention actual: {msg}"
         );
+    }
+
+    #[test]
+    fn load_manifest_parses_optional_affinities_block() {
+        // The requirement TRAVELS: a pack declares the affinities its definitions
+        // use, with an optional tier/capability/recommendation per affinity.
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: design\nnamespace: design\nversion: 0.1.0\n\
+             affinities:\n  \
+             design:\n    tier: frontier\n    capability: UI design annealing\n    \
+             recommended: openrouter/anthropic/claude-sonnet-4-5\n  \
+             rollout:\n    recommended: openrouter/z-ai/glm-5.2\n",
+        );
+        let m = load_manifest(td.path()).expect("manifest with affinities loads");
+        assert_eq!(m.affinities.len(), 2, "both affinities parsed");
+        let d = m.affinities.get("design").expect("design affinity present");
+        assert_eq!(d.tier.as_deref(), Some("frontier"));
+        assert_eq!(d.capability.as_deref(), Some("UI design annealing"));
+        assert_eq!(
+            d.recommended.as_deref(),
+            Some("openrouter/anthropic/claude-sonnet-4-5"),
+            "provider/model-id recommendation round-trips (model-id may contain `/`)"
+        );
+        let r = m.affinities.get("rollout").expect("rollout affinity present");
+        assert!(r.tier.is_none(), "omitted tier defaults None");
+        assert!(r.capability.is_none(), "omitted capability defaults None");
+        assert_eq!(r.recommended.as_deref(), Some("openrouter/z-ai/glm-5.2"));
+    }
+
+    #[test]
+    fn load_manifest_defaults_affinities_empty_when_absent() {
+        // Additive: a v1 stub with no `affinities:` still loads (empty map), so
+        // no existing pack manifest needs editing.
+        let td = TempDir::new().unwrap();
+        write_manifest(td.path(), &minimal_manifest("swe"));
+        assert!(
+            load_manifest(td.path()).unwrap().affinities.is_empty(),
+            "absent affinities defaults to an empty map"
+        );
+    }
+
+    #[test]
+    fn load_manifest_rejects_unknown_affinity_field() {
+        // `deny_unknown_fields` on AffinityRequirement — a typo'd key fails loud.
+        let td = TempDir::new().unwrap();
+        write_manifest(
+            td.path(),
+            "schema: praxec.repo/v1\nname: design\nnamespace: design\nversion: 0.1.0\n\
+             affinities:\n  design:\n    reccomended: openrouter/x\n",
+        );
+        load_manifest(td.path()).expect_err("unknown affinity field should error");
     }
 
     #[test]

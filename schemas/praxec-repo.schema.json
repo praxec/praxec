@@ -40,6 +40,19 @@
         "scripts":       { "type": "string", "default": "scripts" },
         "connections":   { "type": "string", "default": "connections" }
       }
+    },
+    "affinities": {
+      "type": "object",
+      "description": "Optional per-affinity requirements this pack's definitions use — the requirement TRAVELS with the pack. The config-readiness keystone surfaces the recommendation when a MOUNTED affinity resolves to no binding in the operator's models.yaml. A recommendation, never a pin.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "tier":        { "type": "string", "description": "Tier hint (frontier | commodity | …); advisory." },
+          "capability":  { "type": "string", "description": "One-line human description of what this affinity is used for." },
+          "recommended": { "type": "string", "description": "Recommended binding as `<provider>/<model-id>` (the model-id itself may contain `/`)." }
+        }
+      }
     }
   }
 }

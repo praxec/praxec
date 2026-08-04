@@ -275,6 +275,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ConnectionsCommand,
     },
+    /// Manage the operator's `models.yaml` affinity bindings.
+    Models {
+        #[command(subcommand)]
+        command: ModelsCommand,
+    },
     /// Inspect a pack (resource repo) without building a gateway.
     Pack {
         #[command(subcommand)]
@@ -516,6 +521,24 @@ pub(crate) enum ToolsCommand {
         config: PathBuf,
         /// The tool id (or its `command`) to install.
         tool_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ModelsCommand {
+    /// Bind an affinity a MOUNTED pack recommends into the operator's
+    /// `models.yaml`, using the operator's existing provider env. Writes
+    /// `activity: { <affinity>: [ { provider, model } ] }` from the pack's
+    /// `recommended:` binding (self-wiring on pull). NEVER overwrites an existing
+    /// binding; NEVER fabricates a key — if the recommended provider's key is
+    /// absent, it prints the manual snippet instead of writing a dead binding.
+    Bind {
+        /// Path to the gateway YAML config (its `models_yaml` + wired packs
+        /// supply the models.yaml path and the recommendation).
+        #[arg(short, long)]
+        config: PathBuf,
+        /// The affinity to bind (e.g. `design`).
+        affinity: String,
     },
 }
 

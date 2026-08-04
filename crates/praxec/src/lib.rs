@@ -20,5 +20,13 @@ pub mod gateway_config;
 /// file writer, editor MCP-config merge) + the `InitIo` detection/prompt
 /// seam. Orchestrated by `gateway::init`.
 mod init;
+/// `praxec models bind <affinity>` + `doctor --fix` binding: write a pack's
+/// recommended affinity binding into the operator's models.yaml (self-wiring on
+/// pull), never clobbering an existing binding, never fabricating a key.
+pub mod models_bind;
 pub mod preflight;
 pub mod provision;
+/// Config-readiness invariants (the onboarding-hardening keystone + D1): every
+/// mounted agent-step affinity must resolve to a bound model, and a declared
+/// `gateway.models_yaml` must be loadable. Shared by `check` and `doctor`.
+pub mod readiness;
