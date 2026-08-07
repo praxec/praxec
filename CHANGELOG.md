@@ -8,7 +8,25 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
-## [0.0.48] — 2026-08-04 — onboarding: 10-second setup ("zero resistance to implementation")
+## [0.0.49] — 2026-08-07 — governed image inputs for `kind: agent` (vision)
+
+A governed `kind: agent` step can now receive **images** alongside its prompt, so
+design and analysis workflows ground a model in actual pixels — reference
+screenshots, or a render of the agent's own output — instead of a text proxy.
+The change is additive: the text-only agent path is byte-for-byte unchanged, and
+durable resume is unaffected.
+
+### Added
+
+- **`images:` on a `kind: agent` config** — templated entries the executor
+  resolves per run. An entry may render to a file path, a `data:` URI, or a JSON
+  array string (flattened to N images). Fail-fast on an unsupported type, an
+  unreadable path, or a malformed array — never silently drop an image the author
+  declared.
+- **Multimodal initial user message** — when images are present, `rig_runner`
+  builds a `text + image_base64` first user turn; feedback and tool-result turns
+  stay text-only. Carried on `AgentSession.images` (serde-default, so existing
+  durable sessions resume unchanged) as `AgentImageInput { base64, media_type }`.
 
 A new developer gets from install to a running workflow in seconds, and praxec
 feels like a magic MCP extension of Claude Code / Cursor. Found via three
