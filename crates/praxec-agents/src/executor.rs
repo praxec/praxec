@@ -32,7 +32,8 @@ use crate::breaker::BreakerRegistry;
 use crate::config::AgentExecutorConfig;
 use crate::error::{AgentErrorCode, permanent};
 use crate::session::{
-    AgentModelResolver, AgentRunOutcome, AgentSession, AgentSessionRunner, AgentStatus,
+    AgentImageInput, AgentModelResolver, AgentRunOutcome, AgentSession, AgentSessionRunner,
+    AgentStatus,
 };
 
 /// Per-step wall-clock timeout when the step omits `max_seconds`.
@@ -160,6 +161,100 @@ fn walk_summary(attempts: &[AttemptRecord]) -> String {
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Resolve a leaf's declared `images:` entries into loaded, base64-encoded
+/// [`AgentImageInput`]s — the vision message-parts fed to the session. Each raw
+/// entry is templated against the blackboard (like `tools`/`owned_files`), then:
+///   - a `data:image/{png,jpeg};base64,...` URI is split at the comma (prefix
+///     ⇒ media_type, tail ⇒ the already-encoded base64);
+///   - anything else is a filesystem path whose bytes are read + base64-encoded,
+///     media_type inferred from the extension.
+///
+/// FAIL FAST (mirrors the `file:` root poka-yoke): an unreadable file or an
+/// unsupported extension/type is a mis-authored leaf — refuse to dispatch rather
+/// than silently drop the image and let the agent answer blind.
+/// Load ONE image entry (a filesystem path or an inline `data:` URI) into an
+/// `AgentImageInput`. Media type is inferred from the extension / URI prefix and
+/// validated BEFORE the file is read, so an unsupported type fails cheaply.
+fn load_one_image(entry: &str) -> Result<AgentImageInput, ExecutorError> {
+    use base64::Engine as _;
+
+    // Inline data: URI — the base64 is already there, just classify it.
+    if let Some(tail) = entry.strip_prefix("data:image/png;base64,") {
+        return Ok(AgentImageInput {
+            base64: tail.to_string(),
+            media_type: "png".to_string(),
+        });
+    }
+    if let Some(tail) = entry.strip_prefix("data:image/jpeg;base64,") {
+        return Ok(AgentImageInput {
+            base64: tail.to_string(),
+            media_type: "jpeg".to_string(),
+        });
+    }
+    // Otherwise a filesystem path: media_type from the extension first
+    // (so an unsupported type fails before we bother reading bytes).
+    let ext = std::path::Path::new(entry)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let media_type = match ext.as_deref() {
+        Some("png") => "png",
+        Some("jpg") | Some("jpeg") => "jpeg",
+        _ => {
+            return Err(ExecutorError::Permanent(format!(
+                "AGENT_IMAGE_UNSUPPORTED_TYPE: image `{entry}` is not a supported type \
+                 (expected .png/.jpg/.jpeg or a data:image/png|jpeg;base64 URI)"
+            )));
+        }
+    };
+    let bytes = std::fs::read(entry)
+        .map_err(|e| ExecutorError::Permanent(format!("AGENT_IMAGE_UNREADABLE: {entry}: {e}")))?;
+    Ok(AgentImageInput {
+        base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        media_type: media_type.to_string(),
+    })
+}
+
+/// Resolve the declared `images:` entries into loaded image inputs. Each entry is
+/// templated first; the RENDERED value may be:
+///   - empty  → contributes NO image (an optional context slot that resolved to
+///     nothing — e.g. no references this run), never an error;
+///   - a JSON array of strings (`["a.png","b.png"]`) → FLATTENED, one image per
+///     element. This is the DYNAMIC case: a single `{{ $.…reference_images }}`
+///     entry carries however-many references/self-check shots a run produced;
+///   - a scalar path or `data:` URI → one image.
+fn load_agent_images(
+    raw: &[String],
+    workflow: &praxec_core::model::WorkflowInstance,
+) -> Result<Vec<AgentImageInput>, ExecutorError> {
+    let mut out = Vec::new();
+    for entry in raw {
+        let rendered = render_template(entry, workflow);
+        let trimmed = rendered.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Array-valued entry: flatten each element (the dynamic reference/self-check list).
+        if trimmed.starts_with('[') {
+            let list: Vec<String> = serde_json::from_str(trimmed).map_err(|e| {
+                ExecutorError::Permanent(format!(
+                    "AGENT_IMAGE_BAD_ARRAY: an `images:` entry rendered to a JSON array that is \
+                     not a string[] of paths/data-URIs: {e}"
+                ))
+            })?;
+            for item in &list {
+                let item = item.trim();
+                if !item.is_empty() {
+                    out.push(load_one_image(item)?);
+                }
+            }
+            continue;
+        }
+        out.push(load_one_image(&rendered)?);
+    }
+    Ok(out)
 }
 
 /// A short, self-announcing tail of an agent transcript, for surfacing PARTIAL
@@ -464,11 +559,19 @@ impl AgentExecutor {
                 ))),
             );
         }
+        // Resolve declared vision inputs into loaded, base64-encoded parts.
+        // Fail-fast (like the `file:` root check above) on an unreadable file or
+        // an unsupported type — refuse to dispatch rather than answer blind.
+        let images = match load_agent_images(&cfg.images, &request.workflow) {
+            Ok(v) => v,
+            Err(e) => return (None, Err(e)),
+        };
         let session = AgentSession {
             model: model.to_string(),
             system_prompt: system_prompt.clone(),
             user_prompt: user_prompt.to_string(),
             tools,
+            images,
             // WS1-B — `cfg.reasoning_effort` is the per-attempt effort the
             // caller resolved for THIS hop (model-paired ?? phase); the global
             // default is applied downstream by `reasoning_for` when it's None.
@@ -1305,6 +1408,164 @@ mod tests {
             runner.sessions().is_empty(),
             "the runner must NOT be invoked when the file root is unresolved"
         );
+    }
+
+    #[tokio::test]
+    async fn image_file_path_loads_into_session_as_encoded_input() {
+        // A declared `images:` file path is read, base64-encoded, and its
+        // media_type inferred from the extension — landing on the session as a
+        // loaded AgentImageInput the runner can turn into a vision part.
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n").unwrap();
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        exec.execute(request(
+            json!({
+                "affinity": "coding", "goal": "look",
+                "images": [png.to_str().unwrap()]
+            }),
+            bare_def(),
+        ))
+        .await
+        .expect("success");
+        let imgs = &runner.sessions()[0].images;
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].media_type, "png");
+        assert!(!imgs[0].base64.is_empty(), "file bytes must be encoded");
+    }
+
+    #[tokio::test]
+    async fn image_data_uri_parses_prefix_and_base64() {
+        // A `data:image/png;base64,<b64>` entry needs no file read — the prefix
+        // classifies the media_type and the tail is the already-encoded base64.
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        exec.execute(request(
+            json!({
+                "affinity": "coding", "goal": "look",
+                "images": ["data:image/png;base64,AAAA"]
+            }),
+            bare_def(),
+        ))
+        .await
+        .expect("success");
+        let imgs = &runner.sessions()[0].images;
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].media_type, "png");
+        assert_eq!(imgs[0].base64, "AAAA");
+    }
+
+    #[tokio::test]
+    async fn array_valued_images_entry_flattens_and_empty_is_skipped() {
+        // The DYNAMIC case: one `images:` entry that renders to a JSON array of
+        // paths/URIs is flattened to one image per element; a separate entry that
+        // renders to empty (an optional slot with no references) contributes none.
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        exec.execute(request(
+            json!({
+                "affinity": "coding", "goal": "look",
+                "images": [
+                    "[\"data:image/png;base64,AAAA\",\"data:image/jpeg;base64,BBBB\"]",
+                    ""
+                ]
+            }),
+            bare_def(),
+        ))
+        .await
+        .expect("success");
+        let imgs = &runner.sessions()[0].images;
+        assert_eq!(
+            imgs.len(),
+            2,
+            "array entry flattened to 2; empty entry skipped"
+        );
+        assert_eq!(imgs[0].media_type, "png");
+        assert_eq!(imgs[0].base64, "AAAA");
+        assert_eq!(imgs[1].media_type, "jpeg");
+        assert_eq!(imgs[1].base64, "BBBB");
+    }
+
+    #[tokio::test]
+    async fn unsupported_image_type_fails_fast_before_dispatch() {
+        // A `.gif` (or any non-png/jpeg) is refused at dispatch, not silently
+        // dropped — the runner is never invoked.
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        let err = exec
+            .execute(request(
+                json!({
+                    "affinity": "coding", "goal": "look",
+                    "images": ["/tmp/whatever.gif"]
+                }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("unsupported image type must fail fast");
+        assert!(
+            format!("{err:?}").contains("AGENT_IMAGE_UNSUPPORTED_TYPE"),
+            "{err:?}"
+        );
+        assert!(runner.sessions().is_empty(), "runner must NOT be invoked");
+    }
+
+    #[tokio::test]
+    async fn unreadable_image_path_fails_fast_before_dispatch() {
+        // A missing/unreadable file is a mis-authored leaf — fail fast with the
+        // documented code rather than answer blind. The runner is never invoked.
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        let err = exec
+            .execute(request(
+                json!({
+                    "affinity": "coding", "goal": "look",
+                    "images": ["/no/such/file.png"]
+                }),
+                bare_def(),
+            ))
+            .await
+            .expect_err("unreadable image must fail fast");
+        assert!(
+            format!("{err:?}").contains("AGENT_IMAGE_UNREADABLE"),
+            "{err:?}"
+        );
+        assert!(runner.sessions().is_empty(), "runner must NOT be invoked");
     }
 
     #[tokio::test]

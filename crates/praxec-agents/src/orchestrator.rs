@@ -245,6 +245,8 @@ impl TransitionChooser for AgentChooser {
             await_enabled: false,
             // A decision call writes no files — the coding-evidence gate is off.
             requires_file_write: false,
+            // A decision call is pure text — no vision inputs.
+            images: vec![],
             // Decision calls run outside a governed step — no audit identity.
             identity: Default::default(),
         };

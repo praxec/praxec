@@ -37,6 +37,14 @@ pub struct AgentExecutorConfig {
     /// so concurrent agents are file-disjoint (FM13).
     #[serde(default)]
     pub owned_files: Vec<String>,
+    /// Governed vision inputs (`kind: agent` only): each entry is an absolute
+    /// image file path OR a `data:image/{png,jpeg};base64,...` URI, templated
+    /// like `tools`/`owned_files`. The executor resolves each into an
+    /// [`AgentImageInput`](crate::session::AgentImageInput) (reading + base64-
+    /// encoding a path) at dispatch, failing fast on an unreadable file or an
+    /// unsupported type. Empty ⇒ the initial user message stays text-only.
+    #[serde(default)]
+    pub images: Vec<String>,
     /// The only enforceable cap (subprocess wall-clock timeout). No
     /// `max_cost_usd`/`max_iterations` in v1 — unenforceable → rejected by
     /// `deny_unknown_fields` (FM3).

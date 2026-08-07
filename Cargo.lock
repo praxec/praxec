@@ -4701,6 +4701,7 @@ version = "0.0.48"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "futures",
  "praxec-core",

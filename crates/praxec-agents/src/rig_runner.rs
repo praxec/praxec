@@ -28,7 +28,7 @@ use crate::park::{
 use praxec_llm_executor::{ProviderFactory, StreamEvent, ToolCallRequest, TurnRequest};
 use rig::OneOrMany;
 use rig::completion::{AssistantContent, Message, ToolDefinition};
-use rig::message::{ToolResult, ToolResultContent, UserContent};
+use rig::message::{ImageMediaType, ToolResult, ToolResultContent, UserContent};
 use serde_json::{Value, json};
 
 use crate::session::{
@@ -191,6 +191,37 @@ fn compose_system_message(skills: &Option<String>, requires_file_write: bool) ->
     match skills {
         Some(s) if !s.trim().is_empty() => format!("{head}\n\n{s}"),
         _ => head,
+    }
+}
+
+/// Build the FIRST user message (the goal) for a session. Text-only sessions —
+/// the overwhelming majority — get exactly the historical single-`Text`
+/// `Message::user(prompt)`, byte-for-byte unchanged. A vision session
+/// (`session.images` non-empty) gets a multimodal `Message::User`: the text goal
+/// FIRST, then one `Image` part per declared image (already base64-encoded by the
+/// executor). `expect` is safe — `parts` always has the text element, so the
+/// `OneOrMany` is never empty.
+fn build_initial_user_message(session: &AgentSession) -> Message {
+    if session.images.is_empty() {
+        return Message::user(session.user_prompt.clone());
+    }
+    let mut parts: Vec<UserContent> = Vec::with_capacity(session.images.len() + 1);
+    parts.push(UserContent::text(session.user_prompt.clone()));
+    for img in &session.images {
+        let media_type = match img.media_type.as_str() {
+            "jpeg" => ImageMediaType::JPEG,
+            // `png` and any other value the executor produced (it only emits
+            // "png"/"jpeg") default to PNG rather than guess.
+            _ => ImageMediaType::PNG,
+        };
+        parts.push(UserContent::image_base64(
+            img.base64.clone(),
+            Some(media_type),
+            None,
+        ));
+    }
+    Message::User {
+        content: OneOrMany::many(parts).expect("parts always contains the text goal"),
     }
 }
 
@@ -1327,8 +1358,10 @@ impl AgentSessionRunner for RigSessionRunner {
         let mut history: Vec<Message> = Vec::new();
         // The new message each turn: the goal first, then the tool results. The
         // goal stays in `history` after turn 0 so the agent never loses it, and
-        // user/assistant strictly alternate (required by Anthropic et al).
-        let input: Message = Message::user(session.user_prompt.clone());
+        // user/assistant strictly alternate (required by Anthropic et al). When
+        // the session carries vision inputs, the goal message is multimodal
+        // (text goal + image parts); otherwise it's the historical text-only form.
+        let input: Message = build_initial_user_message(&session);
         // Realized token usage summed across every turn (incl. the final-answer
         // turn) — surfaced on the report so the audit can price the run. Lives
         // outside the loop future so it survives the loop's early returns/timeout.
