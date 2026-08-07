@@ -209,9 +209,8 @@ fn load_one_image(entry: &str) -> Result<AgentImageInput, ExecutorError> {
             )));
         }
     };
-    let bytes = std::fs::read(entry).map_err(|e| {
-        ExecutorError::Permanent(format!("AGENT_IMAGE_UNREADABLE: {entry}: {e}"))
-    })?;
+    let bytes = std::fs::read(entry)
+        .map_err(|e| ExecutorError::Permanent(format!("AGENT_IMAGE_UNREADABLE: {entry}: {e}")))?;
     Ok(AgentImageInput {
         base64: base64::engine::general_purpose::STANDARD.encode(bytes),
         media_type: media_type.to_string(),
@@ -1498,7 +1497,11 @@ mod tests {
         .await
         .expect("success");
         let imgs = &runner.sessions()[0].images;
-        assert_eq!(imgs.len(), 2, "array entry flattened to 2; empty entry skipped");
+        assert_eq!(
+            imgs.len(),
+            2,
+            "array entry flattened to 2; empty entry skipped"
+        );
         assert_eq!(imgs[0].media_type, "png");
         assert_eq!(imgs[0].base64, "AAAA");
         assert_eq!(imgs[1].media_type, "jpeg");
