@@ -136,6 +136,7 @@ fn session(tools: Vec<String>) -> AgentSession {
         expected_output_types: Default::default(),
         await_enabled: false,
         requires_file_write: false,
+        images: Vec::new(),
         identity: Default::default(),
     }
 }
@@ -146,6 +147,45 @@ fn session_with_keys(tools: Vec<String>, keys: Vec<String>) -> AgentSession {
         expected_output_types: Default::default(),
         ..session(tools)
     }
+}
+
+#[test]
+fn build_initial_user_message_with_no_images_is_text_only() {
+    // The overwhelming-majority path must be byte-for-byte the historical form:
+    // exactly the single-Text `Message::user(prompt)`.
+    let s = session(vec![]);
+    let msg = build_initial_user_message(&s);
+    assert_eq!(msg, Message::user("do the thing".to_string()));
+}
+
+#[test]
+fn build_initial_user_message_with_one_png_has_text_then_image() {
+    // A vision session yields a multimodal message: the text goal FIRST, then one
+    // Image part carrying the given base64 + PNG media type.
+    let mut s = session(vec![]);
+    s.images = vec![crate::session::AgentImageInput {
+        base64: "QUJD".into(),
+        media_type: "png".into(),
+    }];
+    let msg = build_initial_user_message(&s);
+    let Message::User { content } = msg else {
+        panic!("expected a User message");
+    };
+    let parts: Vec<UserContent> = content.into_iter().collect();
+    assert_eq!(parts.len(), 2, "text goal + one image part");
+    assert!(
+        matches!(&parts[0], UserContent::Text(t) if t.text == "do the thing"),
+        "first part is the text goal, got {:?}",
+        parts[0]
+    );
+    let UserContent::Image(img) = &parts[1] else {
+        panic!("second part must be an Image, got {:?}", parts[1]);
+    };
+    assert_eq!(
+        img.data,
+        rig::message::DocumentSourceKind::Base64("QUJD".to_string())
+    );
+    assert_eq!(img.media_type, Some(ImageMediaType::PNG));
 }
 
 /// Records the prompt (`Message`) handed to the provider each turn, then
@@ -1277,6 +1317,7 @@ async fn tool_setup_timeout_honors_session_value() {
         expected_output_types: Default::default(),
         await_enabled: false,
         requires_file_write: false,
+        images: Vec::new(),
         identity: Default::default(),
     };
     let runner = RigSessionRunner::new(Arc::new(ScriptedFactory::new(vec![])))

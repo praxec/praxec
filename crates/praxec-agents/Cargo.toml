@@ -26,6 +26,9 @@ rmcp = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+# Vision inputs (kind: agent): base64-encode image file bytes for the message
+# part. Already resolved in the tree (rig 0.40 pulls the same 0.22 line).
+base64 = "0.22"
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

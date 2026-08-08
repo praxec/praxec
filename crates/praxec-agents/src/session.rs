@@ -107,6 +107,22 @@ fn default_tool_setup_timeout() -> Duration {
     Duration::from_secs(crate::executor::DEFAULT_TOOL_SETUP_SECONDS)
 }
 
+/// One decoded image message-part fed to a `kind: agent` session (vision).
+///
+/// The executor resolves each declared entry (an absolute file path or a
+/// `data:image/...;base64,...` URI) into this loaded, base64-encoded form BEFORE
+/// the session runs — so the runner never touches the filesystem and a durable
+/// resume replays the exact bytes the run started with. `media_type` is the bare
+/// subtype (`"png"` or `"jpeg"`), mapped to rig's `ImageMediaType` at message
+/// build time.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentImageInput {
+    /// Base64-encoded image bytes (no `data:` prefix).
+    pub base64: String,
+    /// Bare media subtype: `"png"` or `"jpeg"`.
+    pub media_type: String,
+}
+
 /// Everything needed to run one isolated agent session.
 ///
 /// Serde derives exist for exactly one reason: P12 R1.4 persists the session
@@ -175,6 +191,16 @@ pub struct AgentSession {
     /// field existed): a non-coding session is unaffected.
     #[serde(default)]
     pub requires_file_write: bool,
+    /// Governed vision inputs: decoded image message-parts appended (after the
+    /// text goal) to the FIRST user message so the agent can see them.
+    /// `kind: agent` only. Empty for the overwhelming majority of steps, whose
+    /// initial message stays text-only, byte-for-byte unchanged.
+    ///
+    /// `#[serde(default)]`: a session snapshot persisted (P12 R1.4) BEFORE this
+    /// field existed resumes with no images — the exact text-only behavior it
+    /// ran under — rather than failing to deserialize.
+    #[serde(default)]
+    pub images: Vec<AgentImageInput>,
     /// Correlating identity for the in-run `agent.heartbeat` audit events.
     /// Defaulted (all-`None`) for callers that run sessions outside a governed
     /// step (e.g. the orchestrator's decision calls) and for parked frames
@@ -428,5 +454,29 @@ mod tests {
         }))
         .expect("legacy snapshot without tool_setup_timeout must deserialize");
         assert_eq!(s.tool_setup_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn session_snapshot_without_images_resumes_with_no_images() {
+        // Durable-resume back-compat (P12 R1.4): a session parked BEFORE the
+        // `images` field existed must still deserialize — serde-defaulting to an
+        // empty vec (text-only), never a serde error that would strand the frame.
+        let s: AgentSession = serde_json::from_value(json!({
+            "model": "anthropic:claude-sonnet-4-6",
+            "system_prompt": null,
+            "user_prompt": "do the thing",
+            "tools": [],
+            "reasoning_effort": null,
+            "timeout": { "secs": 600, "nanos": 0 },
+            "stall_timeout": { "secs": 120, "nanos": 0 },
+            "tool_setup_timeout": { "secs": 60, "nanos": 0 },
+            "expected_output_keys": [],
+            "expected_output_types": {},
+            "await_enabled": false,
+            "requires_file_write": false,
+            "identity": {}
+        }))
+        .expect("legacy snapshot without images must deserialize");
+        assert!(s.images.is_empty());
     }
 }
