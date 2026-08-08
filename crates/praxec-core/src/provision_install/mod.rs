@@ -191,6 +191,53 @@ pub fn managed_bin_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("praxec").join("bin"))
 }
 
+/// The directories PREPENDED to a spawned MCP child's `PATH` so a bare
+/// `command:` connection resolves even when the gateway was launched by a GUI or
+/// service that did not inherit the interactive shell's `PATH` — the reason
+/// operators otherwise hardcode an absolute `~/.cargo/bin/...` command, which is
+/// machine- and OS-specific and breaks on every other host. In precedence order:
+/// the praxec-managed bin dir ([`managed_bin_dir`]), then the two conventional
+/// user tool-install dirs `~/.cargo/bin` and `~/.local/bin` (on Windows these
+/// resolve under `%USERPROFILE%` via the `home_dir` join). Existence is NOT
+/// required — a missing dir is simply an inert `PATH` entry. Kept here beside
+/// [`managed_bin_dir`] so the installer and the child-spawn PATH never drift.
+pub fn spawn_path_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(m) = managed_bin_dir() {
+        dirs.push(m);
+    }
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".cargo").join("bin"));
+        dirs.push(home.join(".local").join("bin"));
+    }
+    dirs
+}
+
+/// Does `command` resolve to a spawnable binary the gateway could actually
+/// launch? An explicit path (absolute, or containing a separator) is checked
+/// directly; a bare name is searched on the ambient `PATH` and in the
+/// [`spawn_path_dirs`] praxec prepends, `.exe`-aware on Windows via
+/// [`managed_binary_in`]. This mirrors the resolution a real stdio spawn
+/// performs, so an `optional`-connection SKIP decision agrees with what a spawn
+/// would find (an absent binary → skip; an installed one → spawn). Reuses the
+/// ONE `.exe`-aware predicate so install detection and this never drift.
+pub fn command_resolves(command: &str) -> bool {
+    // Explicit path: the operator named the exact file — check it directly
+    // (the machine-specific `~/.cargo/bin/...` case an operator hardcodes).
+    if command.contains('/') || command.contains('\\') {
+        return Path::new(command).is_file();
+    }
+    // Bare name: on the ambient PATH, or in a dir praxec prepends to the child
+    // PATH (managed bin, ~/.cargo/bin, ~/.local/bin).
+    let ambient: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    ambient
+        .iter()
+        .chain(spawn_path_dirs().iter())
+        .any(|d| managed_binary_in(d, command).is_some())
+}
+
 /// Resolve a spawnable binary named `command` inside `dir`, `.exe`-aware on
 /// Windows: returns the existing file's path, or `None` when absent. This is the
 /// ONE managed-bin-dir existence predicate — `provision::detect`, the currency
@@ -706,6 +753,35 @@ mod tests {
         // Single source of truth: the trait impl resolves the exact same path as
         // the free fn (both `Some` on a normal host, or both absent).
         assert_eq!(RealInstallerIo.bin_dir().ok(), managed_bin_dir());
+    }
+
+    #[test]
+    fn command_resolves_true_for_an_existing_explicit_path_false_for_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("mytool");
+        std::fs::write(&present, b"x").unwrap();
+        // An explicit path to a file that exists resolves...
+        assert!(command_resolves(present.to_str().unwrap()));
+        // ...and a machine-specific absolute path that does NOT exist (e.g. a
+        // Linux `~/.cargo/bin/...` command shipped to a Windows host) does not —
+        // which is exactly what makes an optional connection skip.
+        let missing = dir.path().join("sub").join("ghost");
+        assert!(!command_resolves(missing.to_str().unwrap()));
+    }
+
+    #[test]
+    fn command_resolves_false_for_a_bare_name_absent_from_path_and_spawn_dirs() {
+        assert!(!command_resolves("praxec-no-such-binary-xyzzy-9f3c1"));
+    }
+
+    #[test]
+    fn spawn_path_dirs_leads_with_the_managed_bin_dir_when_present() {
+        // The managed bin dir (if the host has a config dir) is the FIRST spawn
+        // dir, ahead of the conventional user tool dirs — install precedence.
+        let dirs = spawn_path_dirs();
+        if let Some(managed) = managed_bin_dir() {
+            assert_eq!(dirs.first(), Some(&managed));
+        }
     }
 
     #[test]
