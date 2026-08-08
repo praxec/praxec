@@ -333,10 +333,6 @@ fn provision_config_from(config: &Value) -> provision::Config {
                     Some(provision::Connection {
                         kind: kind.to_string(),
                         command: command.to_string(),
-                        optional: conn
-                            .get("optional")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
                     })
                 })
                 .collect()
@@ -797,10 +793,7 @@ pub fn format_report(report: &PreflightReport) -> String {
         }
     }
     out.push_str("tools (kind: mcp connection binaries on PATH):\n");
-    if report.tools.present.is_empty()
-        && report.tools.missing.is_empty()
-        && report.tools.missing_optional.is_empty()
-    {
+    if report.tools.present.is_empty() && report.tools.missing.is_empty() {
         out.push_str("  (no kind: mcp connections configured)\n");
     }
     for t in &report.tools.present {
@@ -810,12 +803,6 @@ pub fn format_report(report: &PreflightReport) -> String {
         out.push_str(&format!(
             "  missing  {t} — not on PATH (warning: steps using this connection \
              will fail at invocation)\n"
-        ));
-    }
-    for t in &report.tools.missing_optional {
-        out.push_str(&format!(
-            "  optional {t} — premium/add-on not installed; the gateway and \
-             open-source packs run without it (steps using it are skipped)\n"
         ));
     }
     if let Some(adm) = &report.auto_drive_model {

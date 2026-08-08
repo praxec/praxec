@@ -171,13 +171,6 @@ pub struct McpConnection {
     /// loosen the per-call idle bound, and setting neither preserves the 30s
     /// default on both phases.
     pub startup_timeout_ms: Option<u64>,
-    /// `optional: true` — an add-on/premium connection whose absence must NOT
-    /// fail the open-source flow. When its command does not resolve to an
-    /// installed binary, a call to this connection returns a typed SKIP result
-    /// instead of a spawn error (see [`McpConnection::command_resolves`] and the
-    /// executor's optional-skip path). A REQUIRED connection (the default) still
-    /// fails fast — this never silently weakens a mandatory tool.
-    pub optional: bool,
 }
 
 impl McpConnection {
@@ -195,22 +188,6 @@ impl McpConnection {
         match self.startup_timeout_ms {
             Some(ms) => Duration::from_millis(ms),
             None => self.idle(),
-        }
-    }
-
-    /// Does this connection's command resolve to an installed, spawnable binary?
-    /// A `url:` connection has no local binary, so it is treated as resolvable
-    /// (its reachability is a runtime concern, not an install-time one). Delegates
-    /// to [`praxec_core::provision_install::command_resolves`] so the check mirrors
-    /// the child-spawn PATH exactly. Used to decide whether an `optional`
-    /// connection should be skipped rather than spawned.
-    fn command_resolves(&self) -> bool {
-        if self.url.is_some() {
-            return true;
-        }
-        match self.command.as_deref() {
-            Some(cmd) => praxec_core::provision_install::command_resolves(cmd),
-            None => false,
         }
     }
 }
@@ -240,10 +217,6 @@ impl McpConnections {
                 let url = conn.get("url").and_then(Value::as_str).map(str::to_string);
                 let idle_timeout_ms = conn.get("idleTimeoutMs").and_then(Value::as_u64);
                 let startup_timeout_ms = conn.get("startupTimeoutMs").and_then(Value::as_u64);
-                let optional = conn
-                    .get("optional")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
                 map.insert(
                     name.clone(),
                     McpConnection {
@@ -253,7 +226,6 @@ impl McpConnections {
                         url,
                         idle_timeout_ms,
                         startup_timeout_ms,
-                        optional,
                     },
                 );
             }
@@ -296,15 +268,6 @@ pub trait McpToolCaller: Send + Sync {
         &self,
         connection: &str,
     ) -> Result<Vec<rmcp::model::Tool>, ExecutorError>;
-
-    /// Is `connection` an `optional` connection whose command is not installed?
-    /// When true, the executor returns a typed SKIP instead of attempting a spawn
-    /// that would fail — so an uninstalled premium/add-on tool never takes down
-    /// the open-source flow. Default `false`: a caller with no connection metadata
-    /// (a test double) never skips.
-    fn optional_absent(&self, _connection: &str) -> bool {
-        false
-    }
 }
 
 /// A spawned stdio MCP child, made its own process-group leader (via
@@ -585,12 +548,6 @@ impl McpToolCaller for RmcpToolCaller {
             .map_err(|e| ExecutorError::Connection(format!("mcp list '{connection}': {e}")))?
             .map_err(|e| classify(e.to_string()))
     }
-
-    fn optional_absent(&self, connection: &str) -> bool {
-        self.connections
-            .get(connection)
-            .is_some_and(|c| c.optional && !c.command_resolves())
-    }
 }
 
 /// Dispatches `kind: mcp` transitions: validates config, maps arguments,
@@ -639,43 +596,6 @@ impl McpExecutor {
     }
 }
 
-/// The typed result of skipping an `optional` connection whose tool is not
-/// installed (the open-core degrade path in [`McpExecutor::execute`]). It is a
-/// SUCCESS, not an error — the open-source flow continues — but the payload
-/// records the skip (`skipped: true`, `reason: OPTIONAL_CONNECTION_UNAVAILABLE`)
-/// so it is visible in the transition output and the audit trail, and a
-/// consuming gate can branch on it rather than being silently short-circuited.
-fn optional_skip_result(connection: &str, tool: &str) -> ExecuteResult {
-    let message = format!(
-        "Optional MCP connection '{connection}' is not installed — '{connection}.{tool}' was \
-         skipped. This is a premium/add-on tool; the gateway and open-source packs run without \
-         it. Install the tool and it will be used automatically."
-    );
-    ExecuteResult {
-        output: json!({
-            "skipped": true,
-            "reason": "OPTIONAL_CONNECTION_UNAVAILABLE",
-            "connection": connection,
-            "tool": tool,
-            "message": message,
-        }),
-        evidence: vec![Evidence {
-            kind: "mcp_optional_skip".to_string(),
-            id: Uuid::new_v4().to_string(),
-            uri: None,
-            summary: Some(format!(
-                "Skipped {connection}.{tool} (optional connection not installed)"
-            )),
-            digest: None,
-            confidence: None,
-        }],
-        child_workflow_id: None,
-        next_transition: None,
-        suspend: None,
-        telemetry: None,
-    }
-}
-
 #[async_trait]
 impl Executor for McpExecutor {
     async fn execute(&self, request: ExecuteRequest) -> Result<ExecuteResult, ExecutorError> {
@@ -688,19 +608,6 @@ impl Executor for McpExecutor {
             .get("tool")
             .and_then(Value::as_str)
             .ok_or_else(|| ExecutorError::Permanent("mcp executor needs `tool`".into()))?;
-
-        // Optional-connection graceful skip (open-core boundary). A connection
-        // marked `optional: true` whose command binary is not installed is a
-        // premium/add-on the operator has not provisioned. Return a typed SKIP
-        // result rather than failing the transition with a spawn error — so the
-        // open-source gateway degrades cleanly (the dependent gate is skipped,
-        // visibly and auditably) instead of taking the whole flow down. A
-        // REQUIRED connection still fails fast: this never weakens a mandatory
-        // tool. Checked before argument mapping / schema pre-validation so an
-        // absent tool costs nothing.
-        if self.caller.optional_absent(connection) {
-            return Ok(optional_skip_result(connection, tool));
-        }
 
         // No `map:` declared → pass raw `arguments` through unchanged.
         // `map:` present but a binding fails to resolve → fail-fast rather
@@ -1249,94 +1156,6 @@ mod render_args_tests {
             idempotency_key: None,
             correlation_id: None,
         }
-    }
-
-    // A minimal caller that records whether `call_tool` ran and lets a test
-    // dictate the `optional_absent` verdict — enough to prove the executor's
-    // optional-skip path without a real MCP server.
-    struct SkipProbeCaller {
-        optional_absent: bool,
-        called: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    #[async_trait]
-    impl McpToolCaller for SkipProbeCaller {
-        async fn call_tool(
-            &self,
-            _connection: &str,
-            _tool: &str,
-            _arguments: Option<Map<String, Value>>,
-        ) -> Result<rmcp::model::CallToolResult, ExecutorError> {
-            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(rmcp::model::CallToolResult::structured(
-                json!({ "ok": true }),
-            ))
-        }
-        async fn list_remote_tools(
-            &self,
-            _connection: &str,
-        ) -> Result<Vec<rmcp::model::Tool>, ExecutorError> {
-            Ok(vec![])
-        }
-        fn optional_absent(&self, _connection: &str) -> bool {
-            self.optional_absent
-        }
-    }
-
-    fn mcp_req(connection: &str, tool: &str) -> ExecuteRequest {
-        let mut r = req(json!({}), json!({}), json!({}));
-        r.executor_config = json!({ "connection": connection, "tool": tool });
-        r
-    }
-
-    // Open-core boundary: an `optional` connection whose tool is not installed
-    // degrades to a typed SKIP result — success, not error — and NEVER spawns /
-    // calls the tool.
-    #[tokio::test]
-    async fn optional_absent_connection_skips_without_calling_the_tool() {
-        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let caller = Arc::new(SkipProbeCaller {
-            optional_absent: true,
-            called: called.clone(),
-        });
-        let exec = McpExecutor::with_caller(caller);
-        let out = exec
-            .execute(mcp_req("structureos", "scan_repo"))
-            .await
-            .expect("an absent OPTIONAL connection must degrade to a skip, not error");
-        assert_eq!(
-            out.output.get("skipped").and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            out.output.get("reason").and_then(Value::as_str),
-            Some("OPTIONAL_CONNECTION_UNAVAILABLE")
-        );
-        assert!(
-            !called.load(std::sync::atomic::Ordering::SeqCst),
-            "the tool must NOT be called when the optional connection is absent"
-        );
-    }
-
-    // A present connection (or a required one) is called normally — the skip is
-    // opt-in and only fires on optional-and-absent.
-    #[tokio::test]
-    async fn a_present_connection_calls_the_tool_normally() {
-        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let caller = Arc::new(SkipProbeCaller {
-            optional_absent: false,
-            called: called.clone(),
-        });
-        let exec = McpExecutor::with_caller(caller);
-        let out = exec
-            .execute(mcp_req("structureos", "scan_repo"))
-            .await
-            .expect("a present connection calls normally");
-        assert_eq!(out.output.get("ok").and_then(Value::as_bool), Some(true));
-        assert!(
-            called.load(std::sync::atomic::Ordering::SeqCst),
-            "a present connection must actually call the tool"
-        );
     }
 
     // A nested object binding assembles a shape mixing a resolved `$.` path with
