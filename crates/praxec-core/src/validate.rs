@@ -56,6 +56,11 @@ pub fn validate_workflows(config: &Value) -> Vec<Diagnostic> {
     // bare-optional-arg-binding bug (frontrails proxy start) lives.
     validate_proxy_exposure_arg_scopes(config, &mut diagnostics);
 
+    // Connection command portability — a config can declare `connections:` with no
+    // `workflows:` of its own (a pack, or a connections-only gateway config), so
+    // run this BEFORE the workflows early-return, like the proxy check above.
+    validate_connection_command_portability(config, &mut diagnostics);
+
     let Some(workflows) = config.pointer("/workflows").and_then(Value::as_object) else {
         return diagnostics;
     };
@@ -390,6 +395,53 @@ fn validate_requires_file_write(
 ///
 /// The sanctioned shape — `tools: ["{{ $.run.leased.<pool> }}"]` in a flow that
 /// declares `exclusive_pools: [<pool>]` — passes.
+/// Portability poka-yoke — a `kind: mcp` connection whose `command` is an
+/// absolute path under a home directory (`/home/<user>/…`, `/Users/<user>/…`, a
+/// `.cargo/bin`/`.local/bin` path, or a Windows `X:\Users\…`) is machine- and
+/// OS-specific: it will not resolve on another host — a teammate's machine, CI,
+/// or Windows — the way the author's own box does. Warn (not error): the config
+/// still loads, but the fix is the BARE command name, which praxec resolves at
+/// spawn on `PATH` plus `~/.cargo/bin` and `~/.local/bin`.
+fn validate_connection_command_portability(config: &Value, out: &mut Vec<Diagnostic>) {
+    let Some(conns) = config.pointer("/connections").and_then(Value::as_object) else {
+        return;
+    };
+    for (name, spec) in conns {
+        if spec.get("kind").and_then(Value::as_str) != Some("mcp") {
+            continue;
+        }
+        let Some(command) = spec.get("command").and_then(Value::as_str) else {
+            continue;
+        };
+        if !command_is_machine_specific(command) {
+            continue;
+        }
+        let bare = command
+            .rsplit(['/', '\\'])
+            .find(|s| !s.is_empty())
+            .unwrap_or(command);
+        out.push(Diagnostic::Warning(format!(
+            "NON_PORTABLE_CONNECTION_COMMAND: connection '{name}' command '{command}' is an \
+             absolute path under a home directory — it is machine- and OS-specific and will not \
+             resolve on another host (a teammate's machine, CI, or Windows). Use the bare command \
+             name '{bare}': praxec resolves it at spawn on PATH plus ~/.cargo/bin and ~/.local/bin."
+        )));
+    }
+}
+
+/// Is `command` a path tied to one machine's home directory (so it cannot
+/// travel)? An absolute path under `/home/` or `/Users/`, any path containing a
+/// `.cargo/bin` or `.local/bin` segment, or a Windows `X:\Users\…` path.
+fn command_is_machine_specific(command: &str) -> bool {
+    let c = command.replace('\\', "/");
+    c.starts_with("/home/")
+        || c.starts_with("/Users/")
+        || c.contains("/.cargo/bin/")
+        || c.contains("/.local/bin/")
+        || (c.as_bytes().get(1) == Some(&b':')
+            && c.get(2..).is_some_and(|r| r.starts_with("/Users/")))
+}
+
 fn validate_exclusive_leases(
     config: &Value,
     workflows: &serde_json::Map<String, Value>,
@@ -4295,6 +4347,45 @@ fn pointer_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Portability poka-yoke: an absolute `~/.cargo/bin/...` connection command is
+    // machine-specific and warns; the bare name is portable and does not.
+    #[test]
+    fn an_absolute_home_path_connection_command_warns_non_portable() {
+        let config = json!({
+            "connections": {
+                "structureos": {
+                    "kind": "mcp",
+                    "command": "/home/mc/.cargo/bin/structureos-mcp"
+                }
+            }
+        });
+        let diags = validate_workflows(&config);
+        assert!(
+            diags.iter().any(|d| matches!(
+                d,
+                Diagnostic::Warning(m) if m.contains("NON_PORTABLE_CONNECTION_COMMAND")
+            )),
+            "an absolute ~/.cargo/bin command must warn as non-portable"
+        );
+    }
+
+    #[test]
+    fn a_bare_connection_command_is_portable_and_does_not_warn() {
+        let config = json!({
+            "connections": {
+                "structureos": { "kind": "mcp", "command": "structureos-mcp" }
+            }
+        });
+        let diags = validate_workflows(&config);
+        assert!(
+            !diags.iter().any(|d| matches!(
+                d,
+                Diagnostic::Warning(m) if m.contains("NON_PORTABLE_CONNECTION_COMMAND")
+            )),
+            "a bare command name is portable — no warning"
+        );
+    }
 
     #[test]
     fn valid_workflow_produces_no_diagnostics() {

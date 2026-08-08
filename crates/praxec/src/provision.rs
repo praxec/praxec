@@ -2,6 +2,10 @@
 pub struct Connection {
     pub kind: String,
     pub command: String,
+    /// `optional: true` — a premium/add-on connection whose absence is expected
+    /// and benign (the open-source flow skips it). A missing optional command is
+    /// reported as [`ProvisionReport::missing_optional`], never as a required gap.
+    pub optional: bool,
 }
 
 /// Resolved gateway config for provisioning.
@@ -13,7 +17,11 @@ pub struct Config {
 /// vs missing.
 pub struct ProvisionReport {
     pub present: Vec<String>,
+    /// REQUIRED connections whose command is not installed — a real gap to fix.
     pub missing: Vec<String>,
+    /// OPTIONAL (premium/add-on) connections whose command is not installed —
+    /// expected and benign: the gateway and open-source packs run without them.
+    pub missing_optional: Vec<String>,
 }
 
 /// Enumerate every `kind: mcp` connection, check whether its `command`
@@ -33,19 +41,35 @@ pub fn detect(config: &Config) -> ProvisionReport {
 fn detect_with(config: &Config, managed_dir: Option<&std::path::Path>) -> ProvisionReport {
     let mut present = Vec::new();
     let mut missing = Vec::new();
+    let mut missing_optional = Vec::new();
 
     for conn in &config.connections {
         if conn.kind != "mcp" {
             continue;
         }
-        if which::which(&conn.command).is_ok() || in_managed_dir(managed_dir, &conn.command) {
+        // Resolve exactly as a real spawn would: `command_resolves` searches the
+        // ambient PATH AND the dirs praxec prepends to the child PATH (managed
+        // bin, ~/.cargo/bin, ~/.local/bin), `.exe`-aware — so a `cargo install`'d
+        // tool reads as PRESENT here, not a false "unknown tool". `managed_dir`
+        // is the test-injected override of the managed bin dir.
+        let resolvable = praxec_core::provision_install::command_resolves(&conn.command)
+            || in_managed_dir(managed_dir, &conn.command);
+        if resolvable {
             present.push(conn.command.clone());
+        } else if conn.optional {
+            // A premium/add-on tool the operator has not installed — expected and
+            // benign; never a required gap.
+            missing_optional.push(conn.command.clone());
         } else {
             missing.push(conn.command.clone());
         }
     }
 
-    ProvisionReport { present, missing }
+    ProvisionReport {
+        present,
+        missing,
+        missing_optional,
+    }
 }
 
 /// Does a spawnable binary for `command` exist in the managed bin dir? Delegates
@@ -62,27 +86,31 @@ fn in_managed_dir(managed_dir: Option<&std::path::Path>, command: &str) -> bool 
 mod tests {
     use super::*;
 
+    /// A required `kind: mcp` connection with `command`.
+    fn mcp(command: &str) -> Connection {
+        Connection {
+            kind: "mcp".into(),
+            command: command.into(),
+            optional: false,
+        }
+    }
+
     #[test]
     fn missing_command_classified_as_missing() {
         let config = Config {
-            connections: vec![Connection {
-                kind: "mcp".into(),
-                command: "nonexistent_command_xyz".into(),
-            }],
+            connections: vec![mcp("nonexistent_command_xyz")],
         };
 
         let report = detect(&config);
 
         assert_eq!(report.missing, vec!["nonexistent_command_xyz"]);
+        assert!(report.missing_optional.is_empty());
     }
 
     #[test]
     fn present_command_classified_as_present() {
         let config = Config {
-            connections: vec![Connection {
-                kind: "mcp".into(),
-                command: "cargo".into(),
-            }],
+            connections: vec![mcp("cargo")],
         };
 
         let report = detect(&config);
@@ -93,16 +121,7 @@ mod tests {
     #[test]
     fn mixed_present_and_missing_mcp_commands_are_classified() {
         let config = Config {
-            connections: vec![
-                Connection {
-                    kind: "mcp".into(),
-                    command: "nonexistent_command_xyz".into(),
-                },
-                Connection {
-                    kind: "mcp".into(),
-                    command: "cargo".into(),
-                },
-            ],
+            connections: vec![mcp("nonexistent_command_xyz"), mcp("cargo")],
         };
 
         let report = detect(&config);
@@ -116,6 +135,7 @@ mod tests {
             connections: vec![Connection {
                 kind: "stdio".into(),
                 command: "cargo".into(),
+                optional: false,
             }],
         };
 
@@ -139,10 +159,7 @@ mod tests {
         std::fs::write(dir.path().join(&file_name), b"#!/bin/sh\n").unwrap();
 
         let config = Config {
-            connections: vec![Connection {
-                kind: "mcp".into(),
-                command: cmd.into(),
-            }],
+            connections: vec![mcp(cmd)],
         };
 
         let report = detect_with(&config, Some(dir.path()));
@@ -155,15 +172,38 @@ mod tests {
     fn command_absent_from_path_and_managed_dir_is_missing() {
         let dir = tempfile::tempdir().unwrap(); // empty managed dir
         let config = Config {
-            connections: vec![Connection {
-                kind: "mcp".into(),
-                command: "nonexistent_command_xyz".into(),
-            }],
+            connections: vec![mcp("nonexistent_command_xyz")],
         };
 
         let report = detect_with(&config, Some(dir.path()));
 
         assert_eq!(report.missing, vec!["nonexistent_command_xyz"]);
         assert!(report.present.is_empty());
+    }
+
+    // Open-core boundary: an ABSENT OPTIONAL connection is classified as
+    // `missing_optional` (expected/benign), NOT `missing` (a required gap). This
+    // is what keeps a premium/add-on tool from reading as a problem in doctor.
+    #[test]
+    fn absent_optional_connection_is_missing_optional_not_missing() {
+        let dir = tempfile::tempdir().unwrap(); // empty managed dir
+        let config = Config {
+            connections: vec![Connection {
+                kind: "mcp".into(),
+                command: "nonexistent_premium_tool_xyz".into(),
+                optional: true,
+            }],
+        };
+
+        let report = detect_with(&config, Some(dir.path()));
+
+        assert_eq!(
+            report.missing_optional,
+            vec!["nonexistent_premium_tool_xyz"]
+        );
+        assert!(
+            report.missing.is_empty(),
+            "an optional tool must never be a required gap"
+        );
     }
 }
