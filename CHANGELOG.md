@@ -8,6 +8,42 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.50] — 2026-08-08 — portable spawn PATH + optional (premium) connections
+
+Open-core boundary and portability, from a Windows field report: a paid MCP tool
+(StructureOS/SecurityOS/IntentOS/UXOS) must never be *required* for the
+open-source gateway, and a connection command must never be pinned to one
+machine's absolute path. Additive — required connections still fail fast, and the
+text-only resolution of an installed tool is unchanged.
+
+### Added
+
+- **`optional: true` on a `kind: mcp` connection** — when its command is not
+  installed, a call returns a typed **skip** (`skipped: true`,
+  `OPTIONAL_CONNECTION_UNAVAILABLE`) instead of a spawn error, so a dependent gate
+  degrades cleanly, visibly, and auditably. Opt-in: a REQUIRED connection still
+  fails fast — this never weakens a mandatory tool.
+- **`check` warns `NON_PORTABLE_CONNECTION_COMMAND`** on a connection `command`
+  that is an absolute path under a home directory (`~/.cargo/bin/...`) — it is
+  machine- and OS-specific and will not resolve on another host. Use the bare
+  command name.
+
+### Changed
+
+- **The MCP child spawn `PATH` is widened** to include the standard user
+  tool-install dirs — the praxec-managed bin dir, `~/.cargo/bin`, and
+  `~/.local/bin` (Windows-correct) — so a **bare** `command:` resolves even under
+  a GUI/service launcher (Claude Code, Cursor) whose `PATH` omits them. This is
+  the portable alternative to hardcoding an absolute command path.
+
+### Fixed
+
+- **`doctor` no longer reports a `cargo install`'d tool as "unknown"** — tool
+  detection now uses the same resolver as the spawn (ambient `PATH` +
+  `~/.cargo/bin` + `~/.local/bin` + managed dir, `.exe`-aware). Missing tools are
+  split into required (`missing`) vs optional (`missing_optional`, reported as a
+  benign "premium/add-on not installed; the open-source packs run without it").
+
 ## [0.0.49] — 2026-08-07 — governed image inputs for `kind: agent` (vision)
 
 A governed `kind: agent` step can now receive **images** alongside its prompt, so
