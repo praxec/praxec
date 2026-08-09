@@ -8,6 +8,32 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.51] — 2026-08-08 — remove the speculative optional-connection machinery
+
+0.0.50 added an `optional: true` connection flag that degraded a missing tool to
+a typed skip. In review it proved to be the wrong primitive: the correct way an
+open-source config avoids a paid tool is to **not wire that connection** (pack
+selection), not to silently green-light every gate on it — a connection-level
+"optional" flag skips *any* gate on that connection, load-bearing or not, so a
+premium conformance/spec workflow could report a false pass. It had no legitimate
+user. Removed. The portability fixes from 0.0.50 — the widened spawn `PATH` and
+the `NON_PORTABLE_CONNECTION_COMMAND` check — are the real fix and stay.
+
+### Removed
+
+- **`optional: true` on a `kind: mcp` connection** and its typed-skip path
+  (`OPTIONAL_CONNECTION_UNAVAILABLE`). A missing tool now fails fast at
+  invocation as before — a required tool is never silently skipped.
+- The `doctor`/preflight `missing_optional` split (a missing connection is once
+  again simply `missing`).
+
+### Retained (from 0.0.50)
+
+- The MCP child spawn `PATH` still includes `~/.cargo/bin` and `~/.local/bin`, so
+  a bare `command:` resolves under a GUI/service launcher.
+- `check` still warns `NON_PORTABLE_CONNECTION_COMMAND` on an absolute
+  home-directory command path.
+
 ## [0.0.50] — 2026-08-08 — portable spawn PATH + optional (premium) connections
 
 Open-core boundary and portability, from a Windows field report: a paid MCP tool
