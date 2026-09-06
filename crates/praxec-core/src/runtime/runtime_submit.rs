@@ -1004,6 +1004,27 @@ impl WorkflowRuntime {
                 }
             };
 
+        // Quality optimization consumes explicit independent decisions only.
+        // Validate before any executor or state mutation; absent metadata keeps
+        // existing workflows compatible but their completions remain unverified.
+        let model_acceptance_event = if transition.get("model_acceptance").is_some() {
+            let events = self.audit.try_list_events().await?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MODEL_ACCEPTANCE_INVALID: acceptance requires a readable audit sink"
+                )
+            })?;
+            Some(crate::deescalation::human_acceptance_event(
+                &events,
+                &instance.id,
+                &transition,
+                &request.transition,
+                &request.principal,
+                &request.arguments,
+            )?)
+        } else {
+            None
+        };
+
         // Actor gate. A transition tagged `actor: "human"` requires the
         // submitter to be a human principal (see `Principal::is_human`).
         // Closes the loophole where an agent could call a human-only
@@ -1786,6 +1807,12 @@ impl WorkflowRuntime {
             .store
             .save_if_version(next, request.expected_version)
             .await?;
+
+        // A rejected guard, failed executor, or failed save never emits a pass.
+        // If the audit write fails after persistence, no quality credit is given.
+        if let Some(event) = model_acceptance_event {
+            self.audit.record(event).await?;
+        }
 
         // Persist accumulated evidence so subsequent `evidence` guards can
         // see it. Failures are logged but don't fail the transition — audit
@@ -3202,6 +3229,181 @@ mod tests {
         assert_eq!(
             reloaded.state, "picking",
             "a defective gate must not accept any submission"
+        );
+    }
+    fn model_acceptance_config() -> Value {
+        json!({"version":"1.0.0", "workflows":{"p":{
+            "version":"1.0.0", "initialState":"review", "states":{
+                "review":{"transitions":{"accept":{
+                    "actor":"human", "target":"done",
+                    "model_acceptance":{"producer_transition":"draft", "verdict":"accepted"}
+                }}}, "done":{"terminal":true}
+            }
+        }}})
+    }
+
+    async fn candidate(audit: &MemoryAuditSink, workflow: &str) -> crate::audit::AuditEvent {
+        // The same wire event emitted by a successful direct AgentExecutor call.
+        let event = crate::audit::AuditEvent::new("agent.model_attempt")
+            .with_workflow(workflow).with_correlation("producer-correlation")
+            .with_payload(json!({"transition":"draft", "affinity":"coding",
+                "model":"provider:cheap", "outcome":"success", "reasoning_effort":"low", "cost_usd":0.01}));
+        audit.record(event.clone()).await.unwrap();
+        event
+    }
+
+    fn acceptance_request(workflow: &str, event: &crate::audit::AuditEvent) -> SubmitTransition {
+        SubmitTransition {
+            workflow_id: workflow.into(),
+            expected_version: 0,
+            transition: "accept".into(),
+            arguments: json!({"producer_event_id":event.id,
+                "evidence":"Reviewed patch and independently ran regression suite"}),
+            principal: human_principal(),
+            summary: None,
+            trace_id: None,
+            run_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn model_acceptance_emits_real_provenance_after_persistence() {
+        let (runtime, store, audit) = choice_gate_runtime(&model_acceptance_config());
+        let id = start_id(&runtime, "p").await;
+        let event = candidate(&audit, &id).await;
+        assert!(
+            crate::deescalation::observations_from_audit(&audit.list_events().await.unwrap())
+                .is_empty()
+        );
+        runtime
+            .submit(acceptance_request(&id, &event))
+            .await
+            .unwrap();
+        assert_eq!(store.load(&id).await.unwrap().state, "done");
+        let events = audit.list_events().await.unwrap();
+        let decision = events
+            .iter()
+            .find(|e| e.event_type == "agent.acceptance_recorded")
+            .unwrap();
+        assert_eq!(decision.payload["producer_event_id"], event.id);
+        assert_eq!(decision.correlation_id, event.correlation_id);
+        let observations = crate::deescalation::observations_from_audit(&events);
+        assert_eq!(observations.len(), 1);
+        assert!(observations[0].passed);
+        assert_eq!(observations[0].effort.as_deref(), Some("low"));
+    }
+
+    #[tokio::test]
+    async fn model_acceptance_rejects_invalid_or_stale_claims_without_state_mutation() {
+        for invalid in [
+            "agent",
+            "empty-evidence",
+            "wrong-event",
+            "new-invocation",
+            "foreign-workflow",
+            "duplicate",
+            "malformed",
+        ] {
+            let mut cfg = model_acceptance_config();
+            if invalid == "malformed" {
+                cfg["workflows"]["p"]["states"]["review"]["transitions"]["accept"]["model_acceptance"]
+                    ["verdict"] = json!("probably");
+            }
+            let (runtime, store, audit) = choice_gate_runtime(&cfg);
+            let id = start_id(&runtime, "p").await;
+            let event = candidate(
+                &audit,
+                if invalid == "foreign-workflow" {
+                    "other"
+                } else {
+                    &id
+                },
+            )
+            .await;
+            let mut request = acceptance_request(&id, &event);
+            match invalid {
+                "agent" => request.principal = Principal::anonymous(),
+                "empty-evidence" => request.arguments["evidence"] = json!(" "),
+                "wrong-event" => {
+                    request.arguments["producer_event_id"] = json!("not-the-candidate")
+                }
+                "new-invocation" => audit
+                    .record(
+                        crate::audit::AuditEvent::new("agent.invoked")
+                            .with_workflow(&id)
+                            .with_correlation("new-run")
+                            .with_payload(json!({"transition":"draft"})),
+                    )
+                    .await
+                    .unwrap(),
+                "duplicate" => audit
+                    .record(
+                        crate::audit::AuditEvent::new("agent.acceptance_recorded")
+                            .with_workflow(&id)
+                            .with_correlation(&event.correlation_id)
+                            .with_payload(json!({"transition":"draft"})),
+                    )
+                    .await
+                    .unwrap(),
+                _ => {}
+            }
+            let before = audit
+                .list_events()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == "agent.acceptance_recorded")
+                .count();
+            let error = runtime.submit(request).await.unwrap_err();
+            assert!(
+                error.to_string().contains("MODEL_ACCEPTANCE_INVALID"),
+                "{invalid}: {error}"
+            );
+            assert_eq!(store.load(&id).await.unwrap().version, 0, "{invalid}");
+            assert_eq!(
+                audit
+                    .list_events()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e.event_type == "agent.acceptance_recorded")
+                    .count(),
+                before,
+                "{invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn model_acceptance_does_not_emit_on_failed_save() {
+        let (original, store, audit) = choice_gate_runtime(&model_acceptance_config());
+        let id = start_id(&original, "p").await;
+        let event = candidate(&audit, &id).await;
+        let runtime = WorkflowRuntime::new(
+            Arc::new(ConfigDefinitionStore::from_config(
+                &model_acceptance_config(),
+            )),
+            Arc::new(SaveFailingStore {
+                inner: store.clone(),
+            }),
+            Arc::new(EmptyRegistry),
+            Arc::new(DefaultGuardEvaluator::new()),
+            audit.clone(),
+        );
+        assert!(
+            runtime
+                .submit(acceptance_request(&id, &event))
+                .await
+                .is_err()
+        );
+        assert_eq!(store.load(&id).await.unwrap().version, 0);
+        assert!(
+            !audit
+                .list_events()
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| e.event_type == "agent.acceptance_recorded")
         );
     }
 }

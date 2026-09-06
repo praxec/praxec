@@ -50,3 +50,5 @@ WIP/
 .write.lock
 .frontrails/
 .corpus/
+# Local delegation state, prompts, responses, and acceptance evidence.
+.praxec-runs/

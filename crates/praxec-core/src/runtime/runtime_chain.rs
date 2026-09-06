@@ -3,6 +3,11 @@
 //! sibling files — see `runtime.rs` for the type definition and lifecycle
 //! entry points (`start`, `submit`, `get`).
 
+#[path = "runtime_continuation.rs"]
+mod continuation;
+pub(crate) use continuation::validate as validate_continuation;
+pub(crate) const CONTINUATION_READS_KEY: &str = continuation::KEY;
+
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
@@ -719,6 +724,10 @@ impl WorkflowRuntime {
                 break;
             }
 
+            // Preserve engine metadata independently of model/transition output.
+            let continuation_previous = instance.context.get(CONTINUATION_READS_KEY).cloned();
+            let mut continuation_snapshot = None;
+
             // Select the transition for this hop + compute its arguments + actor.
             let transition_name: String;
             let transition_def: Value;
@@ -770,6 +779,28 @@ impl WorkflowRuntime {
                 // executor to produce the submission, then feed its JSON-object
                 // output as this transition's `arguments` so the cap's existing
                 // `$.arguments.*` output mapping applies unchanged.
+                continuation_snapshot = continuation::capture(definition, &instance)?;
+                if let Some(snapshot) = &continuation_snapshot {
+                    if continuation::unchanged(&instance, snapshot)? {
+                        let reason = format!(
+                            "continuation_unchanged: state '{}' has no change in its declared continuation reads; supply new evidence before another auto-driven model call",
+                            instance.state
+                        );
+                        self.record_or_self_event(
+                            instance.audit_event("chain.quarantined")
+                                .with_correlation(correlation_id)
+                                .with_payload(json!({"state": instance.state, "reason": "continuation_unchanged"})),
+                        ).await;
+                        return Ok(ChainOutcome::Quarantined {
+                            partial: ChainResult {
+                                instance,
+                                steps,
+                                evidence: accumulated_evidence,
+                            },
+                            reason,
+                        });
+                    }
+                }
                 let name = agent_drivable[0].0.clone();
                 let def = agent_drivable[0].1.clone();
                 let state_goal = definition
@@ -1041,7 +1072,9 @@ impl WorkflowRuntime {
                 // Observability: emit a start event so a live `audit tail` shows
                 // exactly which agent step is running (and pinpoints a hang).
                 let agent_started = std::time::Instant::now();
+                let task_cohort = crate::deescalation::task_cohort(&instance, Some(&name));
                 let mut invoked_payload = json!({
+                    "task_cohort": task_cohort,
                     "transition": name,
                     "state": instance.state,
                     "affinity": auto_affinity_tier,
@@ -1119,6 +1152,7 @@ impl WorkflowRuntime {
                                 .with_correlation(correlation_id)
                                 .with_payload(json!({
                                     "transition": name,
+                                    "task_cohort": task_cohort,
                                     "affinity": auto_affinity_tier,
                                     "duration_ms": agent_started.elapsed().as_millis() as u64,
                                     "model": model,
@@ -1408,6 +1442,16 @@ impl WorkflowRuntime {
             let expected_version = instance.version;
             instance.state = target.clone();
             instance.version += 1;
+
+            // Commit the consumed evidence with the hop, never before a failed
+            // executor call. A crash between the model call and this save may
+            // replay the call; this gate is not an exactly-once execution log.
+            continuation::commit(
+                &mut instance.context,
+                continuation_previous,
+                &from_state,
+                continuation_snapshot,
+            )?;
 
             // Bump the persisted cumulative hop counter — and, alongside it,
             // this hop's wall-clock duration (mission-deadline backstop) — as

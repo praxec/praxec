@@ -1,5 +1,7 @@
 # North-Star Plan Index — Evidence-Gated Boundaries + the file-mutation probe
 
+**Implementation status (2026-09-06):** see [current controls and limits](../2026-09-06-commodity-harness-controls.md). This is a roadmap, not a release checklist.
+
 **Design of record:** `docs/design/2026-07-28-change-building-block-design.md` (vetted, aligned).
 **Method:** design big, build small. This index is the *big* — the complete, ordered plan-set we
 drive toward. Each plan is *small* — a standalone, testable, subagent-buildable unit. No code lands
@@ -57,12 +59,12 @@ A/B-gated), not an engine `kind`. The engine stays lean: it gains only the gener
   `outcomes`; no parallel abstractions without a migration+removal plan.
 
 ## Status
-- [x] Plan A — entry gate (`2026-07-28-entry-gate-fallible-render.md`)
-- [ ] Plan B — continuation delta-gate
+- [x] Plan A — entry gate (`2026-07-28-entry-gate-fallible-render.md`); ordinary dispatch defaults to enforced as of 2026-09-06
+- [x] Plan B — explicit read-slice continuation gate for auto-drive; automatic slice inference remains deferred
 - [ ] Plan C — fallback-ledger + telemetry
 - [ ] Plan D — admissibility validator + external-effect rule
 - [ ] Plan E — acceptance-criteria handoff (outcomes extension)
 - [ ] Plan F — apply-strategy tool + change workflow (A/B probe)
 
-Execution mode chosen: **subagent-driven** (fresh subagent per task, review between tasks). Begins
-once the plan-set above is complete.
+Execution uses bounded delegation and independent acceptance. Do not wait for the
+entire roadmap to finish before shipping independently verified controls.

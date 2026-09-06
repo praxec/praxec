@@ -1,8 +1,8 @@
 //! The **value-prop savings report** — aggregates the realized cost telemetry
-//! that the agent auto-drive path now records on each `agent.completed` audit
+//! recorded on `agent.completed` and direct `agent.model_attempt` audit
 //! event ({affinity, duration_ms, model, prompt_tokens, completion_tokens,
 //! cost_usd}) into a per-run / cross-run cost picture, and computes the
-//! **counterfactual**: what the same
+//! **token-pricing counterfactual** (not measured productivity savings): what the same
 //! realized tokens *would* have cost at the most-capable ("ceiling") catalog
 //! model. The headline is "saved Z% vs ceiling" — the evidence that justifies
 //! the chosen base model and that the de-escalation loop consumes.
@@ -215,31 +215,79 @@ pub fn build_cost_report(
 ) -> CostReport {
     // 0. Affinity join table: `agent.invoked` carries the affinity the agent
     // was resolved under; older `agent.completed` events don't self-carry it,
-    // so join by the shared `correlation_id`.
-    let invoked_affinity: BTreeMap<&str, &str> = events
+    // so join by workflow, correlation, and transition (a chain shares correlations).
+    let invocation_key = |e: &AuditEvent| {
+        (
+            e.workflow_id.clone(),
+            e.correlation_id.clone(),
+            e.payload
+                .get("transition")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
+    };
+    let invoked_affinity: BTreeMap<_, &str> = events
         .iter()
         .filter(|e| e.event_type == AGENT_INVOKED)
         .filter_map(|e| {
             let a = e.payload.get("affinity").and_then(Value::as_str)?;
-            Some((e.correlation_id.as_str(), a))
+            Some((invocation_key(e), a))
         })
         .collect();
 
-    // 1. Distill the in-scope agent steps.
+    let in_scope = |e: &AuditEvent| {
+        opts.workflow
+            .as_ref()
+            .is_none_or(|wf| e.workflow_id.as_ref() == Some(wf))
+            && opts.since.is_none_or(|since| e.timestamp >= since)
+    };
+    let identity = |e: &AuditEvent| {
+        (
+            e.workflow_id.clone(),
+            e.correlation_id.clone(),
+            e.payload
+                .get("transition")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            e.payload
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
+    };
+    // Auto-drive emits both an attempt and completion. Direct agent executors
+    // may emit only the attempt. Match occurrences (not just correlation ids,
+    // which can span several steps) so each successful execution is priced once.
+    let mut completions = BTreeMap::new();
+    for e in events
+        .iter()
+        .filter(|e| e.event_type == AGENT_COMPLETED && in_scope(e))
+    {
+        *completions.entry(identity(e)).or_insert(0usize) += 1;
+    }
+
+    // 1. Distill the in-scope agent steps, including direct-agent winners.
     let mut runs: Vec<Run> = Vec::new();
     for e in events {
-        if e.event_type != AGENT_COMPLETED {
+        if !in_scope(e) {
             continue;
         }
-        if let Some(wf) = &opts.workflow {
-            if e.workflow_id.as_deref() != Some(wf.as_str()) {
+        let is_attempt = e.event_type == AGENT_MODEL_ATTEMPT;
+        if is_attempt {
+            if !matches!(
+                e.payload.get("outcome").and_then(Value::as_str),
+                Some("success" | "suspended")
+            ) {
                 continue;
             }
-        }
-        if let Some(since) = opts.since {
-            if e.timestamp < since {
-                continue;
+            if let Some(count) = completions.get_mut(&identity(e)) {
+                if *count > 0 {
+                    *count -= 1;
+                    continue;
+                }
             }
+        } else if e.event_type != AGENT_COMPLETED {
+            continue;
         }
         let p = &e.payload;
         let transition = p
@@ -252,7 +300,7 @@ pub fn build_cost_report(
         let affinity = p
             .get("affinity")
             .and_then(Value::as_str)
-            .or_else(|| invoked_affinity.get(e.correlation_id.as_str()).copied())
+            .or_else(|| invoked_affinity.get(&invocation_key(e)).copied())
             .map(str::to_string);
         let model = p.get("model").and_then(Value::as_str).map(str::to_string);
         let prompt_tokens = p.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
@@ -263,7 +311,12 @@ pub fn build_cost_report(
         let duration_ms = p.get("duration_ms").and_then(Value::as_u64).unwrap_or(0);
         // Prefer the realized cost the runtime recorded; if absent, reprice from
         // the catalog; if the model is uncatalogued, the cost stays unknown.
+        let has_usage = p.get("prompt_tokens").and_then(Value::as_u64).is_some()
+            && p.get("completion_tokens").and_then(Value::as_u64).is_some();
         let cost_usd = p.get("cost_usd").and_then(Value::as_f64).or_else(|| {
+            if !has_usage {
+                return None;
+            }
             model
                 .as_deref()
                 .and_then(|m| cost_usd_in(models, m, prompt_tokens, completion_tokens))
@@ -335,7 +388,8 @@ pub fn build_cost_report(
         }
         let model = p.get("model").and_then(Value::as_str).map(str::to_string);
         // A pre-0.0.37 attempt event has no token keys → unpriced (not $0-priced).
-        let has_tokens = p.get("prompt_tokens").is_some();
+        let has_tokens = p.get("prompt_tokens").and_then(Value::as_u64).is_some()
+            && p.get("completion_tokens").and_then(Value::as_u64).is_some();
         let prompt_tokens = p.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
         let completion_tokens = p
             .get("completion_tokens")
@@ -568,6 +622,7 @@ mod tests {
         cost: Option<f64>,
     ) -> AuditEvent {
         let mut payload = serde_json::Map::new();
+        payload.insert("transition".into(), json!("scan"));
         payload.insert("model".into(), json!(model_str));
         payload.insert("outcome".into(), json!(outcome));
         payload.insert("duration_ms".into(), json!(720_000));
@@ -592,7 +647,8 @@ mod tests {
         let models = vec![model("base", 56.0, 1.0, 3.0)];
         let events = vec![
             // the winning step (a fallback succeeded) — via agent.completed.
-            completed("wf1", "scan", "v:base", 1_000_000, 1_000_000, Some(4.00)),
+            completed("wf1", "scan", "v:base", 1_000_000, 1_000_000, Some(4.00))
+                .with_correlation("scan-attempt"),
             // a non-converging model burned tokens then fell back → WASTED.
             attempt(
                 "wf1",
@@ -608,7 +664,8 @@ mod tests {
                 "success",
                 Some((1_000_000, 1_000_000)),
                 Some(4.00),
-            ),
+            )
+            .with_correlation("scan-attempt"),
         ];
         let r = build_cost_report(&events, &models, &ReportOptions::default());
         assert_eq!(r.total_cost_usd, 4.00, "succeeded-step figure unchanged");
@@ -866,6 +923,82 @@ mod tests {
             },
         );
         assert_eq!(by_since.runs, 2);
+    }
+
+    #[test]
+    fn direct_agent_attempt_is_priced_without_a_completion_event() {
+        let e = attempt("wf1", "v:base", "success", Some((100, 200)), Some(0.25));
+        let r = build_cost_report(&[e], &[], &ReportOptions::default());
+        assert_eq!(r.runs, 1);
+        assert_eq!(r.total_prompt_tokens, 100);
+        assert_eq!(r.total_spend_usd, 0.25);
+        assert_eq!(r.failed_attempts, 0);
+    }
+
+    #[test]
+    fn completion_and_attempt_are_counted_once_per_step_not_per_correlation() {
+        let mut a = attempt("wf1", "v:base", "success", Some((100, 200)), Some(0.25))
+            .with_correlation("shared");
+        a.payload["transition"] = json!("first");
+        let c =
+            completed("wf1", "first", "v:base", 100, 200, Some(0.25)).with_correlation("shared");
+        let mut b = a.clone();
+        b.payload["transition"] = json!("second");
+        for events in [
+            vec![a.clone(), c.clone(), b.clone()],
+            vec![c.clone(), b.clone(), a.clone()],
+        ] {
+            let r = build_cost_report(&events, &[], &ReportOptions::default());
+            assert_eq!(r.runs, 2);
+            assert_eq!(r.total_spend_usd, 0.5);
+        }
+        // An additional occurrence of the same step is not hidden by one completion.
+        let r = build_cost_report(&[a.clone(), c, a], &[], &ReportOptions::default());
+        assert_eq!(r.runs, 2);
+    }
+
+    #[test]
+    fn affinity_join_cannot_cross_workflows_or_steps_sharing_a_correlation() {
+        let events = vec![
+            invoked("wf1", "shared", "draft", "coding"),
+            invoked("wf1", "shared", "review", "review"),
+            invoked("wf2", "shared", "draft", "reasoning"),
+            completed("wf1", "draft", "v:base", 1, 1, Some(0.1)).with_correlation("shared"),
+        ];
+        let r = build_cost_report(&events, &[], &ReportOptions::default());
+        assert_eq!(r.by_affinity.len(), 1);
+        assert_eq!(r.by_affinity[0].key, "coding");
+    }
+
+    #[test]
+    fn missing_completion_usage_does_not_become_zero_cost() {
+        let mut event = completed("wf1", "draft", "v:base", 0, 0, None);
+        event.payload["prompt_tokens"] = Value::Null;
+        let r = build_cost_report(
+            &[event],
+            &[model("base", 56.0, 1.0, 3.0)],
+            &ReportOptions::default(),
+        );
+        assert_eq!(r.priced_runs, 0);
+        assert_eq!(r.uncatalogued_runs, 1);
+        assert!(r.counterfactual.is_none());
+    }
+
+    #[test]
+    fn null_attempt_usage_is_unknown_instead_of_free() {
+        let models = vec![model("base", 56.0, 1.0, 3.0)];
+        for outcome in ["success", "NetworkTimeout"] {
+            let mut e = attempt("wf1", "v:base", outcome, None, None);
+            e.payload["prompt_tokens"] = Value::Null;
+            e.payload["completion_tokens"] = Value::Null;
+            let r = build_cost_report(&[e], &models, &ReportOptions::default());
+            if outcome == "success" {
+                assert_eq!(r.uncatalogued_runs, 1);
+                assert_eq!(r.priced_runs, 0);
+            } else {
+                assert_eq!(r.unpriced_failed_attempts, 1);
+            }
+        }
     }
 
     #[test]

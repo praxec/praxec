@@ -92,6 +92,48 @@ That's the shape. The rest of this guide is the detail behind each piece.
 
 ---
 
+## Ground the task before dispatch
+
+`kind: agent` now defaults to `enforce_input_grounding: true`. A missing
+reference in the goal, such as `{{ $.context.acceptance }}`, fails with
+`AGENT_INPUT_UNRESOLVED` before resolving the model chain or starting a session.
+An empty or whitespace-only rendered goal also fails before dispatch. This
+updates the original Plan A rollout from shadow mode to enforcement.
+
+Use workflow and transition `inputSchema` contracts for required handoff data.
+For example, a task string that must carry content should declare both its type
+and a non-whitespace pattern; `required` alone only requires the key:
+
+```yaml
+inputSchema:
+  type: object
+  required: [task, acceptance]
+  properties:
+    task: { type: string, pattern: "\\S" }
+    acceptance: { type: string, pattern: "\\S" }
+    notes: { type: [string, "null"] }
+```
+
+Forward these values to the consuming step and reference the task and acceptance
+criteria in its goal. Leave optional fields out of `required`; prepare defaults
+before referencing an optional field in a goal. The renderer does not interpret
+`$optional` inside `{{ ... }}`. A resolved literal such as `(task: unset)` is
+ordinary source text, not a missing binding. Resolved nulls are not automatically
+rejected by the goal gate: a required string contract must exclude null.
+
+For migration only, an authored executor can explicitly set
+`enforce_input_grounding: false` to retain shadow behavior for missing references.
+`praxec check` reports `AGENT_INPUT_GROUNDING_DISABLED`, and dispatch records
+`agent.input_unresolved`. This override does not permit an empty rendered goal.
+Fix incomplete bindings before removing the override. Resume of an already
+parked session retains its existing prompt and reply gate; the sandboxed
+`untrusted` command path has a separate command contract.
+
+These checks establish structural completeness, not whether the supplied context
+is accurate or sufficient. Acceptance criteria, relevant source evidence, scoped
+tools, bounded attempts, and independent verification still belong in the
+workflow. A successful model response is a candidate until those checks pass.
+
 ## The models file
 
 Agent (and affinity-resolved `kind: llm`) steps declare a *binding* — an
