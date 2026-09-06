@@ -467,6 +467,7 @@ impl WorkflowRuntime {
         max_depth: u64,
         livelock_budget: u64,
     ) -> anyhow::Result<ChainOutcome> {
+        crate::amplifier::validate_input(definition, &instance.input)?;
         let mut steps: Vec<ChainStep> = Vec::new();
         let mut accumulated_evidence: Vec<Evidence> = Vec::new();
 
@@ -662,6 +663,7 @@ impl WorkflowRuntime {
             // Collect deterministic transitions
             let deterministic: Vec<(&String, &Value)> = transitions
                 .iter()
+                .filter(|(name, _)| name.as_str() != crate::config::HALT_TRANSITION)
                 .filter(|(_, t)| t.get("actor").and_then(Value::as_str) == Some("deterministic"))
                 .collect();
 
@@ -689,6 +691,7 @@ impl WorkflowRuntime {
                         .iter()
                         .filter(|(_, t)| t.get("actor").and_then(Value::as_str) == Some("agent"))
                         .filter(|(name, _)| name.as_str() != "escalate")
+                        .filter(|(name, _)| name.as_str() != crate::config::HALT_TRANSITION)
                         .collect()
                 } else {
                     Vec::new()
@@ -733,10 +736,19 @@ impl WorkflowRuntime {
             let transition_def: Value;
             let chain_arguments: Value;
             let chain_actor: &'static str;
-            if !deterministic.is_empty() {
+            let direct_model_drive = definition.get("amplifier").is_some() && use_agent_drive;
+            if !deterministic.is_empty() || direct_model_drive {
+                // A coarse generative task already declares its executor and
+                // grounded contract. Select its legal transition mechanically;
+                // never pay a second model to synthesize submission arguments.
+                let candidates = if direct_model_drive {
+                    &agent_drivable
+                } else {
+                    &deterministic
+                };
                 match self
                     .select_deterministic_transition(
-                        &deterministic,
+                        candidates,
                         &instance,
                         principal,
                         correlation_id,
@@ -773,7 +785,11 @@ impl WorkflowRuntime {
                     }
                 }
                 chain_arguments = json!({});
-                chain_actor = "deterministic";
+                chain_actor = if direct_model_drive {
+                    "agent"
+                } else {
+                    "deterministic"
+                };
             } else {
                 // Auto-drive the first agent move: invoke the `kind: agent`
                 // executor to produce the submission, then feed its JSON-object

@@ -131,6 +131,9 @@ pub fn validate_workflows(config: &Value) -> Vec<Diagnostic> {
     };
 
     for (id, def) in workflows {
+        if let Err(error) = crate::amplifier::validate(def) {
+            diagnostics.push(Diagnostic::Error(format!("workflow '{id}': {error}")));
+        }
         validate_one_workflow(id, def, &skill_subjects, &ctx, strict, &mut diagnostics);
     }
 

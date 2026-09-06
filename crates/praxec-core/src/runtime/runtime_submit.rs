@@ -919,6 +919,8 @@ impl WorkflowRuntime {
             ));
         }
 
+        crate::amplifier::validate_input(&definition, &instance.input)?;
+
         // T24 — cancelled workflows refuse submit. The caller sees
         // WORKFLOW_CANCELLED with the original reason in the error
         // body so retry loops don't loop forever.

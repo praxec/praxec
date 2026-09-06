@@ -27,6 +27,7 @@
 //! `parking_lot` (no poisoning).
 
 pub mod accounts;
+pub mod amplifier;
 pub mod audit;
 pub mod binding;
 pub mod bus;
