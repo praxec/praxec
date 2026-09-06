@@ -1,5 +1,10 @@
 # Entry Gate (Fallible Render) Implementation Plan
 
+> Updated 2026-09-06: the original shadow-first rollout below is historical.
+> Ordinary agent dispatch now defaults to enforced grounding; explicit false
+> retains shadow mode with a doctor warning. Empty rendered goals always fail.
+> See [current controls](../2026-09-06-commodity-harness-controls.md) for tested scope.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stop an agent step from being dispatched with a goal/prompt that silently contains an unresolved `(x: unset)` template stub — the failure that let a surface-name (`"organization-payment"`) reach a coder where real values were expected.

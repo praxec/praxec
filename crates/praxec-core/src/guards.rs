@@ -33,6 +33,8 @@ pub enum GuardKind {
     GuidanceAcknowledged,
     ScriptAcknowledged,
     Evidence,
+    /// Runtime capability marker and validation for the coarse-task profile.
+    AmplifierContract,
 }
 
 impl GuardKind {
@@ -49,6 +51,7 @@ impl GuardKind {
         GuardKind::GuidanceAcknowledged,
         GuardKind::ScriptAcknowledged,
         GuardKind::Evidence,
+        GuardKind::AmplifierContract,
     ];
 
     /// Parse the wire-format string. Returns `None` for any value not in
@@ -68,6 +71,7 @@ impl GuardKind {
             "guidance_acknowledged" => Some(GuardKind::GuidanceAcknowledged),
             "script_acknowledged" => Some(GuardKind::ScriptAcknowledged),
             "evidence" => Some(GuardKind::Evidence),
+            "amplifier_contract" => Some(GuardKind::AmplifierContract),
             _ => None,
         }
     }
@@ -85,6 +89,7 @@ impl GuardKind {
             GuardKind::GuidanceAcknowledged => "guidance_acknowledged",
             GuardKind::ScriptAcknowledged => "script_acknowledged",
             GuardKind::Evidence => "evidence",
+            GuardKind::AmplifierContract => "amplifier_contract",
         }
     }
 }
@@ -193,6 +198,14 @@ impl GuardEvaluator for DefaultGuardEvaluator {
         // evaluator can't drift out of sync without `cargo build`
         // failing first.
         match kind {
+            GuardKind::AmplifierContract => {
+                anyhow::ensure!(
+                    instance.definition.get("amplifier").is_some(),
+                    "AMPLIFIER_INVALID: amplifier_contract guard requires the workflow profile"
+                );
+                crate::amplifier::validate_input(&instance.definition, &instance.input)?;
+                Ok(true)
+            }
             GuardKind::Permission => {
                 let required = guard
                     .get("permission")

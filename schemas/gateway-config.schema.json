@@ -802,6 +802,21 @@
           "additionalProperties": {
             "$ref": "#/$defs/state"
           }
+        },
+        "amplifier": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max_model_steps"
+          ],
+          "properties": {
+            "max_model_steps": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16
+            }
+          },
+          "description": "Opt-in coarse-task profile. Requires intent/context/deliverable/acceptance input, classified execution, bounded acyclic model work, and script verification after the last change on every success path."
         }
       }
     },
@@ -849,6 +864,32 @@
             "$ref": "#/$defs/transition"
           },
           "default": {}
+        },
+        "continuation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reads"
+          ],
+          "properties": {
+            "reads": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^\\$\\.(context|workflow\\.input)\\.[^_\\s].*$"
+              }
+            }
+          },
+          "description": "Opt-in auto-drive gate: a repeated state requires a changed declared evidence slice before another model call. Missing reads fail closed; counters and timestamps are not progress evidence."
+        },
+        "outcome": {
+          "enum": [
+            "success",
+            "failure"
+          ],
+          "description": "Explicit terminal outcome; required by the amplifier profile."
         }
       }
     },
@@ -926,6 +967,37 @@
           },
           "default": [],
           "description": "Auto-branch the destination state based on the executor's result. Evaluated after the executor succeeds and after `output` mappings have been applied. First branch whose `when` guard passes wins; if none match, falls back to the transition's `target`."
+        },
+        "model_acceptance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "producer_transition",
+            "verdict"
+          ],
+          "properties": {
+            "producer_transition": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S"
+            },
+            "verdict": {
+              "enum": [
+                "accepted",
+                "rejected"
+              ]
+            }
+          },
+          "description": "Executor-free human acceptance attestation linked to the latest producer audit event by producer_event_id and nonempty evidence arguments. Model completion alone is not optimizer quality evidence."
+        },
+        "work_kind": {
+          "enum": [
+            "generative",
+            "deterministic",
+            "verification",
+            "intent"
+          ],
+          "description": "Execution responsibility under the amplifier profile. Models generate; tools execute and verify; humans supply intent. This label alone does not enable enforcement."
         }
       }
     },

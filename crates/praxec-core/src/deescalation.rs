@@ -9,7 +9,7 @@
 //!
 //! Three pure layers, each independently testable:
 //! 1. [`observations_from_audit`] — correlate `agent.invoked` / `agent.completed`
-//!    / `chain.failed` events (by `correlation_id`) into per-step outcomes.
+//!    / `agent.acceptance_recorded` / `chain.failed` into per-step outcomes.
 //! 2. [`aggregate`] — roll observations up per `(affinity, model, effort)`: run
 //!    count, pass-rate, mean realized cost. (Affinity is the `models.yaml` key —
 //!    the unit the base actually configures; the steps it covers are evidence.)
@@ -22,7 +22,8 @@
 //!    come from [`tuning`](crate::tuning), never hard-coded.
 //!
 //! Producer ≠ evaluator: "passed" means the step cleared its *independent*
-//! acceptance bar (the next transition advanced) — never a model grading itself.
+//! acceptance bar (an explicit, attributed human decision) — never merely a
+//! completion, state advancement, or a model grading itself.
 
 use crate::audit::AuditEvent;
 use serde::Serialize;
@@ -36,6 +37,9 @@ pub struct StepObservation {
     pub affinity: String,
     /// The transition (step) name.
     pub step: String,
+    /// Engine fingerprint of definition snapshot, state and transition.
+    /// Absent historical provenance cannot justify a cost downgrade.
+    pub task_cohort: Option<String>,
     /// The `provider:model` that ran.
     pub model: String,
     /// (#12) The reasoning effort the model ACTUALLY ran under — read from
@@ -45,7 +49,7 @@ pub struct StepObservation {
     /// Effort is non-portable across models, so `qwen3-coder@medium` and
     /// `@high` are DISTINCT observations — never lumped.
     pub effort: Option<String>,
-    /// Cleared its independent acceptance bar (advanced) vs failed / aborted.
+    /// Explicit independent acceptance vs rejection / contract failure.
     pub passed: bool,
     /// Realized USD for the step (`None` on failure / uncatalogued).
     pub cost_usd: Option<f64>,
@@ -68,8 +72,52 @@ pub struct ModelStats {
     pub pass_rate: f64,
     /// Mean realized USD over the priced runs (`None` if none were priced).
     pub mean_cost_usd: Option<f64>,
+    /// Runs with finite, nonnegative realized cost. Partial coverage cannot
+    /// establish savings.
+    pub priced_runs: usize,
+    pub cohorts: BTreeMap<String, CohortStats>,
     /// Distinct steps observed under this `(affinity, model)` — evidence.
     pub steps: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CohortStats {
+    pub runs: usize,
+    pub passes: usize,
+}
+
+/// Stable engine provenance for observational comparison, not an assertion
+/// that tasks of one definition have identical difficulty or input size.
+pub fn task_cohort(instance: &crate::model::WorkflowInstance, transition: Option<&str>) -> String {
+    crate::contract_hash::compute_contract_hash(&serde_json::json!({
+        "definition_id": instance.definition_id,
+        "definition": instance.definition,
+        "state": instance.state,
+        "transition": transition,
+    }))
+}
+
+fn valid_cost(cost: f64) -> bool {
+    cost.is_finite() && cost >= 0.0
+}
+
+/// Require complete cohort provenance, adequately sampled matching task classes,
+/// equal observed task mix, and no candidate regression within any class.
+fn comparable_for_lower(base: &ModelStats, candidate: &ModelStats, min_runs: usize) -> bool {
+    if base.cohorts.is_empty()
+        || base.cohorts.keys().ne(candidate.cohorts.keys())
+        || base.cohorts.values().map(|c| c.runs).sum::<usize>() != base.runs
+        || candidate.cohorts.values().map(|c| c.runs).sum::<usize>() != candidate.runs
+    {
+        return false;
+    }
+    base.cohorts.iter().all(|(key, b)| {
+        let c = &candidate.cohorts[key];
+        b.runs >= min_runs
+            && c.runs >= min_runs
+            && (b.runs as u128) * candidate.runs as u128 == (c.runs as u128) * base.runs as u128
+            && (c.passes as u128) * b.runs as u128 >= (b.passes as u128) * c.runs as u128
+    })
 }
 
 /// Which way a proposal moves the base.
@@ -181,136 +229,216 @@ fn same_identity(a: &str, b: &str) -> bool {
     identity_key(a) == identity_key(b)
 }
 
-/// Correlate audit events into per-step outcomes. A correlation that carries an
-/// `agent.invoked` is an agent step; it **passed** if its `agent.completed`
-/// fired, **failed** if a `chain.failed` fired instead (model/affinity come from
-/// `agent.invoked`, realized cost from `agent.completed`).
-pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
-    #[derive(Default)]
-    struct Acc {
-        /// (step, affinity, model) from `agent.invoked`.
-        invoked: Option<(String, String, String)>,
-        /// (model, cost, effort) from `agent.completed`. Model+effort come from
-        /// the SAME event so they're paired — the walked model and the effort it
-        /// actually ran under (#12).
-        completed: Option<(String, Option<f64>, Option<String>)>,
-        failed: bool,
-        /// (model, effort) of each attempt that FAILED the structured-output
-        /// contract (AGENT_NOT_CONVERGING / NO_RESULT / RESULT_FAILED /
-        /// NO_FILE_WRITES). Only the
-        /// WINNER reaches `agent.completed`, so without these a model that can't
-        /// emit the contract stays invisible to the flywheel and keeps getting
-        /// routed contract-critical work. Each becomes a FAILED observation.
-        contract_failed: Vec<(String, Option<String>)>,
-    }
-    let str_field = |p: &Value, k: &str| {
-        p.get(k)
-            .and_then(Value::as_str)
-            .unwrap_or("(unknown)")
-            .to_string()
-    };
+/// A producer result is a candidate, never an independent quality verdict.
+fn is_candidate(event: &AuditEvent) -> bool {
+    event.event_type == "agent.completed"
+        || (event.event_type == "agent.model_attempt"
+            && event.payload["outcome"].as_str() == Some("success"))
+}
 
-    let mut by_cor: BTreeMap<String, Acc> = BTreeMap::new();
-    for e in events {
-        match e.event_type.as_str() {
-            "agent.invoked" => {
-                let p = &e.payload;
-                by_cor.entry(e.correlation_id.clone()).or_default().invoked = Some((
-                    str_field(p, "transition"),
-                    str_field(p, "affinity"),
-                    str_field(p, "model"),
-                ));
+fn nonempty(value: &Value) -> Option<&str> {
+    value.as_str().filter(|s| !s.trim().is_empty())
+}
+
+/// Validate an explicit human decision against an immutable, current producer
+/// event. Called before executing an acceptance transition; emission happens only
+/// after its state change is persisted. Identity trust belongs to the embedding
+/// channel, exactly as it does for all `actor: human` transitions.
+pub(crate) fn human_acceptance_event(
+    events: &[AuditEvent],
+    workflow_id: &str,
+    transition: &Value,
+    review_transition: &str,
+    principal: &crate::model::Principal,
+    arguments: &Value,
+) -> anyhow::Result<AuditEvent> {
+    use anyhow::{bail, ensure};
+    let metadata = &transition["model_acceptance"];
+    ensure!(
+        transition["actor"] == "human"
+            && principal.is_human()
+            && !principal.subject.trim().is_empty(),
+        "MODEL_ACCEPTANCE_INVALID: acceptance requires a human transition and trusted human principal"
+    );
+    ensure!(
+        transition.get("executor").is_none(),
+        "MODEL_ACCEPTANCE_INVALID: human acceptance must not execute producer code"
+    );
+    let Some(fields) = metadata.as_object() else {
+        bail!("MODEL_ACCEPTANCE_INVALID: model_acceptance must be an object");
+    };
+    ensure!(
+        fields.len() == 2,
+        "MODEL_ACCEPTANCE_INVALID: expected producer_transition and verdict only"
+    );
+    let producer = nonempty(&metadata["producer_transition"]).ok_or_else(|| {
+        anyhow::anyhow!("MODEL_ACCEPTANCE_INVALID: producer_transition is required")
+    })?;
+    let verdict = metadata["verdict"].as_str().unwrap_or("");
+    ensure!(
+        matches!(verdict, "accepted" | "rejected"),
+        "MODEL_ACCEPTANCE_INVALID: verdict must be accepted or rejected"
+    );
+    let event_id = nonempty(&arguments["producer_event_id"]).ok_or_else(|| {
+        anyhow::anyhow!("MODEL_ACCEPTANCE_INVALID: producer_event_id is required")
+    })?;
+    let evidence = nonempty(&arguments["evidence"]).ok_or_else(|| {
+        anyhow::anyhow!("MODEL_ACCEPTANCE_INVALID: independent evidence is required")
+    })?;
+    // Include new invocations and failed/suspended attempts: an older successful
+    // candidate is stale as soon as another execution begins or stops unfinished.
+    let latest = events
+        .iter()
+        .filter(|e| {
+            e.workflow_id.as_deref() == Some(workflow_id)
+                && e.payload["transition"].as_str() == Some(producer)
+                && matches!(
+                    e.event_type.as_str(),
+                    "agent.invoked" | "agent.completed" | "agent.model_attempt" | "chain.failed"
+                )
+        })
+        .max_by_key(|e| e.timestamp)
+        .ok_or_else(|| anyhow::anyhow!("MODEL_ACCEPTANCE_INVALID: no producer execution found"))?;
+    ensure!(
+        latest.id == event_id && is_candidate(latest),
+        "MODEL_ACCEPTANCE_INVALID: producer_event_id must identify the latest completed candidate"
+    );
+    ensure!(
+        nonempty(&latest.payload["model"]).is_some(),
+        "MODEL_ACCEPTANCE_INVALID: candidate has no attributed model"
+    );
+    ensure!(
+        !events
+            .iter()
+            .any(|e| e.event_type == "agent.acceptance_recorded"
+                && e.workflow_id == latest.workflow_id
+                && e.correlation_id == latest.correlation_id
+                && e.payload["transition"] == latest.payload["transition"]),
+        "MODEL_ACCEPTANCE_INVALID: this producer execution already has a decision"
+    );
+    Ok(AuditEvent::new("agent.acceptance_recorded")
+        .with_workflow(workflow_id)
+        .with_correlation(&latest.correlation_id)
+        .with_actor(&principal.subject)
+        .with_payload(serde_json::json!({
+            "transition": producer, "producer_event_id": latest.id,
+            "review_transition": review_transition, "verdict": verdict,
+            "evaluator": {"kind": "human", "id": principal.subject}, "evidence": evidence,
+        })))
+}
+
+/// Only explicitly accepted, independently reviewed candidates count as passes.
+/// Historical completions without this provenance are unknown and excluded, not
+/// failures. Contract failures remain negative evidence. Workflow, correlation,
+/// transition and immutable producer event ID prevent unrelated runs joining.
+pub fn observations_from_audit(events: &[AuditEvent]) -> Vec<StepObservation> {
+    type Key = (Option<String>, String, String);
+    let key = |e: &AuditEvent| -> Option<Key> {
+        Some((
+            e.workflow_id.clone(),
+            e.correlation_id.clone(),
+            nonempty(&e.payload["transition"])?.to_string(),
+        ))
+    };
+    let mut reviews: BTreeMap<&str, Vec<&AuditEvent>> = BTreeMap::new();
+    for event in events {
+        if event.event_type == "agent.acceptance_recorded"
+            && event.payload["evaluator"]["kind"] == "human"
+            && nonempty(&event.payload["evaluator"]["id"]).is_some()
+            && event.actor.as_deref() == event.payload["evaluator"]["id"].as_str()
+            && nonempty(&event.payload["evidence"]).is_some()
+        {
+            if let Some(id) = nonempty(&event.payload["producer_event_id"]) {
+                reviews.entry(id).or_default().push(event);
             }
-            "agent.completed" => {
-                let p = &e.payload;
-                let cost = p.get("cost_usd").and_then(Value::as_f64);
-                // Effort is read HERE (beside the walked model), never from
-                // `agent.invoked`: on an escalated hop the completed model differs
-                // from the composer's, and effort belongs to the model that ran.
-                let effort = p
-                    .get("reasoning_effort")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                by_cor
-                    .entry(e.correlation_id.clone())
-                    .or_default()
-                    .completed = Some((str_field(p, "model"), cost, effort));
-            }
-            "chain.failed" => {
-                by_cor.entry(e.correlation_id.clone()).or_default().failed = true;
-            }
-            "agent.model_attempt" => {
-                let p = &e.payload;
-                // Match on the STABLE wire-code prefix of `error`, not the Debug
-                // `outcome` string. A `success`/`suspended` attempt has no such
-                // error, so it is naturally excluded (its spend/pass is on
-                // `agent.completed`). A `BudgetExceeded` cut is NOT a contract
-                // failure — the per-attempt wall, not the model — so it is excluded.
-                let is_contract_failure =
-                    p.get("error").and_then(Value::as_str).is_some_and(|err| {
-                        err.starts_with("AGENT_NOT_CONVERGING")
-                            || err.starts_with("AGENT_NO_RESULT")
-                            || err.starts_with("AGENT_RESULT_FAILED")
-                            // A coding leaf that reported success but wrote no file
-                            // (after in-context correction) is a contract failure of
-                            // that model too — so the flywheel demotes a lead coder
-                            // that narrates instead of writing, and stops routing it
-                            // contract-critical coding work.
-                            || err.starts_with("AGENT_NO_FILE_WRITES")
-                    });
-                if is_contract_failure {
-                    let effort = p
-                        .get("reasoning_effort")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    by_cor
-                        .entry(e.correlation_id.clone())
-                        .or_default()
-                        .contract_failed
-                        .push((str_field(p, "model"), effort));
-                }
-            }
-            _ => {}
         }
     }
-
+    let mut ordered: Vec<_> = events.iter().collect();
+    ordered.sort_by_key(|e| e.timestamp);
+    let mut seen = BTreeSet::new();
+    let mut invoked: BTreeMap<Key, &AuditEvent> = BTreeMap::new();
+    let mut failed_attempt_keys = BTreeSet::new();
     let mut out = Vec::new();
-    for (_cor, acc) in by_cor {
-        let Some((step, affinity, inv_model)) = acc.invoked else {
+    for e in ordered {
+        if !seen.insert(&e.id) {
+            continue;
+        }
+        let Some(k) = key(e) else {
             continue;
         };
-        // Contract-failure attempts → one FAILED observation each, keyed on the
-        // attempt's OWN (model, effort) so a losing model's real pass-rate is
-        // seen even when the correlation ultimately succeeded via a fallback.
-        // These are terminal facts about that attempt, independent of the
-        // correlation's final outcome, so they're emitted regardless.
-        for (model, effort) in &acc.contract_failed {
-            out.push(StepObservation {
-                affinity: affinity.clone(),
-                step: step.clone(),
-                model: model.clone(),
-                effort: effort.clone(),
-                passed: false,
-                cost_usd: None,
-            });
+        if e.event_type == "agent.invoked" {
+            failed_attempt_keys.remove(&k);
+            invoked.insert(k, e);
+            continue;
         }
-        // Passed iff its `agent.completed` fired; failed iff a `chain.failed`
-        // fired instead; otherwise still in flight — neither, so skip. On a PASS
-        // model+cost+effort all come from `agent.completed` (the actual walked
-        // hop); on a FAILURE the model falls back to `agent.invoked` and there's
-        // no realized cost or applied effort.
-        let (passed, model, cost, effort) = match acc.completed {
-            Some((model, cost, effort)) => (true, model, cost, effort),
-            None if acc.failed => (false, inv_model, None, None),
-            None => continue,
+        let invocation = invoked.get(&k).copied();
+        let affinity = nonempty(&e.payload["affinity"])
+            .or_else(|| invocation.and_then(|i| nonempty(&i.payload["affinity"])));
+        let Some(affinity) = affinity else {
+            continue;
         };
+        let contract_failed = e.event_type == "agent.model_attempt"
+            && e.payload["error"].as_str().is_some_and(|err| {
+                [
+                    "AGENT_NOT_CONVERGING",
+                    "AGENT_NO_RESULT",
+                    "AGENT_RESULT_FAILED",
+                    "AGENT_NO_FILE_WRITES",
+                ]
+                .iter()
+                .any(|code| err.starts_with(code))
+            });
+        let passed = if is_candidate(e) {
+            let decisions: Vec<_> = reviews
+                .get(e.id.as_str())
+                .into_iter()
+                .flatten()
+                .filter(|a| {
+                    key(a).as_ref() == Some(&k)
+                        && e.workflow_id.is_some()
+                        && a.timestamp >= e.timestamp
+                })
+                .collect();
+            // Conflicting decisions never establish a pass. Identical audit
+            // copies are harmless; distinct accepted/rejected records are not.
+            if decisions.is_empty() {
+                continue;
+            }
+            if decisions.iter().any(|d| d.payload["verdict"] == "rejected") {
+                false
+            } else if decisions.iter().all(|d| d.payload["verdict"] == "accepted") {
+                true
+            } else {
+                continue;
+            }
+        } else if contract_failed {
+            failed_attempt_keys.insert(k.clone());
+            false
+        } else if e.event_type == "chain.failed" && !failed_attempt_keys.contains(&k) {
+            false
+        } else {
+            continue;
+        };
+        let model = nonempty(&e.payload["model"])
+            .or_else(|| invocation.and_then(|i| nonempty(&i.payload["model"])));
+        let Some(model) = model else {
+            continue;
+        };
+        let effort = nonempty(&e.payload["reasoning_effort"]).or_else(|| {
+            (e.event_type == "chain.failed")
+                .then(|| invocation.and_then(|i| nonempty(&i.payload["reasoning_effort"])))
+                .flatten()
+        });
         out.push(StepObservation {
-            affinity,
-            step,
-            model,
-            effort,
+            affinity: affinity.to_string(),
+            step: k.2,
+            task_cohort: nonempty(&e.payload["task_cohort"])
+                .or_else(|| invocation.and_then(|i| nonempty(&i.payload["task_cohort"])))
+                .map(str::to_string),
+            model: model.to_string(),
+            effort: effort.map(str::to_string),
             passed,
-            cost_usd: cost,
+            cost_usd: e.payload["cost_usd"].as_f64(),
         });
     }
     out
@@ -325,6 +453,7 @@ pub fn aggregate(observations: &[StepObservation]) -> Vec<ModelStats> {
         cost_sum: f64,
         priced: usize,
         steps: BTreeSet<String>,
+        cohorts: BTreeMap<String, CohortStats>,
     }
     // Effort is part of the key: the same model at two efforts is two buckets.
     let mut map: BTreeMap<(String, String, Option<String>), Acc> = BTreeMap::new();
@@ -336,7 +465,15 @@ pub fn aggregate(observations: &[StepObservation]) -> Vec<ModelStats> {
         if o.passed {
             a.passes += 1;
         }
-        if let Some(c) = o.cost_usd {
+        if let Some(cohort) = &o.task_cohort {
+            let bucket = a
+                .cohorts
+                .entry(cohort.clone())
+                .or_insert(CohortStats { runs: 0, passes: 0 });
+            bucket.runs += 1;
+            bucket.passes += usize::from(o.passed);
+        }
+        if let Some(c) = o.cost_usd.filter(|c| valid_cost(*c)) {
             a.cost_sum += c;
             a.priced += 1;
         }
@@ -359,6 +496,8 @@ pub fn aggregate(observations: &[StepObservation]) -> Vec<ModelStats> {
             } else {
                 None
             },
+            priced_runs: a.priced,
+            cohorts: a.cohorts,
             steps: a.steps.into_iter().collect(),
         })
         .collect()
@@ -407,7 +546,15 @@ pub fn propose(
         // savings fraction of the base's cost (positive ⇒ cheaper).
         let savings_of = |cand: &ModelStats| -> Option<f64> {
             match (base.mean_cost_usd, cand.mean_cost_usd) {
-                (Some(b), Some(c)) if b > 0.0 => Some((b - c) / b),
+                (Some(b), Some(c))
+                    if valid_cost(b)
+                        && valid_cost(c)
+                        && b > 0.0
+                        && base.priced_runs == base.runs
+                        && cand.priced_runs == cand.runs =>
+                {
+                    Some((b - c) / b)
+                }
                 _ => None,
             }
         };
@@ -417,11 +564,10 @@ pub fn propose(
             // Prefer an evidenced alternative that clears the bar (most reliable,
             // ties to cheaper); else escalate per the operator's own next rung.
             let mut best: Option<&ModelStats> = None;
-            for c in candidates
-                .iter()
-                .copied()
-                .filter(|c| c.pass_rate >= params.lower_min_pass_rate)
-            {
+            for c in candidates.iter().copied().filter(|c| {
+                c.pass_rate >= params.lower_min_pass_rate
+                    && comparable_for_lower(base, c, params.min_runs)
+            }) {
                 best = Some(match best {
                     None => c,
                     Some(b) => {
@@ -500,7 +646,8 @@ pub fn propose(
                 let (Some(cc), Some(savings)) = (c.mean_cost_usd, savings_of(c)) else {
                     continue;
                 };
-                if savings >= params.material_savings_pct
+                if comparable_for_lower(base, c, params.min_runs)
+                    && savings >= params.material_savings_pct
                     && c.pass_rate >= params.lower_min_pass_rate
                     && c.pass_rate >= base.pass_rate
                 {
@@ -525,8 +672,10 @@ pub fn propose(
                     candidate_mean_cost_usd: cand.mean_cost_usd,
                     savings_pct: Some(savings),
                     rationale: format!(
-                        "{} clears the bar {:.0}% of {} runs (>= base {} at {:.0}%) and costs \
-                         {:.0}% less — lower the base to bank the saving.",
+                        "{} clears the observed bar {:.0}% of {} reviewed runs (>= base {} at {:.0}%) \
+                         within adequately sampled matching definition/step cohorts and equal task mix; \
+                         fully priced worker calls cost {:.0}% less. Review a downgrade; this observational \
+                         comparison is not randomized quality equivalence or total task cost.",
                         cand.model,
                         cand.pass_rate * 100.0,
                         cand.runs,
@@ -735,6 +884,18 @@ mod tests {
             passes: (runs as f64 * pass_rate).round() as usize,
             pass_rate,
             mean_cost_usd: mean_cost,
+            priced_runs: if mean_cost.is_some_and(valid_cost) {
+                runs
+            } else {
+                0
+            },
+            cohorts: BTreeMap::from([(
+                "test-definition/draft".into(),
+                CohortStats {
+                    runs,
+                    passes: (runs as f64 * pass_rate).round() as usize,
+                },
+            )]),
             steps: vec!["draft".into()],
         }
     }
@@ -895,6 +1056,7 @@ mod tests {
             StepObservation {
                 affinity: "reasoning".into(),
                 step: "draft".into(),
+                task_cohort: Some("test-definition/draft".into()),
                 model: "v:base".into(),
                 effort: None,
                 passed: true,
@@ -903,6 +1065,7 @@ mod tests {
             StepObservation {
                 affinity: "reasoning".into(),
                 step: "review".into(),
+                task_cohort: Some("test-definition/review".into()),
                 model: "v:base".into(),
                 effort: None,
                 passed: true,
@@ -911,6 +1074,7 @@ mod tests {
             StepObservation {
                 affinity: "reasoning".into(),
                 step: "draft".into(),
+                task_cohort: Some("test-definition/draft".into()),
                 model: "v:base".into(),
                 effort: None,
                 passed: false,
@@ -930,16 +1094,40 @@ mod tests {
 
     // ── audit correlation ───────────────────────────────────────────────────
 
+    // These fixtures explicitly add independent human review; completion alone
+    // deliberately no longer supplies the quality label in existing tests.
+    fn reviewed(mut events: Vec<AuditEvent>) -> Vec<AuditEvent> {
+        let reviews: Vec<_> = events
+            .iter()
+            .filter(|e| is_candidate(e))
+            .map(|e| {
+                AuditEvent::new("agent.acceptance_recorded")
+                    .with_workflow(e.workflow_id.as_deref().unwrap())
+                    .with_correlation(&e.correlation_id)
+                    .with_actor("reviewer")
+                    .with_payload(json!({"transition": e.payload["transition"],
+                    "producer_event_id": e.id, "verdict": "accepted",
+                    "evaluator": {"kind": "human", "id": "reviewer"},
+                    "evidence": "Independent regression suite and artifact review passed"}))
+            })
+            .collect();
+        events.extend(reviews);
+        events
+    }
+
     fn invoked(cor: &str, step: &str, affinity: &str, model: &str) -> AuditEvent {
         AuditEvent::new("agent.invoked")
+            .with_workflow("wf-test")
             .with_correlation(cor)
             .with_payload(json!({
                 "transition": step, "state": "s", "affinity": affinity,
+                "task_cohort": format!("test-definition/{step}"),
                 "model": model, "max_seconds": 60,
             }))
     }
     fn completed(cor: &str, step: &str, model: &str, cost: f64) -> AuditEvent {
         AuditEvent::new("agent.completed")
+            .with_workflow("wf-test")
             .with_correlation(cor)
             .with_payload(json!({
                 "transition": step, "duration_ms": 10, "model": model,
@@ -950,6 +1138,7 @@ mod tests {
     /// model + the effort it actually ran under, paired on the SAME event.
     fn completed_effort(cor: &str, step: &str, model: &str, cost: f64, effort: &str) -> AuditEvent {
         AuditEvent::new("agent.completed")
+            .with_workflow("wf-test")
             .with_correlation(cor)
             .with_payload(json!({
                 "transition": step, "duration_ms": 10, "model": model,
@@ -959,6 +1148,7 @@ mod tests {
     }
     fn failed(cor: &str, step: &str) -> AuditEvent {
         AuditEvent::new("chain.failed")
+            .with_workflow("wf-test")
             .with_correlation(cor)
             .with_payload(json!({
                 "fromState": "s", "transition": step, "chainDepth": 1,
@@ -970,9 +1160,10 @@ mod tests {
     /// fell back). Carries the stable wire-code `error` prefix + the effort it ran.
     fn contract_attempt(cor: &str, model: &str, effort: &str) -> AuditEvent {
         AuditEvent::new("agent.model_attempt")
+            .with_workflow("wf-test")
             .with_correlation(cor)
             .with_payload(json!({
-                "attempt_index": 0, "model": model, "outcome": "Capability",
+                "transition": "scan", "attempt_index": 0, "model": model, "outcome": "Capability",
                 "error": "AGENT_NOT_CONVERGING: emitted status:success 4x, never the contract",
                 "duration_ms": 720_000, "reasoning_effort": effort,
             }))
@@ -985,9 +1176,10 @@ mod tests {
     #[test]
     fn a_no_file_writes_attempt_becomes_a_negative_observation() {
         let no_write_attempt = AuditEvent::new("agent.model_attempt")
+            .with_workflow("wf-test")
             .with_correlation("cor_c")
             .with_payload(json!({
-                "attempt_index": 0, "model": "glm", "outcome": "Capability",
+                "transition": "implement", "affinity": "coding", "attempt_index": 0, "model": "glm", "outcome": "Capability",
                 "error": "AGENT_NO_FILE_WRITES: reported success but wrote no file",
                 "duration_ms": 253_000, "reasoning_effort": "low",
             }));
@@ -996,7 +1188,7 @@ mod tests {
             no_write_attempt,
             completed_effort("cor_c", "implement", "deepseek", 0.11, "low"),
         ];
-        let obs = observations_from_audit(&events);
+        let obs = observations_from_audit(&reviewed(events));
         let glm = obs.iter().find(|o| o.model == "glm").expect("glm observed");
         assert!(
             !glm.passed,
@@ -1019,7 +1211,7 @@ mod tests {
             contract_attempt("cor_1", "glm", "high"),
             completed_effort("cor_1", "scan", "deepseek", 0.11, "high"),
         ];
-        let obs = observations_from_audit(&events);
+        let obs = observations_from_audit(&reviewed(events));
         assert_eq!(
             obs.len(),
             2,
@@ -1051,7 +1243,7 @@ mod tests {
             // a non-agent event is ignored
             AuditEvent::new("workflow.started"),
         ];
-        let mut obs = observations_from_audit(&events);
+        let mut obs = observations_from_audit(&reviewed(events));
         obs.sort_by(|a, b| a.step.cmp(&b.step));
         assert_eq!(obs.len(), 2);
 
@@ -1079,7 +1271,7 @@ mod tests {
             events.push(invoked(&c2, "draft", "reasoning", "v:cheap"));
             events.push(completed(&c2, "draft", "v:cheap", 0.40));
         }
-        let obs = observations_from_audit(&events);
+        let obs = observations_from_audit(&reviewed(events));
         let stats = aggregate(&obs);
         let ch = chains(&[("reasoning", &["v:base", "v:ceiling"])]);
         let props = propose(&stats, &ch, &params(), &[]);
@@ -1105,7 +1297,7 @@ mod tests {
             events.push(invoked(&c, "draft", "reasoning", "v:base"));
             events.push(completed_effort(&c, "draft", "v:base", 2.0, "high"));
         }
-        let stats = aggregate(&observations_from_audit(&events));
+        let stats = aggregate(&observations_from_audit(&reviewed(events)));
         assert_eq!(stats.len(), 2, "two effort buckets expected: {stats:?}");
         let med = stats
             .iter()
@@ -1132,7 +1324,7 @@ mod tests {
             invoked("cor_esc", "draft", "reasoning", "v:base"),
             completed_effort("cor_esc", "draft", "v:strong", 3.0, "high"),
         ];
-        let obs = observations_from_audit(&events);
+        let obs = observations_from_audit(&reviewed(events));
         assert_eq!(obs.len(), 1);
         assert_eq!(obs[0].model, "v:strong", "walked model, not composer's");
         assert_eq!(obs[0].effort.as_deref(), Some("high"));
@@ -1155,6 +1347,213 @@ mod tests {
         assert_eq!(props[0].direction, Direction::Lower);
         assert_eq!(props[0].from_model, "v:base@high");
         assert_eq!(props[0].to_model, "v:cheap@high");
+    }
+
+    #[test]
+    fn unverified_completions_cannot_propose_a_downgrade() {
+        let mut events = Vec::new();
+        for i in 0..10 {
+            let cor = i.to_string();
+            events.push(invoked(&cor, "draft", "reasoning", "v:cheap"));
+            events.push(completed(&cor, "draft", "v:cheap", 0.001));
+        }
+        assert!(observations_from_audit(&events).is_empty());
+        assert!(
+            propose(
+                &aggregate(&observations_from_audit(&events)),
+                &chains(&[("reasoning", &["v:base", "v:cheap"])]),
+                &params(),
+                &[]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn decisions_cannot_cross_workflows_transitions_or_event_ids() {
+        let base = reviewed(vec![
+            invoked("shared", "draft", "reasoning", "v:base"),
+            completed("shared", "draft", "v:base", 1.0),
+        ]);
+        for field in ["workflow", "transition", "event", "evaluator", "evidence"] {
+            let mut events = base.clone();
+            let review = events.last_mut().unwrap();
+            match field {
+                "workflow" => review.workflow_id = Some("another-workflow".into()),
+                "transition" => review.payload["transition"] = json!("another-step"),
+                "event" => review.payload["producer_event_id"] = json!("old-event"),
+                "evaluator" => review.payload["evaluator"]["kind"] = json!("agent"),
+                "evidence" => review.payload["evidence"] = json!("  "),
+                _ => unreachable!(),
+            }
+            assert!(observations_from_audit(&events).is_empty(), "{field}");
+        }
+        let mut shared = base;
+        shared.extend(reviewed(vec![
+            invoked("shared", "review", "coding", "v:cheap"),
+            completed("shared", "review", "v:cheap", 0.1),
+        ]));
+        assert_eq!(observations_from_audit(&shared).len(), 2);
+        let mut copied = shared.clone();
+        copied.extend(shared);
+        assert_eq!(
+            observations_from_audit(&copied).len(),
+            2,
+            "audit replay is idempotent"
+        );
+    }
+
+    #[test]
+    fn accepted_direct_attempt_keeps_default_effort_and_rejected_candidate_is_failure() {
+        let attempt = AuditEvent::new("agent.model_attempt")
+            .with_workflow("wf-test")
+            .with_correlation("direct")
+            .with_payload(json!({"transition":"run", "affinity":"coding",
+                "model":"v:cheap", "outcome":"success", "reasoning_effort":null, "cost_usd":0.1}));
+        let mut events = reviewed(vec![attempt]);
+        let obs = observations_from_audit(&events);
+        assert_eq!(obs.len(), 1);
+        assert!(obs[0].passed);
+        assert_eq!(obs[0].effort, None);
+        events.last_mut().unwrap().payload["verdict"] = json!("rejected");
+        assert!(!observations_from_audit(&events)[0].passed);
+    }
+
+    #[test]
+    fn lower_requires_complete_valid_pricing_and_task_provenance() {
+        let base = stat("reasoning", "v:base", 10, 1.0, Some(1.0));
+        let cheap = stat("reasoning", "v:cheap", 10, 1.0, Some(0.1));
+        let chains = chains(&[("reasoning", &["v:base", "v:cheap"])]);
+        for case in [
+            "partial-price",
+            "unknown-price",
+            "negative-price",
+            "infinite-price",
+            "missing-provenance",
+            "disjoint-cohorts",
+            "partially-attributed",
+        ] {
+            let mut candidate = cheap.clone();
+            match case {
+                "partial-price" => candidate.priced_runs = 1,
+                "unknown-price" => candidate.mean_cost_usd = None,
+                "negative-price" => candidate.mean_cost_usd = Some(-1.0),
+                "infinite-price" => candidate.mean_cost_usd = Some(f64::INFINITY),
+                "missing-provenance" => candidate.cohorts.clear(),
+                "disjoint-cohorts" => {
+                    candidate.cohorts = BTreeMap::from([(
+                        "another-definition/draft".into(),
+                        CohortStats {
+                            runs: 10,
+                            passes: 10,
+                        },
+                    )])
+                }
+                "partially-attributed" => candidate.cohorts.values_mut().next().unwrap().runs = 5,
+                _ => unreachable!(),
+            }
+            assert!(
+                propose(&[base.clone(), candidate], &chains, &params(), &[]).is_empty(),
+                "{case}"
+            );
+        }
+        assert!(matches!(
+            propose(&[base, cheap], &chains, &params(), &[])[0].direction,
+            Direction::Lower
+        ));
+    }
+
+    #[test]
+    fn lower_refuses_unequal_task_mix_and_within_cohort_regressions() {
+        let mut base = stat("reasoning", "v:base", 100, 0.90, Some(1.0));
+        let mut cheap = stat("reasoning", "v:cheap", 100, 0.99, Some(0.1));
+        let chains = chains(&[("reasoning", &["v:base", "v:cheap"])]);
+        base.cohorts = BTreeMap::from([
+            (
+                "hard".into(),
+                CohortStats {
+                    runs: 50,
+                    passes: 40,
+                },
+            ),
+            (
+                "easy".into(),
+                CohortStats {
+                    runs: 50,
+                    passes: 50,
+                },
+            ),
+        ]);
+        cheap.cohorts = BTreeMap::from([
+            ("hard".into(), CohortStats { runs: 5, passes: 4 }),
+            (
+                "easy".into(),
+                CohortStats {
+                    runs: 95,
+                    passes: 95,
+                },
+            ),
+        ]);
+        assert!(propose(&[base.clone(), cheap.clone()], &chains, &params(), &[]).is_empty());
+        // Equal mix, stronger overall rate, but regression on easy tasks.
+        cheap.cohorts = BTreeMap::from([
+            (
+                "hard".into(),
+                CohortStats {
+                    runs: 50,
+                    passes: 50,
+                },
+            ),
+            (
+                "easy".into(),
+                CohortStats {
+                    runs: 50,
+                    passes: 49,
+                },
+            ),
+        ]);
+        assert!(propose(&[base, cheap], &chains, &params(), &[]).is_empty());
+    }
+
+    #[test]
+    fn aggregate_keeps_invalid_and_unknown_costs_unpriced() {
+        let observations: Vec<_> = [
+            Some(1.0),
+            None,
+            Some(-1.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ]
+        .into_iter()
+        .map(|cost_usd| StepObservation {
+            affinity: "coding".into(),
+            step: "draft".into(),
+            task_cohort: None,
+            model: "m".into(),
+            effort: None,
+            passed: true,
+            cost_usd,
+        })
+        .collect();
+        let stats = aggregate(&observations);
+        assert_eq!(stats[0].runs, 5);
+        assert_eq!(stats[0].priced_runs, 1);
+        assert_eq!(stats[0].mean_cost_usd, Some(1.0));
+        assert!(stats[0].cohorts.is_empty());
+    }
+
+    #[test]
+    fn cohort_fingerprint_tracks_definition_and_step_not_run_counters() {
+        let mut instance =
+            crate::model::WorkflowInstance::for_test_with_context(json!({"attempt":1}));
+        instance.definition = json!({"states":{"s":{"goal":"review"}}});
+        let first = task_cohort(&instance, Some("draft"));
+        instance.context["attempt"] = json!(999);
+        instance.id = "another-workflow-run".into();
+        assert_eq!(first, task_cohort(&instance, Some("draft")));
+        assert_ne!(first, task_cohort(&instance, Some("review")));
+        instance.definition["states"]["s"]["goal"] = json!("different contract");
+        assert_ne!(first, task_cohort(&instance, Some("draft")));
     }
 
     // ── #13 fair-trial exploration ────────────────────────────────────────────

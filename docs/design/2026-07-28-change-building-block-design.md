@@ -1,8 +1,21 @@
 # Design: Evidence-Gated Workflow Boundaries (and a narrow file-mutation probe)
 
-Status: DRAFT, **post-FMECA-vetting revision**. Phase-1 (L1 gates) recommended for implementation;
-L3 interpreter recommended as an A/B-gated probe; everything above rung-0/3 is a data-gated roadmap.
-Date: 2026-07-28. Vetted by three independent FMECA/poka-yoke/TRIZ reviews (see Appendix A).
+Status: PARTIALLY IMPLEMENTED; implementation reconciliation updated 2026-09-06.
+The historical proposal below explains the design intent. The current contract is
+[commodity-model harness controls](2026-09-06-commodity-harness-controls.md).
+
+| Boundary | Current implementation | Remaining limit |
+| --- | --- | --- |
+| Entry | Ordinary agent dispatch refuses unresolved goal bindings by default; explicit `enforce_input_grounding: false` retains audited shadow mode. Empty rendered goals always fail. Existing consuming JSON Schemas enforce declared types/nonempty constraints. | Resolved data can still be inaccurate or insufficient; path meaning is not certified by string validation. |
+| Continuation | Opt-in `state.continuation.reads` compares an explicit evidence slice before auto-drive dispatch and persists it across drives. | Authors must choose meaningful evidence; automatic read-slice inference and universal external-agent enforcement are not implemented. |
+| Exit | Existing file-write evidence, typed outputs, deterministic guards and declared outcomes remain the completion controls. | A write is not correctness; an arbitrary producer-authored boolean is not independent verification. |
+| Optimization | Direct-attempt spend is counted; quality proposals require attributed independent acceptance rather than completion alone. | New acceptance provenance supports trusted human attestations; deterministic/model-only reviews are excluded from positive quality evidence. |
+| L3 apply tool / generalized criteria recognizers | Still proposals. | No comparative quality/cost experiment establishes their value yet. |
+
+The controls reduce specific failure modes; they do not make all three incident
+classes impossible. Keep deterministic validation and independent review. The
+original three FMECA reviews are historical design evidence, not tests of this
+implementation.
 
 > **What changed after vetting.** The first draft led with a "change building block" (a
 > plan→execute→verify micro-waterfall) as *the core*, plus a large `ImplementationStrategy`
@@ -29,15 +42,17 @@ architectures#65). This design targets the class.
 4. Silent fallback (empty/ungrounded value silently becomes a default).
 5. Feedback-loop starvation (retry with no new information).
 
-**All three incidents are killed by L1 (§2) alone — no interpreter required.** That is the central
-finding of the vetting and it shapes the whole design.
+**L1 targets all three incidents without requiring an interpreter.** Whether a
+specific workflow prevents them depends on its declared contracts, evidence
+sources, and enabled gates; the implementation table above is authoritative.
 
 ## 2. The atom: L1 — evidence-gated boundaries + typed handoffs
 
 The shipped forcing function gates the **exit** boundary (success needs evidence). L1 applies the
 same principle at **entry** and **continuation**, and promotes handoffs from stringly-typed
-blackboard slots to **validated typed artifacts**. This is the atom of *every* workflow, not just
-code:
+blackboard slots to **validated typed artifacts**. This is the intended reusable boundary for workflows, not just
+code. The following bullets are the original target design, not a claim that
+every mechanism is enabled everywhere:
 
 - **Entry gate** — no agent is dispatched on inputs that don't provably resolve to real referents.
   Mechanism: make `render_template` **fallible** (today it silently emits `(x: unset)` stubs —

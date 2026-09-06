@@ -6,10 +6,11 @@ the blurbs below in sync with `server.json` and the README.
 
 ## Status
 
-praxec is **not yet published to any package registry**. No `v*`
-tag has been cut, so there is no crates.io crate, no GHCR image, and no
-GitHub Release. Every listing step below depends on a release existing
-first — see step 1.
+GitHub binary releases are published by pushing a `v*` tag. Registry publishing
+is separate and opt-in: `PUBLISH_CRATES=true` enables crates.io and
+`PUBLISH_MCP=true` enables GHCR/MCP Registry publishing. Leave those repository
+variables unchanged for a binary-only release. Check actual release/workflow
+status rather than assuming every configured publishing channel is enabled.
 
 ## Canonical metadata
 
@@ -29,17 +30,35 @@ Reuse this verbatim everywhere so listings stay consistent:
 ## 1. Cut a release (prerequisite for everything else)
 
 ```bash
-git tag v0.0.15
-git push origin v0.0.15
+git tag -a vX.Y.Z <verified-main-commit> -m "Release vX.Y.Z"
+git push origin vX.Y.Z
 ```
 
-The `v*` tag triggers three workflows:
+First bump the workspace and internal dependency versions in `Cargo.toml`, update
+workspace entries in `Cargo.lock`, add the changelog entry, and synchronize
+`server.json`. Merge the release feature branch into `dev` after CI, then promote
+`dev` into `main` through a PR. Tag that verified main commit; the tag version
+must match the workspace version. Never move an existing release tag.
+
+The `v*` tag triggers three workflows (the registry jobs skip unless enabled):
 
 | Workflow          | Produces |
 |-------------------|----------|
 | `release.yml`     | Cross-platform binaries + checksums on the GitHub Release |
-| `publish.yml`     | All workspace crates on crates.io |
-| `publish-mcp.yml` | GHCR image **and** the official MCP Registry entry (new) |
+| `publish.yml`     | Workspace crates on crates.io, when `PUBLISH_CRATES=true` |
+| `publish-mcp.yml` | GHCR image and MCP Registry entry, when `PUBLISH_MCP=true` |
+
+Verify all five platform archives and `checksums.sha256` on the GitHub release.
+A partially successful build can publish partial assets but deliberately fails
+the workflow; do not call that a complete release. Rebuild an existing tag with
+`gh workflow run release.yml --ref main -f tag=vX.Y.Z` if necessary.
+
+Install the host archive only after verifying its checksum and version. The
+release archive contains the `praxec` gateway; auxiliary TUI/cockpit binaries must
+be built from the same tag when updating an installation that uses them. Replace
+binaries atomically so existing processes can finish with their original inode.
+Run `cargo clean` only after installation and smoke checks, and check that no
+active build is using the target directory.
 
 Confirm the GHCR image is public afterward: GitHub → repo → Packages →
 `praxec` → Package settings → set visibility to **Public**. The

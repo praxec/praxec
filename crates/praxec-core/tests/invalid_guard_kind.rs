@@ -183,6 +183,7 @@ async fn runtime_evaluator_recognises_every_guard_kind_variant() {
                 json!({ "kind": "script_acknowledged", "subject": "x" })
             }
             GuardKind::Evidence => json!({ "kind": "evidence", "requires": [] }),
+            GuardKind::AmplifierContract => json!({ "kind": "amplifier_contract" }),
         };
         let result = evaluator
             .evaluate(&guard, &inst, &json!({}), &principal)
