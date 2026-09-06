@@ -1147,6 +1147,7 @@ impl WorkflowRuntime {
         }
 
         let definition = self.definitions.load(&request.definition_id).await?;
+        crate::amplifier::validate_input(&definition, &request.input)?;
 
         // SPEC §30.10.4 — pre-start subject walk.
         //

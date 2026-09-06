@@ -947,7 +947,7 @@ impl Executor for AgentExecutor {
                     format!(
                         "the {}s step budget was spent after {} model attempt(s) \
                          ({}) without a result; stopping the chain-walk rather than \
-                         starting another full-length attempt — this step needs a human. \
+                         starting another full-length attempt — revise the task context or model binding before a new bounded attempt. \
                          Walk: {}",
                         step_budget.as_secs(),
                         idx,

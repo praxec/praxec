@@ -4,6 +4,11 @@ Updated 2026-09-06. This reconciles the July evidence-gated-boundary design with
 current source. Quality is the constraint; speed and total accepted-task cost
 are measurements. A successful model call is a candidate, not a verified task.
 
+The next source increment is the [coarse-task amplifier profile](2026-09-06-coarse-task-amplifier.md):
+humans provide intent, models own coherent generative deliverables, and tools
+perform mechanical execution and verification. It adds enforced role/graph
+checks and removes the extra model argument chooser for profiled auto-drive.
+
 ## Criteria and enforcement
 
 | Criterion | Control | What it does not establish |

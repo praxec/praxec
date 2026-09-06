@@ -1,5 +1,10 @@
 # Program: the reusable Change Atom + DoD handoff + org migration
 
+Current interpretation (2026-09-06): delegate coarse deliverables, not a model
+invocation for every stage or command. The [coarse-task amplifier profile](2026-09-06-coarse-task-amplifier.md)
+defines enforced source controls. This historical program is not evidence that
+all pack migrations or comparative evaluations have completed.
+
 Goal (session): ship (1) the **handoff definition-of-done**, (2) a **reusable change-atom workflow**
 in cognitive-architectures, (3) **migration of all /praxec org workflows** to use it, plus supporting
 engine features. Design of record: `2026-07-28-change-building-block-design.md`; engine plan-set:

@@ -136,6 +136,14 @@ workflow. A successful model response is a candidate until those checks pass.
 
 ## The models file
 
+For coarse, well-defined tasks, the opt-in
+[amplifier profile](../design/2026-09-06-coarse-task-amplifier.md) assigns models to
+generative deliverables and auto-drives deterministic execution and verification.
+It requires tool verification after the last change on every success path and
+runs declared model executors without a second model preparing arguments.
+See the [example](../../examples/coarse-task-amplifier/README.md) for configuration
+and the limits of structural verification.
+
 Agent (and affinity-resolved `kind: llm`) steps declare a *binding* — an
 affinity like `coding`, a tier like `frontier`, or a named activity — and the
 runtime resolves it to a concrete `provider` + `model` through your models file.

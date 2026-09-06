@@ -10,6 +10,12 @@ responsible for the task contract, integration, and independent verification.
 Use another model when a bounded deliverable can advance useful work; handle
 small tasks directly when delegation overhead exceeds the benefit.
 
+Delegate coarse, well-defined deliverables, not individual commands or edits.
+Humans supply intent; models generate solutions; tools execute mechanical work
+and verify artifacts. Keep a worker responsible for a coherent result through
+its internal tool operations. Do not split formatting, extraction, test running,
+or a known next transition into separate paid model tasks.
+
 ## Discover only what this task needs
 
 Use exposed `praxec.query` / `praxec.command` tools, or the equivalent installed
@@ -108,3 +114,11 @@ artifact digest, verifier diagnostics, and selected model tier). Counters and
 timestamps alone are not progress. The guard detects exact repeated inputs;
 it cannot prove semantic progress. Use current source excerpts alongside design
 documents in reviewer handoffs; historical designs can misdescribe today's code.
+
+For source builds supporting `amplifier`, use the
+[coarse-task profile](../../design/2026-09-06-coarse-task-amplifier.md) when its
+supported execution shapes fit. It enforces classified work and tool verification
+on every success path and avoids the extra auto-drive argument-generation call.
+It does not prove task coarseness or semantic quality, and older installed
+binaries must not be assumed to enforce it. Keep independent quality measurement
+separate from routine tool verification; do not add human approval to every step.
