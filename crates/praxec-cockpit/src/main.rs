@@ -29,6 +29,10 @@ fn arg_value(args: &[String], flag: &str) -> Option<String> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("praxec-cockpit {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     if args.iter().any(|a| a == "--snapshot") {
         return print_snapshot();

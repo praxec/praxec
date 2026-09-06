@@ -9,6 +9,10 @@ use praxec_cockpit_mcp::CockpitServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("praxec-cockpit-mcp {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

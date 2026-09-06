@@ -19,6 +19,8 @@ covered by a stability commitment.
 
 ### Fixed
 
+- Side-effect-free `--version` responses for both cockpit executables, enabling
+  installation checks without starting a UI or MCP server.
 - Extra model invocation during auto-drive of profiled generative tasks.
 - Verification bypasses, stale candidate evidence, hidden loops, and automatic halt execution.
 - Missing handoff grounding, repeated unchanged continuations, per-model reasoning
