@@ -383,6 +383,8 @@ impl AgentExecutor {
             .with_workflow(request.workflow.id.clone())
             .with_payload(json!({
                 "attempt_index": attempt_index,
+                "task_cohort": praxec_core::deescalation::task_cohort(&request.workflow, request.transition.as_deref()),
+                "affinity": request.executor_config.get("affinity").and_then(Value::as_str),
                 "model": model,
                 "outcome": outcome,
                 "error": error,
@@ -825,11 +827,20 @@ impl Executor for AgentExecutor {
 
         // User prompt = the templated goal, rendered against the blackboard.
         // Entry gate (Plan A) — the tracked render also reports any `$.`-paths
-        // that stubbed. Shadow mode (`enforce_input_grounding == false`, the
-        // default) proceeds regardless, only emitting the anomaly below.
-        // Enforced mode (Task 4) refuses before any model dispatch.
+        // that stubbed. Enforcement is the default; explicitly setting
+        // `enforce_input_grounding: false` preserves legacy shadow mode.
+        // This detects unresolved references, not semantic context sufficiency.
         let (user_prompt, unresolved) =
             praxec_core::templating::render_template_tracked(&cfg.goal, &request.workflow);
+        if user_prompt.trim().is_empty() {
+            return Err(permanent(
+                AgentErrorCode::InputUnresolved,
+                format!(
+                    "goal for transition {:?} of workflow '{}' renders empty — provide a concrete task before dispatch",
+                    request.transition, request.workflow.id
+                ),
+            ));
+        }
         if !unresolved.is_empty() {
             if let Some(sink) = &self.audit {
                 let mut event = AuditEvent::new("agent.input_unresolved")
@@ -859,13 +870,20 @@ impl Executor for AgentExecutor {
         // Resolve the full ordered model chain (cheapest-effective first). Each
         // hop carries its model-paired reasoning effort (WS1-B).
         let chain = self.resolver.resolve_chain(&cfg.model_binding()).await?;
-        // Re-associate each model with its paired effort so it survives the
-        // breaker's reorder below (which works on bare model strings). Effort is
-        // per-model, so keying by model is exact.
-        let effort_by_model: std::collections::HashMap<String, Option<String>> = chain
-            .iter()
-            .map(|h| (h.model.clone(), h.effort.clone()))
-            .collect();
+        // Preserve each occurrence: one model may appear first at low effort
+        // and later at higher effort. A single value per model would overwrite
+        // the cheap attempt with the fallback's effort. The breaker preserves
+        // order within each model, including its single all-open probe.
+        let mut efforts_by_model: std::collections::HashMap<
+            &str,
+            std::collections::VecDeque<Option<String>>,
+        > = std::collections::HashMap::new();
+        for hop in &chain {
+            efforts_by_model
+                .entry(hop.model.as_str())
+                .or_default()
+                .push_back(hop.effort.clone());
+        }
         let chain_models: Vec<String> = chain.iter().map(|h| h.model.clone()).collect();
 
         // P12 — consult the per-model breaker: skip models whose breaker is
@@ -971,7 +989,10 @@ impl Executor for AgentExecutor {
             // the walk (does not silently downgrade, does not escalate). The
             // preflight validator catches this statically; this is the runtime
             // backstop.
-            let hop_effort = effort_by_model.get(model).cloned().flatten();
+            let hop_effort = efforts_by_model
+                .get_mut(model.as_str())
+                .and_then(|efforts| efforts.pop_front())
+                .flatten();
             let applied_effort = hop_effort
                 .clone()
                 .or_else(|| cfg.reasoning_effort.clone())
@@ -1280,7 +1301,7 @@ mod tests {
         // goal references a context key that is NOT present → renders "(missing: unset)"
         let res = exec
             .execute(request(
-                json!({ "affinity": "coding", "goal": "do {{ $.context.missing }}" }),
+                json!({ "affinity": "coding", "goal": "do {{ $.context.missing }}", "enforce_input_grounding": false }),
                 bare_def(),
             ))
             .await;
@@ -1302,7 +1323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entry_gate_enforced_refuses_before_dispatch() {
+    async fn entry_gate_default_refuses_before_dispatch() {
         let runner = Arc::new(MockSessionRunner::completed(AgentResult {
             status: AgentStatus::Success,
             output: json!({}),
@@ -1315,8 +1336,7 @@ mod tests {
         let err = exec
             .execute(request(
                 json!({
-                    "affinity": "coding", "goal": "do {{ $.context.missing }}",
-                    "enforce_input_grounding": true
+                    "affinity": "coding", "goal": "do {{ $.context.missing }}"
                 }),
                 bare_def(),
             ))
@@ -1329,6 +1349,58 @@ mod tests {
             runner.sessions().is_empty(),
             "enforced refusal must happen before the runner is invoked"
         );
+    }
+
+    #[tokio::test]
+    async fn entry_gate_refuses_empty_render_even_in_shadow_mode() {
+        for enforce in [true, false] {
+            for value in ["", " \n\t"] {
+                let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+                    status: AgentStatus::Success,
+                    output: json!({}),
+                    internal_monologue: None,
+                }));
+                let exec = AgentExecutor::new(
+                    runner.clone(),
+                    Arc::new(MockModelResolver("anthropic:x".into())),
+                );
+                let mut req = request(
+                    json!({
+                        "affinity": "coding", "goal": "{{ $.context.task }}",
+                        "enforce_input_grounding": enforce
+                    }),
+                    bare_def(),
+                );
+                req.workflow.context = json!({"task": value});
+                let err = exec.execute(req).await.expect_err("empty task");
+                assert!(err.to_string().contains("AGENT_INPUT_UNRESOLVED"));
+                assert!(runner.sessions().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn entry_gate_allows_literal_stub_text_and_absent_unreferenced_fields() {
+        let runner = Arc::new(MockSessionRunner::completed(AgentResult {
+            status: AgentStatus::Success,
+            output: json!({}),
+            internal_monologue: None,
+        }));
+        let exec = AgentExecutor::new(
+            runner.clone(),
+            Arc::new(MockModelResolver("anthropic:x".into())),
+        );
+        let mut req = request(
+            json!({
+                "affinity": "coding", "goal": "Review: {{ $.context.source }}"
+            }),
+            bare_def(),
+        );
+        req.workflow.context = json!({"source": "(source: unset) {{ $.context.literal }}"});
+        exec.execute(req)
+            .await
+            .expect("source text is not a missing binding");
+        assert_eq!(runner.sessions().len(), 1);
     }
 
     #[tokio::test]
@@ -1623,6 +1695,60 @@ mod tests {
             user, "refactor the parser module",
             "the rendered goal (USER prompt) must contain the seeded \
              $.workflow.input.instructions value at invocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_model_preserves_each_hops_effort_after_breaker_planning() {
+        struct EffortLadder;
+        #[async_trait]
+        impl AgentModelResolver for EffortLadder {
+            async fn resolve(&self, _b: &ModelBinding) -> Result<String, ExecutorError> {
+                Ok("openrouter:qwen/qwen3-coder".into())
+            }
+            async fn resolve_chain(
+                &self,
+                _b: &ModelBinding,
+            ) -> Result<Vec<crate::session::ResolvedHop>, ExecutorError> {
+                Ok([Some("low"), None, Some("medium")]
+                    .into_iter()
+                    .map(|effort| crate::session::ResolvedHop {
+                        model: "openrouter:qwen/qwen3-coder".into(),
+                        effort: effort.map(str::to_owned),
+                    })
+                    .collect())
+            }
+        }
+        let runner = Arc::new(MockSessionRunner::no_result());
+        let exec = AgentExecutor::new(runner.clone(), Arc::new(EffortLadder));
+        let req = || {
+            request(
+                json!({ "affinity": "coding", "goal": "go", "reasoning_effort": "none" }),
+                bare_def(),
+            )
+        };
+        exec.execute(req()).await.expect_err("all attempts fail");
+        let efforts: Vec<_> = runner
+            .sessions()
+            .into_iter()
+            .map(|s| s.reasoning_effort)
+            .collect();
+        assert_eq!(
+            efforts,
+            vec![
+                Some("low".into()),
+                Some("none".into()),
+                Some("medium".into())
+            ]
+        );
+
+        // All entries now share an open model breaker. Its single probe must
+        // retain the FIRST occurrence's effort, not the last fallback's.
+        exec.execute(req()).await.expect_err("probe fails");
+        assert_eq!(runner.sessions().len(), 4);
+        assert_eq!(
+            runner.sessions()[3].reasoning_effort.as_deref(),
+            Some("low")
         );
     }
 
@@ -2883,6 +3009,8 @@ mod tests {
             bare_def(),
         );
         req.correlation_id = Some("cor_attempt_test".into());
+        let expected_cohort =
+            praxec_core::deescalation::task_cohort(&req.workflow, req.transition.as_deref());
         exec.execute(req).await.expect("strong model succeeds");
 
         let attempts: Vec<_> = audit
@@ -2895,6 +3023,11 @@ mod tests {
             2,
             "one event per attempt (weak failed, strong succeeded)"
         );
+
+        for attempt in &attempts {
+            assert_eq!(attempt.payload["affinity"], json!("coding"));
+            assert_eq!(attempt.payload["task_cohort"], json!(expected_cohort));
+        }
 
         // Attempt 0: the weak model's NoResult → Capability.
         assert_eq!(attempts[0].payload["attempt_index"], json!(0));

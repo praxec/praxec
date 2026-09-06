@@ -140,8 +140,59 @@ pub fn validate_workflows(config: &Value) -> Vec<Diagnostic> {
     validate_reasoning_efforts(workflows, &mut diagnostics);
     validate_requires_file_write(workflows, &mut diagnostics);
     validate_grounding_scopes(workflows, &mut diagnostics);
+    validate_model_boundaries(workflows, &mut diagnostics);
 
     diagnostics
+}
+
+/// Refuse malformed protection metadata before a model or evaluator can run.
+fn validate_model_boundaries(
+    workflows: &serde_json::Map<String, Value>,
+    out: &mut Vec<Diagnostic>,
+) {
+    for (id, def) in workflows {
+        let Some(states) = def.get("states").and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, state) in states {
+            let transitions = state.get("transitions").and_then(Value::as_object);
+            if let Some(policy) = state.get("continuation") {
+                if let Err(error) = crate::runtime::runtime_chain::validate_continuation(policy) {
+                    out.push(Diagnostic::Error(format!(
+                        "workflow '{id}' state '{name}': {error}"
+                    )));
+                }
+                if !transitions.is_some_and(|ts| ts.values().any(|t| t["actor"] == "agent")) {
+                    out.push(Diagnostic::Error(format!(
+                        "CONTINUATION_INVALID: workflow '{id}' state '{name}' needs an auto-drivable agent transition"
+                    )));
+                }
+            }
+            for (transition_name, transition) in transitions.into_iter().flatten() {
+                let Some(policy) = transition.get("model_acceptance") else {
+                    continue;
+                };
+                let valid_shape = policy.as_object().is_some_and(|p| {
+                    p.len() == 2
+                        && p.get("producer_transition")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.trim().is_empty())
+                        && matches!(
+                            p.get("verdict").and_then(Value::as_str),
+                            Some("accepted" | "rejected")
+                        )
+                });
+                if !valid_shape
+                    || transition["actor"] != "human"
+                    || transition.get("executor").is_some()
+                {
+                    out.push(Diagnostic::Error(format!(
+                        "MODEL_ACCEPTANCE_INVALID: workflow '{id}' transition '{transition_name}' requires an executor-free human transition and {{producer_transition, verdict: accepted|rejected}}"
+                    )));
+                }
+            }
+        }
+    }
 }
 
 /// Collect every `definitionId` a definition references via `kind: workflow`,
@@ -4347,6 +4398,46 @@ fn pointer_escape(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn model_boundaries_reject_invalid_policies_before_dispatch() {
+        for policy in [
+            json!({}),
+            json!({"reads":[]}),
+            json!({"reads":["$.context"]}),
+            json!({"reads":["$.context._agent_continuation_reads"]}),
+            json!({"reads":["$.context.feedback"],"ignored":true}),
+        ] {
+            let workflows = json!({"task":{"states":{"work":{
+                "continuation":policy,"transitions":{"run":{"actor":"agent"}}
+            }}}});
+            let mut out = vec![];
+            validate_model_boundaries(workflows.as_object().unwrap(), &mut out);
+            assert!(out.iter().any(Diagnostic::is_error), "{workflows}");
+        }
+        for actor in ["agent", "deterministic", "human"] {
+            let workflows = json!({"task":{"states":{"review":{"transitions":{"accept":{
+                "actor":actor,"executor":{"kind":"noop"},
+                "model_acceptance":{"producer_transition":"run","verdict":"accepted"}
+            }}}}}});
+            let mut out = vec![];
+            validate_model_boundaries(workflows.as_object().unwrap(), &mut out);
+            assert!(out.iter().any(Diagnostic::is_error));
+        }
+    }
+
+    #[test]
+    fn model_boundaries_accept_explicit_evidence_and_human_review() {
+        let workflows = json!({"task":{"states":{
+            "work":{"continuation":{"reads":["$.context.feedback"]},
+                "transitions":{"run":{"actor":"agent"}}},
+            "review":{"transitions":{"accept":{"actor":"human",
+                "model_acceptance":{"producer_transition":"run","verdict":"accepted"}}}}
+        }}});
+        let mut out = vec![];
+        validate_model_boundaries(workflows.as_object().unwrap(), &mut out);
+        assert!(out.is_empty(), "{out:?}");
+    }
 
     // Portability poka-yoke: an absolute `~/.cargo/bin/...` connection command is
     // machine-specific and warns; the bare name is portable and does not.

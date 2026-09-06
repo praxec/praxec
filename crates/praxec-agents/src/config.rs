@@ -133,12 +133,16 @@ pub struct AgentExecutorConfig {
     /// Default `false`: a non-coding leaf is unaffected.
     #[serde(default)]
     pub requires_file_write: bool,
-    /// Entry gate (Plan A). When true, a step whose rendered goal contains an
-    /// unresolved `(x: unset)` template stub is REFUSED before dispatch
-    /// (AGENT_INPUT_UNRESOLVED). Default false = shadow mode (emit anomaly,
-    /// proceed). Flip per-step, or gateway-wide via the auto-drive composer.
-    #[serde(default)]
+    /// Entry gate (Plan A): unresolved goal template references are refused
+    /// before model dispatch (AGENT_INPUT_UNRESOLVED). Default true. Explicit
+    /// false preserves legacy shadow mode (emit the anomaly and proceed).
+    /// Resolved source text resembling a stub is not an unresolved reference.
+    #[serde(default = "default_enforce_input_grounding")]
     pub enforce_input_grounding: bool,
+}
+
+fn default_enforce_input_grounding() -> bool {
+    true
 }
 
 /// An agent's `affinity:` value — a closed [`ModelRef`] OR an open `activity:`
@@ -249,6 +253,7 @@ mod tests {
             ModelBinding::Affinity(ModelRef::parse("coding").unwrap())
         );
         assert_eq!(c.goal, "fix the failing test");
+        assert!(c.enforce_input_grounding);
     }
 
     #[test]

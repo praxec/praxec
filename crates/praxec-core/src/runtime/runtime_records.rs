@@ -52,6 +52,14 @@ pub(crate) fn validate_blackboard_writes(
     let Some(mapping) = output_mapping.and_then(Value::as_object) else {
         return Ok(());
     };
+    // The runtime owns continuation constraints. A producer must not erase or
+    // replace them via its ordinary blackboard output mapping.
+    if mapping.contains_key("_agent_continuation_reads") {
+        return Err((
+            "_agent_continuation_reads".into(),
+            "reserved engine continuation slot cannot be written by a transition".into(),
+        ));
+    }
     let context_obj = context.as_object();
     // L1 envelope: typed-slot schema validation (only when a `blackboard:` map
     // declares per-slot schemas).
@@ -184,4 +192,26 @@ fn validate_schema_bound_values(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod continuation_slot_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn continuation_contract_slot_is_reserved_even_without_a_blackboard_schema() {
+        for value in [Value::Null, json!([]), json!(["untrusted-override"])] {
+            let mapping = json!({"_agent_continuation_reads": value});
+            assert!(validate_blackboard_writes(&json!({}), Some(&mapping), &mapping).is_err());
+        }
+        assert!(
+            validate_blackboard_writes(
+                &json!({}),
+                Some(&json!({"result":1})),
+                &json!({"result":1, "_agent_continuation_reads":["trusted"]})
+            )
+            .is_ok()
+        );
+    }
 }

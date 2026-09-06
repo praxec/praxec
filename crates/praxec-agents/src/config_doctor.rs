@@ -85,6 +85,11 @@ fn check_agent(wf_id: &str, location: &str, executor: &Value, out: &mut Vec<Diag
             "workflow '{wf_id}' {location}: {e}"
         ))),
         Ok(cfg) => {
+            if !cfg.enforce_input_grounding {
+                out.push(Diagnostic::Warning(format!(
+                    "AGENT_INPUT_GROUNDING_DISABLED: workflow '{wf_id}' {location} explicitly uses shadow mode; unresolved goal references may reach a model."
+                )));
+            }
             if cfg.tools.iter().any(|t| t == RESERVED_SELF_TOOL) {
                 out.push(Diagnostic::Error(format!(
                     "AGENT_FORBIDDEN_SELF_TOOL: workflow '{wf_id}' {location} lists `{RESERVED_SELF_TOOL}` \
@@ -117,6 +122,17 @@ mod tests {
             "kind": "agent", "affinity": "coding", "goal": "do it", "tools": ["github"]
         })));
         assert!(d.is_empty(), "got: {d:?}");
+    }
+
+    #[test]
+    fn explicit_shadow_mode_is_visible_at_check() {
+        let d = doctor_check(&reg(json!({
+            "kind": "agent", "affinity": "coding", "goal": "do it",
+            "enforce_input_grounding": false
+        })));
+        assert!(
+            matches!(&d[..], [Diagnostic::Warning(m)] if m.contains("AGENT_INPUT_GROUNDING_DISABLED"))
+        );
     }
 
     #[test]
