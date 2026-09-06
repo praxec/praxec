@@ -8,6 +8,26 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [0.0.52] — 2026-09-06 — coarse-task amplifier and evidence-based routing
+
+### Added
+
+- Opt-in coarse-task execution contracts: human intent, grounded generative
+  deliverables, deterministic tool verification, and bounded workflow graphs.
+- A preflight compatibility guard that rejects unsupported runtimes before paid work.
+- Independent acceptance provenance and comparable task cohorts for model-cost proposals.
+
+### Fixed
+
+- Extra model invocation during auto-drive of profiled generative tasks.
+- Verification bypasses, stale candidate evidence, hidden loops, and automatic halt execution.
+- Missing handoff grounding, repeated unchanged continuations, per-model reasoning
+  effort propagation, and accounting for direct model attempts and failed spend.
+
+### Documentation
+
+- Reconciled implementation, orchestration skill, historical designs, and release instructions.
+
 ## [0.0.51] — 2026-08-08 — remove the speculative optional-connection machinery
 
 0.0.50 added an `optional: true` connection flag that degraded a missing tool to
