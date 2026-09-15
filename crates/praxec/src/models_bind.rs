@@ -88,7 +88,7 @@ fn pointer_escape(seg: &str) -> String {
 }
 
 /// Split a `"<provider>/<model-id>"` recommendation. The model-id itself may
-/// contain `/` (e.g. `openrouter/z-ai/glm-5.2` → `("openrouter", "z-ai/glm-5.2")`),
+/// contain `/` (e.g. `openrouter/~z-ai/glm-latest` → `("openrouter", "~z-ai/glm-latest")`),
 /// so only the FIRST segment is the provider.
 pub fn split_recommended(recommended: &str) -> Option<(&str, &str)> {
     let (provider, model) = recommended.split_once('/')?;
@@ -348,7 +348,7 @@ mod tests {
         std::fs::write(&models, "version: 1\ndefault: []\n").unwrap();
         let cfg = config_with(
             models.to_str().unwrap(),
-            json!({ "design": { "design": { "recommended": "openrouter/z-ai/glm-5.2" } } }),
+            json!({ "design": { "design": { "recommended": "openrouter/~z-ai/glm-latest" } } }),
         );
         // No env → do NOT fabricate a key; surface the manual snippet.
         let out = bind_affinity_with(&cfg, "design", |_| false).unwrap();
@@ -358,7 +358,7 @@ mod tests {
             } => {
                 assert_eq!(provider, "openrouter");
                 assert!(snippet.contains("activity:"), "snippet: {snippet}");
-                assert!(snippet.contains("z-ai/glm-5.2"), "snippet: {snippet}");
+                assert!(snippet.contains("~z-ai/glm-latest"), "snippet: {snippet}");
             }
             other => panic!("expected NoProviderKey, got {other:?}"),
         }

@@ -395,14 +395,14 @@ mod tests {
     #[test]
     fn effort_supported_gates_a_reasoning_model_on_its_advertised_levels() {
         // A reasoning model must genuinely advertise the requested level.
-        assert!(effort_supported("z-ai/glm-5.2", "high")); // glm advertises high
-        assert!(!effort_supported("qwen/qwen3-coder", "high")); // qwen maxes at medium
-        assert!(effort_supported("qwen/qwen3-coder", "low")); // qwen has low
+        assert!(effort_supported("~z-ai/glm-latest", "high")); // glm-latest advertises high
+        assert!(!effort_supported("~z-ai/glm-flash-latest", "high")); // glm-flash maxes at medium
+        assert!(effort_supported("~z-ai/glm-flash-latest", "low")); // glm-flash has low
         // A leading vendor prefix is stripped before matching the bare model id.
-        assert!(!effort_supported("openrouter:qwen/qwen3-coder", "high"));
+        assert!(!effort_supported("openrouter:~z-ai/glm-flash-latest", "high"));
         // `medium`/empty send no param → always supported (nothing to honor).
-        assert!(effort_supported("qwen/qwen3-coder", "medium"));
-        assert!(effort_supported("qwen/qwen3-coder", ""));
+        assert!(effort_supported("~z-ai/glm-flash-latest", "medium"));
+        assert!(effort_supported("~z-ai/glm-flash-latest", ""));
         // A model absent from the catalog can't be disproven → supported (the
         // validator surfaces it as an info; the runtime never fail-fasts on it).
         assert!(effort_supported("openrouter:made/up-model", "high"));

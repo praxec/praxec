@@ -45,7 +45,7 @@ type AffinityResolveFn<'a> = &'a dyn Fn(&str) -> Option<String>;
 /// any entry is re-verified; operators can read this off the binary to
 /// answer "how fresh is your shipped cost catalog?". Format: ISO 8601
 /// date (`YYYY-MM-DD`).
-pub const LAST_VERIFIED: &str = "2026-05-29";
+pub const LAST_VERIFIED: &str = "2026-09-15";
 
 /// Maximum age (in days) of a catalog entry's `verified_at` before
 /// load-time validation considers it stale. Per SPEC §33 plan FMECA F8.
@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn compute_cost_usd_for_zero_tokens_is_zero() {
-        let result = compute_cost_usd("anthropic:claude-sonnet-4-6", 0, 0)
+        let result = compute_cost_usd("anthropic:claude-sonnet-latest", 0, 0)
             .expect("known model with zero tokens must compute");
         assert!(result.abs() < f64::EPSILON);
     }

@@ -66,6 +66,7 @@ pub mod providers;
 pub mod provision_install;
 pub mod proxy_workflow;
 pub mod registry_v3;
+pub mod seed_models;
 pub mod reliability;
 pub mod repo;
 pub mod repo_git;

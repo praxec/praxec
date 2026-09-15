@@ -708,7 +708,7 @@ mod tests {
              affinities:\n  \
              design:\n    tier: frontier\n    capability: UI design annealing\n    \
              recommended: openrouter/anthropic/claude-sonnet-4-5\n  \
-             rollout:\n    recommended: openrouter/z-ai/glm-5.2\n",
+             rollout:\n    recommended: openrouter/~z-ai/glm-latest\n",
         );
         let m = load_manifest(td.path()).expect("manifest with affinities loads");
         assert_eq!(m.affinities.len(), 2, "both affinities parsed");
@@ -726,7 +726,7 @@ mod tests {
             .expect("rollout affinity present");
         assert!(r.tier.is_none(), "omitted tier defaults None");
         assert!(r.capability.is_none(), "omitted capability defaults None");
-        assert_eq!(r.recommended.as_deref(), Some("openrouter/z-ai/glm-5.2"));
+        assert_eq!(r.recommended.as_deref(), Some("openrouter/~z-ai/glm-latest"));
     }
 
     #[test]

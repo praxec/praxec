@@ -123,7 +123,7 @@ async fn record_mission(sink: &FileAuditSink, wf: &str, template: &str, met: boo
         AuditEvent::new(AGENT_COMPLETED)
             .with_workflow(wf)
             .with_payload(json!({
-                "model": "openrouter:z-ai/glm-5.2",
+                "model": "openrouter:~z-ai/glm-latest",
                 "prompt_tokens": 1000,
                 "completion_tokens": 200,
                 "cost_usd": cost,
