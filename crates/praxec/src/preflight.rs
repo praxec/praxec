@@ -1102,7 +1102,8 @@ mod tests {
         let n = diags
             .iter()
             .filter(|d| {
-                d.code == "REASONING_LEVEL_UNSUPPORTED" && d.model == "openrouter:~z-ai/glm-flash-latest"
+                d.code == "REASONING_LEVEL_UNSUPPORTED"
+                    && d.model == "openrouter:~z-ai/glm-flash-latest"
             })
             .count();
         assert_eq!(n, 1, "must dedup per (code, model), got {diags:?}");

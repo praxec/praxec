@@ -399,7 +399,10 @@ mod tests {
         assert!(!effort_supported("~z-ai/glm-flash-latest", "high")); // glm-flash maxes at medium
         assert!(effort_supported("~z-ai/glm-flash-latest", "low")); // glm-flash has low
         // A leading vendor prefix is stripped before matching the bare model id.
-        assert!(!effort_supported("openrouter:~z-ai/glm-flash-latest", "high"));
+        assert!(!effort_supported(
+            "openrouter:~z-ai/glm-flash-latest",
+            "high"
+        ));
         // `medium`/empty send no param → always supported (nothing to honor).
         assert!(effort_supported("~z-ai/glm-flash-latest", "medium"));
         assert!(effort_supported("~z-ai/glm-flash-latest", ""));
