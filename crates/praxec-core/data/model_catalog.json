@@ -1,14 +1,14 @@
 {
-  "source": "Intelligence + affinity scores: Artificial Analysis Intelligence Index, whose overall is the 25%-each mean of general / coding / agents / scientific reasoning. Affinity scores carry the coding / agentic / reasoning sub-indices (general == overall intelligence). Speed: AA output tok/s. Price: provider published API pricing. See README_chat_models.md. NOTE: the openrouter z-ai/glm-5.2, deepseek/deepseek-v4-pro, deepseek/deepseek-v4-flash, deepseek/deepseek-r1-0528, z-ai/glm-4.7-flash entries have cost SOURCED from OpenRouter (captured 2026-06-23); their intelligence/affinity scores are best-available ESTIMATES calibrated relative to existing entries, pending an Artificial-Analysis refresh. The second-tier open-weight intelligence figures (minimax-m3, deepseek-v4-pro, moonshotai/kimi-k2.6) were re-derated 2026-06-26 against AA Intelligence Index v4.1 (catalog runs ~+5 hot vs AA v4.1). The `prose` sub-score is NOT an AA sub-index \u2014 AA publishes no prose/copywriting axis \u2014 so every `prose` value here is a calibrated ESTIMATE (closed frontier models seeded above their general index, open-weight coders/reasoners below it to reflect their relative copy weakness); refine from real prose-step pass-rates.",
-  "captured": "2026-06-23",
+  "source": "Intelligence + affinity scores: Artificial Analysis Intelligence Index, whose overall is the 25%-each mean of general / coding / agents / scientific reasoning. Affinity scores carry the coding / agentic / reasoning sub-indices (general == overall intelligence). Speed: AA output tok/s. Price: provider published API pricing. See README_chat_models.md. NOTE: this catalog was migrated 2026-09-15 from pinned model versions to OpenRouter rolling `-latest` aliases (the `~vendor/model-latest` ids that always resolve to the vendor's newest build). Every openrouter `~...-latest` row's PRICE and context were captured from the OpenRouter models API on 2026-09-15; their intelligence/affinity scores are best-available ESTIMATES calibrated relative to the prior pinned entries they supersede (glm-latest≈glm-5.2+1, deepseek-pro-latest≈deepseek-v4-pro, deepseek-flash-latest≈deepseek-v4-flash, claude-*-latest and gpt tiers seeded from their tier positioning), pending an Artificial-Analysis refresh. moonshotai/kimi-k2.6 and qwen/qwen3-coder were RETIRED from OpenRouter (2026-09-15) and removed. The `prose` sub-score is NOT an AA sub-index — AA publishes no prose/copywriting axis — so every `prose` value here is a calibrated ESTIMATE (closed frontier models seeded above their general index, open-weight coders/reasoners below it to reflect their relative copy weakness); refine from real prose-step pass-rates.",
+  "captured": "2026-09-15",
   "models": [
     {
       "vendor": "anthropic",
-      "model": "claude-opus-4-8",
+      "model": "claude-opus-latest",
       "input_usd_per_million": 5.0,
       "output_usd_per_million": 25.0,
-      "context": 200000,
-      "intelligence": 61.4,
+      "context": 1000000,
+      "intelligence": 63,
       "speed_tps": 70,
       "tools": true,
       "reasoning_levels": [
@@ -18,19 +18,19 @@
         "high"
       ],
       "scores": {
-        "coding": 64,
-        "agentic": 66,
-        "reasoning": 56,
-        "prose": 66
+        "coding": 66,
+        "agentic": 68,
+        "reasoning": 60,
+        "prose": 68
       }
     },
     {
       "vendor": "anthropic",
-      "model": "claude-sonnet-4-6",
-      "input_usd_per_million": 3.0,
-      "output_usd_per_million": 15.0,
+      "model": "claude-sonnet-latest",
+      "input_usd_per_million": 2.0,
+      "output_usd_per_million": 10.0,
       "context": 1000000,
-      "intelligence": 52,
+      "intelligence": 55,
       "speed_tps": 90,
       "tools": true,
       "reasoning_levels": [
@@ -40,15 +40,15 @@
         "high"
       ],
       "scores": {
-        "coding": 55,
-        "agentic": 54,
-        "reasoning": 47,
-        "prose": 60
+        "coding": 58,
+        "agentic": 57,
+        "reasoning": 52,
+        "prose": 62
       }
     },
     {
       "vendor": "anthropic",
-      "model": "claude-haiku-4-5",
+      "model": "claude-haiku-latest",
       "input_usd_per_million": 1.0,
       "output_usd_per_million": 5.0,
       "context": 200000,
@@ -69,11 +69,11 @@
     },
     {
       "vendor": "openai",
-      "model": "gpt-5.5",
-      "input_usd_per_million": 5.0,
-      "output_usd_per_million": 30.0,
-      "context": 400000,
-      "intelligence": 60.2,
+      "model": "gpt-sol-latest",
+      "input_usd_per_million": 2.0,
+      "output_usd_per_million": 10.0,
+      "context": 1050000,
+      "intelligence": 61,
       "speed_tps": 100,
       "tools": true,
       "reasoning_levels": [
@@ -85,9 +85,9 @@
         "xhigh"
       ],
       "scores": {
-        "coding": 60,
-        "agentic": 58,
-        "reasoning": 62,
+        "coding": 62,
+        "agentic": 60,
+        "reasoning": 63,
         "prose": 58
       }
     },
@@ -136,11 +136,11 @@
     },
     {
       "vendor": "openrouter",
-      "model": "anthropic/claude-opus-4-8",
+      "model": "~anthropic/claude-opus-latest",
       "input_usd_per_million": 5.0,
       "output_usd_per_million": 25.0,
-      "context": 200000,
-      "intelligence": 61.4,
+      "context": 1000000,
+      "intelligence": 63,
       "speed_tps": 70,
       "tools": true,
       "reasoning_levels": [
@@ -150,19 +150,19 @@
         "high"
       ],
       "scores": {
-        "coding": 64,
-        "agentic": 66,
-        "reasoning": 56,
-        "prose": 66
+        "coding": 66,
+        "agentic": 68,
+        "reasoning": 60,
+        "prose": 68
       }
     },
     {
       "vendor": "openrouter",
-      "model": "anthropic/claude-sonnet-4-6",
-      "input_usd_per_million": 3.0,
-      "output_usd_per_million": 15.0,
+      "model": "~anthropic/claude-sonnet-latest",
+      "input_usd_per_million": 2.0,
+      "output_usd_per_million": 10.0,
       "context": 1000000,
-      "intelligence": 52,
+      "intelligence": 55,
       "speed_tps": 90,
       "tools": true,
       "reasoning_levels": [
@@ -172,19 +172,64 @@
         "high"
       ],
       "scores": {
-        "coding": 55,
-        "agentic": 54,
-        "reasoning": 47,
+        "coding": 58,
+        "agentic": 57,
+        "reasoning": 52,
+        "prose": 62
+      }
+    },
+    {
+      "vendor": "openrouter",
+      "model": "~anthropic/claude-haiku-latest",
+      "input_usd_per_million": 1.0,
+      "output_usd_per_million": 5.0,
+      "context": 200000,
+      "intelligence": 40,
+      "speed_tps": 160,
+      "tools": true,
+      "reasoning_levels": [
+        "none",
+        "low",
+        "medium"
+      ],
+      "scores": {
+        "coding": 42,
+        "agentic": 40,
+        "reasoning": 38,
+        "prose": 48
+      }
+    },
+    {
+      "vendor": "openrouter",
+      "model": "~openai/gpt-astra-latest",
+      "input_usd_per_million": 10.0,
+      "output_usd_per_million": 50.0,
+      "context": 1050000,
+      "intelligence": 65,
+      "speed_tps": 90,
+      "tools": true,
+      "reasoning_levels": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "scores": {
+        "coding": 64,
+        "agentic": 70,
+        "reasoning": 66,
         "prose": 60
       }
     },
     {
       "vendor": "openrouter",
-      "model": "openai/gpt-5.5",
-      "input_usd_per_million": 5.0,
-      "output_usd_per_million": 30.0,
-      "context": 400000,
-      "intelligence": 60.2,
+      "model": "~openai/gpt-sol-latest",
+      "input_usd_per_million": 2.0,
+      "output_usd_per_million": 10.0,
+      "context": 1050000,
+      "intelligence": 61,
       "speed_tps": 100,
       "tools": true,
       "reasoning_levels": [
@@ -196,10 +241,54 @@
         "xhigh"
       ],
       "scores": {
-        "coding": 60,
-        "agentic": 58,
-        "reasoning": 62,
+        "coding": 62,
+        "agentic": 60,
+        "reasoning": 63,
         "prose": 58
+      }
+    },
+    {
+      "vendor": "openrouter",
+      "model": "~openai/gpt-terra-latest",
+      "input_usd_per_million": 2.0,
+      "output_usd_per_million": 12.0,
+      "context": 1050000,
+      "intelligence": 55,
+      "speed_tps": 110,
+      "tools": true,
+      "reasoning_levels": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high"
+      ],
+      "scores": {
+        "coding": 56,
+        "agentic": 54,
+        "reasoning": 56,
+        "prose": 55
+      }
+    },
+    {
+      "vendor": "openrouter",
+      "model": "~openai/gpt-luna-latest",
+      "input_usd_per_million": 0.2,
+      "output_usd_per_million": 1.2,
+      "context": 1050000,
+      "intelligence": 46,
+      "speed_tps": 200,
+      "tools": true,
+      "reasoning_levels": [
+        "none",
+        "low",
+        "medium"
+      ],
+      "scores": {
+        "coding": 45,
+        "agentic": 44,
+        "reasoning": 45,
+        "prose": 52
       }
     },
     {
@@ -226,140 +315,11 @@
     },
     {
       "vendor": "openrouter",
-      "model": "deepseek/deepseek-v4",
-      "input_usd_per_million": 0.45,
-      "output_usd_per_million": 0.9,
-      "context": 128000,
-      "intelligence": 52,
-      "speed_tps": 60,
-      "tools": true,
-      "reasoning_levels": [
-        "none",
-        "high"
-      ],
-      "scores": {
-        "coding": 56,
-        "agentic": 48,
-        "reasoning": 54,
-        "prose": 48
-      }
-    },
-    {
-      "vendor": "openrouter",
-      "model": "moonshotai/kimi-k2.6",
-      "input_usd_per_million": 0.6,
-      "output_usd_per_million": 2.5,
-      "context": 256000,
-      "intelligence": 48,
-      "speed_tps": 70,
-      "tools": true,
-      "reasoning_levels": [
-        "none",
-        "low",
-        "medium",
-        "high"
-      ],
-      "scores": {
-        "coding": 54,
-        "agentic": 58,
-        "reasoning": 51,
-        "prose": 46
-      }
-    },
-    {
-      "vendor": "openrouter",
-      "model": "z-ai/glm-5.1",
-      "input_usd_per_million": 0.5,
-      "output_usd_per_million": 2.0,
-      "context": 200000,
-      "intelligence": 51,
-      "speed_tps": 80,
-      "tools": true,
-      "reasoning_levels": [
-        "none",
-        "low",
-        "medium",
-        "high"
-      ],
-      "scores": {
-        "coding": 53,
-        "agentic": 50,
-        "reasoning": 50,
-        "prose": 47
-      }
-    },
-    {
-      "vendor": "openrouter",
-      "model": "minimax/minimax-m3",
-      "input_usd_per_million": 0.4,
-      "output_usd_per_million": 1.6,
-      "context": 256000,
-      "intelligence": 49,
-      "speed_tps": 90,
-      "tools": true,
-      "reasoning_levels": [
-        "none",
-        "low",
-        "medium",
-        "high"
-      ],
-      "scores": {
-        "coding": 54,
-        "agentic": 57,
-        "reasoning": 55,
-        "prose": 46
-      }
-    },
-    {
-      "vendor": "openrouter",
-      "model": "qwen/qwen3-coder",
-      "input_usd_per_million": 0.22,
-      "output_usd_per_million": 1.8,
-      "context": 256000,
-      "intelligence": 51,
-      "speed_tps": 90,
-      "tools": true,
-      "reasoning_levels": [
-        "none",
-        "low",
-        "medium"
-      ],
-      "scores": {
-        "coding": 64,
-        "agentic": 52,
-        "reasoning": 44,
-        "prose": 40
-      }
-    },
-    {
-      "vendor": "openrouter",
-      "model": "z-ai/glm-5.2",
-      "input_usd_per_million": 0.95,
-      "output_usd_per_million": 3.0,
+      "model": "~deepseek/deepseek-pro-latest",
+      "input_usd_per_million": 0.66,
+      "output_usd_per_million": 1.98,
       "context": 1048576,
-      "intelligence": 56,
-      "speed_tps": 80,
-      "tools": true,
-      "reasoning_levels": [
-        "none",
-        "low",
-        "medium",
-        "high"
-      ],
-      "scores": {
-        "coding": 58,
-        "agentic": 56,
-        "reasoning": 55,
-        "prose": 52
-      }
-    },
-    {
-      "vendor": "openrouter",
-      "model": "deepseek/deepseek-v4-pro",
-      "input_usd_per_million": 0.435,
-      "output_usd_per_million": 0.87,
-      "context": 1048576,
-      "intelligence": 49,
+      "intelligence": 50,
       "speed_tps": 60,
       "tools": true,
       "reasoning_levels": [
@@ -368,18 +328,18 @@
       ],
       "scores": {
         "coding": 57,
-        "agentic": 50,
-        "reasoning": 56,
+        "agentic": 51,
+        "reasoning": 57,
         "prose": 47
       }
     },
     {
       "vendor": "openrouter",
-      "model": "deepseek/deepseek-v4-flash",
-      "input_usd_per_million": 0.09,
-      "output_usd_per_million": 0.18,
+      "model": "~deepseek/deepseek-flash-latest",
+      "input_usd_per_million": 0.15,
+      "output_usd_per_million": 0.6,
       "context": 1048576,
-      "intelligence": 44,
+      "intelligence": 45,
       "speed_tps": 130,
       "tools": true,
       "reasoning_levels": [
@@ -387,39 +347,41 @@
         "high"
       ],
       "scores": {
-        "coding": 46,
-        "agentic": 42,
-        "reasoning": 45,
-        "prose": 42
+        "coding": 47,
+        "agentic": 43,
+        "reasoning": 46,
+        "prose": 43
       }
     },
     {
       "vendor": "openrouter",
-      "model": "deepseek/deepseek-r1-0528",
-      "input_usd_per_million": 0.5,
-      "output_usd_per_million": 2.15,
-      "context": 163840,
-      "intelligence": 53,
-      "speed_tps": 50,
+      "model": "~z-ai/glm-latest",
+      "input_usd_per_million": 0.8775,
+      "output_usd_per_million": 2.97,
+      "context": 1310720,
+      "intelligence": 57,
+      "speed_tps": 80,
       "tools": true,
       "reasoning_levels": [
         "none",
+        "low",
+        "medium",
         "high"
       ],
       "scores": {
-        "coding": 52,
-        "agentic": 48,
-        "reasoning": 60,
-        "prose": 46
+        "coding": 59,
+        "agentic": 57,
+        "reasoning": 56,
+        "prose": 53
       }
     },
     {
       "vendor": "openrouter",
-      "model": "z-ai/glm-4.7-flash",
-      "input_usd_per_million": 0.06,
-      "output_usd_per_million": 0.4,
-      "context": 202752,
-      "intelligence": 41,
+      "model": "~z-ai/glm-flash-latest",
+      "input_usd_per_million": 0.075,
+      "output_usd_per_million": 0.25,
+      "context": 1310720,
+      "intelligence": 42,
       "speed_tps": 150,
       "tools": true,
       "reasoning_levels": [
@@ -428,54 +390,10 @@
         "medium"
       ],
       "scores": {
-        "coding": 43,
-        "agentic": 40,
-        "reasoning": 39,
-        "prose": 40
-      }
-    },
-    {
-      "vendor": "openrouter/qwen",
-      "model": "qwen3-235b-a22b-thinking-2507",
-      "input_usd_per_million": 0.1,
-      "output_usd_per_million": 0.1,
-      "context": 262144,
-      "intelligence": 50,
-      "speed_tps": 45,
-      "tools": true,
-      "reasoning_levels": [
-        "none",
-        "low",
-        "medium",
-        "high"
-      ],
-      "scores": {
-        "coding": 54,
-        "agentic": 50,
-        "reasoning": 58,
-        "prose": 50
-      }
-    },
-    {
-      "vendor": "openrouter/z-ai",
-      "model": "glm-4.7",
-      "input_usd_per_million": 0.4,
-      "output_usd_per_million": 1.75,
-      "context": 202752,
-      "intelligence": 48,
-      "speed_tps": 60,
-      "tools": true,
-      "reasoning_levels": [
-        "none",
-        "low",
-        "medium",
-        "high"
-      ],
-      "scores": {
-        "coding": 50,
-        "agentic": 48,
-        "reasoning": 50,
-        "prose": 52
+        "coding": 44,
+        "agentic": 41,
+        "reasoning": 40,
+        "prose": 41
       }
     }
   ]

@@ -538,19 +538,20 @@ mod tests {
     #[test]
     fn shipped_catalog_has_a_coding_specialist_and_open_models() {
         let opts = default_chat_options();
-        // An open coding specialist exists and is genuinely coding-strongest.
+        // An open coding specialist exists and is genuinely coding-strongest
+        // (glm-latest leads commodity coding after qwen3-coder's retirement).
         let coder = opts
             .iter()
-            .find(|o| o.model == "qwen/qwen3-coder")
+            .find(|o| o.model == "~z-ai/glm-latest")
             .expect("coding model");
         assert!(coder.scores.coding > coder.scores.agentic);
         assert!(coder.scores.coding > coder.scores.reasoning);
         // More than one open-weight option (not just DeepSeek).
         let open = [
-            "deepseek/deepseek-v4",
-            "moonshotai/kimi-k2.6",
-            "z-ai/glm-5.1",
-            "minimax/minimax-m3",
+            "~deepseek/deepseek-pro-latest",
+            "~deepseek/deepseek-flash-latest",
+            "~z-ai/glm-latest",
+            "~z-ai/glm-flash-latest",
         ];
         let have = open
             .iter()
@@ -600,7 +601,7 @@ mod tests {
     fn cost_scales_with_requests_and_reasoning() {
         let opus = default_chat_options()
             .into_iter()
-            .find(|o| o.model == "claude-opus-4-8")
+            .find(|o| o.model == "claude-opus-latest")
             .unwrap();
         // Volume: cheap at low, expensive at high.
         assert!(
@@ -618,7 +619,7 @@ mod tests {
     fn default_reasoning_prefers_medium() {
         let opus = default_chat_options()
             .into_iter()
-            .find(|o| o.model == "claude-opus-4-8")
+            .find(|o| o.model == "claude-opus-latest")
             .unwrap();
         assert_eq!(default_reasoning(&opus), "medium");
     }

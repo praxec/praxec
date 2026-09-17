@@ -124,8 +124,8 @@ enum Command {
                       Example:\n  \
                       px walk --workflow swe_agent \\\n    \
                       --input '{\"issue\":\"add timeout to RegistryExecutor\"}' \\\n    \
-                      --agent planning=anthropic/claude-sonnet-4 \\\n    \
-                      --agent editing=anthropic/claude-haiku-4-5-20251001"
+                      --agent planning=anthropic/claude-sonnet-latest \\\n    \
+                      --agent editing=anthropic/claude-haiku-latest"
     )]
     Walk(WalkArgs),
     /// Pre-flight checks for `px walk` — binary discovery, config
@@ -313,7 +313,7 @@ pub struct WalkArgs {
 
     /// Agent config in `name=provider/model` form. Repeat for each
     /// sub-agent referenced by `delegate:` fields in the workflow.
-    /// Example: `--agent planning=anthropic/claude-sonnet-4 --agent editing=anthropic/claude-haiku-4-5-20251001`
+    /// Example: `--agent planning=anthropic/claude-sonnet-latest --agent editing=anthropic/claude-haiku-latest`
     ///
     /// **Deprecated in v0.3 in favor of `models.yaml`** — prefer the
     /// file-based config for per-affinity overrides + feature toggles.
@@ -449,8 +449,10 @@ fn run_migrate_agents_from_cli(args: MigrateAgentsArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The shipped commodity-first, specialist-per-activity seed `models.yaml`.
-const SEED_MODELS_YAML: &str = include_str!("../data/seed-models.yaml");
+/// The shipped commodity-first, specialist-per-activity seed `models.yaml` — the
+/// single source of truth lives in praxec-core (shared with the `praxec init`
+/// scaffold), so model choices are updated in exactly one file.
+use praxec_core::seed_models::SEED_MODELS_YAML;
 
 fn run_init_models(args: InitModelsArgs) -> Result<ExitCode> {
     if args.dry_run {

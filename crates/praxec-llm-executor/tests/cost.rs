@@ -17,13 +17,13 @@ use serde_json::json;
 fn today() -> NaiveDate {
     // Pinned reference date matches the shipped LAST_VERIFIED so
     // freshness math is deterministic in tests.
-    NaiveDate::from_ymd_opt(2026, 5, 29).expect("static date")
+    NaiveDate::from_ymd_opt(2026, 9, 15).expect("static date")
 }
 
 #[test]
 fn lookup_finds_anthropic_sonnet() {
-    let entry =
-        lookup("anthropic:claude-sonnet-4-6").expect("anthropic:claude-sonnet-4-6 must be shipped");
+    let entry = lookup("anthropic:claude-sonnet-latest")
+        .expect("anthropic:claude-sonnet-latest must be shipped");
     assert!(entry.input_usd_per_million_tokens > 0.0);
     assert!(entry.output_usd_per_million_tokens > 0.0);
     assert!(entry.verified_at_date().is_some());
@@ -42,11 +42,11 @@ fn lookup_returns_missing_for_unknown_model() {
 
 #[test]
 fn compute_cost_usd_multiplies_correctly() {
-    // Sonnet ships at $3.00 / $15.00 per million.
-    // 1000 in + 1000 out => 1000 * 3e-6 + 1000 * 15e-6 = 0.003 + 0.015 = 0.018
-    let cost =
-        compute_cost_usd("anthropic:claude-sonnet-4-6", 1000, 1000).expect("known model must cost");
-    let expected = 0.018_f64;
+    // Sonnet-latest ships at $2.00 / $10.00 per million.
+    // 1000 in + 1000 out => 1000 * 2e-6 + 1000 * 10e-6 = 0.002 + 0.010 = 0.012
+    let cost = compute_cost_usd("anthropic:claude-sonnet-latest", 1000, 1000)
+        .expect("known model must cost");
+    let expected = 0.012_f64;
     assert!(
         (cost - expected).abs() < 1e-9,
         "expected {expected}, got {cost}"
@@ -62,7 +62,7 @@ fn compute_cost_usd_returns_missing_for_unknown_model() {
 
 #[test]
 fn validate_for_workflow_passes_for_known_fresh_model() {
-    validate_for_workflow("anthropic:claude-sonnet-4-6", true, today())
+    validate_for_workflow("anthropic:claude-sonnet-latest", true, today())
         .expect("fresh known model with budget cap must pass");
 }
 
@@ -121,7 +121,7 @@ fn validate_for_workflow_rejects_stale_with_budget_cap() {
     // The shipped sonnet entry was verified on `today()`. Drive the
     // clock forward past the staleness threshold to trigger the gate.
     let future = today() + chrono::Duration::days(STALENESS_THRESHOLD_DAYS + 1);
-    let err = validate_for_workflow("anthropic:claude-sonnet-4-6", true, future)
+    let err = validate_for_workflow("anthropic:claude-sonnet-latest", true, future)
         .expect_err("stale entry + cap must be rejected");
     match err {
         CostCatalogError::Stale {
@@ -129,7 +129,7 @@ fn validate_for_workflow_rejects_stale_with_budget_cap() {
             verified_at,
             threshold_days,
         } => {
-            assert_eq!(model, "anthropic:claude-sonnet-4-6");
+            assert_eq!(model, "anthropic:claude-sonnet-latest");
             assert_eq!(threshold_days, STALENESS_THRESHOLD_DAYS);
             assert!(
                 NaiveDate::parse_from_str(&verified_at, "%Y-%m-%d").is_ok(),
@@ -143,7 +143,7 @@ fn validate_for_workflow_rejects_stale_with_budget_cap() {
 #[test]
 fn validate_for_workflow_warns_stale_without_budget_cap() {
     let future = today() + chrono::Duration::days(STALENESS_THRESHOLD_DAYS + 1);
-    validate_for_workflow("anthropic:claude-sonnet-4-6", false, future)
+    validate_for_workflow("anthropic:claude-sonnet-latest", false, future)
         .expect("stale entry without budget cap must pass validate");
 
     let registry = json!({
@@ -157,7 +157,7 @@ fn validate_for_workflow_warns_stale_without_budget_cap() {
                                 "executor": {
                                     "kind": "llm",
                                     "config": {
-                                        "model": "anthropic:claude-sonnet-4-6",
+                                        "model": "anthropic:claude-sonnet-latest",
                                         "prompt_template": "x"
                                     }
                                 }
@@ -247,7 +247,7 @@ fn doctor_check_emits_error_with_wire_code_for_stale_with_cap() {
                                 "executor": {
                                     "kind": "llm",
                                     "config": {
-                                        "model": "anthropic:claude-sonnet-4-6",
+                                        "model": "anthropic:claude-sonnet-latest",
                                         "prompt_template": "x",
                                         "max_cost_usd": 1.0
                                     }
