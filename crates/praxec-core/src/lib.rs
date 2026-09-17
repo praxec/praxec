@@ -73,6 +73,7 @@ pub mod repo_locks;
 pub mod run_env;
 pub mod runtime;
 pub mod sandbox;
+pub mod seed_models;
 pub mod skills;
 pub mod slot;
 pub mod store;

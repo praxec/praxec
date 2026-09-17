@@ -1762,15 +1762,15 @@ mod tests {
         #[async_trait::async_trait]
         impl AgentModelResolver for EffortMismatchResolver {
             async fn resolve(&self, _b: &ModelBinding) -> Result<String, ExecutorError> {
-                Ok("openrouter:qwen/qwen3-coder".into())
+                Ok("openrouter:~z-ai/glm-flash-latest".into())
             }
             async fn resolve_chain(
                 &self,
                 _b: &ModelBinding,
             ) -> Result<Vec<crate::session::ResolvedHop>, ExecutorError> {
-                // qwen3-coder advertises [none,low,medium]; pair it with `high`.
+                // glm-flash-latest advertises [none,low,medium]; pair it with `high`.
                 Ok(vec![crate::session::ResolvedHop {
-                    model: "openrouter:qwen/qwen3-coder".into(),
+                    model: "openrouter:~z-ai/glm-flash-latest".into(),
                     effort: Some("high".into()),
                 }])
             }
@@ -1807,15 +1807,15 @@ mod tests {
         #[async_trait::async_trait]
         impl AgentModelResolver for FrontierResolver {
             async fn resolve(&self, _b: &ModelBinding) -> Result<String, ExecutorError> {
-                Ok("anthropic:claude-opus-4-8".into())
+                Ok("anthropic:claude-opus-latest".into())
             }
             async fn resolve_chain(
                 &self,
                 _b: &ModelBinding,
             ) -> Result<Vec<crate::session::ResolvedHop>, ExecutorError> {
-                // claude-opus-4-8 is $25/M output — over the $5 cap.
+                // claude-opus-latest is $25/M output — over the $5 cap.
                 Ok(vec![crate::session::ResolvedHop {
-                    model: "anthropic:claude-opus-4-8".into(),
+                    model: "anthropic:claude-opus-latest".into(),
                     effort: None,
                 }])
             }
@@ -1850,14 +1850,14 @@ mod tests {
         #[async_trait::async_trait]
         impl AgentModelResolver for FrontierResolver {
             async fn resolve(&self, _b: &ModelBinding) -> Result<String, ExecutorError> {
-                Ok("anthropic:claude-opus-4-8".into())
+                Ok("anthropic:claude-opus-latest".into())
             }
             async fn resolve_chain(
                 &self,
                 _b: &ModelBinding,
             ) -> Result<Vec<crate::session::ResolvedHop>, ExecutorError> {
                 Ok(vec![crate::session::ResolvedHop {
-                    model: "anthropic:claude-opus-4-8".into(),
+                    model: "anthropic:claude-opus-latest".into(),
                     effort: None,
                 }])
             }
@@ -1872,7 +1872,7 @@ mod tests {
             json!({
                 "affinity": "coding", "goal": "go",
                 "frontier_cap_usd_per_m": 5.0,
-                "approve_frontier": ["anthropic:claude-opus-4-8"]
+                "approve_frontier": ["anthropic:claude-opus-latest"]
             }),
             bare_def(),
         ))

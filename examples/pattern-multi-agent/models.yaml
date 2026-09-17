@@ -8,4 +8,4 @@ version: 1
 default:
   - provider:
       name: openrouter
-    model: z-ai/glm-5.2
+    model: ~z-ai/glm-latest

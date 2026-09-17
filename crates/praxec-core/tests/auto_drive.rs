@@ -233,7 +233,7 @@ async fn agent_completed_carries_cost_telemetry() {
     let exec = std::sync::Arc::new(common::chain::TelemetryExecutor::new(
         json!({}),
         ExecutorTelemetry {
-            model: "openrouter:z-ai/glm-5.2".into(),
+            model: "openrouter:~z-ai/glm-latest".into(),
             prompt_tokens: 1200,
             completion_tokens: 340,
             cost_usd: Some(0.123),
@@ -265,7 +265,7 @@ async fn agent_completed_carries_cost_telemetry() {
         .find(|e| e.event_type == "agent.completed")
         .expect("an agent.completed event must be recorded");
     let p = &completed.payload;
-    assert_eq!(p["model"], "openrouter:z-ai/glm-5.2");
+    assert_eq!(p["model"], "openrouter:~z-ai/glm-latest");
     assert_eq!(p["prompt_tokens"], 1200);
     assert_eq!(p["completion_tokens"], 340);
     assert_eq!(p["cost_usd"], 0.123);

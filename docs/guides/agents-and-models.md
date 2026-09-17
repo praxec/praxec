@@ -31,11 +31,11 @@ authenticate. Everything below is copy-paste.
 version: 1
 default:
   - provider: { name: anthropic }
-    model: claude-sonnet-4-6
+    model: claude-sonnet-latest
 overrides:
   coding-frontier:
     - provider: { name: anthropic }
-      model: claude-opus-4-7
+      model: claude-opus-latest
 ```
 
 **2. Set a provider key** (writes `~/.config/praxec/providers.env`, mode 0600) —
@@ -84,7 +84,7 @@ praxec check --config gateway.yaml      # fails fast if models_yaml is missing (
 praxec orchestrate --config gateway.yaml \
   --definition fix_readme \
   --input '{"repo_path": "/abs/path/to/repo"}' \
-  --model anthropic:claude-sonnet-4-6 \
+  --model anthropic:claude-sonnet-latest \
   --policy auto-approve
 ```
 
@@ -166,14 +166,14 @@ are mandatory; `overrides` and `strict_specificity` are optional:
 version: 1                               # only version 1 is supported
 default:                                 # the fallback chain, tried in order
   - provider: { name: anthropic }
-    model: claude-sonnet-4-6
+    model: claude-sonnet-latest
 overrides:                               # key = <affinity> | <tier> | <affinity>-<tier>
   coding-frontier:
     - provider: { name: openai }
-      model: gpt-5
+      model: gpt-sol-latest
   coding:
     - provider: { name: anthropic }
-      model: claude-sonnet-4-6
+      model: claude-sonnet-latest
 ```
 
 - **Affinities:** `coding`, `reasoning` (aliases: `math`, `science`), `prose`,
@@ -215,7 +215,7 @@ first dispatch — see [Troubleshooting](#troubleshooting) for the exact errors.
 
 ## Provider keys
 
-Once a binding resolves to `provider: anthropic, model: claude-sonnet-4-6`, the
+Once a binding resolves to `provider: anthropic, model: claude-sonnet-latest`, the
 runtime needs that provider's credential. Each provider reads its own env var:
 
 | Provider     | Credential |
@@ -279,7 +279,7 @@ hits the step bound.
 ```bash
 praxec orchestrate --config gateway.yaml \
   --definition my_mission \
-  --model anthropic:claude-sonnet-4-6 \
+  --model anthropic:claude-sonnet-latest \
   --policy auto-approve
 ```
 

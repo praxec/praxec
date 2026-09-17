@@ -989,20 +989,20 @@ mod tests {
 
     #[test]
     fn reasoning_validator_flags_a_level_the_model_cannot_do() {
-        // qwen3-coder advertises [none,low,medium] — asking `high` must warn.
+        // glm-flash-latest advertises [none,low,medium] — asking `high` must warn.
         let path = write_models(
             "unsup",
             concat!(
-                // `default:` is required by the models.yaml schema; glm-5.2
+                // `default:` is required by the models.yaml schema; glm-latest
                 // supports `high`, so it is silent — only the qwen activity fires.
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: openrouter }\n",
-                "    model: z-ai/glm-5.2\n",
+                "    model: ~z-ai/glm-latest\n",
                 "activity:\n",
                 "  coding:\n",
                 "    - provider: { name: openrouter }\n",
-                "      model: qwen/qwen3-coder\n",
+                "      model: ~z-ai/glm-flash-latest\n",
             ),
         );
         let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
@@ -1010,7 +1010,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(
             diags.iter().any(|d| d.code == "REASONING_LEVEL_UNSUPPORTED"
-                && d.model == "openrouter:qwen/qwen3-coder"
+                && d.model == "openrouter:~z-ai/glm-flash-latest"
                 && d.severity == ReasoningSeverity::Warn),
             "{diags:?}"
         );
@@ -1018,14 +1018,14 @@ mod tests {
 
     #[test]
     fn reasoning_validator_passes_a_supported_level_silently() {
-        // deepseek-v4-pro advertises [none,high] — `high` is supported → no finding.
+        // deepseek-pro-latest advertises [none,high] — `high` is supported → no finding.
         let path = write_models(
             "ok",
             concat!(
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: openrouter }\n",
-                "    model: deepseek/deepseek-v4-pro\n",
+                "    model: ~deepseek/deepseek-pro-latest\n",
             ),
         );
         let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
@@ -1068,7 +1068,7 @@ mod tests {
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: openrouter }\n",
-                "    model: qwen/qwen3-coder\n",
+                "    model: ~z-ai/glm-flash-latest\n",
             ),
         );
         let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
@@ -1086,14 +1086,14 @@ mod tests {
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: openrouter }\n",
-                "    model: z-ai/glm-5.2\n",
+                "    model: ~z-ai/glm-latest\n",
                 "activity:\n",
                 "  coding:\n",
                 "    - provider: { name: openrouter }\n",
-                "      model: qwen/qwen3-coder\n",
+                "      model: ~z-ai/glm-flash-latest\n",
                 "  uifix:\n",
                 "    - provider: { name: openrouter }\n",
-                "      model: qwen/qwen3-coder\n",
+                "      model: ~z-ai/glm-flash-latest\n",
             ),
         );
         let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
@@ -1102,7 +1102,8 @@ mod tests {
         let n = diags
             .iter()
             .filter(|d| {
-                d.code == "REASONING_LEVEL_UNSUPPORTED" && d.model == "openrouter:qwen/qwen3-coder"
+                d.code == "REASONING_LEVEL_UNSUPPORTED"
+                    && d.model == "openrouter:~z-ai/glm-flash-latest"
             })
             .count();
         assert_eq!(n, 1, "must dedup per (code, model), got {diags:?}");
@@ -1110,7 +1111,7 @@ mod tests {
 
     #[test]
     fn reasoning_validator_honors_a_binding_paired_effort_over_the_global() {
-        // Global is `low` (which deepseek-v4-pro can't do), but the binding
+        // Global is `low` (which deepseek-pro-latest can't do), but the binding
         // PAIRS deepseek with `high` (which it can) → no finding. The pair wins
         // over the global — this is the WS1-B fix for the live config bug.
         let path = write_models(
@@ -1119,7 +1120,7 @@ mod tests {
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: openrouter }\n",
-                "    model: deepseek/deepseek-v4-pro\n",
+                "    model: ~deepseek/deepseek-pro-latest\n",
                 "    effort: high\n",
             ),
         );
@@ -1143,7 +1144,7 @@ mod tests {
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: openrouter }\n",
-                "    model: qwen/qwen3-coder\n",
+                "    model: ~z-ai/glm-flash-latest\n",
                 "    effort: high\n",
             ),
         );
@@ -1152,7 +1153,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(
             diags.iter().any(|d| d.code == "REASONING_LEVEL_UNSUPPORTED"
-                && d.model == "openrouter:qwen/qwen3-coder"),
+                && d.model == "openrouter:~z-ai/glm-flash-latest"),
             "{diags:?}"
         );
     }
@@ -1166,11 +1167,11 @@ mod tests {
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: openrouter }\n",
-                "    model: z-ai/glm-5.2\n",
+                "    model: ~z-ai/glm-latest\n",
                 "activity:\n",
                 "  coding:\n",
                 "    - provider: { name: openrouter }\n",
-                "      model: qwen/qwen3-coder\n",
+                "      model: ~z-ai/glm-flash-latest\n",
             ),
         );
         let cfg = json!({
@@ -1185,7 +1186,7 @@ mod tests {
             diags
                 .iter()
                 .any(|d| d.code == "STATE_REASONING_EFFORT_UNSUPPORTED"
-                    && d.model == "openrouter:qwen/qwen3-coder"
+                    && d.model == "openrouter:~z-ai/glm-flash-latest"
                     && d.scope == "wf/hard"),
             "{diags:?}"
         );
@@ -1193,18 +1194,18 @@ mod tests {
 
     #[test]
     fn g3_is_silent_when_the_state_effort_is_supported() {
-        // affinity `coding` → glm-5.2 (advertises `high`) → no finding.
+        // affinity `coding` → glm-latest (advertises `high`) → no finding.
         let path = write_models(
             "g3ok",
             concat!(
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: openrouter }\n",
-                "    model: z-ai/glm-5.2\n",
+                "    model: ~z-ai/glm-latest\n",
                 "activity:\n",
                 "  coding:\n",
                 "    - provider: { name: openrouter }\n",
-                "      model: z-ai/glm-5.2\n",
+                "      model: ~z-ai/glm-latest\n",
             ),
         );
         let cfg = json!({
@@ -1223,14 +1224,14 @@ mod tests {
 
     #[test]
     fn frontier_lead_warns_for_an_unapproved_over_cap_model() {
-        // claude-opus-4-8 is $25/M output — over the $5 cap, not allowlisted.
+        // claude-opus-latest is $25/M output — over the $5 cap, not allowlisted.
         let path = write_models(
             "frontier",
             concat!(
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: anthropic }\n",
-                "    model: claude-opus-4-8\n",
+                "    model: claude-opus-latest\n",
             ),
         );
         let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });
@@ -1238,7 +1239,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(
             diags.iter().any(|d| d.code == "FRONTIER_LEAD"
-                && d.model == "anthropic:claude-opus-4-8"
+                && d.model == "anthropic:claude-opus-latest"
                 && d.severity == ReasoningSeverity::Warn),
             "{diags:?}"
         );
@@ -1252,13 +1253,13 @@ mod tests {
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: anthropic }\n",
-                "    model: claude-opus-4-8\n",
+                "    model: claude-opus-latest\n",
             ),
         );
         let cfg = json!({
             "gateway": {
                 "models_yaml": path.to_str().unwrap(),
-                "cost": { "approve_frontier": ["anthropic:claude-opus-4-8"] }
+                "cost": { "approve_frontier": ["anthropic:claude-opus-latest"] }
             }
         });
         let diags = check_frontier_cost_config(&cfg);
@@ -1275,14 +1276,14 @@ mod tests {
 
     #[test]
     fn a_commodity_model_trips_no_cost_finding() {
-        // glm-5.2 is $3/M — under the $5 cap.
+        // glm-latest is $2.97/M — under the $5 cap.
         let path = write_models(
             "commodity",
             concat!(
                 "version: 1\n",
                 "default:\n",
                 "  - provider: { name: openrouter }\n",
-                "    model: z-ai/glm-5.2\n",
+                "    model: ~z-ai/glm-latest\n",
             ),
         );
         let cfg = json!({ "gateway": { "models_yaml": path.to_str().unwrap() } });

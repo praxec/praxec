@@ -1,9 +1,19 @@
 {
-  "anthropic:claude-opus-4-7":           { "input_usd_per_million_tokens": 15.0, "output_usd_per_million_tokens": 75.0, "verified_at": "2026-05-29" },
-  "anthropic:claude-sonnet-4-6":         { "input_usd_per_million_tokens": 3.0,  "output_usd_per_million_tokens": 15.0, "verified_at": "2026-05-29" },
-  "anthropic:claude-haiku-4-5-20251001": { "input_usd_per_million_tokens": 1.0,  "output_usd_per_million_tokens": 5.0,  "verified_at": "2026-05-29" },
-  "openai:gpt-4o":                       { "input_usd_per_million_tokens": 2.5,  "output_usd_per_million_tokens": 10.0, "verified_at": "2026-05-29" },
-  "ollama:llama3.1":                     { "input_usd_per_million_tokens": 0.0,  "output_usd_per_million_tokens": 0.0,  "verified_at": "2026-05-29" },
-  "ollama:llama3.2":                     { "input_usd_per_million_tokens": 0.0,  "output_usd_per_million_tokens": 0.0,  "verified_at": "2026-05-29" },
-  "ollama:mistral":                      { "input_usd_per_million_tokens": 0.0,  "output_usd_per_million_tokens": 0.0,  "verified_at": "2026-05-29" }
+  "anthropic:claude-opus-latest":                { "input_usd_per_million_tokens": 5.0,  "output_usd_per_million_tokens": 25.0, "verified_at": "2026-09-15" },
+  "anthropic:claude-sonnet-latest":              { "input_usd_per_million_tokens": 2.0,  "output_usd_per_million_tokens": 10.0, "verified_at": "2026-09-15" },
+  "anthropic:claude-haiku-latest":               { "input_usd_per_million_tokens": 1.0,  "output_usd_per_million_tokens": 5.0,  "verified_at": "2026-09-15" },
+  "openrouter:~anthropic/claude-opus-latest":    { "input_usd_per_million_tokens": 5.0,  "output_usd_per_million_tokens": 25.0, "verified_at": "2026-09-15" },
+  "openrouter:~anthropic/claude-sonnet-latest":  { "input_usd_per_million_tokens": 2.0,  "output_usd_per_million_tokens": 10.0, "verified_at": "2026-09-15" },
+  "openrouter:~anthropic/claude-haiku-latest":   { "input_usd_per_million_tokens": 1.0,  "output_usd_per_million_tokens": 5.0,  "verified_at": "2026-09-15" },
+  "openrouter:~openai/gpt-astra-latest":         { "input_usd_per_million_tokens": 10.0, "output_usd_per_million_tokens": 50.0, "verified_at": "2026-09-15" },
+  "openrouter:~openai/gpt-sol-latest":           { "input_usd_per_million_tokens": 2.0,  "output_usd_per_million_tokens": 10.0, "verified_at": "2026-09-15" },
+  "openrouter:~openai/gpt-terra-latest":         { "input_usd_per_million_tokens": 2.0,  "output_usd_per_million_tokens": 12.0, "verified_at": "2026-09-15" },
+  "openrouter:~openai/gpt-luna-latest":          { "input_usd_per_million_tokens": 0.2,  "output_usd_per_million_tokens": 1.2,  "verified_at": "2026-09-15" },
+  "openrouter:~z-ai/glm-latest":                 { "input_usd_per_million_tokens": 0.8775, "output_usd_per_million_tokens": 2.97, "verified_at": "2026-09-15" },
+  "openrouter:~z-ai/glm-flash-latest":           { "input_usd_per_million_tokens": 0.075, "output_usd_per_million_tokens": 0.25, "verified_at": "2026-09-15" },
+  "openrouter:~deepseek/deepseek-pro-latest":    { "input_usd_per_million_tokens": 0.66, "output_usd_per_million_tokens": 1.98, "verified_at": "2026-09-15" },
+  "openrouter:~deepseek/deepseek-flash-latest":  { "input_usd_per_million_tokens": 0.15, "output_usd_per_million_tokens": 0.6,  "verified_at": "2026-09-15" },
+  "ollama:llama3.1":                             { "input_usd_per_million_tokens": 0.0,  "output_usd_per_million_tokens": 0.0,  "verified_at": "2026-09-15" },
+  "ollama:llama3.2":                             { "input_usd_per_million_tokens": 0.0,  "output_usd_per_million_tokens": 0.0,  "verified_at": "2026-09-15" },
+  "ollama:mistral":                              { "input_usd_per_million_tokens": 0.0,  "output_usd_per_million_tokens": 0.0,  "verified_at": "2026-09-15" }
 }

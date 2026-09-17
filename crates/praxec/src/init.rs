@@ -78,15 +78,12 @@ repos:
     )
 }
 
-/// The scaffolded starter `models.yaml`: a commodity-first default chain on
-/// OpenRouter (SPEC §33 D9 model-cost-control defaults).
+/// The scaffolded starter `models.yaml` (SPEC §33 D9 model-cost-control
+/// defaults). Sourced from the single canonical routing table in praxec-core so
+/// model choices live in exactly one file — the same seed the TUI
+/// `seed`/`migrate` path writes.
 pub(crate) fn models_yaml_content() -> &'static str {
-    r#"version: 1
-default:
-  - { provider: { name: openrouter }, model: z-ai/glm-5.2 }
-  - { provider: { name: openrouter }, model: deepseek/deepseek-v4-pro, effort: high }
-  - { provider: { name: openrouter }, model: anthropic/claude-haiku-4-5 }
-"#
+    praxec_core::seed_models::SEED_MODELS_YAML
 }
 
 /// The two **OPEN** starter packs `--with-starter-packs` wires under `repos:`,
@@ -577,13 +574,17 @@ mod tests {
 
     #[test]
     fn models_yaml_content_is_the_commodity_default_chain() {
+        // Sourced from praxec-core's canonical seed: a commodity-first default
+        // chain (un-pinned OpenRouter `-latest` aliases) plus the curated
+        // activity/override routing table.
         let yaml = models_yaml_content();
         assert!(yaml.contains("version: 1"));
-        assert!(yaml.contains("z-ai/glm-5.2"));
-        assert!(yaml.contains("deepseek/deepseek-v4-pro"));
+        assert!(yaml.contains("~z-ai/glm-latest"));
+        assert!(yaml.contains("~deepseek/deepseek-pro-latest"));
         assert!(yaml.contains("effort: high"));
-        assert!(yaml.contains("anthropic/claude-haiku-4-5"));
         assert!(yaml.contains("openrouter"));
+        // It is the shared single source of truth, not a hand-rolled literal.
+        assert_eq!(yaml, praxec_core::seed_models::SEED_MODELS_YAML);
     }
 
     /// The scaffolded gateway.yaml PARSES and passes the same resolved-config
