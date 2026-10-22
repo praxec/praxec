@@ -27,7 +27,11 @@ jobs:
         # the workflow_dispatch path too.
         if: github.repository == 'praxec/praxec'
         steps:
+            # Scheduled runs use the default branch (main) for this file;
+            # the nightly still tests the latest integrated code on dev.
             - uses: actions/checkout@v5
+              with:
+                  ref: ${{ github.event_name == 'schedule' && 'dev' || github.ref }}
 
             - name: Install system dependencies
               # libdbus-1-dev is required by libdbus-sys (transitive dep
