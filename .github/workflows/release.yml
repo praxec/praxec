@@ -90,7 +90,7 @@ jobs:
             # dbus dependency (libdbus-sys only reaches the `px` TUI), and both
             # Linux legs build inside `cross`'s musl container anyway.
             - name: Install Rust toolchain
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@1.99.1
               with:
                   targets: ${{ matrix.target }}
 
