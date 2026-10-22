@@ -57,7 +57,7 @@ jobs:
                   echo "after:"; df -h / ; free -h
 
             - name: Install Rust toolchain
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@1.99.1
               with:
                   components: clippy, rustfmt
 

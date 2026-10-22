@@ -1,5 +1,5 @@
 # Builder — compiles the release gateway binary.
-FROM rust:1.83-slim AS builder
+FROM rust:1.99.1-slim-bookworm AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p praxec
