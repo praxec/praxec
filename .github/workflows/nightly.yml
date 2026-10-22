@@ -8,6 +8,11 @@ on:
         - cron: "0 4 * * *"
     workflow_dispatch: {}
 
+# Read the code; write issues (failure reporting below).
+permissions:
+    contents: read
+    issues: write
+
 env:
     CARGO_TERM_COLOR: always
     RUSTFLAGS: "-Dwarnings"
@@ -22,7 +27,11 @@ jobs:
         # the workflow_dispatch path too.
         if: github.repository == 'praxec/praxec'
         steps:
-            - uses: actions/checkout@v4
+            # Scheduled runs use the default branch (main) for this file;
+            # the nightly still tests the latest integrated code on dev.
+            - uses: actions/checkout@v5
+              with:
+                  ref: ${{ github.event_name == 'schedule' && 'dev' || github.ref }}
 
             - name: Install system dependencies
               # libdbus-1-dev is required by libdbus-sys (transitive dep
@@ -32,7 +41,7 @@ jobs:
                   sudo apt-get install -y libdbus-1-dev pkg-config
 
             - name: Install Rust toolchain
-              uses: dtolnay/rust-toolchain@stable
+              uses: dtolnay/rust-toolchain@1.99.1
 
             - name: Cache cargo registry + build
               uses: Swatinem/rust-cache@v2
@@ -45,21 +54,80 @@ jobs:
               run: |
                   cargo test --workspace -- --include-ignored
 
+            - name: Check for the live smoke key
+              id: keys
+              env:
+                  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_CI }}
+              run: |
+                  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+                      echo "anthropic=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "anthropic=false" >> "$GITHUB_OUTPUT"
+                      msg="ANTHROPIC_API_KEY_CI secret is not set: skipping the live smoke-ete walk (configuration gap, not a test failure)."
+                      echo "::notice title=Live smoke skipped::$msg"
+                      echo "### Live smoke-ete walk skipped" >> "$GITHUB_STEP_SUMMARY"
+                      echo "$msg Set the repo secret \`ANTHROPIC_API_KEY_CI\` to enable it." >> "$GITHUB_STEP_SUMMARY"
+                  fi
+
             - name: Run the live smoke-ete walk
+              if: steps.keys.outputs.anthropic == 'true'
               env:
                   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY_CI }}
               run: |
                   bash examples/smoke-ete/walk-live.sh
 
-            - name: Notify on failure
-              if: failure()
-              uses: actions/github-script@v7
+            # One tracking issue, not one per night: comment on the newest
+            # open `nightly-failure` issue if there is one, else open one.
+            # Scheduled runs only; a manual dispatch is watched by whoever
+            # started it.
+            - name: Report failure
+              if: failure() && github.event_name == 'schedule'
+              uses: actions/github-script@v8
               with:
                   script: |
-                      github.rest.issues.create({
-                          owner: context.repo.owner,
-                          repo: context.repo.repo,
-                          title: `Nightly live-integration failed: ${context.runId}`,
-                          body: `Run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nThe nightly live-integration suite failed. Investigate ASAP — failures here indicate either a live-API contract drift or a regression in praxec's live paths.`,
-                          labels: ['nightly-failure', 'priority']
+                      const { owner, repo } = context.repo;
+                      const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+                      const open = await github.rest.issues.listForRepo({
+                          owner, repo, state: 'open', labels: 'nightly-failure',
+                          sort: 'created', direction: 'desc', per_page: 1,
                       });
+                      if (open.data.length > 0) {
+                          const issue = open.data[0];
+                          await github.rest.issues.createComment({
+                              owner, repo, issue_number: issue.number,
+                              body: `Failed again: ${runUrl}`,
+                          });
+                          core.notice(`Commented on #${issue.number}`);
+                          return;
+                      }
+                      const created = await github.rest.issues.create({
+                          owner, repo,
+                          title: `Nightly live-integration failed: ${context.runId}`,
+                          body: `Run: ${runUrl}\n\nThe nightly live-integration suite failed. Investigate ASAP — failures here indicate either a live-API contract drift or a regression in praxec's live paths.\n\nLater failures are added as comments here; the issue closes itself on the next fully green run (live smoke included).`,
+                          labels: ['nightly-failure', 'priority'],
+                      });
+                      core.notice(`Opened #${created.data.number}`);
+
+            # Close the tracking issue only when everything ran and passed,
+            # live smoke included: a run that skipped the smoke for a
+            # missing key has not proven the live path green.
+            - name: Close tracking issue on green
+              if: success() && github.event_name == 'schedule' && steps.keys.outputs.anthropic == 'true'
+              uses: actions/github-script@v8
+              with:
+                  script: |
+                      const { owner, repo } = context.repo;
+                      const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+                      const open = await github.paginate(github.rest.issues.listForRepo, {
+                          owner, repo, state: 'open', labels: 'nightly-failure', per_page: 100,
+                      });
+                      for (const issue of open) {
+                          await github.rest.issues.createComment({
+                              owner, repo, issue_number: issue.number,
+                              body: `Nightly is green again (live smoke included): ${runUrl}`,
+                          });
+                          await github.rest.issues.update({
+                              owner, repo, issue_number: issue.number,
+                              state: 'closed', state_reason: 'completed',
+                          });
+                      }
