@@ -5485,4 +5485,49 @@ mod tests {
             td.path().canonicalize().unwrap()
         );
     }
+
+    #[test]
+    fn linked_worktrees_have_distinct_roots_and_one_governance_common_dir() {
+        fn git(cwd: &Path, args: &[&str]) {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap_or_else(|err| panic!("running git {args:?}: {err}"));
+            assert!(status.success(), "git {args:?} failed with {status}");
+        }
+
+        let td = tempfile::tempdir().unwrap();
+        let primary = td.path().join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        git(&primary, &["init", "--quiet"]);
+        git(&primary, &["config", "user.email", "test@example.invalid"]);
+        git(&primary, &["config", "user.name", "Praxec test"]);
+        std::fs::write(primary.join("README.md"), "fixture\n").unwrap();
+        git(&primary, &["add", "README.md"]);
+        git(&primary, &["commit", "--quiet", "-m", "fixture"]);
+
+        let linked = td.path().join("linked");
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        assert_ne!(
+            git_toplevel(&primary).unwrap(),
+            git_toplevel(&linked).unwrap()
+        );
+        assert_eq!(
+            git_common_dir(&primary).unwrap(),
+            git_common_dir(&linked).unwrap(),
+            "linked worktrees must converge on one governance-store parent"
+        );
+    }
 }
