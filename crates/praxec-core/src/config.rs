@@ -3007,8 +3007,9 @@ pub fn load_resolved_with_repos(
 /// startup failure.
 ///
 /// This is the serve/runtime entrypoint. `praxec check` keeps calling the
-/// strict [`load_resolved_with_repos`] so authors still see a dead entry as
-/// a hard failure.
+/// strict [`load_resolved_with_repos`] so authors still see invalid manifests
+/// as hard failures. Unavailable local directories are diagnosed and skipped
+/// by both loaders (#272); no writable root is stamped for them.
 pub fn load_resolved_with_repos_resilient(
     path: impl AsRef<Path>,
 ) -> anyhow::Result<(Value, Vec<Diagnostic>)> {
@@ -3019,8 +3020,8 @@ pub fn load_resolved_with_repos_resilient(
 /// [`load_resolved_with_repos_resilient`] (finding #13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoLoadMode {
-    /// Any repo entry failing to load fails the whole config load
-    /// (`praxec check` and other authoring surfaces).
+    /// Invalid manifests/definitions fail the whole config load. Unavailable
+    /// local directories are skipped with diagnostics, in both modes (#272).
     Strict,
     /// A failing repo entry is skipped with a warning diagnostic; the rest
     /// of the config loads (serve/runtime surfaces).
@@ -3031,8 +3032,14 @@ fn load_resolved_with_repos_mode(
     path: impl AsRef<Path>,
     mode: RepoLoadMode,
 ) -> anyhow::Result<(Value, Vec<Diagnostic>)> {
-    let path = path.as_ref();
-    let host = load_yaml(path)?;
+    // Use the physical config directory for every relative path, just as
+    // load_yaml already does for includes/scripts. The repos CLI edits that
+    // same canonical file; a symlink must not select a different write root.
+    let path = path
+        .as_ref()
+        .canonicalize()
+        .with_context(|| format!("resolving config path {}", path.as_ref().display()))?;
+    let host = load_yaml(&path)?;
     let parent_dir = path
         .parent()
         .map(Path::to_path_buf)
@@ -3263,8 +3270,10 @@ fn git_currency_diagnostics(
 /// Extract `repos:` + `overrides:` from `host`, load each repo, validate
 /// V20 / V21 / V22 / V23, deep-merge repo contents (then host on top so
 /// declared overrides win), and return the cleaned value (with `repos:`
-/// and `overrides:` stripped). Hosts without a `repos:` block round-trip
-/// through unchanged.
+/// and `overrides:` stripped). A host invoked from a Git worktree without a
+/// `repos:` block acquires that worktree as its single writable run root; this
+/// is the #206 worktree-native default. Host-only configs outside Git still
+/// round-trip unchanged for migration compatibility.
 fn merge_declared_repos(
     mut host: Value,
     host_dir: &Path,
@@ -3273,6 +3282,21 @@ fn merge_declared_repos(
 ) -> anyhow::Result<Value> {
     let (repos, overrides) = take_repos_and_overrides(&mut host)?;
     if repos.is_empty() {
+        // #206 — a portable, in-repo config must not need a machine-specific
+        // absolute `repos.path`. When invoked inside Git, stamp the discovered
+        // worktree as the existing runtime's single allowed write root. Outside
+        // Git, preserve host-only behavior; run-capable commands remain loud.
+        // A resolved config can retain internal `_writableRepos` across a hot
+        // reload. Never overwrite that operator/runtime state: invalid roots
+        // must stay visible to the reload gate rather than being masked by CWD.
+        if host.pointer("/praxec/_writableRepos").is_none() {
+            if let Ok(root) = invocation_repo_root() {
+                stamp_writable_repos(&mut host, vec![(root.display().to_string(), true, None)]);
+                if let Ok(common_dir) = git_common_dir(&root) {
+                    stamp_worktree_native_state(&mut host, &root, &common_dir);
+                }
+            }
+        }
         // No repos declared — strip an empty `overrides:` (it's meaningless
         // without any repo-provided ids to shadow). Host-level staged
         // connections (`px connections add` / `grant`) still get the grant gate.
@@ -3356,10 +3380,47 @@ fn merge_declared_repos(
         let entry_desc = match &source {
             RepoSource::Local(p) => p.display().to_string(),
             RepoSource::Remote { uri, .. } => uri.clone(),
+            RepoSource::InvocationCwd => "cwd:true".to_string(),
             RepoSource::WorktreesOf { anchor, name } => {
                 format!("worktrees_of:{} name:{name}", anchor.display())
             }
         };
+        // #206 foundation: an invocation-root declaration is intentionally not a
+        // machine path. Resolve it once at config load through git, then let the
+        // existing local-root containment and manifest-loading path handle it.
+        let source = match source {
+            RepoSource::InvocationCwd => RepoSource::Local(invocation_repo_root()?),
+            RepoSource::Local(path) if !path.is_absolute() => {
+                RepoSource::Local(host_dir.join(path))
+            }
+            source => source,
+        };
+        // #272: a pruned worktree is an availability problem, not a malformed
+        // pack. Check every local root before manifest loading (including bare
+        // writable targets) and never stamp an unavailable root into authority.
+        // A present root with a bad/missing manifest still takes the normal
+        // strict validation path below; do not silently reinterpret it.
+        if let RepoSource::Local(path) = &source {
+            if let Err(reason) = local_repo_root_readable(path) {
+                let message = format!("REPO_ROOT_MISSING: {} — skipped ({reason})", path.display());
+                tracing::warn!(entry = %entry_desc, %reason, "{message}");
+                diagnostics.push(Diagnostic {
+                    severity: DiagnosticSeverity::Warn,
+                    code: "REPO_ROOT_MISSING".into(),
+                    message: message.clone(),
+                    location: None,
+                    suggestion: Some(
+                        "recreate the directory, or remove/comment out the entry (or use \
+                         `praxec repos remove <path> --config <gateway.yaml>`), then reload."
+                            .into(),
+                    ),
+                });
+                if definitions {
+                    skipped.push((entry_desc, message));
+                }
+                continue;
+            }
+        }
         // pack-provenance-recording — a remote `uri:` entry's declared `ref:`,
         // captured before `source` is consumed below. Takes priority over the
         // clone-cache dir's own branch name (an internal `git init`-default
@@ -3492,13 +3553,9 @@ fn merge_declared_repos(
         type LoadedRepo = (PathBuf, Option<(crate::repo::RepoManifest, Value)>);
         let loaded: anyhow::Result<LoadedRepo> = (|| {
             let repo_path = match source {
-                RepoSource::Local(p) => {
-                    if p.is_absolute() {
-                        p
-                    } else {
-                        host_dir.join(p)
-                    }
-                }
+                // Local paths were resolved against host_dir before the
+                // availability probe. Do not join a relative host twice.
+                RepoSource::Local(p) => p,
                 RepoSource::Remote { uri, gitref } => {
                     let dest = host_dir
                         .join(".praxec")
@@ -3506,6 +3563,12 @@ fn merge_declared_repos(
                         .join(crate::repo_git::cache_dir_name(&uri, &gitref));
                     crate::repo_git::clone_or_update(&uri, &gitref, &dest)
                         .with_context(|| format!("importing repo {uri}"))?
+                }
+                // `InvocationCwd` is converted to `Local` immediately after
+                // parsing, before any source is loaded. Reaching this arm
+                // would mean a future refactor bypassed that boundary.
+                RepoSource::InvocationCwd => {
+                    unreachable!("InvocationCwd must resolve to Local before repo loading")
                 }
                 // WS-B B3 — a `worktrees_of:` source is fully resolved and
                 // `continue`d above; it never reaches this load path. Exhaustive
@@ -3531,8 +3594,8 @@ fn merge_declared_repos(
         let (repo_path, manifest_and_registry) = match loaded {
             Ok(v) => v,
             Err(err) => match mode {
-                // Strict (check/authoring): keep the historical
-                // all-or-nothing contract — a dead entry fails the load.
+                // Strict (check/authoring): invalid manifests/definitions
+                // remain hard failures after directory availability is checked.
                 RepoLoadMode::Strict => return Err(err),
                 // Resilient (serve/runtime): one stale entry must not
                 // poison every session using this gateway config. Skip it,
@@ -3693,7 +3756,7 @@ fn merge_declared_repos(
         bail!(
             "ALL_REPOS_FAILED: no definition-bearing `repos:` entry loaded (of {declared_count} \
              declared) — every registry-providing repo was skipped, so no repo definitions are \
-             available:\n{}",
+             available. Recreate the directories or remove/comment out the dead entries:\n{}",
             details.join("\n")
         );
     }
@@ -3787,6 +3850,27 @@ fn merge_declared_repos(
     ungranted_connections.extend(staged_ungranted);
     stamp_ungranted_connections(&mut merged, ungranted_connections);
     Ok(merged)
+}
+
+/// Availability only: retain manifest/schema/identity validation at its normal
+/// hard boundary. Reading one directory entry also catches directory listing
+/// failures that `metadata` alone cannot detect.
+fn local_repo_root_readable(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => "directory not found".to_string(),
+        _ => format!("directory unreadable: {err}"),
+    })?;
+    if !metadata.is_dir() {
+        return Err("not a directory".into());
+    }
+    std::fs::metadata(path.join("."))
+        .map_err(|err| format!("directory unreadable (cannot search): {err}"))?;
+    let mut entries =
+        std::fs::read_dir(path).map_err(|err| format!("directory unreadable: {err}"))?;
+    if let Some(entry) = entries.next() {
+        entry.map_err(|err| format!("directory unreadable: {err}"))?;
+    }
+    Ok(())
 }
 
 /// SPEC §9.5 — top-level config key holding operator-staged (not-yet-granted)
@@ -4162,6 +4246,29 @@ fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool, Option<Str
     }
 }
 
+/// #206 — runtime-only state derived from the invocation worktree. It is
+/// deliberately stamped after parsing rather than written into user YAML: the
+/// authored configuration stays portable, while every worktree of the same Git
+/// repository converges on one governance SQLite database under its common Git
+/// directory.
+fn stamp_worktree_native_state(config: &mut Value, repo_root: &Path, common_dir: &Path) {
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let praxec = obj
+        .entry("praxec")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(praxec) = praxec.as_object_mut() {
+        praxec.insert(
+            "_worktreeNative".into(),
+            json!({
+                "repoRoot": repo_root,
+                "governanceStore": common_dir.join("praxec").join("governance.db"),
+            }),
+        );
+    }
+}
+
 /// WS-B B2 — the durable, worktree-INDEPENDENT operator-state directory that
 /// `${praxec.state_dir}` resolves to: `$XDG_STATE_HOME/praxec` when
 /// `XDG_STATE_HOME` is set (and non-empty), else `$HOME/.local/state/praxec`.
@@ -4362,6 +4469,9 @@ struct RepoDecl {
 enum RepoSource {
     /// A local directory (resolved relative to the host config).
     Local(PathBuf),
+    /// The Git top-level containing the gateway invocation CWD. This is the
+    /// worktree-native source for #206: it never serializes a machine path.
+    InvocationCwd,
     /// A remote git repo imported (cloned/updated) into a local cache.
     Remote { uri: String, gitref: String },
     /// WS-B B3 — an IDENTITY + discovery rule, not a literal path. `anchor` is a
@@ -4596,16 +4706,24 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
             short_value_kind(other)
         ),
     };
-    // SPEC §9 + WS-B B3 — a repo is declared by exactly one of: a local `path`, a
+    // SPEC §9 + #206 — a repo is declared by exactly one of: a local `path`, a
     // remote `uri` (imported via git), or `worktrees_of:` (identity-first
     // discovery of a live git worktree). A remote repo may pin a `ref`
     // (default `main`).
     let path = entry.get("path").and_then(Value::as_str);
     let uri = entry.get("uri").and_then(Value::as_str);
     let worktrees_of = entry.get("worktrees_of").and_then(Value::as_str);
-    let source = match (path, uri, worktrees_of) {
-        (Some(p), None, None) => RepoSource::Local(expand_repo_path(p)),
-        (None, Some(u), None) => {
+    let cwd = match entry.get("cwd") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(other) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}].cwd` must be a boolean ({})",
+            short_value_kind(other)
+        ),
+    };
+    let source = match (path, uri, worktrees_of, cwd) {
+        (Some(p), None, None, false) => RepoSource::Local(expand_repo_path(p)),
+        (None, Some(u), None, false) => {
             let gitref = entry
                 .get("ref")
                 .and_then(Value::as_str)
@@ -4616,7 +4734,7 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
                 gitref,
             }
         }
-        (None, None, Some(anchor)) => {
+        (None, None, Some(anchor), false) => {
             // A `worktrees_of:` entry is resolved by IDENTITY, so `name:` is
             // mandatory — there is nothing to match a worktree stub against
             // without it (poka-yoke against a silently unresolvable entry).
@@ -4644,21 +4762,32 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
         }
         // `worktrees_of:` is mutually exclusive with a literal `path`/`uri` — a
         // repo is discovered by identity OR pinned to a literal location.
-        (_, _, Some(_)) => bail!(
+        (_, _, Some(_), false) => bail!(
             "INVALID_REPO_ENTRY: `repos[{index}]` declares `worktrees_of:` together with \
              `path:`/`uri:` — a repo is resolved by worktree identity OR a literal path/uri, \
              not both."
         ),
-        (Some(_), Some(_), None) => bail!(
+        (Some(_), Some(_), None, false) => bail!(
             "INVALID_REPO_ENTRY: `repos[{index}]` declares both `path` and `uri` — \
              a repo is either local or remote, not both."
         ),
-        (None, None, None) => bail!(
+        (None, None, None, true) => {
+            if !writable {
+                bail!(
+                    "INVALID_REPO_ENTRY: `repos[{index}].cwd: true` requires `writable: true` \
+                     because an invocation root is a run target."
+                );
+            }
+            RepoSource::InvocationCwd
+        }
+        (_, _, _, true) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}].cwd: true` cannot be combined with `path`, \
+             `uri`, or `worktrees_of:`."
+        ),
+        (None, None, None, false) => bail!(
             "INVALID_REPO_ENTRY: `repos[{index}]` needs a `path` (local dir), a `uri` \
-             (remote git repo to import), or `worktrees_of:` (identity-first worktree \
-             discovery), e.g. `- path: ~/repos/swe-core` or \
-             `- uri: git+https://github.com/acme/workflows@main` or \
-             `- worktrees_of: ~/repos/anchor` with `name:` + `writable: true`."
+             (remote git repo to import), `worktrees_of:` (identity-first worktree discovery), \
+             or `cwd: true` (the invocation Git worktree)."
         ),
     };
     Ok(RepoDecl {
@@ -4683,6 +4812,67 @@ fn expand_repo_path(p: &str) -> PathBuf {
         }
     }
     PathBuf::from(p)
+}
+
+/// Resolve the Git worktree root for a `cwd: true` repository declaration.
+/// The command runs before any writable root is stamped, so a non-Git invocation
+/// fails closed instead of falling back to the gateway's process CWD.
+fn invocation_repo_root() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("reading invocation current directory")?;
+    git_toplevel(&cwd).with_context(|| {
+        format!(
+            "CWD_REPO_ROOT_UNRESOLVED: `cwd: true` requires the invocation CWD ({}) to be inside a Git worktree",
+            cwd.display()
+        )
+    })
+}
+
+fn git_toplevel(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("running git rev-parse in {}", cwd.display()))?;
+    if !output.status.success() {
+        bail!("git rev-parse --show-toplevel failed in {}", cwd.display());
+    }
+    let root = std::str::from_utf8(&output.stdout)
+        .context("git rev-parse emitted non-UTF-8 output")?
+        .trim();
+    if root.is_empty() {
+        bail!("git rev-parse --show-toplevel returned an empty root");
+    }
+    PathBuf::from(root)
+        .canonicalize()
+        .with_context(|| format!("canonicalizing Git root {root}"))
+}
+
+/// Return the Git common directory for an invocation worktree. Git emits an
+/// absolute path here, so all linked worktrees resolve to exactly the same
+/// durable governance location.
+fn git_common_dir(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(cwd)
+        .output()
+        .with_context(|| {
+            format!(
+                "running git rev-parse --git-common-dir in {}",
+                cwd.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!("git rev-parse --git-common-dir failed in {}", cwd.display());
+    }
+    let common = std::str::from_utf8(&output.stdout)
+        .context("git rev-parse emitted non-UTF-8 common directory")?
+        .trim();
+    if common.is_empty() {
+        bail!("git rev-parse --git-common-dir returned an empty path");
+    }
+    PathBuf::from(common)
+        .canonicalize()
+        .with_context(|| format!("canonicalizing Git common directory {common}"))
 }
 
 /// Collect every host-declared definitionId across the four prefixable
@@ -5265,5 +5455,132 @@ mod tests {
         .unwrap();
         synthesize_input_schema(&mut def);
         assert!(def.get("inputSchema").is_some());
+    }
+
+    #[test]
+    fn cwd_repo_declaration_is_a_writable_invocation_root() {
+        let decl = parse_repo_entry(
+            0,
+            json!({ "cwd": true, "writable": true, "definitions": false }),
+        )
+        .expect("cwd declaration is valid");
+        assert!(matches!(decl.source, RepoSource::InvocationCwd));
+        assert!(decl.writable);
+        assert!(!decl.definitions);
+    }
+
+    #[test]
+    fn cwd_repo_declaration_rejects_ambiguous_or_read_only_shapes() {
+        let read_only = match parse_repo_entry(0, json!({ "cwd": true })) {
+            Err(err) => err,
+            Ok(_) => panic!("an invocation root must explicitly allow writes"),
+        };
+        assert!(format!("{read_only:#}").contains("requires `writable: true`"));
+
+        let mixed = match parse_repo_entry(
+            0,
+            json!({ "cwd": true, "path": "./other", "writable": true }),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("cwd must not be mixed with a machine path"),
+        };
+        assert!(format!("{mixed:#}").contains("cannot be combined"));
+    }
+
+    #[test]
+    fn host_only_config_uses_the_invocation_worktree_as_its_run_root() {
+        let expected =
+            invocation_repo_root().expect("test process runs inside the Praxec Git worktree");
+        let common_dir =
+            git_common_dir(&expected).expect("test worktree has a Git common directory");
+        let mut diagnostics = Vec::new();
+        let merged = merge_declared_repos(
+            json!({ "version": "1.0.0", "workflows": {} }),
+            Path::new("."),
+            RepoLoadMode::Strict,
+            &mut diagnostics,
+        )
+        .expect("host-only config resolves");
+
+        assert_eq!(
+            merged.pointer("/praxec/_writableRepos/0/root"),
+            Some(&Value::String(expected.display().to_string()))
+        );
+        assert_eq!(
+            merged.pointer("/praxec/_writableRepos/0/push"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            merged.pointer("/praxec/_worktreeNative/governanceStore"),
+            Some(&Value::String(
+                common_dir
+                    .join("praxec")
+                    .join("governance.db")
+                    .display()
+                    .to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn git_toplevel_resolves_a_nested_worktree_directory() {
+        let td = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(td.path())
+            .status()
+            .expect("git is available for worktree-native resolution");
+        assert!(init.success());
+        let nested = td.path().join("nested").join("leaf");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            git_toplevel(&nested).unwrap(),
+            td.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn linked_worktrees_have_distinct_roots_and_one_governance_common_dir() {
+        fn git(cwd: &Path, args: &[&str]) {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .status()
+                .unwrap_or_else(|err| panic!("running git {args:?}: {err}"));
+            assert!(status.success(), "git {args:?} failed with {status}");
+        }
+
+        let td = tempfile::tempdir().unwrap();
+        let primary = td.path().join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        git(&primary, &["init", "--quiet"]);
+        git(&primary, &["config", "user.email", "test@example.invalid"]);
+        git(&primary, &["config", "user.name", "Praxec test"]);
+        std::fs::write(primary.join("README.md"), "fixture\n").unwrap();
+        git(&primary, &["add", "README.md"]);
+        git(&primary, &["commit", "--quiet", "-m", "fixture"]);
+
+        let linked = td.path().join("linked");
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        assert_ne!(
+            git_toplevel(&primary).unwrap(),
+            git_toplevel(&linked).unwrap()
+        );
+        assert_eq!(
+            git_common_dir(&primary).unwrap(),
+            git_common_dir(&linked).unwrap(),
+            "linked worktrees must converge on one governance-store parent"
+        );
     }
 }

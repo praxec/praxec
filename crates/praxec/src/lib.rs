@@ -31,3 +31,4 @@ pub mod provision;
 /// mounted agent-step affinity must resolve to a bound model, and a declared
 /// `gateway.models_yaml` must be loadable. Shared by `check` and `doctor`.
 pub mod readiness;
+mod repos;

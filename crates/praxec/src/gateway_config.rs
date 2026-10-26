@@ -84,6 +84,11 @@ pub(crate) enum Command {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Manage local repo roots in a gateway config without replacing its settings.
+    Repos {
+        #[command(subcommand)]
+        command: ReposCommand,
+    },
     Observe {
         #[arg(short, long)]
         config: PathBuf,
@@ -366,6 +371,37 @@ pub(crate) enum Command {
         /// provisioning step (default is offer-only). `--yes` implies this.
         #[arg(long)]
         install_tools: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ReposCommand {
+    /// Register an existing local directory (plain writable roots need no manifest).
+    Add {
+        path: PathBuf,
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(long)]
+        writable: bool,
+        #[arg(long, requires = "writable")]
+        push: bool,
+        /// Create a zero-definition manifest and exclude it in this Git repo.
+        #[arg(long, requires = "writable")]
+        stub_manifest: bool,
+        /// Optional stable selector name for this root.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Print the config's directly declared repos as JSON (no clones or reload).
+    List {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Unregister exactly one local path or declared name; leaves its files intact.
+    Remove {
+        path_or_name: String,
+        #[arg(short, long)]
+        config: PathBuf,
     },
 }
 
@@ -793,8 +829,8 @@ pub(crate) fn load_config(path: &PathBuf) -> anyhow::Result<Value> {
     // RESILIENT loader: a `repos:` entry that fails to load (e.g. a pruned
     // worktree with no praxec.repo.yaml) is skipped with a logged warning
     // instead of poisoning every session's config load. `praxec check` keeps
-    // the strict all-or-nothing loader so authors still see the dead entry
-    // as a hard error.
+    // strict manifest/definition validation; unavailable local directories
+    // receive REPO_ROOT_MISSING warnings on both paths (#272).
     praxec_core::config::load_resolved_with_repos_resilient(path)
         .map(|(config, _diagnostics)| config)
         .with_context(|| format!("loading config {}", path.display()))
@@ -811,6 +847,7 @@ pub fn collect_diagnostics_with(
     extra: &[DiagnosticProvider],
 ) -> Vec<praxec_core::validate::Diagnostic> {
     let mut diagnostics = praxec_core::validate::validate_workflows(config);
+    diagnostics.extend(worktree_native_path_findings(config));
     diagnostics.extend(praxec_executors::kind_doctor::doctor_check(config));
     #[cfg(feature = "llm-executor")]
     {
@@ -852,6 +889,87 @@ pub fn collect_diagnostics_with(
         diagnostics.extend(provider(config));
     }
     diagnostics
+}
+
+/// #206 portability gate. A config resolved from a Git worktree must not carry
+/// a machine-specific absolute path in its authored durable settings or its
+/// workflow path inputs. Loader-injected `_worktreeNative` metadata is
+/// deliberately outside this scan: it is derived per invocation, never author
+/// input. Legacy configurations outside this mode retain existing behavior.
+fn worktree_native_path_findings(config: &Value) -> Vec<praxec_core::validate::Diagnostic> {
+    use praxec_core::validate::Diagnostic;
+
+    if config.pointer("/praxec/_worktreeNative").is_none() {
+        return Vec::new();
+    }
+
+    let mut findings = Vec::new();
+    for pointer in ["/store/path", "/audit/path"] {
+        if let Some(path) = config.pointer(pointer).and_then(Value::as_str) {
+            if authored_path_is_absolute(path) {
+                findings.push(Diagnostic::Error(format!(
+                    "WORKTREE_PATH_ABSOLUTE: `{pointer}` is an absolute path (`{path}`); use a repo-relative path or the worktree defaults"
+                )));
+            }
+        }
+    }
+    if let Some(workflows) = config.pointer("/workflows") {
+        collect_absolute_workflow_paths(workflows, "/workflows", &mut findings);
+    }
+    findings
+}
+
+fn collect_absolute_workflow_paths(
+    value: &Value,
+    location: &str,
+    findings: &mut Vec<praxec_core::validate::Diagnostic>,
+) {
+    use praxec_core::validate::Diagnostic;
+
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let child_location = format!("{location}/{key}");
+                if is_authored_filesystem_path_key(key, &child_location) {
+                    if let Some(path) = child.as_str() {
+                        if authored_path_is_absolute(path) {
+                            findings.push(Diagnostic::Error(format!(
+                                "WORKTREE_PATH_ABSOLUTE: `{child_location}` is an absolute path (`{path}`); path inputs must be repo-relative"
+                            )));
+                        }
+                    }
+                }
+                collect_absolute_workflow_paths(child, &child_location, findings);
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                collect_absolute_workflow_paths(child, &format!("{location}/{index}"), findings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_authored_filesystem_path_key(key: &str, location: &str) -> bool {
+    // REST executors use `path` as an HTTP endpoint (for example `/documents`),
+    // not a host filesystem path. It is therefore unrelated to a worktree and
+    // must remain absolute when the remote service's route is root-relative.
+    if key == "path" && location.ends_with("/executor/path") {
+        return false;
+    }
+    matches!(
+        key,
+        "path" | "file" | "dir" | "directory" | "cwd" | "root" | "repoRoot" | "worktrees_of"
+    )
+}
+
+fn authored_path_is_absolute(path: &str) -> bool {
+    std::path::Path::new(path).is_absolute()
+        || (path.len() >= 3
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && path.as_bytes()[1] == b':'
+            && matches!(path.as_bytes()[2], b'/' | b'\\'))
 }
 
 /// Map the `--policy` flag to a headless HITL policy. Unknown values fall back to
@@ -1207,12 +1325,39 @@ pub(crate) fn warn_if_ephemeral_store(path: &str) {
     }
 }
 
-pub(crate) fn build_workflow_store(config: &Value) -> anyhow::Result<Arc<dyn WorkflowStore>> {
-    let kind = config
+/// #206 — host-only configs resolved from a Git worktree carry this internal
+/// stamp. It gives every linked worktree one SQLite governance database under
+/// Git's common directory without requiring a machine-specific authored path.
+fn resolved_store_kind(config: &Value) -> &str {
+    config
         .pointer("/store/kind")
         .and_then(Value::as_str)
-        .unwrap_or("memory");
-    let path = config.pointer("/store/path").and_then(Value::as_str);
+        .unwrap_or_else(|| {
+            if config
+                .pointer("/praxec/_worktreeNative/governanceStore")
+                .is_some()
+            {
+                "sqlite"
+            } else {
+                "memory"
+            }
+        })
+}
+
+fn resolved_store_path(config: &Value) -> Option<&str> {
+    config
+        .pointer("/store/path")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            config
+                .pointer("/praxec/_worktreeNative/governanceStore")
+                .and_then(Value::as_str)
+        })
+}
+
+pub(crate) fn build_workflow_store(config: &Value) -> anyhow::Result<Arc<dyn WorkflowStore>> {
+    let kind = resolved_store_kind(config);
+    let path = resolved_store_path(config);
 
     match kind {
         "memory" => Ok(Arc::new(InMemoryWorkflowStore::new())),
@@ -1232,6 +1377,22 @@ pub(crate) fn build_workflow_store(config: &Value) -> anyhow::Result<Arc<dyn Wor
     }
 }
 
+/// #206 — linked worktrees share the durable repo-lock authority under Git's
+/// common directory. Other deployments retain the in-process lock space.
+pub(crate) fn build_repo_locks(
+    config: &Value,
+) -> anyhow::Result<Arc<dyn praxec_core::repo_locks::RepoLocks>> {
+    if let Some(path) = config
+        .pointer("/praxec/_worktreeNative/governanceStore")
+        .and_then(Value::as_str)
+    {
+        return Ok(Arc::new(
+            praxec_core::repo_locks::SqliteRepoLockSpace::open(path)?,
+        ));
+    }
+    Ok(Arc::new(praxec_core::repo_locks::RepoLockSpace::new()))
+}
+
 /// Build the evidence store from `config`. The only durable evidence backend is
 /// `store.kind=sqlite` (a distinct `evidence` table coexisting in the same DB
 /// file as the workflow store). `memory` and `file` get an ephemeral in-memory
@@ -1239,11 +1400,8 @@ pub(crate) fn build_workflow_store(config: &Value) -> anyhow::Result<Arc<dyn Wor
 /// [`guard_durable_serve`] refuses for a production `serve`. An unknown kind
 /// fails fast, mirroring [`build_workflow_store`] — no silent fallback.
 pub fn build_evidence_store(config: &Value) -> anyhow::Result<Arc<dyn EvidenceStore>> {
-    let kind = config
-        .pointer("/store/kind")
-        .and_then(Value::as_str)
-        .unwrap_or("memory");
-    let path = config.pointer("/store/path").and_then(Value::as_str);
+    let kind = resolved_store_kind(config);
+    let path = resolved_store_path(config);
 
     match kind {
         "sqlite" => {
@@ -1263,11 +1421,8 @@ pub fn build_evidence_store(config: &Value) -> anyhow::Result<Arc<dyn EvidenceSt
 pub fn build_guidance_ack_store(
     config: &Value,
 ) -> anyhow::Result<Arc<dyn GuidanceAcknowledgmentStore>> {
-    let kind = config
-        .pointer("/store/kind")
-        .and_then(Value::as_str)
-        .unwrap_or("memory");
-    let path = config.pointer("/store/path").and_then(Value::as_str);
+    let kind = resolved_store_kind(config);
+    let path = resolved_store_path(config);
 
     match kind {
         "sqlite" => {
@@ -1287,11 +1442,8 @@ pub fn build_guidance_ack_store(
 pub fn build_script_ack_store(
     config: &Value,
 ) -> anyhow::Result<Arc<dyn ScriptAcknowledgmentStore>> {
-    let kind = config
-        .pointer("/store/kind")
-        .and_then(Value::as_str)
-        .unwrap_or("memory");
-    let path = config.pointer("/store/path").and_then(Value::as_str);
+    let kind = resolved_store_kind(config);
+    let path = resolved_store_path(config);
 
     match kind {
         "sqlite" => {
@@ -1315,11 +1467,8 @@ pub fn build_script_ack_store(
 pub fn build_parked_session_store(
     config: &Value,
 ) -> anyhow::Result<Option<Arc<dyn praxec_core::ports::ParkedSessionStore>>> {
-    let kind = config
-        .pointer("/store/kind")
-        .and_then(Value::as_str)
-        .unwrap_or("memory");
-    let path = config.pointer("/store/path").and_then(Value::as_str);
+    let kind = resolved_store_kind(config);
+    let path = resolved_store_path(config);
 
     match kind {
         "sqlite" => {
@@ -1515,7 +1664,7 @@ mod audit_config_tests {
 
 #[cfg(test)]
 mod parked_store_wiring_tests {
-    use super::build_parked_session_store;
+    use super::{build_parked_session_store, resolved_store_kind, resolved_store_path};
     use praxec_core::model::ParkedAgentSession;
     use serde_json::json;
 
@@ -1565,6 +1714,18 @@ mod parked_store_wiring_tests {
             Ok(_) => panic!("sqlite without a path must fail fast"),
         };
         assert!(err.to_string().contains("store.path is required"));
+    }
+
+    #[test]
+    fn worktree_native_metadata_defaults_every_governance_store_to_shared_sqlite() {
+        let cfg = json!({
+            "praxec": { "_worktreeNative": { "governanceStore": "/git/common/praxec/governance.db" } }
+        });
+        assert_eq!(resolved_store_kind(&cfg), "sqlite");
+        assert_eq!(
+            resolved_store_path(&cfg),
+            Some("/git/common/praxec/governance.db")
+        );
     }
 }
 
@@ -1737,5 +1898,56 @@ mod config_path_echo_tests {
                 "serving the conventional file itself is not a trap"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod worktree_path_gate_tests {
+    use super::worktree_native_path_findings;
+    use serde_json::json;
+
+    #[test]
+    fn worktree_configs_reject_absolute_authored_config_and_flow_paths() {
+        let cfg = json!({
+            "praxec": { "_worktreeNative": { "repoRoot": "/derived" } },
+            "store": { "path": "/machine/state.db" },
+            "workflows": {
+                "flow.test": { "states": { "run": { "file": "/tmp/escape" } } }
+            }
+        });
+        let findings = worktree_native_path_findings(&cfg);
+        assert_eq!(findings.len(), 2, "config and flow paths are both gated");
+        assert!(
+            findings
+                .iter()
+                .all(|d| d.to_string().contains("WORKTREE_PATH_ABSOLUTE"))
+        );
+    }
+
+    #[test]
+    fn legacy_or_relative_configs_do_not_trip_the_worktree_path_gate() {
+        let relative = json!({
+            "praxec": { "_worktreeNative": { "repoRoot": "/derived" } },
+            "store": { "path": ".praxec/state.db" },
+            "workflows": { "flow.test": { "states": { "run": { "file": "src/main.rs" } } } }
+        });
+        assert!(worktree_native_path_findings(&relative).is_empty());
+        assert!(
+            worktree_native_path_findings(&json!({
+                "store": { "path": "/legacy/state.db" }
+            }))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn worktree_configs_allow_absolute_rest_executor_endpoints() {
+        let cfg = json!({
+            "praxec": { "_worktreeNative": { "repoRoot": "/derived" } },
+            "workflows": {
+                "publish": { "states": { "run": { "executor": { "kind": "rest", "path": "/documents" } } } }
+            }
+        });
+        assert!(worktree_native_path_findings(&cfg).is_empty());
     }
 }

@@ -5,8 +5,8 @@ pub(crate) use crate::gateway_config::{
     ApprovalsCommand, AuditCommand, Cli, CliConnectionKind, Command, ConnectionsCommand,
     CostCommand, InitEditorArg, InspectCommand, IntentCommand, ModelsCommand, OneshotServer,
     PackCommand, SchemaCommand, ToolsCommand, ack_guards_used, apply_overlays, build_audit_sink,
-    build_workflow_store, cli_principal, headless_policy_from, is_ephemeral_path, load_config,
-    parse_since, resolve_embedder,
+    build_repo_locks, build_workflow_store, cli_principal, headless_policy_from, is_ephemeral_path,
+    load_config, parse_since, resolve_embedder,
 };
 pub use crate::gateway_config::{
     GatewayOverlays, OverlayCtx, build_evidence_store, build_guidance_ack_store,
@@ -109,6 +109,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
         Command::Check { config } => check(config, &overlays.diagnostics),
         Command::Doctor { config, fix } => doctor(config, fix),
         Command::Health { config } => health(config),
+        Command::Repos { command } => crate::repos::run(command),
         Command::Observe {
             config,
             follow,
@@ -896,8 +897,7 @@ async fn build_runtime_for_orchestrate(
     let store = build_workflow_store(config)?;
     let evidence: Arc<dyn EvidenceStore> = build_evidence_store(config)?;
     let guards = Arc::new(DefaultGuardEvaluator::with_evidence(evidence.clone()));
-    let repo_locks: Arc<dyn praxec_core::repo_locks::RepoLocks> =
-        Arc::new(praxec_core::repo_locks::RepoLockSpace::new());
+    let repo_locks = build_repo_locks(config)?;
     let lock_scheduler = Arc::new(praxec_core::lock_scheduler::LockScheduler::new());
     let runtime = WorkflowRuntime::new(
         swappable_defs.clone() as Arc<dyn praxec_core::ports::DefinitionStore>,
@@ -1092,8 +1092,7 @@ async fn build_oneshot_server(
     // Global repository write-exclusion: no two agents — across any workflows
     // or sub-workflows — hold a lock on the same file at once. Contention
     // durably suspends (`waiting_on_lock`) and auto-resumes FIFO on release.
-    let repo_locks: Arc<dyn praxec_core::repo_locks::RepoLocks> =
-        Arc::new(praxec_core::repo_locks::RepoLockSpace::new());
+    let repo_locks = build_repo_locks(config)?;
     let lock_scheduler = Arc::new(praxec_core::lock_scheduler::LockScheduler::new());
     let runtime = WorkflowRuntime::new(
         swappable_defs.clone() as Arc<dyn praxec_core::ports::DefinitionStore>,
@@ -4100,7 +4099,7 @@ fn aggregate_calls(records: &[Value]) -> ObserveReport {
 }
 
 fn health(config_path: PathBuf) -> anyhow::Result<()> {
-    let (config, _) = praxec_core::config::load_resolved_with_repos(&config_path)
+    let (config, diagnostics) = praxec_core::config::load_resolved_with_repos(&config_path)
         .with_context(|| format!("loading config {}", config_path.display()))?;
 
     let connections: Vec<String> = config
@@ -4143,6 +4142,7 @@ fn health(config_path: PathBuf) -> anyhow::Result<()> {
         "repos": repos,
         "definition_count": definition_count,
         "store": store,
+        "diagnostics": diagnostics,
     });
 
     println!("{}", serde_json::to_string(&snapshot)?);

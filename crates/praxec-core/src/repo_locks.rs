@@ -15,11 +15,12 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tokio::sync::Mutex;
 
 /// A currently-held file lock.
@@ -139,6 +140,50 @@ impl Default for RepoLockSpace {
     }
 }
 
+/// Durable repository lock authority shared by independent gateway processes.
+/// #206 places its SQLite file under Git's common directory, so linked
+/// worktrees contend on one lock table rather than each seeing a private map.
+pub struct SqliteRepoLockSpace {
+    conn: Arc<StdMutex<Connection>>,
+}
+
+impl SqliteRepoLockSpace {
+    pub fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS repo_locks (
+                file TEXT PRIMARY KEY NOT NULL,
+                holder TEXT NOT NULL,
+                expires_ms INTEGER NOT NULL,
+                ttl_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_repo_locks_expires ON repo_locks(expires_ms);",
+        )?;
+        Ok(Self {
+            conn: Arc::new(StdMutex::new(conn)),
+        })
+    }
+
+    fn now_ms() -> i64 {
+        Utc::now().timestamp_millis()
+    }
+
+    fn ttl_ms(ttl: Duration) -> i64 {
+        i64::try_from(ttl.as_millis()).unwrap_or(300_000).max(1)
+    }
+
+    fn reap(conn: &Connection, now: i64) -> rusqlite::Result<()> {
+        conn.execute("DELETE FROM repo_locks WHERE expires_ms < ?1", params![now])?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl RepoLocks for RepoLockSpace {
     async fn acquire(
@@ -220,6 +265,144 @@ impl RepoLocks for RepoLockSpace {
     }
 }
 
+#[async_trait]
+impl RepoLocks for SqliteRepoLockSpace {
+    async fn acquire(
+        &self,
+        files: &[PathBuf],
+        holder: &str,
+        ttl: Duration,
+    ) -> Result<(), LockConflict> {
+        let now = Self::now_ms();
+        let ttl_ms = Self::ttl_ms(ttl);
+        let mut conn = self.conn.lock().expect("LOCK_POISONED: sqlite_repo_locks");
+        let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(_) => {
+                return Err(LockConflict {
+                    conflicts: files
+                        .iter()
+                        .cloned()
+                        .map(|file| (file, "LOCK_STORE_UNAVAILABLE".into()))
+                        .collect(),
+                });
+            }
+        };
+        if Self::reap(&tx, now).is_err() {
+            return Err(LockConflict {
+                conflicts: files
+                    .iter()
+                    .cloned()
+                    .map(|file| (file, "LOCK_STORE_UNAVAILABLE".into()))
+                    .collect(),
+            });
+        }
+        let mut conflicts = Vec::new();
+        for file in files {
+            let key = file.to_string_lossy();
+            match tx
+                .query_row(
+                    "SELECT holder FROM repo_locks WHERE file = ?1",
+                    params![key.as_ref()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+            {
+                Ok(Some(existing)) if existing != holder => {
+                    conflicts.push((file.clone(), existing))
+                }
+                Ok(_) => {}
+                Err(_) => conflicts.push((file.clone(), "LOCK_STORE_UNAVAILABLE".into())),
+            }
+        }
+        if !conflicts.is_empty() {
+            return Err(LockConflict { conflicts });
+        }
+        for file in files {
+            let key = file.to_string_lossy();
+            if tx
+                .execute(
+                    "INSERT INTO repo_locks (file, holder, expires_ms, ttl_ms) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(file) DO UPDATE SET holder=excluded.holder, expires_ms=excluded.expires_ms, ttl_ms=excluded.ttl_ms",
+                    params![key.as_ref(), holder, now + ttl_ms, ttl_ms],
+                )
+                .is_err()
+            {
+                return Err(LockConflict {
+                    conflicts: files
+                        .iter()
+                        .cloned()
+                        .map(|file| (file, "LOCK_STORE_UNAVAILABLE".into()))
+                        .collect(),
+                });
+            }
+        }
+        if tx.commit().is_err() {
+            return Err(LockConflict {
+                conflicts: files
+                    .iter()
+                    .cloned()
+                    .map(|file| (file, "LOCK_STORE_UNAVAILABLE".into()))
+                    .collect(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn release(&self, files: &[PathBuf], holder: &str) {
+        let conn = self.conn.lock().expect("LOCK_POISONED: sqlite_repo_locks");
+        for file in files {
+            let _ = conn.execute(
+                "DELETE FROM repo_locks WHERE file = ?1 AND holder = ?2",
+                params![file.to_string_lossy().as_ref(), holder],
+            );
+        }
+    }
+
+    async fn heartbeat(&self, files: &[PathBuf], holder: &str) {
+        let now = Self::now_ms();
+        let conn = self.conn.lock().expect("LOCK_POISONED: sqlite_repo_locks");
+        let _ = Self::reap(&conn, now);
+        for file in files {
+            let _ = conn.execute(
+                "UPDATE repo_locks SET expires_ms = ?1 + ttl_ms WHERE file = ?2 AND holder = ?3",
+                params![now, file.to_string_lossy().as_ref(), holder],
+            );
+        }
+    }
+
+    async fn held(&self) -> Vec<HeldLock> {
+        let now = Self::now_ms();
+        let conn = self.conn.lock().expect("LOCK_POISONED: sqlite_repo_locks");
+        if Self::reap(&conn, now).is_err() {
+            return Vec::new();
+        }
+        let mut statement = match conn.prepare("SELECT file, holder, expires_ms FROM repo_locks") {
+            Ok(statement) => statement,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(Result::ok)
+            .filter_map(|(file, holder, expires_ms)| {
+                DateTime::from_timestamp_millis(expires_ms).map(|expires_at| HeldLock {
+                    file: PathBuf::from(file),
+                    holder,
+                    expires_at,
+                })
+            })
+            .collect()
+    }
+}
+
 /// The file-set a transition's executor declares it will write. A single
 /// executor contributes its own `owned_files`; a `kind: parallel` executor
 /// contributes the **union** of its branches' `owned_files`. Empty when none
@@ -282,6 +465,35 @@ mod tests {
     async fn acquire_free_files_succeeds() {
         let space = RepoLockSpace::new();
         assert!(space.acquire(&[p("a")], "h1", ttl()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn sqlite_lock_spaces_share_a_lease_across_independent_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("common").join("governance.db");
+        let first = SqliteRepoLockSpace::open(&db).unwrap();
+        let second = SqliteRepoLockSpace::open(&db).unwrap();
+
+        first
+            .acquire(&[p("src/lib.rs")], "worktree-a", ttl())
+            .await
+            .unwrap();
+        let blocked = second
+            .acquire(&[p("src/lib.rs")], "worktree-b", ttl())
+            .await
+            .expect_err("a lease from another handle must be visible");
+        assert_eq!(
+            blocked.conflicts,
+            vec![(p("src/lib.rs"), "worktree-a".into())]
+        );
+
+        first.release(&[p("src/lib.rs")], "worktree-a").await;
+        assert!(
+            second
+                .acquire(&[p("src/lib.rs")], "worktree-b", ttl())
+                .await
+                .is_ok()
+        );
     }
 
     // --- acquire_any: pool acquisition ------------------------------------
