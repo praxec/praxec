@@ -2030,11 +2030,19 @@ mod worktree_lock_authority_tests {
         let second = build_repo_locks(&config(&second_store)).unwrap();
         let file = PathBuf::from("src/lib.rs");
         first
-            .acquire(&[file.clone()], "worktree-a", Duration::from_secs(60))
+            .acquire(
+                std::slice::from_ref(&file),
+                "worktree-a",
+                Duration::from_secs(60),
+            )
             .await
             .unwrap();
         let blocked = second
-            .acquire(&[file.clone()], "worktree-b", Duration::from_secs(60))
+            .acquire(
+                std::slice::from_ref(&file),
+                "worktree-b",
+                Duration::from_secs(60),
+            )
             .await
             .expect_err("a lease from the linked worktree must be visible");
         assert_eq!(blocked.conflicts, vec![(file, "worktree-a".into())]);
