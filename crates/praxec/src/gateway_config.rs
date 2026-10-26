@@ -1335,6 +1335,22 @@ pub(crate) fn build_workflow_store(config: &Value) -> anyhow::Result<Arc<dyn Wor
     }
 }
 
+/// #206 — linked worktrees share the durable repo-lock authority under Git's
+/// common directory. Other deployments retain the in-process lock space.
+pub(crate) fn build_repo_locks(
+    config: &Value,
+) -> anyhow::Result<Arc<dyn praxec_core::repo_locks::RepoLocks>> {
+    if let Some(path) = config
+        .pointer("/praxec/_worktreeNative/governanceStore")
+        .and_then(Value::as_str)
+    {
+        return Ok(Arc::new(
+            praxec_core::repo_locks::SqliteRepoLockSpace::open(path)?,
+        ));
+    }
+    Ok(Arc::new(praxec_core::repo_locks::RepoLockSpace::new()))
+}
+
 /// Build the evidence store from `config`. The only durable evidence backend is
 /// `store.kind=sqlite` (a distinct `evidence` table coexisting in the same DB
 /// file as the workflow store). `memory` and `file` get an ephemeral in-memory
