@@ -109,6 +109,7 @@ pub async fn run_cli(overlays: GatewayOverlays) -> anyhow::Result<()> {
         Command::Check { config } => check(config, &overlays.diagnostics),
         Command::Doctor { config, fix } => doctor(config, fix),
         Command::Health { config } => health(config),
+        Command::Repos { command } => crate::repos::run(command),
         Command::Observe {
             config,
             follow,
@@ -4098,7 +4099,7 @@ fn aggregate_calls(records: &[Value]) -> ObserveReport {
 }
 
 fn health(config_path: PathBuf) -> anyhow::Result<()> {
-    let (config, _) = praxec_core::config::load_resolved_with_repos(&config_path)
+    let (config, diagnostics) = praxec_core::config::load_resolved_with_repos(&config_path)
         .with_context(|| format!("loading config {}", config_path.display()))?;
 
     let connections: Vec<String> = config
@@ -4141,6 +4142,7 @@ fn health(config_path: PathBuf) -> anyhow::Result<()> {
         "repos": repos,
         "definition_count": definition_count,
         "store": store,
+        "diagnostics": diagnostics,
     });
 
     println!("{}", serde_json::to_string(&snapshot)?);

@@ -1054,8 +1054,8 @@ repos:
     // and the underlying error.
     let skip = diagnostics
         .iter()
-        .find(|d| d.code == "REPO_LOAD_SKIPPED")
-        .expect("skipped repo must surface a REPO_LOAD_SKIPPED diagnostic");
+        .find(|d| d.code == "REPO_ROOT_MISSING")
+        .expect("missing directory must surface a REPO_ROOT_MISSING diagnostic");
     assert_eq!(
         skip.severity,
         praxec_core::config::DiagnosticSeverity::Warn,
@@ -1069,9 +1069,9 @@ repos:
 }
 
 #[test]
-fn f13_strict_load_still_fails_on_a_bad_repo_entry() {
-    // `praxec check` keeps the all-or-nothing contract: the default
-    // (strict) loader must still reject a config with a dead entry loudly.
+fn issue_272_strict_load_reports_every_missing_root_and_loads_available_repos() {
+    // Availability is diagnosable in authoring too; invalid manifests remain
+    // hard errors, but a pruned worktree does not hide the other repositories.
     let td = TempDir::new().unwrap();
     let host = format!(
         r#"
@@ -1079,14 +1079,27 @@ version: "1.0.0"
 repos:
   - path: "{swe}"
   - path: "{gone}"
+  - path: "{gone_again}"
 "#,
         swe = fixtures_root().join("swe-core").display(),
         gone = td.path().join("no-such-worktree").display(),
+        gone_again = td.path().join("another-dead-root").display(),
     );
     let path = write_host(&td, &host);
-    let err = load_resolved_with_repos(&path).expect_err("strict load must still fail");
-    let msg = format!("{:#}", err);
-    assert!(msg.contains("no-such-worktree"), "msg: {msg}");
+    let (config, diagnostics) = load_resolved_with_repos(&path).unwrap();
+    assert!(config.pointer("/workflows/swe~1flow.add-feature").is_some());
+    let missing: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| d.code == "REPO_ROOT_MISSING")
+        .collect();
+    assert_eq!(missing.len(), 2);
+    assert!(missing[0].message.contains("no-such-worktree"));
+    assert!(missing[1].message.contains("another-dead-root"));
+    assert!(
+        missing
+            .iter()
+            .all(|d| d.suggestion.as_deref().unwrap().contains("recreate"))
+    );
 }
 
 #[test]
@@ -1107,6 +1120,156 @@ repos:
         .expect_err("every repo failing means no definitions — that stays an error");
     let msg = format!("{:#}", err);
     assert!(msg.contains("ALL_REPOS_FAILED"), "msg: {msg}");
+    assert!(
+        msg.contains("gone-a") && msg.contains("gone-b"),
+        "msg: {msg}"
+    );
+    assert!(
+        msg.contains("REPO_ROOT_MISSING") && msg.contains("remove/comment"),
+        "msg: {msg}"
+    );
+}
+
+#[test]
+fn issue_272_missing_bare_target_never_enters_writable_authority() {
+    let td = TempDir::new().unwrap();
+    let host =
+        "version: '1.0.0'\nrepos:\n  - path: gone\n    writable: true\n    definitions: false\n";
+    let path = write_host(&td, host);
+    for resilient in [false, true] {
+        let (config, diagnostics) = if resilient {
+            praxec_core::config::load_resolved_with_repos_resilient(&path)
+        } else {
+            load_resolved_with_repos(&path)
+        }
+        .unwrap();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.code == "REPO_ROOT_MISSING")
+                .count(),
+            1
+        );
+        assert!(
+            config
+                .pointer("/praxec/_writableRepos")
+                .and_then(Value::as_array)
+                .is_none_or(|r| r.is_empty())
+        );
+    }
+}
+
+#[test]
+fn issue_272_existing_root_without_manifest_remains_a_hard_strict_error() {
+    let td = TempDir::new().unwrap();
+    std::fs::create_dir(td.path().join("plain")).unwrap();
+    let path = write_host(&td, "version: '1.0.0'\nrepos:\n  - path: plain\n");
+    let err = load_resolved_with_repos(&path).unwrap_err();
+    assert!(format!("{err:#}").contains("praxec.repo.yaml"));
+}
+
+#[test]
+fn issue_272_corrupt_manifest_never_becomes_a_bare_root() {
+    let td = TempDir::new().unwrap();
+    let repo = td.path().join("bad");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("praxec.repo.yaml"), "schema: wrong\n").unwrap();
+    let path = write_host(
+        &td,
+        "version: '1.0.0'\nrepos:\n  - path: bad\n    writable: true\n",
+    );
+    assert!(load_resolved_with_repos(&path).is_err());
+}
+
+#[test]
+fn issue_272_file_instead_of_root_is_diagnosed_and_not_stamped() {
+    let td = TempDir::new().unwrap();
+    std::fs::write(td.path().join("file"), "not a directory").unwrap();
+    let path = write_host(
+        &td,
+        "version: '1.0.0'\nrepos:\n  - path: file\n    writable: true\n    definitions: false\n",
+    );
+    let (config, diagnostics) = load_resolved_with_repos(&path).unwrap();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.code == "REPO_ROOT_MISSING" && d.message.contains("not a directory"))
+    );
+    assert!(
+        config
+            .pointer("/praxec/_writableRepos")
+            .and_then(Value::as_array)
+            .is_none_or(|r| r.is_empty())
+    );
+}
+
+#[test]
+fn issue_272_relative_config_resolves_local_paths_only_once() {
+    let td = tempfile::tempdir_in(".").unwrap();
+    std::fs::create_dir(td.path().join("plain")).unwrap();
+    let path = write_host(
+        &td,
+        "version: '1.0.0'\nrepos:\n  - path: plain\n    writable: true\n    definitions: false\n",
+    );
+    let (config, diagnostics) = load_resolved_with_repos(&path).unwrap();
+    assert!(!diagnostics.iter().any(|d| d.code == "REPO_ROOT_MISSING"));
+    let root = config
+        .pointer("/praxec/_writableRepos/0/root")
+        .and_then(Value::as_str)
+        .unwrap();
+    assert_eq!(
+        std::path::Path::new(root).canonicalize().unwrap(),
+        td.path().join("plain").canonicalize().unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn issue_272_symlink_config_keeps_existing_relative_root_at_physical_config_base() {
+    let td = TempDir::new().unwrap();
+    let actual = td.path().join("actual");
+    let alias = td.path().join("alias/deep");
+    std::fs::create_dir_all(actual.join("plain")).unwrap();
+    std::fs::create_dir_all(&alias).unwrap();
+    let config = actual.join("gateway.yaml");
+    std::fs::write(
+        &config,
+        "version: '1.0.0'\nrepos:\n  - path: plain\n    writable: true\n    definitions: false\n",
+    )
+    .unwrap();
+    let link = alias.join("gateway.yaml");
+    std::os::unix::fs::symlink(&config, &link).unwrap();
+    let (physical, _) = load_resolved_with_repos(&config).unwrap();
+    let (via_link, diagnostics) = load_resolved_with_repos(&link).unwrap();
+    assert_eq!(via_link, physical);
+    assert!(!diagnostics.iter().any(|d| d.code == "REPO_ROOT_MISSING"));
+}
+
+#[cfg(unix)]
+#[test]
+fn issue_272_unreadable_root_is_reported() {
+    use std::os::unix::fs::PermissionsExt;
+    let td = TempDir::new().unwrap();
+    let root = td.path().join("denied");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Some CI/container users have CAP_DAC_OVERRIDE; there is no unreadable
+    // directory to exercise under that capability.
+    let inaccessible = std::fs::read_dir(&root).is_err();
+    let path = write_host(
+        &td,
+        "version: '1.0.0'\nrepos:\n  - path: denied\n    writable: true\n    definitions: false\n",
+    );
+    let result = load_resolved_with_repos(&path);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if inaccessible {
+        let (_, diagnostics) = result.unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == "REPO_ROOT_MISSING" && d.message.contains("unreadable"))
+        );
+    }
 }
 
 #[test]
