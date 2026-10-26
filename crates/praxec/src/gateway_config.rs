@@ -894,7 +894,7 @@ fn collect_absolute_workflow_paths(
         Value::Object(object) => {
             for (key, child) in object {
                 let child_location = format!("{location}/{key}");
-                if is_path_key(key) {
+                if is_authored_filesystem_path_key(key, &child_location) {
                     if let Some(path) = child.as_str() {
                         if authored_path_is_absolute(path) {
                             findings.push(Diagnostic::Error(format!(
@@ -915,7 +915,13 @@ fn collect_absolute_workflow_paths(
     }
 }
 
-fn is_path_key(key: &str) -> bool {
+fn is_authored_filesystem_path_key(key: &str, location: &str) -> bool {
+    // REST executors use `path` as an HTTP endpoint (for example `/documents`),
+    // not a host filesystem path. It is therefore unrelated to a worktree and
+    // must remain absolute when the remote service's route is root-relative.
+    if key == "path" && location.ends_with("/executor/path") {
+        return false;
+    }
     matches!(
         key,
         "path" | "file" | "dir" | "directory" | "cwd" | "root" | "repoRoot" | "worktrees_of"
@@ -1896,5 +1902,16 @@ mod worktree_path_gate_tests {
             }))
             .is_empty()
         );
+    }
+
+    #[test]
+    fn worktree_configs_allow_absolute_rest_executor_endpoints() {
+        let cfg = json!({
+            "praxec": { "_worktreeNative": { "repoRoot": "/derived" } },
+            "workflows": {
+                "publish": { "states": { "run": { "executor": { "kind": "rest", "path": "/documents" } } } }
+            }
+        });
+        assert!(worktree_native_path_findings(&cfg).is_empty());
     }
 }
