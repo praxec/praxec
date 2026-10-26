@@ -811,6 +811,7 @@ pub fn collect_diagnostics_with(
     extra: &[DiagnosticProvider],
 ) -> Vec<praxec_core::validate::Diagnostic> {
     let mut diagnostics = praxec_core::validate::validate_workflows(config);
+    diagnostics.extend(worktree_native_path_findings(config));
     diagnostics.extend(praxec_executors::kind_doctor::doctor_check(config));
     #[cfg(feature = "llm-executor")]
     {
@@ -852,6 +853,81 @@ pub fn collect_diagnostics_with(
         diagnostics.extend(provider(config));
     }
     diagnostics
+}
+
+/// #206 portability gate. A config resolved from a Git worktree must not carry
+/// a machine-specific absolute path in its authored durable settings or its
+/// workflow path inputs. Loader-injected `_worktreeNative` metadata is
+/// deliberately outside this scan: it is derived per invocation, never author
+/// input. Legacy configurations outside this mode retain existing behavior.
+fn worktree_native_path_findings(config: &Value) -> Vec<praxec_core::validate::Diagnostic> {
+    use praxec_core::validate::Diagnostic;
+
+    if config.pointer("/praxec/_worktreeNative").is_none() {
+        return Vec::new();
+    }
+
+    let mut findings = Vec::new();
+    for pointer in ["/store/path", "/audit/path"] {
+        if let Some(path) = config.pointer(pointer).and_then(Value::as_str) {
+            if authored_path_is_absolute(path) {
+                findings.push(Diagnostic::Error(format!(
+                    "WORKTREE_PATH_ABSOLUTE: `{pointer}` is an absolute path (`{path}`); use a repo-relative path or the worktree defaults"
+                )));
+            }
+        }
+    }
+    if let Some(workflows) = config.pointer("/workflows") {
+        collect_absolute_workflow_paths(workflows, "/workflows", &mut findings);
+    }
+    findings
+}
+
+fn collect_absolute_workflow_paths(
+    value: &Value,
+    location: &str,
+    findings: &mut Vec<praxec_core::validate::Diagnostic>,
+) {
+    use praxec_core::validate::Diagnostic;
+
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object {
+                let child_location = format!("{location}/{key}");
+                if is_path_key(key) {
+                    if let Some(path) = child.as_str() {
+                        if authored_path_is_absolute(path) {
+                            findings.push(Diagnostic::Error(format!(
+                                "WORKTREE_PATH_ABSOLUTE: `{child_location}` is an absolute path (`{path}`); path inputs must be repo-relative"
+                            )));
+                        }
+                    }
+                }
+                collect_absolute_workflow_paths(child, &child_location, findings);
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                collect_absolute_workflow_paths(child, &format!("{location}/{index}"), findings);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_path_key(key: &str) -> bool {
+    matches!(
+        key,
+        "path" | "file" | "dir" | "directory" | "cwd" | "root" | "repoRoot" | "worktrees_of"
+    )
+}
+
+fn authored_path_is_absolute(path: &str) -> bool {
+    std::path::Path::new(path).is_absolute()
+        || (path.len() >= 3
+            && path.as_bytes()[0].is_ascii_alphabetic()
+            && path.as_bytes()[1] == b':'
+            && matches!(path.as_bytes()[2], b'/' | b'\\'))
 }
 
 /// Map the `--policy` flag to a headless HITL policy. Unknown values fall back to
@@ -1764,5 +1840,45 @@ mod config_path_echo_tests {
                 "serving the conventional file itself is not a trap"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod worktree_path_gate_tests {
+    use super::worktree_native_path_findings;
+    use serde_json::json;
+
+    #[test]
+    fn worktree_configs_reject_absolute_authored_config_and_flow_paths() {
+        let cfg = json!({
+            "praxec": { "_worktreeNative": { "repoRoot": "/derived" } },
+            "store": { "path": "/machine/state.db" },
+            "workflows": {
+                "flow.test": { "states": { "run": { "file": "/tmp/escape" } } }
+            }
+        });
+        let findings = worktree_native_path_findings(&cfg);
+        assert_eq!(findings.len(), 2, "config and flow paths are both gated");
+        assert!(
+            findings
+                .iter()
+                .all(|d| d.to_string().contains("WORKTREE_PATH_ABSOLUTE"))
+        );
+    }
+
+    #[test]
+    fn legacy_or_relative_configs_do_not_trip_the_worktree_path_gate() {
+        let relative = json!({
+            "praxec": { "_worktreeNative": { "repoRoot": "/derived" } },
+            "store": { "path": ".praxec/state.db" },
+            "workflows": { "flow.test": { "states": { "run": { "file": "src/main.rs" } } } }
+        });
+        assert!(worktree_native_path_findings(&relative).is_empty());
+        assert!(
+            worktree_native_path_findings(&json!({
+                "store": { "path": "/legacy/state.db" }
+            }))
+            .is_empty()
+        );
     }
 }
