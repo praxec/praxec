@@ -3356,9 +3356,17 @@ fn merge_declared_repos(
         let entry_desc = match &source {
             RepoSource::Local(p) => p.display().to_string(),
             RepoSource::Remote { uri, .. } => uri.clone(),
+            RepoSource::InvocationCwd => "cwd:true".to_string(),
             RepoSource::WorktreesOf { anchor, name } => {
                 format!("worktrees_of:{} name:{name}", anchor.display())
             }
+        };
+        // #206 foundation: an invocation-root declaration is intentionally not a
+        // machine path. Resolve it once at config load through git, then let the
+        // existing local-root containment and manifest-loading path handle it.
+        let source = match source {
+            RepoSource::InvocationCwd => RepoSource::Local(invocation_repo_root()?),
+            source => source,
         };
         // pack-provenance-recording — a remote `uri:` entry's declared `ref:`,
         // captured before `source` is consumed below. Takes priority over the
@@ -3506,6 +3514,12 @@ fn merge_declared_repos(
                         .join(crate::repo_git::cache_dir_name(&uri, &gitref));
                     crate::repo_git::clone_or_update(&uri, &gitref, &dest)
                         .with_context(|| format!("importing repo {uri}"))?
+                }
+                // `InvocationCwd` is converted to `Local` immediately after
+                // parsing, before any source is loaded. Reaching this arm
+                // would mean a future refactor bypassed that boundary.
+                RepoSource::InvocationCwd => {
+                    unreachable!("InvocationCwd must resolve to Local before repo loading")
                 }
                 // WS-B B3 — a `worktrees_of:` source is fully resolved and
                 // `continue`d above; it never reaches this load path. Exhaustive
@@ -4362,6 +4376,9 @@ struct RepoDecl {
 enum RepoSource {
     /// A local directory (resolved relative to the host config).
     Local(PathBuf),
+    /// The Git top-level containing the gateway invocation CWD. This is the
+    /// worktree-native source for #206: it never serializes a machine path.
+    InvocationCwd,
     /// A remote git repo imported (cloned/updated) into a local cache.
     Remote { uri: String, gitref: String },
     /// WS-B B3 — an IDENTITY + discovery rule, not a literal path. `anchor` is a
@@ -4596,16 +4613,24 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
             short_value_kind(other)
         ),
     };
-    // SPEC §9 + WS-B B3 — a repo is declared by exactly one of: a local `path`, a
+    // SPEC §9 + #206 — a repo is declared by exactly one of: a local `path`, a
     // remote `uri` (imported via git), or `worktrees_of:` (identity-first
     // discovery of a live git worktree). A remote repo may pin a `ref`
     // (default `main`).
     let path = entry.get("path").and_then(Value::as_str);
     let uri = entry.get("uri").and_then(Value::as_str);
     let worktrees_of = entry.get("worktrees_of").and_then(Value::as_str);
-    let source = match (path, uri, worktrees_of) {
-        (Some(p), None, None) => RepoSource::Local(expand_repo_path(p)),
-        (None, Some(u), None) => {
+    let cwd = match entry.get("cwd") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(other) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}].cwd` must be a boolean ({})",
+            short_value_kind(other)
+        ),
+    };
+    let source = match (path, uri, worktrees_of, cwd) {
+        (Some(p), None, None, false) => RepoSource::Local(expand_repo_path(p)),
+        (None, Some(u), None, false) => {
             let gitref = entry
                 .get("ref")
                 .and_then(Value::as_str)
@@ -4616,7 +4641,7 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
                 gitref,
             }
         }
-        (None, None, Some(anchor)) => {
+        (None, None, Some(anchor), false) => {
             // A `worktrees_of:` entry is resolved by IDENTITY, so `name:` is
             // mandatory — there is nothing to match a worktree stub against
             // without it (poka-yoke against a silently unresolvable entry).
@@ -4644,21 +4669,32 @@ fn parse_repo_entry(index: usize, entry: Value) -> anyhow::Result<RepoDecl> {
         }
         // `worktrees_of:` is mutually exclusive with a literal `path`/`uri` — a
         // repo is discovered by identity OR pinned to a literal location.
-        (_, _, Some(_)) => bail!(
+        (_, _, Some(_), false) => bail!(
             "INVALID_REPO_ENTRY: `repos[{index}]` declares `worktrees_of:` together with \
              `path:`/`uri:` — a repo is resolved by worktree identity OR a literal path/uri, \
              not both."
         ),
-        (Some(_), Some(_), None) => bail!(
+        (Some(_), Some(_), None, false) => bail!(
             "INVALID_REPO_ENTRY: `repos[{index}]` declares both `path` and `uri` — \
              a repo is either local or remote, not both."
         ),
-        (None, None, None) => bail!(
+        (None, None, None, true) => {
+            if !writable {
+                bail!(
+                    "INVALID_REPO_ENTRY: `repos[{index}].cwd: true` requires `writable: true` \
+                     because an invocation root is a run target."
+                );
+            }
+            RepoSource::InvocationCwd
+        }
+        (_, _, _, true) => bail!(
+            "INVALID_REPO_ENTRY: `repos[{index}].cwd: true` cannot be combined with `path`, \
+             `uri`, or `worktrees_of:`."
+        ),
+        (None, None, None, false) => bail!(
             "INVALID_REPO_ENTRY: `repos[{index}]` needs a `path` (local dir), a `uri` \
-             (remote git repo to import), or `worktrees_of:` (identity-first worktree \
-             discovery), e.g. `- path: ~/repos/swe-core` or \
-             `- uri: git+https://github.com/acme/workflows@main` or \
-             `- worktrees_of: ~/repos/anchor` with `name:` + `writable: true`."
+             (remote git repo to import), `worktrees_of:` (identity-first worktree discovery), \
+             or `cwd: true` (the invocation Git worktree)."
         ),
     };
     Ok(RepoDecl {
@@ -4683,6 +4719,39 @@ fn expand_repo_path(p: &str) -> PathBuf {
         }
     }
     PathBuf::from(p)
+}
+
+/// Resolve the Git worktree root for a `cwd: true` repository declaration.
+/// The command runs before any writable root is stamped, so a non-Git invocation
+/// fails closed instead of falling back to the gateway's process CWD.
+fn invocation_repo_root() -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("reading invocation current directory")?;
+    git_toplevel(&cwd).with_context(|| {
+        format!(
+            "CWD_REPO_ROOT_UNRESOLVED: `cwd: true` requires the invocation CWD ({}) to be inside a Git worktree",
+            cwd.display()
+        )
+    })
+}
+
+fn git_toplevel(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("running git rev-parse in {}", cwd.display()))?;
+    if !output.status.success() {
+        bail!("git rev-parse --show-toplevel failed in {}", cwd.display());
+    }
+    let root = std::str::from_utf8(&output.stdout)
+        .context("git rev-parse emitted non-UTF-8 output")?
+        .trim();
+    if root.is_empty() {
+        bail!("git rev-parse --show-toplevel returned an empty root");
+    }
+    PathBuf::from(root)
+        .canonicalize()
+        .with_context(|| format!("canonicalizing Git root {root}"))
 }
 
 /// Collect every host-declared definitionId across the four prefixable
@@ -5265,5 +5334,52 @@ mod tests {
         .unwrap();
         synthesize_input_schema(&mut def);
         assert!(def.get("inputSchema").is_some());
+    }
+
+    #[test]
+    fn cwd_repo_declaration_is_a_writable_invocation_root() {
+        let decl = parse_repo_entry(
+            0,
+            json!({ "cwd": true, "writable": true, "definitions": false }),
+        )
+        .expect("cwd declaration is valid");
+        assert!(matches!(decl.source, RepoSource::InvocationCwd));
+        assert!(decl.writable);
+        assert!(!decl.definitions);
+    }
+
+    #[test]
+    fn cwd_repo_declaration_rejects_ambiguous_or_read_only_shapes() {
+        let read_only = match parse_repo_entry(0, json!({ "cwd": true })) {
+            Err(err) => err,
+            Ok(_) => panic!("an invocation root must explicitly allow writes"),
+        };
+        assert!(format!("{read_only:#}").contains("requires `writable: true`"));
+
+        let mixed = match parse_repo_entry(
+            0,
+            json!({ "cwd": true, "path": "./other", "writable": true }),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("cwd must not be mixed with a machine path"),
+        };
+        assert!(format!("{mixed:#}").contains("cannot be combined"));
+    }
+
+    #[test]
+    fn git_toplevel_resolves_a_nested_worktree_directory() {
+        let td = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(td.path())
+            .status()
+            .expect("git is available for worktree-native resolution");
+        assert!(init.success());
+        let nested = td.path().join("nested").join("leaf");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            git_toplevel(&nested).unwrap(),
+            td.path().canonicalize().unwrap()
+        );
     }
 }
