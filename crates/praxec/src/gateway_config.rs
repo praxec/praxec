@@ -1207,12 +1207,39 @@ pub(crate) fn warn_if_ephemeral_store(path: &str) {
     }
 }
 
-pub(crate) fn build_workflow_store(config: &Value) -> anyhow::Result<Arc<dyn WorkflowStore>> {
-    let kind = config
+/// #206 — host-only configs resolved from a Git worktree carry this internal
+/// stamp. It gives every linked worktree one SQLite governance database under
+/// Git's common directory without requiring a machine-specific authored path.
+fn resolved_store_kind(config: &Value) -> &str {
+    config
         .pointer("/store/kind")
         .and_then(Value::as_str)
-        .unwrap_or("memory");
-    let path = config.pointer("/store/path").and_then(Value::as_str);
+        .unwrap_or_else(|| {
+            if config
+                .pointer("/praxec/_worktreeNative/governanceStore")
+                .is_some()
+            {
+                "sqlite"
+            } else {
+                "memory"
+            }
+        })
+}
+
+fn resolved_store_path(config: &Value) -> Option<&str> {
+    config
+        .pointer("/store/path")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            config
+                .pointer("/praxec/_worktreeNative/governanceStore")
+                .and_then(Value::as_str)
+        })
+}
+
+pub(crate) fn build_workflow_store(config: &Value) -> anyhow::Result<Arc<dyn WorkflowStore>> {
+    let kind = resolved_store_kind(config);
+    let path = resolved_store_path(config);
 
     match kind {
         "memory" => Ok(Arc::new(InMemoryWorkflowStore::new())),
@@ -1239,11 +1266,8 @@ pub(crate) fn build_workflow_store(config: &Value) -> anyhow::Result<Arc<dyn Wor
 /// [`guard_durable_serve`] refuses for a production `serve`. An unknown kind
 /// fails fast, mirroring [`build_workflow_store`] — no silent fallback.
 pub fn build_evidence_store(config: &Value) -> anyhow::Result<Arc<dyn EvidenceStore>> {
-    let kind = config
-        .pointer("/store/kind")
-        .and_then(Value::as_str)
-        .unwrap_or("memory");
-    let path = config.pointer("/store/path").and_then(Value::as_str);
+    let kind = resolved_store_kind(config);
+    let path = resolved_store_path(config);
 
     match kind {
         "sqlite" => {
@@ -1263,11 +1287,8 @@ pub fn build_evidence_store(config: &Value) -> anyhow::Result<Arc<dyn EvidenceSt
 pub fn build_guidance_ack_store(
     config: &Value,
 ) -> anyhow::Result<Arc<dyn GuidanceAcknowledgmentStore>> {
-    let kind = config
-        .pointer("/store/kind")
-        .and_then(Value::as_str)
-        .unwrap_or("memory");
-    let path = config.pointer("/store/path").and_then(Value::as_str);
+    let kind = resolved_store_kind(config);
+    let path = resolved_store_path(config);
 
     match kind {
         "sqlite" => {
@@ -1287,11 +1308,8 @@ pub fn build_guidance_ack_store(
 pub fn build_script_ack_store(
     config: &Value,
 ) -> anyhow::Result<Arc<dyn ScriptAcknowledgmentStore>> {
-    let kind = config
-        .pointer("/store/kind")
-        .and_then(Value::as_str)
-        .unwrap_or("memory");
-    let path = config.pointer("/store/path").and_then(Value::as_str);
+    let kind = resolved_store_kind(config);
+    let path = resolved_store_path(config);
 
     match kind {
         "sqlite" => {
@@ -1315,11 +1333,8 @@ pub fn build_script_ack_store(
 pub fn build_parked_session_store(
     config: &Value,
 ) -> anyhow::Result<Option<Arc<dyn praxec_core::ports::ParkedSessionStore>>> {
-    let kind = config
-        .pointer("/store/kind")
-        .and_then(Value::as_str)
-        .unwrap_or("memory");
-    let path = config.pointer("/store/path").and_then(Value::as_str);
+    let kind = resolved_store_kind(config);
+    let path = resolved_store_path(config);
 
     match kind {
         "sqlite" => {
@@ -1515,7 +1530,7 @@ mod audit_config_tests {
 
 #[cfg(test)]
 mod parked_store_wiring_tests {
-    use super::build_parked_session_store;
+    use super::{build_parked_session_store, resolved_store_kind, resolved_store_path};
     use praxec_core::model::ParkedAgentSession;
     use serde_json::json;
 
@@ -1565,6 +1580,18 @@ mod parked_store_wiring_tests {
             Ok(_) => panic!("sqlite without a path must fail fast"),
         };
         assert!(err.to_string().contains("store.path is required"));
+    }
+
+    #[test]
+    fn worktree_native_metadata_defaults_every_governance_store_to_shared_sqlite() {
+        let cfg = json!({
+            "praxec": { "_worktreeNative": { "governanceStore": "/git/common/praxec/governance.db" } }
+        });
+        assert_eq!(resolved_store_kind(&cfg), "sqlite");
+        assert_eq!(
+            resolved_store_path(&cfg),
+            Some("/git/common/praxec/governance.db")
+        );
     }
 }
 

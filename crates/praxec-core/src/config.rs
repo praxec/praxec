@@ -3279,8 +3279,16 @@ fn merge_declared_repos(
         // absolute `repos.path`. When invoked inside Git, stamp the discovered
         // worktree as the existing runtime's single allowed write root. Outside
         // Git, preserve host-only behavior; run-capable commands remain loud.
-        if let Ok(root) = invocation_repo_root() {
-            stamp_writable_repos(&mut host, vec![(root.display().to_string(), true, None)]);
+        // A resolved config can retain internal `_writableRepos` across a hot
+        // reload. Never overwrite that operator/runtime state: invalid roots
+        // must stay visible to the reload gate rather than being masked by CWD.
+        if host.pointer("/praxec/_writableRepos").is_none() {
+            if let Ok(root) = invocation_repo_root() {
+                stamp_writable_repos(&mut host, vec![(root.display().to_string(), true, None)]);
+                if let Ok(common_dir) = git_common_dir(&root) {
+                    stamp_worktree_native_state(&mut host, &root, &common_dir);
+                }
+            }
         }
         // No repos declared — strip an empty `overrides:` (it's meaningless
         // without any repo-provided ids to shadow). Host-level staged
@@ -4185,6 +4193,29 @@ fn stamp_writable_repos(config: &mut Value, roots: Vec<(String, bool, Option<Str
     }
 }
 
+/// #206 — runtime-only state derived from the invocation worktree. It is
+/// deliberately stamped after parsing rather than written into user YAML: the
+/// authored configuration stays portable, while every worktree of the same Git
+/// repository converges on one governance SQLite database under its common Git
+/// directory.
+fn stamp_worktree_native_state(config: &mut Value, repo_root: &Path, common_dir: &Path) {
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let praxec = obj
+        .entry("praxec")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(praxec) = praxec.as_object_mut() {
+        praxec.insert(
+            "_worktreeNative".into(),
+            json!({
+                "repoRoot": repo_root,
+                "governanceStore": common_dir.join("praxec").join("governance.db"),
+            }),
+        );
+    }
+}
+
 /// WS-B B2 — the durable, worktree-INDEPENDENT operator-state directory that
 /// `${praxec.state_dir}` resolves to: `$XDG_STATE_HOME/praxec` when
 /// `XDG_STATE_HOME` is set (and non-empty), else `$HOME/.local/state/praxec`.
@@ -4761,6 +4792,34 @@ fn git_toplevel(cwd: &Path) -> anyhow::Result<PathBuf> {
     PathBuf::from(root)
         .canonicalize()
         .with_context(|| format!("canonicalizing Git root {root}"))
+}
+
+/// Return the Git common directory for an invocation worktree. Git emits an
+/// absolute path here, so all linked worktrees resolve to exactly the same
+/// durable governance location.
+fn git_common_dir(cwd: &Path) -> anyhow::Result<PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(cwd)
+        .output()
+        .with_context(|| {
+            format!(
+                "running git rev-parse --git-common-dir in {}",
+                cwd.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!("git rev-parse --git-common-dir failed in {}", cwd.display());
+    }
+    let common = std::str::from_utf8(&output.stdout)
+        .context("git rev-parse emitted non-UTF-8 common directory")?
+        .trim();
+    if common.is_empty() {
+        bail!("git rev-parse --git-common-dir returned an empty path");
+    }
+    PathBuf::from(common)
+        .canonicalize()
+        .with_context(|| format!("canonicalizing Git common directory {common}"))
 }
 
 /// Collect every host-declared definitionId across the four prefixable
@@ -5379,6 +5438,8 @@ mod tests {
     fn host_only_config_uses_the_invocation_worktree_as_its_run_root() {
         let expected =
             invocation_repo_root().expect("test process runs inside the Praxec Git worktree");
+        let common_dir =
+            git_common_dir(&expected).expect("test worktree has a Git common directory");
         let mut diagnostics = Vec::new();
         let merged = merge_declared_repos(
             json!({ "version": "1.0.0", "workflows": {} }),
@@ -5395,6 +5456,16 @@ mod tests {
         assert_eq!(
             merged.pointer("/praxec/_writableRepos/0/push"),
             Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            merged.pointer("/praxec/_worktreeNative/governanceStore"),
+            Some(&Value::String(
+                common_dir
+                    .join("praxec")
+                    .join("governance.db")
+                    .display()
+                    .to_string()
+            ))
         );
     }
 
