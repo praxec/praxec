@@ -36,46 +36,22 @@ pub(crate) fn resolve_target_dir(dir: Option<PathBuf>) -> anyhow::Result<PathBuf
     })
 }
 
-/// Quote an absolute path as a YAML double-quoted scalar, escaping `\` and
-/// `"` so a Windows path (`C:\Users\...`) round-trips safely and a path with
-/// spaces/colons never needs a plain-scalar edge case.
-fn yaml_quoted(p: &Path) -> String {
-    let raw = p.to_string_lossy();
-    let escaped = raw.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}
-
-/// The scaffolded `gateway.yaml` content. `dir` is the config directory (expected
-/// absolute); `project_dir` is the directory `praxec init` was run from — scaffolded
-/// as a `writable: true` repo so the FIRST run has a `repo_root` and works with no
-/// hand-editing (without it, every real command dies on `REPO_ROOT_REQUIRED`). The
-/// repo is `definitions: false` — it is a WRITE TARGET (where agents edit code), not
-/// a source of workflow definitions.
-pub(crate) fn gateway_yaml_content(dir: &Path, project_dir: &Path) -> String {
-    let models = yaml_quoted(&dir.join("models.yaml"));
-    let audit = yaml_quoted(&dir.join("audit-logs"));
-    let db = yaml_quoted(&dir.join("praxec.db"));
-    let project = yaml_quoted(project_dir);
-    format!(
-        r#"version: "1.0.0"
+/// The scaffolded `gateway.yaml` contains no machine paths. When invoked from
+/// a Git worktree, #206 resolves its root and common-dir governance store at
+/// runtime; artifacts and audit logs remain relative to that worktree.
+pub(crate) fn gateway_yaml_content(_dir: &Path, _project_dir: &Path) -> String {
+    r#"version: "1.0.0"
 gateway:
-  principal: {{ subject: operator, roles: [human] }}
-  models_yaml: {models}
+  principal: { subject: operator, roles: [human] }
+  models_yaml: models.yaml
 praxec:
-  embeddings: {{ enabled: false }}
-  agents: {{ auto_drive: false }}
-audit: {{ sink: file, path: {audit}, rotation: daily }}
-store: {{ kind: sqlite, path: {db} }}
-repos:
-  # The project praxec operates on — a WRITE TARGET for agent edits (not a pack).
-  # This is what gives a run its `repo_root`; point it at the repo you want praxec
-  # to work in (add more `- path:` entries for more repos, or `praxec sync` for packs).
-  - path: {project}
-    writable: true
-    definitions: false
-# connections: {{}}  # add MCP tools here (or provision via flow.tools.provision)
+  embeddings: { enabled: false }
+  agents: { auto_drive: false }
+audit: { sink: file, path: .praxec/audit-logs, rotation: daily }
+# Git worktree invocation supplies repo_root and a common-dir SQLite governance store.
+# connections: {}  # add MCP tools here (or provision via flow.tools.provision)
 "#
-    )
+    .to_string()
 }
 
 /// The scaffolded starter `models.yaml` (SPEC §33 D9 model-cost-control
@@ -533,42 +509,27 @@ mod tests {
     // ── gateway.yaml / models.yaml content ──────────────────────────────────
 
     #[test]
-    fn gateway_yaml_content_embeds_absolute_paths_under_the_target_dir() {
+    fn gateway_yaml_content_is_portable_and_has_no_machine_paths() {
         let dir = Path::new("/tmp/praxec-init-test-xyz");
         let yaml = gateway_yaml_content(dir, dir);
         assert!(yaml.contains("version: \"1.0.0\""));
-        assert!(yaml.contains("\"/tmp/praxec-init-test-xyz/models.yaml\""));
-        assert!(yaml.contains("\"/tmp/praxec-init-test-xyz/audit-logs\""));
-        assert!(yaml.contains("\"/tmp/praxec-init-test-xyz/praxec.db\""));
+        assert!(yaml.contains("models_yaml: models.yaml"));
+        assert!(yaml.contains("path: .praxec/audit-logs"));
+        assert!(!yaml.contains("/tmp/praxec-init-test-xyz"));
         assert!(yaml.contains("embeddings: { enabled: false }"));
         assert!(yaml.contains("auto_drive: false"));
         assert!(yaml.contains("sink: file"));
-        assert!(yaml.contains("kind: sqlite"));
-        // The project dir is scaffolded as a writable repo so the first run works.
-        assert!(yaml.contains("repos:"));
-        assert!(yaml.contains("writable: true"));
-        assert!(yaml.contains("definitions: false"));
-        assert!(
-            yaml.contains("\"/tmp/praxec-init-test-xyz\""),
-            "the project dir is the repo path:\n{yaml}"
-        );
+        assert!(!yaml.contains("store:"));
+        assert!(!yaml.contains("repos:"));
+        assert!(yaml.contains("common-dir SQLite governance store"));
         assert!(yaml.contains("# connections: {}"));
     }
 
     #[test]
-    fn gateway_yaml_content_escapes_windows_style_backslash_paths() {
-        // `Path::join` inserts the HOST platform's separator (`/` when this
-        // test runs on Linux/macOS, `\` on Windows) — this asserts only the
-        // thing `yaml_quoted` is actually responsible for: every backslash
-        // already in the input is doubled so the YAML double-quoted scalar
-        // round-trips, independent of which separator the join used.
+    fn gateway_yaml_content_ignores_windows_style_machine_paths() {
         let dir = Path::new(r"C:\Users\op\AppData\Roaming\praxec");
         let yaml = gateway_yaml_content(dir, dir);
-        let escaped_dir = r"C:\\Users\\op\\AppData\\Roaming\\praxec";
-        assert!(
-            yaml.contains(escaped_dir),
-            "expected escaped dir prefix {escaped_dir:?} in:\n{yaml}"
-        );
+        assert!(!yaml.contains("C:\\Users"));
         assert!(yaml.contains("models.yaml"));
     }
 
