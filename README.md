@@ -290,6 +290,39 @@ piggybacking entirely on your own git) → [docs/remote-pack-sourcing.md](docs/r
 · [Capabilities & orchestrators](https://praxec.dev/guides/capabilities-and-orchestrators/)
 · [Multi-repo loading](https://praxec.dev/guides/multi-repo-loading/)
 
+Manage a local writable root without hand-editing or replacing the gateway:
+
+```sh
+praxec repos add ./my-project --writable --name app --config gateway.yaml
+praxec repos list --config gateway.yaml
+praxec repos remove app --config gateway.yaml
+```
+
+A plain code directory needs no `praxec.repo.yaml`: `add --writable` records
+`definitions: false` when no manifest exists. Existing manifests are validated;
+invalid manifests are never treated as empty roots. `--push` explicitly enables
+publishing authored commits and requires a writable Git worktree root. Optional
+`--stub-manifest` creates a zero-definition compatibility manifest and adds
+`/praxec.repo.yaml` to Git's local exclude file, including in linked worktrees.
+It requires a writable Git worktree root and never overwrites an existing manifest.
+
+`repos` edits only the named config file, preserves its YAML values and key order,
+and writes an exact, permission-preserving backup whose path is printed. YAML
+comments/formatting are retained in that backup; serialization may normalize them
+in the edited file. Edits use a process lock, concurrent-change checks and atomic
+replacement. A symlinked config resolves relative paths from its physical file's
+directory, consistently for edits and gateway loads. Inherited declarations must be edited using the declaring file's
+`--config`; the CLI refuses to mask an included repo list. Removing a declaration
+retains all repository files, stubs and Git exclusions. Reload the gateway after
+an edit; restore the printed backup to roll back its config change.
+
+`check`, `doctor` and `health` report every missing or unreadable local directory
+as `REPO_ROOT_MISSING` and continue loading the available repositories. No missing
+directory becomes a writable root. If no definition-bearing repository can load,
+the aggregate `ALL_REPOS_FAILED` error lists the dead roots and recovery steps;
+an explicitly root-only configuration remains valid. Invalid manifests, ambiguous
+identities and unresolved workflow references keep their validation safeguards.
+
 ## Companion MCP tools
 
 Standalone MCP servers that praxec consumes purely over the protocol — no crate

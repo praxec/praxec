@@ -8,6 +8,21 @@ on the cargo crate version. The **config schema** is versioned
 separately — see [`docs/reference/stability.md`](docs/reference/stability.md) for what is and isn't
 covered by a stability commitment.
 
+## [Unreleased]
+
+### Added
+
+- `praxec repos add/list/remove` manages local roots, including manifest-free
+  writable directories and optional locally excluded compatibility stubs. Edits
+  preserve config values, create exact backups, and refuse conflicting edits (#272).
+
+### Fixed
+
+- Every unavailable local root is diagnosed by `check`, `doctor` and `health`
+  as `REPO_ROOT_MISSING`; available repositories remain loadable and missing roots
+  receive no write authority. Total definition-repository loss reports an aggregate
+  failure with recovery steps (#272).
+
 ## [0.0.52] — 2026-09-06 — coarse-task amplifier and evidence-based routing
 
 ### Added

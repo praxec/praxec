@@ -3007,8 +3007,9 @@ pub fn load_resolved_with_repos(
 /// startup failure.
 ///
 /// This is the serve/runtime entrypoint. `praxec check` keeps calling the
-/// strict [`load_resolved_with_repos`] so authors still see a dead entry as
-/// a hard failure.
+/// strict [`load_resolved_with_repos`] so authors still see invalid manifests
+/// as hard failures. Unavailable local directories are diagnosed and skipped
+/// by both loaders (#272); no writable root is stamped for them.
 pub fn load_resolved_with_repos_resilient(
     path: impl AsRef<Path>,
 ) -> anyhow::Result<(Value, Vec<Diagnostic>)> {
@@ -3019,8 +3020,8 @@ pub fn load_resolved_with_repos_resilient(
 /// [`load_resolved_with_repos_resilient`] (finding #13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoLoadMode {
-    /// Any repo entry failing to load fails the whole config load
-    /// (`praxec check` and other authoring surfaces).
+    /// Invalid manifests/definitions fail the whole config load. Unavailable
+    /// local directories are skipped with diagnostics, in both modes (#272).
     Strict,
     /// A failing repo entry is skipped with a warning diagnostic; the rest
     /// of the config loads (serve/runtime surfaces).
@@ -3031,8 +3032,14 @@ fn load_resolved_with_repos_mode(
     path: impl AsRef<Path>,
     mode: RepoLoadMode,
 ) -> anyhow::Result<(Value, Vec<Diagnostic>)> {
-    let path = path.as_ref();
-    let host = load_yaml(path)?;
+    // Use the physical config directory for every relative path, just as
+    // load_yaml already does for includes/scripts. The repos CLI edits that
+    // same canonical file; a symlink must not select a different write root.
+    let path = path
+        .as_ref()
+        .canonicalize()
+        .with_context(|| format!("resolving config path {}", path.as_ref().display()))?;
+    let host = load_yaml(&path)?;
     let parent_dir = path
         .parent()
         .map(Path::to_path_buf)
@@ -3383,8 +3390,37 @@ fn merge_declared_repos(
         // existing local-root containment and manifest-loading path handle it.
         let source = match source {
             RepoSource::InvocationCwd => RepoSource::Local(invocation_repo_root()?),
+            RepoSource::Local(path) if !path.is_absolute() => {
+                RepoSource::Local(host_dir.join(path))
+            }
             source => source,
         };
+        // #272: a pruned worktree is an availability problem, not a malformed
+        // pack. Check every local root before manifest loading (including bare
+        // writable targets) and never stamp an unavailable root into authority.
+        // A present root with a bad/missing manifest still takes the normal
+        // strict validation path below; do not silently reinterpret it.
+        if let RepoSource::Local(path) = &source {
+            if let Err(reason) = local_repo_root_readable(path) {
+                let message = format!("REPO_ROOT_MISSING: {} — skipped ({reason})", path.display());
+                tracing::warn!(entry = %entry_desc, %reason, "{message}");
+                diagnostics.push(Diagnostic {
+                    severity: DiagnosticSeverity::Warn,
+                    code: "REPO_ROOT_MISSING".into(),
+                    message: message.clone(),
+                    location: None,
+                    suggestion: Some(
+                        "recreate the directory, or remove/comment out the entry (or use \
+                         `praxec repos remove <path> --config <gateway.yaml>`), then reload."
+                            .into(),
+                    ),
+                });
+                if definitions {
+                    skipped.push((entry_desc, message));
+                }
+                continue;
+            }
+        }
         // pack-provenance-recording — a remote `uri:` entry's declared `ref:`,
         // captured before `source` is consumed below. Takes priority over the
         // clone-cache dir's own branch name (an internal `git init`-default
@@ -3517,13 +3553,9 @@ fn merge_declared_repos(
         type LoadedRepo = (PathBuf, Option<(crate::repo::RepoManifest, Value)>);
         let loaded: anyhow::Result<LoadedRepo> = (|| {
             let repo_path = match source {
-                RepoSource::Local(p) => {
-                    if p.is_absolute() {
-                        p
-                    } else {
-                        host_dir.join(p)
-                    }
-                }
+                // Local paths were resolved against host_dir before the
+                // availability probe. Do not join a relative host twice.
+                RepoSource::Local(p) => p,
                 RepoSource::Remote { uri, gitref } => {
                     let dest = host_dir
                         .join(".praxec")
@@ -3562,8 +3594,8 @@ fn merge_declared_repos(
         let (repo_path, manifest_and_registry) = match loaded {
             Ok(v) => v,
             Err(err) => match mode {
-                // Strict (check/authoring): keep the historical
-                // all-or-nothing contract — a dead entry fails the load.
+                // Strict (check/authoring): invalid manifests/definitions
+                // remain hard failures after directory availability is checked.
                 RepoLoadMode::Strict => return Err(err),
                 // Resilient (serve/runtime): one stale entry must not
                 // poison every session using this gateway config. Skip it,
@@ -3724,7 +3756,7 @@ fn merge_declared_repos(
         bail!(
             "ALL_REPOS_FAILED: no definition-bearing `repos:` entry loaded (of {declared_count} \
              declared) — every registry-providing repo was skipped, so no repo definitions are \
-             available:\n{}",
+             available. Recreate the directories or remove/comment out the dead entries:\n{}",
             details.join("\n")
         );
     }
@@ -3818,6 +3850,27 @@ fn merge_declared_repos(
     ungranted_connections.extend(staged_ungranted);
     stamp_ungranted_connections(&mut merged, ungranted_connections);
     Ok(merged)
+}
+
+/// Availability only: retain manifest/schema/identity validation at its normal
+/// hard boundary. Reading one directory entry also catches directory listing
+/// failures that `metadata` alone cannot detect.
+fn local_repo_root_readable(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => "directory not found".to_string(),
+        _ => format!("directory unreadable: {err}"),
+    })?;
+    if !metadata.is_dir() {
+        return Err("not a directory".into());
+    }
+    std::fs::metadata(path.join("."))
+        .map_err(|err| format!("directory unreadable (cannot search): {err}"))?;
+    let mut entries =
+        std::fs::read_dir(path).map_err(|err| format!("directory unreadable: {err}"))?;
+    if let Some(entry) = entries.next() {
+        entry.map_err(|err| format!("directory unreadable: {err}"))?;
+    }
+    Ok(())
 }
 
 /// SPEC §9.5 — top-level config key holding operator-staged (not-yet-granted)

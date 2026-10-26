@@ -84,6 +84,11 @@ pub(crate) enum Command {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Manage local repo roots in a gateway config without replacing its settings.
+    Repos {
+        #[command(subcommand)]
+        command: ReposCommand,
+    },
     Observe {
         #[arg(short, long)]
         config: PathBuf,
@@ -366,6 +371,37 @@ pub(crate) enum Command {
         /// provisioning step (default is offer-only). `--yes` implies this.
         #[arg(long)]
         install_tools: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ReposCommand {
+    /// Register an existing local directory (plain writable roots need no manifest).
+    Add {
+        path: PathBuf,
+        #[arg(short, long)]
+        config: PathBuf,
+        #[arg(long)]
+        writable: bool,
+        #[arg(long, requires = "writable")]
+        push: bool,
+        /// Create a zero-definition manifest and exclude it in this Git repo.
+        #[arg(long, requires = "writable")]
+        stub_manifest: bool,
+        /// Optional stable selector name for this root.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Print the config's directly declared repos as JSON (no clones or reload).
+    List {
+        #[arg(short, long)]
+        config: PathBuf,
+    },
+    /// Unregister exactly one local path or declared name; leaves its files intact.
+    Remove {
+        path_or_name: String,
+        #[arg(short, long)]
+        config: PathBuf,
     },
 }
 
@@ -793,8 +829,8 @@ pub(crate) fn load_config(path: &PathBuf) -> anyhow::Result<Value> {
     // RESILIENT loader: a `repos:` entry that fails to load (e.g. a pruned
     // worktree with no praxec.repo.yaml) is skipped with a logged warning
     // instead of poisoning every session's config load. `praxec check` keeps
-    // the strict all-or-nothing loader so authors still see the dead entry
-    // as a hard error.
+    // strict manifest/definition validation; unavailable local directories
+    // receive REPO_ROOT_MISSING warnings on both paths (#272).
     praxec_core::config::load_resolved_with_repos_resilient(path)
         .map(|(config, _diagnostics)| config)
         .with_context(|| format!("loading config {}", path.display()))
