@@ -10,18 +10,31 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+## [0.0.53] — 2026-10-26 — portable worktrees and local roots
+
 ### Added
 
+- Git worktree invocation resolves its writable root and shares durable SQLite
+  governance state and repository leases through the common Git directory.
+  `praxec init` generates portable worktree configuration without machine-specific
+  repository or state paths (#206).
 - `praxec repos add/list/remove` manages local roots, including manifest-free
   writable directories and optional locally excluded compatibility stubs. Edits
   preserve config values, create exact backups, and refuse conflicting edits (#272).
 
 ### Fixed
 
+- Worktree configuration checks reject absolute machine-specific paths while
+  retaining absolute REST endpoint paths (#206).
 - Every unavailable local root is diagnosed by `check`, `doctor` and `health`
   as `REPO_ROOT_MISSING`; available repositories remain loadable and missing roots
   receive no write authority. Total definition-repository loss reports an aggregate
   failure with recovery steps (#272).
+
+### Documentation
+
+- Publishing guidance now records channel-specific release verification and
+  rollback, including config backups and common-directory governance state.
 
 ## [0.0.52] — 2026-09-06 — coarse-task amplifier and evidence-based routing
 
