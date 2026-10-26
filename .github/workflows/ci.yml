@@ -44,16 +44,18 @@ jobs:
               # it small — after the cleanup the build is disk-bound, not RAM.
               run: |
                   echo "before:"; df -h /
-                  sudo rm -rf \
+                  timeout 300s sudo rm -rf \
                     /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
                     /usr/local/lib/android /opt/hostedtoolcache/CodeQL \
                     /usr/share/swift /usr/local/share/powershell \
                     /usr/local/share/chromium /usr/local/lib/node_modules || true
-                  sudo docker image prune --all --force 2>/dev/null || true
-                  sudo apt-get clean
-                  sudo swapoff -a || true
-                  sudo fallocate -l 6G /swapfile2
-                  sudo chmod 600 /swapfile2 && sudo mkswap /swapfile2 && sudo swapon /swapfile2
+                  timeout 120s sudo docker image prune --all --force 2>/dev/null || true
+                  timeout 60s sudo apt-get clean || true
+                  timeout 60s sudo swapoff -a || true
+                  timeout 120s sudo fallocate -l 6G /swapfile2
+                  timeout 30s sudo chmod 600 /swapfile2
+                  timeout 60s sudo mkswap /swapfile2
+                  timeout 60s sudo swapon /swapfile2
                   echo "after:"; df -h / ; free -h
 
             - name: Install Rust toolchain
