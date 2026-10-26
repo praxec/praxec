@@ -1951,3 +1951,100 @@ mod worktree_path_gate_tests {
         assert!(worktree_native_path_findings(&cfg).is_empty());
     }
 }
+
+#[cfg(test)]
+mod worktree_lock_authority_tests {
+    use super::build_repo_locks;
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::Duration;
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap_or_else(|err| panic!("running git {args:?}: {err}"));
+        assert!(status.success(), "git {args:?} failed with {status}");
+    }
+
+    fn common_dir(cwd: &Path) -> PathBuf {
+        let output = Command::new("git")
+            .args(["rev-parse", "--git-common-dir"])
+            .current_dir(cwd)
+            .output()
+            .expect("git is available");
+        assert!(output.status.success());
+        let raw = String::from_utf8(output.stdout).unwrap();
+        let path = PathBuf::from(raw.trim());
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        absolute.canonicalize().unwrap()
+    }
+
+    /// #206 — the authority is not merely a shared path on paper: gateway
+    /// instances built from two real linked worktrees contend through the same
+    /// SQLite lease table.
+    #[tokio::test]
+    async fn linked_worktrees_share_gateway_repo_lock_authority() {
+        let td = tempfile::tempdir().unwrap();
+        let primary = td.path().join("primary");
+        std::fs::create_dir_all(&primary).unwrap();
+        git(&primary, &["init", "--quiet"]);
+        git(&primary, &["config", "user.email", "test@example.invalid"]);
+        git(&primary, &["config", "user.name", "Praxec test"]);
+        std::fs::write(primary.join("README.md"), "fixture\n").unwrap();
+        git(&primary, &["add", "README.md"]);
+        git(&primary, &["commit", "--quiet", "-m", "fixture"]);
+
+        let linked = td.path().join("linked");
+        git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+            ],
+        );
+
+        let first_store = common_dir(&primary).join("praxec").join("governance.db");
+        let second_store = common_dir(&linked).join("praxec").join("governance.db");
+        assert_eq!(
+            first_store, second_store,
+            "linked worktrees share governance state"
+        );
+
+        let config = |store: &Path| {
+            json!({
+                "praxec": { "_worktreeNative": { "governanceStore": store } }
+            })
+        };
+        let first = build_repo_locks(&config(&first_store)).unwrap();
+        let second = build_repo_locks(&config(&second_store)).unwrap();
+        let file = PathBuf::from("src/lib.rs");
+        first
+            .acquire(
+                std::slice::from_ref(&file),
+                "worktree-a",
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let blocked = second
+            .acquire(
+                std::slice::from_ref(&file),
+                "worktree-b",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("a lease from the linked worktree must be visible");
+        assert_eq!(blocked.conflicts, vec![(file, "worktree-a".into())]);
+    }
+}
