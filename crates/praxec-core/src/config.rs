@@ -3263,8 +3263,10 @@ fn git_currency_diagnostics(
 /// Extract `repos:` + `overrides:` from `host`, load each repo, validate
 /// V20 / V21 / V22 / V23, deep-merge repo contents (then host on top so
 /// declared overrides win), and return the cleaned value (with `repos:`
-/// and `overrides:` stripped). Hosts without a `repos:` block round-trip
-/// through unchanged.
+/// and `overrides:` stripped). A host invoked from a Git worktree without a
+/// `repos:` block acquires that worktree as its single writable run root; this
+/// is the #206 worktree-native default. Host-only configs outside Git still
+/// round-trip unchanged for migration compatibility.
 fn merge_declared_repos(
     mut host: Value,
     host_dir: &Path,
@@ -3273,6 +3275,13 @@ fn merge_declared_repos(
 ) -> anyhow::Result<Value> {
     let (repos, overrides) = take_repos_and_overrides(&mut host)?;
     if repos.is_empty() {
+        // #206 — a portable, in-repo config must not need a machine-specific
+        // absolute `repos.path`. When invoked inside Git, stamp the discovered
+        // worktree as the existing runtime's single allowed write root. Outside
+        // Git, preserve host-only behavior; run-capable commands remain loud.
+        if let Ok(root) = invocation_repo_root() {
+            stamp_writable_repos(&mut host, vec![(root.display().to_string(), true, None)]);
+        }
         // No repos declared — strip an empty `overrides:` (it's meaningless
         // without any repo-provided ids to shadow). Host-level staged
         // connections (`px connections add` / `grant`) still get the grant gate.
@@ -5364,6 +5373,29 @@ mod tests {
             Ok(_) => panic!("cwd must not be mixed with a machine path"),
         };
         assert!(format!("{mixed:#}").contains("cannot be combined"));
+    }
+
+    #[test]
+    fn host_only_config_uses_the_invocation_worktree_as_its_run_root() {
+        let expected =
+            invocation_repo_root().expect("test process runs inside the Praxec Git worktree");
+        let mut diagnostics = Vec::new();
+        let merged = merge_declared_repos(
+            json!({ "version": "1.0.0", "workflows": {} }),
+            Path::new("."),
+            RepoLoadMode::Strict,
+            &mut diagnostics,
+        )
+        .expect("host-only config resolves");
+
+        assert_eq!(
+            merged.pointer("/praxec/_writableRepos/0/root"),
+            Some(&Value::String(expected.display().to_string()))
+        );
+        assert_eq!(
+            merged.pointer("/praxec/_writableRepos/0/push"),
+            Some(&Value::Bool(true))
+        );
     }
 
     #[test]
