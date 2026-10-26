@@ -64,6 +64,61 @@ Confirm the GHCR image is public afterward: GitHub → repo → Packages →
 `praxec` → Package settings → set visibility to **Public**. The
 registry cannot verify a private image.
 
+### Release receipt and ownership
+
+The maintainer promoting `dev` owns the release until the following receipt is
+attached to the promotion PR or GitHub release:
+
+- Version, immutable tag and commit, changelog, and green CI/release workflow links.
+- All five archives, their verified `checksums.sha256` entries, and a host install
+  reporting the expected `praxec --version`.
+- Each enabled publishing channel's result. Record intentionally disabled
+  crates.io/GHCR/MCP Registry channels as disabled; a skipped job does not prove
+  a package or image exists. Record the immutable GHCR digest if that channel runs.
+- `check`, `doctor`, and an offline workflow smoke on a disposable config,
+  plus the consuming Junior/toolchain versions and their compatibility receipt.
+- The prior known-good version and artifact/digest, config/state backup location,
+  rollback smoke result, operator, and time. Keep credentials out of the receipt.
+
+### Rollback
+
+Before upgrading, record the installed binary path/version (and image digest for
+container deployments). Stop every gateway using the affected config or shared
+state and save a consistent backup of the config, included files, and configured
+file/SQLite state. For worktree-native configs, include
+`<git-common-dir>/praxec/governance.db` and the related state directory; all linked
+worktrees share it. Use SQLite's backup API or copy the state after all processes
+have stopped, including any remaining WAL/journal files. Keep the snapshot outside
+the active state directory and retain its original permissions.
+
+If validation fails, stop the new gateway, preserve its logs/audit/state for
+diagnosis, and reinstall the prior checksum-verified release in a staging directory.
+For example, with `install.sh` from the trusted checkout:
+
+```bash
+rollback_stage=$(mktemp -d)
+PRAXEC_VERSION=v0.0.52 PRAXEC_BIN_DIR="$rollback_stage" sh install.sh
+"$rollback_stage/praxec" --version
+```
+
+Confirm the checksum entry exists in the prior release's `checksums.sha256` before
+installation. Replace the installed executable atomically from a temporary file
+in its destination directory, or pin the prior container digest. Restore the
+matching pre-upgrade config/state snapshot before restarting; do not let old and
+new gateways write the same database concurrently. Changes accepted after the
+snapshot require reconciliation with the retained audit evidence before rollback
+can be declared complete. A `repos` edit's `.bak` file can restore that one config
+edit, but does not replace the complete pre-upgrade state snapshot.
+
+Run `check`, `doctor`, and the same offline smoke against the restored disposable
+copy first, then restart the intended deployment and record its version and smoke
+result. Do not move/delete the failed release tag or overwrite its published
+archives. Mark the release as affected, direct operators to the known-good version,
+and ship a new patch through the usual PR/CI flow. Published crate and MCP Registry
+versions are immutable; consumers must pin the prior known-good version. If a crate
+must be yanked or an image's `latest` reference changed, record that separate
+maintainer action and its result in the receipt.
+
 ## 2. Official MCP Registry
 
 This is the high-leverage step — several directories below feed off it.

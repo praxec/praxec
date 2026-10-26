@@ -16,6 +16,8 @@ your time and ours land in the same place.
   [`docs/reference/stability.md`](docs/reference/stability.md).
 - **Verification coverage (what's tested vs. what isn't):**
   see the "Verification coverage" section in [`docs/reference/stability.md`](docs/reference/stability.md).
+- **Release preparation, publication, and rollback:**
+  [`docs/development/publishing.md`](docs/development/publishing.md).
 
 ## Branching model
 
