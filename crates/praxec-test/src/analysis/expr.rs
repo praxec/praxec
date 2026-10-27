@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GuardClause {
     /// The context slot path after `$.context.` (e.g. "approved", "fmeca.rpn").
     pub slot: String,

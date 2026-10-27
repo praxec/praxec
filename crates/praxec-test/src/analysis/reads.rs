@@ -36,6 +36,29 @@ pub fn seed_input_guards(input: &mut Value, transition: &Value) {
     }
 }
 
+/// Make comparisons between a context slot and a workflow-input slot true on
+/// both sides. A transition-local fuzzer owns both values, so treating only
+/// input literals as seedable leaves bounded-loop edges falsely uncovered.
+pub fn seed_cross_scope_pairs(context: &mut Value, input: &mut Value, transition: &Value) {
+    let (Some(ctx), Some(in_value)) = (context.as_object_mut(), input.as_object_mut()) else {
+        return;
+    };
+    for expr in all_guard_exprs(transition) {
+        let Some(cmp) = parse_comparison(&expr) else {
+            continue;
+        };
+        let (Some(context_path), Some(input_path)) = (context_ref(&cmp.lhs), input_ref(&cmp.rhs))
+        else {
+            continue;
+        };
+        let Some((context_value, input_value)) = satisfying_pair(&cmp.op) else {
+            continue;
+        };
+        insert_at_path(ctx, context_path, context_value);
+        insert_at_path(in_value, input_path, input_value);
+    }
+}
+
 /// A type-appropriate dummy for context slot `slot`, using the workflow's
 /// `blackboard` slot-type declaration when present. Falls back to a string
 /// (`"fuzz"`) for slots with no declared type. This is what makes a seeded
@@ -155,34 +178,73 @@ fn collect_reads(value: &Value, paths: &mut Vec<String>) {
     }
 }
 
-/// Insert `val` at a dotted `path` inside `map`, creating intermediate objects.
-/// A non-object sitting where an object is needed is replaced — a `{}` dummy must
-/// not block seeding `scoped_out.status`.
-fn insert_at_path(map: &mut Map<String, Value>, path: &str, val: Value) {
+/// Insert `val` at a dotted `path` inside `map`, creating intermediate objects
+/// and indexed arrays. A non-object sitting where an object is needed is
+/// replaced — a `{}` dummy must not block seeding `scoped_out.status`.
+pub(crate) fn insert_at_path(map: &mut Map<String, Value>, path: &str, val: Value) {
     let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
-    let Some((last, parents)) = parts.split_last() else {
+    insert_parts(map, &parts, val);
+}
+
+fn insert_parts(map: &mut Map<String, Value>, parts: &[&str], val: Value) {
+    let Some((head, tail)) = parts.split_first() else {
         return;
     };
-    let mut cursor = map;
-    for p in parents {
-        let entry = cursor
-            .entry((*p).to_string())
+    if let Some((key, index)) = array_segment(head) {
+        let entry = map.entry(key).or_insert_with(|| Value::Array(Vec::new()));
+        if !entry.is_array() {
+            *entry = Value::Array(Vec::new());
+        }
+        let items = entry.as_array_mut().expect("coerced to array above");
+        while items.len() <= index {
+            items.push(Value::Null);
+        }
+        if tail.is_empty() {
+            items[index] = val;
+        } else {
+            if !items[index].is_object() {
+                items[index] = Value::Object(Map::new());
+            }
+            insert_parts(
+                items[index]
+                    .as_object_mut()
+                    .expect("coerced to object above"),
+                tail,
+                val,
+            );
+        }
+    } else if tail.is_empty() {
+        map.insert((*head).to_string(), val);
+    } else {
+        let entry = map
+            .entry((*head).to_string())
             .or_insert_with(|| Value::Object(Map::new()));
         if !entry.is_object() {
             *entry = Value::Object(Map::new());
         }
-        cursor = entry.as_object_mut().expect("coerced to object above");
+        insert_parts(
+            entry.as_object_mut().expect("coerced to object above"),
+            tail,
+            val,
+        );
     }
-    cursor.insert((*last).to_string(), val);
 }
 
 /// True when `path` already resolves to a value in `map`.
 fn path_is_set(map: &Map<String, Value>, path: &str) -> bool {
     let mut cur: Option<&Value> = None;
     for (i, part) in path.split('.').filter(|p| !p.is_empty()).enumerate() {
-        cur = match (i, cur) {
-            (0, _) => map.get(part),
-            (_, Some(v)) => v.get(part),
+        cur = match (i, cur, array_segment(part)) {
+            (0, _, Some((key, index))) => map
+                .get(key)
+                .and_then(Value::as_array)
+                .and_then(|a| a.get(index)),
+            (0, _, None) => map.get(part),
+            (_, Some(v), Some((key, index))) => v
+                .get(key)
+                .and_then(Value::as_array)
+                .and_then(|a| a.get(index)),
+            (_, Some(v), None) => v.get(part),
             _ => None,
         };
         if cur.is_none() {
@@ -190,6 +252,13 @@ fn path_is_set(map: &Map<String, Value>, path: &str) -> bool {
         }
     }
     cur.is_some()
+}
+
+fn array_segment(part: &str) -> Option<(&str, usize)> {
+    let (key, index) = part.strip_suffix(']')?.rsplit_once('[')?;
+    (!key.is_empty())
+        .then_some(())
+        .and_then(|_| index.parse::<usize>().ok().map(|index| (key, index)))
 }
 
 /// The context an isolated probe should START from: every slot the DEFINITION
@@ -291,14 +360,28 @@ pub fn definition_wide_context(def: &Value, blackboard: &Value) -> Map<String, V
         insert_at_path(&mut map, &path, val);
     }
 
-    // 3. initialContext wins — it is what the author actually declared.
+    // 3. initialContext wins at every declared leaf — it is what the author
+    // actually declared. Deep-merge objects so an empty output floor (`{}`)
+    // does not erase an indexed subpath seeded solely to make an isolated
+    // deterministic probe plausible.
     if let Some(seeds) = def.pointer("/initialContext").and_then(Value::as_object) {
         for (k, v) in seeds {
-            map.insert(k.clone(), v.clone());
+            merge_initial_context(map.entry(k.clone()).or_insert(Value::Null), v);
         }
     }
 
     map
+}
+
+fn merge_initial_context(existing: &mut Value, declared: &Value) {
+    match (existing, declared) {
+        (Value::Object(existing), Value::Object(declared)) => {
+            for (key, value) in declared {
+                merge_initial_context(existing.entry(key.clone()).or_insert(Value::Null), value);
+            }
+        }
+        (existing, declared) => *existing = declared.clone(),
+    }
 }
 
 /// A context object that satisfies the transition's guards and populates every
@@ -506,6 +589,21 @@ mod tests {
     }
 
     #[test]
+    fn indexed_context_path_is_seeded_as_an_array_element() {
+        let mut context = Map::new();
+        insert_at_path(
+            &mut context,
+            "flake_report.results[0].deterministic",
+            json!(true),
+        );
+        let context = Value::Object(context);
+        assert_eq!(
+            context.pointer("/flake_report/results/0/deterministic"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
     fn branched_router_has_no_violating_context() {
         // A deterministic router gates nothing (branches route; default fires).
         // No top-level guard ⇒ no violating-path check.
@@ -579,6 +677,22 @@ mod tests {
     }
 
     #[test]
+    fn cross_scope_pair_seeds_context_and_workflow_input_together() {
+        let t = json!({ "target": "x", "actor": "deterministic",
+            "guards": [ { "kind": "expr", "expr": "$.context.round >= $.workflow.input.cap" } ],
+            "executor": { "kind": "noop" } });
+        let mut context = json!({});
+        let mut input = json!({});
+        seed_cross_scope_pairs(&mut context, &mut input, &t);
+        let round = context
+            .pointer("/round")
+            .and_then(Value::as_i64)
+            .expect("round");
+        let cap = input.pointer("/cap").and_then(Value::as_i64).expect("cap");
+        assert!(round >= cap, "pair must satisfy `>=`: {round} >= {cap}");
+    }
+
+    #[test]
     fn definition_wide_context_seeds_a_slot_only_a_downstream_gate_reads() {
         // A slot read by a gate but written by no probed edge and absent from
         // blackboard/initialContext must still be seeded to a type-correct value
@@ -625,6 +739,25 @@ mod tests {
             ctx.get("mode"),
             Some(&json!("declared")),
             "initialContext is the author's declared truth and must win"
+        );
+    }
+
+    #[test]
+    fn empty_initial_object_preserves_seeded_indexed_subpath() {
+        let def = json!({
+            "initialContext": { "report": {} },
+            "states": {
+                "a": { "transitions": { "go": {
+                    "target": "done", "actor": "deterministic",
+                    "guards": [{ "kind": "expr", "expr": "$.context.report.results[0].ok == true" }]
+                } } },
+                "done": { "terminal": true }
+            }
+        });
+        let ctx = definition_wide_context(&def, &json!({}));
+        assert_eq!(
+            Value::Object(ctx).pointer("/report/results/0/ok"),
+            Some(&json!(true))
         );
     }
 }
