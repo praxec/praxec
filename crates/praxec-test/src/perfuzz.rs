@@ -19,7 +19,8 @@ use crate::analysis::output_map::{
 };
 use crate::analysis::plan::{OutputPlan, add_capability_outputs, derive_plan};
 use crate::analysis::reads::{
-    definition_wide_context, satisfying_context_over, seed_input_guards, violating_context_over,
+    definition_wide_context, satisfying_context_over, seed_cross_scope_pairs, seed_input_guards,
+    violating_context_over,
 };
 use crate::isolate::{SubmitResult, submit_isolated, submit_isolated_with_acks};
 use crate::smartmock::SmartMockRegistry;
@@ -305,10 +306,46 @@ fn input_for(def: &serde_json::Value) -> serde_json::Value {
 /// nested required schema (e.g. `cap.plan.build-graph`'s
 /// `graph.deliverables[].{id,…}`): `dummy_for_schema` recurses through `required`.
 fn arguments_for(transition: &serde_json::Value) -> serde_json::Value {
-    match transition.pointer("/inputSchema") {
+    let mut arguments = match transition.pointer("/inputSchema") {
         Some(schema) if !schema.is_null() => crate::analysis::dummy::dummy_arguments(schema),
         _ => serde_json::json!({}),
+    };
+    let Some(choices) = transition.get("choices").and_then(Value::as_object) else {
+        return arguments;
+    };
+    let Some(field) = choices.get("field").and_then(Value::as_str) else {
+        return arguments;
+    };
+    if let Some(target) = arguments.as_object_mut() {
+        target.insert(field.to_owned(), serde_json::json!("fuzz"));
     }
+    arguments
+}
+
+/// Seed the live option set for a human `choices` contract. The production
+/// runtime enforces that an operator's selected value is present in that set;
+/// an isolated fuzzer must therefore create both halves of the contract.
+fn seed_choices(context: &mut Value, transition: &Value) {
+    let Some(choices) = transition.get("choices").and_then(Value::as_object) else {
+        return;
+    };
+    let (Some(from), Some(value)) = (
+        choices.get("from").and_then(Value::as_str),
+        choices.get("value").and_then(Value::as_str),
+    ) else {
+        return;
+    };
+    let Some(path) = from.strip_prefix("$.context.") else {
+        return;
+    };
+    let mut option = serde_json::Map::new();
+    option.insert(value.to_owned(), serde_json::json!("fuzz"));
+    option.insert("name".to_owned(), serde_json::json!("fuzz"));
+    option.insert("layer".to_owned(), serde_json::json!("unit"));
+    let Value::Object(map) = context else {
+        return;
+    };
+    crate::analysis::reads::insert_at_path(map, path, Value::Array(vec![Value::Object(option)]));
 }
 
 /// Test every transition in `definition` (one resolved workflow def) in
@@ -317,12 +354,16 @@ pub async fn fuzz_transitions(
     resolved: &Value,
     definition_id: &str,
 ) -> anyhow::Result<Vec<TransitionVerdict>> {
-    let def = &resolved["workflows"][definition_id];
-    let edges = walk(def).edges;
-
     // Load the definition snapshot once — every isolated submit needs it.
     let definitions = ConfigDefinitionStore::from_config(resolved);
     let snapshot = definitions.load(definition_id).await?;
+    // Plan against the same normalized definition carried by each isolated
+    // instance.  In particular, `kind: workflow` `use.outputs` bindings are
+    // expanded into transition `output:` mappings during config resolution;
+    // using the pre-resolution source here leaves their mock output shapes
+    // invisible and creates false unset-slot failures downstream.
+    let def = &snapshot;
+    let edges = walk(def).edges;
 
     // Build a definition-wide mock plan ONCE: covers every transition's outputs
     // so that auto-chained deterministic transitions can also resolve their
@@ -419,11 +460,13 @@ pub async fn fuzz_transitions(
 
         let mut sat_ctx = satisfying_context_over(tobj, &blackboard, Some(&def_context));
         seed_declared_outputs(&mut sat_ctx, def);
+        seed_choices(&mut sat_ctx, tobj);
         // Per-edge input: satisfy THIS edge's `$.workflow.input.*` / `$.input.*`
         // guards. Sibling edges gate the same input slot on exclusive values, so
         // this can't be shared across the definition.
         let mut edge_input = workflow_input.clone();
         seed_input_guards(&mut edge_input, tobj);
+        seed_cross_scope_pairs(&mut sat_ctx, &mut edge_input, tobj);
         let executors: Arc<dyn ExecutorRegistry> =
             Arc::new(SmartMockRegistry::new(def_plan.clone()));
         let (rt, store, ack_store) = build_runtime(resolved, executors);

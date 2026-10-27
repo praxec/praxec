@@ -1,8 +1,8 @@
 //! Loads a resolved config and drives every definition N seeded times with the
 //! smart mock registry + failure injection + fuzz chooser, classifying each run.
 
-use std::collections::HashSet;
-use std::path::Path;
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use praxec_agents::orchestrator::{
@@ -16,6 +16,7 @@ use praxec_core::config;
 use praxec_core::guards::DefaultGuardEvaluator;
 use praxec_core::model::{Principal, StartWorkflow};
 use praxec_core::ports::{DefinitionStore, ExecutorRegistry};
+use praxec_core::repo_locks::RepoLockSpace;
 use praxec_core::store::{ConfigDefinitionStore, InMemoryWorkflowStore};
 use serde_json::Value;
 
@@ -38,6 +39,27 @@ const STEP_BUDGET: usize = 40;
 // oracle accepts as Pass). Rate 15 is safe: it exercises failure paths while
 // leaving the sound fixture's single-transition flow resolvable on every run.
 const FAILURE_RATE: u8 = 15;
+
+/// The mock harness has no live connections, but workflows that declare an
+/// exclusive pool must still exercise their scheduler path. Give each declared
+/// pool one deterministic in-process member; no external resource is touched.
+fn mock_exclusive_pools(resolved: &Value) -> BTreeMap<String, Vec<PathBuf>> {
+    let mut pools = BTreeMap::new();
+    let Some(workflows) = resolved.get("workflows").and_then(Value::as_object) else {
+        return pools;
+    };
+    for definition in workflows.values() {
+        let Some(names) = definition.get("exclusive_pools").and_then(Value::as_array) else {
+            continue;
+        };
+        for name in names.iter().filter_map(Value::as_str) {
+            pools
+                .entry(name.to_owned())
+                .or_insert_with(|| vec![PathBuf::from(format!("fuzz-pool-{name}"))]);
+        }
+    }
+    pools
+}
 
 pub struct ScenarioResult {
     pub seed: u64,
@@ -150,13 +172,17 @@ async fn run_one(
     let guards = Arc::new(DefaultGuardEvaluator::new());
     let audit = Arc::new(MemoryAuditSink::new());
 
-    let runtime = Arc::new(WorkflowRuntime::new(
-        definitions,
-        store,
-        executors,
-        guards,
-        audit.clone() as Arc<dyn AuditSink>,
-    ));
+    let runtime = Arc::new(
+        WorkflowRuntime::new(
+            definitions,
+            store,
+            executors,
+            guards,
+            audit.clone() as Arc<dyn AuditSink>,
+        )
+        .with_repo_locks(Arc::new(RepoLockSpace::new()))
+        .with_exclusive_pools(mock_exclusive_pools(resolved)),
+    );
 
     // Seed the start input from the workflow's `inputSchema` so flows with
     // required inputs actually start (an empty `{}` would fail validation and be
