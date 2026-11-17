@@ -10,6 +10,19 @@ covered by a stability commitment.
 
 ## [Unreleased]
 
+## [0.0.54] — 2026-11-17 — deterministic fuzz harness
+
+### Fixed
+
+- `praxec fuzz` mock planning now carries guard requirements through deterministic
+  routing paths, supports indexed JSON-path context slots, keeps generated nested
+  seeds under declared object floors, and synthesizes anchored-prefix string dummies
+  for transition input schemas. Chained output contracts are seeded
+  deterministically (#309, #310).
+- The fuzz driver wires repository locks and exclusive pools, so definitions that
+  need a lease (for example browser-exclusive pools) no longer report
+  `POOL_LEASE_UNAVAILABLE` under mock execution (#310).
+
 ## [0.0.53] — 2026-10-26 — portable worktrees and local roots
 
 ### Added
