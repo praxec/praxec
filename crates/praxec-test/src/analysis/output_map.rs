@@ -89,6 +89,28 @@ pub fn insert_nested(obj: &mut serde_json::Map<String, Value>, parts: &[&str], v
     if parts.is_empty() {
         return;
     }
+    if let Some((key, index)) = array_segment(parts[0]) {
+        let entry = obj.entry(key).or_insert_with(|| Value::Array(Vec::new()));
+        let Some(items) = entry.as_array_mut() else {
+            return;
+        };
+        while items.len() <= index {
+            items.push(Value::Null);
+        }
+        if parts.len() == 1 {
+            if items[index].is_null() {
+                items[index] = value;
+            }
+            return;
+        }
+        if !items[index].is_object() {
+            items[index] = Value::Object(serde_json::Map::new());
+        }
+        if let Some(child) = items[index].as_object_mut() {
+            insert_nested(child, &parts[1..], value);
+        }
+        return;
+    }
     if parts.len() == 1 {
         obj.entry(parts[0]).or_insert(value);
         return;
@@ -110,15 +132,42 @@ pub fn insert_nested(obj: &mut serde_json::Map<String, Value>, parts: &[&str], v
 pub fn remove_nested(obj: &mut serde_json::Map<String, Value>, parts: &[&str]) {
     match parts {
         [] => {}
+        [head] if array_segment(head).is_some() => {
+            let (key, index) = array_segment(head).expect("checked above");
+            if let Some(items) = obj.get_mut(key).and_then(Value::as_array_mut)
+                && let Some(item) = items.get_mut(index)
+            {
+                *item = Value::Null;
+            }
+        }
         [leaf] => {
             obj.remove(*leaf);
         }
         [head, tail @ ..] => {
-            if let Some(sub) = obj.get_mut(*head).and_then(Value::as_object_mut) {
+            if let Some((key, index)) = array_segment(head) {
+                if let Some(sub) = obj
+                    .get_mut(key)
+                    .and_then(Value::as_array_mut)
+                    .and_then(|items| items.get_mut(index))
+                    .and_then(Value::as_object_mut)
+                {
+                    remove_nested(sub, tail);
+                }
+            } else if let Some(sub) = obj.get_mut(*head).and_then(Value::as_object_mut) {
                 remove_nested(sub, tail);
             }
         }
     }
+}
+
+/// A dotted path component may address one array element (for example
+/// `results[0]`).  Keep this small parser local to mock-output construction;
+/// the runtime remains the authority for general JSON-path evaluation.
+fn array_segment(part: &str) -> Option<(&str, usize)> {
+    let (key, index) = part.strip_suffix(']')?.rsplit_once('[')?;
+    (!key.is_empty())
+        .then_some(())
+        .and_then(|_| index.parse::<usize>().ok().map(|index| (key, index)))
 }
 
 #[cfg(test)]
@@ -195,6 +244,13 @@ mod tests {
         insert_nested(&mut obj, &["json", "b"], json!(2));
         assert_eq!(obj["json"]["a"], json!(1));
         assert_eq!(obj["json"]["b"], json!(2));
+    }
+
+    #[test]
+    fn insert_nested_creates_array_element_for_indexed_path() {
+        let mut obj = serde_json::Map::new();
+        insert_nested(&mut obj, &["results[0]", "deterministic"], json!(true));
+        assert_eq!(obj["results"][0]["deterministic"], json!(true));
     }
 
     #[test]

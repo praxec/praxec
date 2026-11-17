@@ -3,7 +3,7 @@
 //! — letting a guard-gated flow traverse under mock execution.
 
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::analysis::dummy::dummy_for_schema;
 use crate::analysis::expr::{GuardClause, parse_clause, satisfying_value};
@@ -40,6 +40,58 @@ pub(crate) fn output_obj<'a>(
         .expect("just coerced to an object above")
 }
 
+/// Guard clauses that an auto-chained deterministic path can reach from
+/// `state`.  A mock output is often consumed after one or more deterministic
+/// routing states, so planning only the immediate target state's guards leaves
+/// a real context value overwritten by an incomplete mock before its reader.
+fn reachable_deterministic_guards(
+    states: &Map<String, Value>,
+    state: &str,
+    visited: &mut HashSet<String>,
+) -> Vec<GuardClause> {
+    if !visited.insert(state.to_owned()) {
+        return Vec::new();
+    }
+
+    let mut clauses = Vec::new();
+    let Some(transitions) = states
+        .get(state)
+        .and_then(|state| state.get("transitions"))
+        .and_then(Value::as_object)
+    else {
+        return clauses;
+    };
+
+    for transition in transitions.values() {
+        // Every outgoing edge can consume an upstream mock output, regardless
+        // of who performs that edge. Only automatic deterministic edges are
+        // safe to traverse beyond this state; agent and human edges stop the
+        // chain but their own guard still needs a satisfiable producer value.
+        if let Some(guards) = transition["guards"].as_array() {
+            for guard in guards {
+                if let Some(expr) = guard["expr"].as_str()
+                    && let Some(clause) = parse_clause(expr)
+                {
+                    clauses.push(clause);
+                }
+            }
+        }
+        // Omitted actor defaults to deterministic in the resolved workflow
+        // contract; preserve that behavior for compact fixtures as well.
+        if transition["actor"]
+            .as_str()
+            .is_some_and(|actor| actor != "deterministic")
+        {
+            continue;
+        }
+        if let Some(target) = transition["target"].as_str() {
+            clauses.extend(reachable_deterministic_guards(states, target, visited));
+        }
+    }
+
+    clauses
+}
+
 /// `definition` is a resolved workflow definition JSON (one `workflows.<id>` value).
 pub fn derive_plan(definition: &Value) -> OutputPlan {
     // TODO(P1.1): composite keys if names collide across states
@@ -49,35 +101,10 @@ pub fn derive_plan(definition: &Value) -> OutputPlan {
         return plan;
     };
 
-    // Step 1: Build downstream guard clauses per state name.
-    // downstream[stateName] = all GuardClauses from that state's OUTGOING transitions.
-    // These are the clauses a flow must satisfy to LEAVE that state.
-    let mut downstream: HashMap<&str, Vec<GuardClause>> = HashMap::new();
-    for (state_name, state_obj) in states {
-        let Some(transitions) = state_obj["transitions"].as_object() else {
-            continue;
-        };
-        for (_t_name, t_obj) in transitions {
-            let Some(guards) = t_obj["guards"].as_array() else {
-                continue;
-            };
-            for guard in guards {
-                let Some(expr_str) = guard["expr"].as_str() else {
-                    continue;
-                };
-                if let Some(clause) = parse_clause(expr_str) {
-                    downstream
-                        .entry(state_name.as_str())
-                        .or_default()
-                        .push(clause);
-                }
-            }
-        }
-    }
-
-    // Step 2: For each outgoing transition T from state S -> target S2,
-    // look at downstream[S2] to find which context slots must be satisfied,
-    // then check if T's output map feeds any of those slots from an executor field.
+    // For each outgoing transition T from state S -> target S2, collect guards
+    // reachable through deterministic auto-chains and plan values for any output
+    // slot T writes.  This is intentionally transitive: routing states can sit
+    // between a producer and the first guard that reads its output.
     for (_state_name, state_obj) in states {
         let Some(transitions) = state_obj["transitions"].as_object() else {
             continue;
@@ -90,10 +117,11 @@ pub fn derive_plan(definition: &Value) -> OutputPlan {
             // What does this transition write to context?
             let output_mappings = analyze_output(t_obj);
 
-            // What does the target state require?
-            let Some(clauses) = downstream.get(target) else {
+            let mut visited = HashSet::new();
+            let clauses = reachable_deterministic_guards(states, target, &mut visited);
+            if clauses.is_empty() {
                 continue;
-            };
+            }
 
             for (slot, source) in &output_mappings {
                 let OutputSource::Field(field) = source else {
@@ -111,7 +139,7 @@ pub fn derive_plan(definition: &Value) -> OutputPlan {
                 //
                 // So match on the clause's TOP segment and plant the satisfying
                 // value at the sub-path INSIDE the emitted field.
-                for clause in clauses {
+                for clause in &clauses {
                     let (top, rest) = match clause.slot.split_once('.') {
                         Some((t, r)) => (t, Some(r)),
                         None => (clause.slot.as_str(), None),
@@ -303,6 +331,36 @@ mod tests {
         assert_eq!(
             plan.get("t").and_then(|m| m.get("verdict")),
             Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn output_satisfies_guard_after_deterministic_routing_hop() {
+        // `advance` produces the whole item, then the deterministic `route`
+        // transition moves through a routing state before `kind` reads it.
+        // The fuzz mock must preserve a shape that reaches that second gate.
+        let d = json!({
+            "initialState": "producer",
+            "states": {
+                "producer": { "transitions": { "advance": {
+                    "target": "router", "actor": "deterministic", "executor": {"kind":"noop"},
+                    "output": { "current_item": "$.output.json.item" }
+                } } },
+                "router": { "transitions": { "route": {
+                    "target": "kind_gate", "actor": "deterministic", "executor": {"kind":"noop"}
+                } } },
+                "kind_gate": { "transitions": { "kind": {
+                    "target": "done", "actor": "deterministic", "executor": {"kind":"noop"},
+                    "guards": [ { "kind": "expr", "expr": "$.context.current_item.kind == 'doc'" } ]
+                } } },
+                "done": { "terminal": true, "transitions": {} }
+            }
+        });
+        let plan = derive_plan(&d);
+        assert_eq!(
+            plan.get("advance")
+                .and_then(|value| value.pointer("/json/item/kind")),
+            Some(&json!("doc"))
         );
     }
 }

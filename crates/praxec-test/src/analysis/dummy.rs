@@ -58,7 +58,7 @@ pub fn dummy_for_schema(schema: &Value) -> Value {
             // declared `minLength: 200`) produce a *satisfying* dummy rather than
             // a too-short value that trips INPUT_SCHEMA_VIOLATION.
             let min = schema.get("minLength").and_then(Value::as_u64).unwrap_or(0) as usize;
-            let mut s = String::from("fuzz");
+            let mut s = anchored_literal_prefix(schema).unwrap_or_else(|| String::from("fuzz"));
             while s.len() < min {
                 s.push('x');
             }
@@ -96,6 +96,24 @@ pub fn dummy_for_schema(schema: &Value) -> Value {
         }
         _ => Value::Null,
     }
+}
+
+/// Return the literal prefix of a small anchored pattern, if one is evident.
+/// Fuzz input generation must not pretend to implement a regex engine; this
+/// deliberately supports only the safe `^literal` subset, then lets the
+/// runtime schema gate expose patterns that need a richer generator.
+fn anchored_literal_prefix(schema: &Value) -> Option<String> {
+    let pattern = schema.get("pattern")?.as_str()?.strip_prefix('^')?;
+    let prefix: String = pattern
+        .chars()
+        .take_while(|ch| {
+            !matches!(
+                ch,
+                '\\' | '[' | ']' | '(' | ')' | '{' | '}' | '.' | '*' | '+' | '?' | '|' | '$' | '^'
+            )
+        })
+        .collect();
+    (!prefix.is_empty()).then_some(prefix)
 }
 
 /// Build an object populating EVERY declared property of an object schema
@@ -233,6 +251,14 @@ mod tests {
         assert_eq!(
             dummy_for_schema(&json!({ "type": "string", "minLength": 2 })),
             json!("fuzz")
+        );
+    }
+
+    #[test]
+    fn string_honors_anchored_literal_prefix() {
+        assert_eq!(
+            dummy_for_schema(&json!({ "type": "string", "pattern": "^tests/" })),
+            json!("tests/")
         );
     }
 
